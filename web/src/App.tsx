@@ -52,6 +52,7 @@ import {
 } from "./actors";
 import { BoardColumn } from "./components/BoardColumn";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
+import { AgentLaneBoard } from "./components/AgentLaneBoard";
 import { BoardCardDisplayMenu } from "./components/BoardCardDisplayMenu";
 import { DashboardView } from "./components/DashboardView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
@@ -135,7 +136,7 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
-type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt";
+type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt" | "lanes";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
@@ -1551,7 +1552,11 @@ export function App() {
       if (!routeIssueIdentifier) detailSourceProjectIdRef.current = null;
       setDetailTaskIdentifier(routeIssueIdentifier);
       if (routeProjectId === selectedProjectId) return;
-      setBoardView(routeProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(routeProjectId));
+      setBoardView(routeProjectId === ALL_PROJECTS_ID
+        ? "issues"
+        : routeProjectId === "capstone-dev"
+          ? "lanes"
+          : readProjectBoardView(routeProjectId));
       setSelectedProjectId(routeProjectId);
     }
 
@@ -1846,6 +1851,10 @@ export function App() {
     void loadProjectList(controller.signal);
     return () => controller.abort();
   }, [loadProjectList]);
+
+  useEffect(() => {
+    if (selectedProjectId === "capstone-dev") setBoardView("lanes");
+  }, [selectedProjectId]);
 
   const refreshProjectList = useCallback(async () => {
     const requestId = ++projectsRequestRef.current;
@@ -2974,7 +2983,11 @@ export function App() {
     setProjectMenuOpen(false);
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
-    setBoardView(projectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(projectId));
+    setBoardView(projectId === ALL_PROJECTS_ID
+      ? "issues"
+      : projectId === "capstone-dev"
+        ? "lanes"
+        : readProjectBoardView(projectId));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -3392,6 +3405,16 @@ export function App() {
                 {text("项目文档", "Project Docs")}
               </button>
             )}
+            {selectedProjectId === "capstone-dev" && (
+              <button
+                className={`view-tab${boardView === "lanes" ? " active" : ""}`}
+                type="button"
+                aria-pressed={boardView === "lanes"}
+                onClick={() => selectBoardView("lanes")}
+              >
+                Agent Lanes
+              </button>
+            )}
           </div>
           {(boardView === "issues" || boardView === "list" || boardView === "gantt") && <div className="toolbar-tools">
             <div className={`search-field${search ? " has-value" : ""}`} title={text("搜索议题 (/)", "Search issues (/)")}>
@@ -3611,6 +3634,8 @@ export function App() {
               onUpdate={updateTaskProperties}
             />
           </Suspense>
+        ) : boardView === "lanes" ? (
+          <AgentLaneBoard projectId={selectedProject?.id ?? "capstone-dev"} />
         ) : (
           <div
             className={`issue-board-layout${otherTasksVisible ? " has-other-tasks" : ""}`}

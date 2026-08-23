@@ -1,0 +1,621 @@
+import { createReadStream } from "node:fs";
+import { open, readFile, readdir, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import path from "node:path";
+import { createInterface } from "node:readline";
+
+export const AGENT_LANE_SNAPSHOT_VERSION = 3;
+const MAX_TAIL_BYTES = 512 * 1024;
+const MAX_VISIBLE_SUBAGENTS = 12;
+const CONNECTED_SOURCES = new Set(["codex"]);
+const CONNECTIONS = new Set(["connected", "not_connected"]);
+const TASK_TYPES = new Set(["root_task", "peer_task", "infrastructure_task"]);
+const TODO_STATES = new Set(["ready", "claimed", "waiting_user", "blocked", "validating", "completed"]);
+
+class AgentLaneSnapshotError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = "AgentLaneSnapshotError";
+    this.code = code;
+  }
+}
+
+function text(value, fallback = null) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function compact(value, maxLength = 360) {
+  const normalized = text(value)
+    ?.replace(/-----BEGIN [^-]+-----[\s\S]*?-----END [^-]+-----/g, "[redacted]")
+    .replace(/\bAKIA[A-Z0-9]{16}\b/g, "[redacted]")
+    .replace(/https?:\/\/[^\s/:@]+:[^\s/@]+@/gi, "https://[redacted]@")
+    ?.replace(/\b(api[_-]?key|token|password|secret)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_]{16,}\b/g, "[redacted]")
+    .replace(/\b[A-Za-z0-9+/_=-]{32,}\b/g, (candidate) => (
+      /^[a-f0-9]{40}$/i.test(candidate) ? candidate : "[redacted]"
+    ))
+    .replace(/\s+/g, " ") ?? null;
+  if (!normalized || normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function completionSummary(value) {
+  const raw = text(value, "") ?? "";
+  const payload = raw.match(/(?:^|\s)Payload:\s*([\s\S]+)$/i)?.[1] ?? raw;
+  return compact(payload, 180);
+}
+
+function validateConfigTask(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = text(value.id);
+  const label = text(value.label);
+  const owner = text(value.owner);
+  const source = text(value.source);
+  if (!id || !label || !owner || !source) return null;
+  const explicitConnection = text(value.connection);
+  const connection = explicitConnection ?? (CONNECTED_SOURCES.has(source) ? "connected" : "not_connected");
+  if (!CONNECTIONS.has(connection)) return null;
+  const threadId = text(value.threadId);
+  if (connection === "connected" && source === "codex" && !threadId) return null;
+  return {
+    id,
+    label,
+    owner,
+    source,
+    connection,
+    threadId,
+    roleNote: text(value.roleNote),
+    taskType: TASK_TYPES.has(value.taskType) ? value.taskType : "peer_task",
+    issueIdentifier: text(value.issueIdentifier),
+  };
+}
+
+function validateConfigAdapter(value) {
+  const lane = validateConfigTask({ ...value, taskType: "peer_task" });
+  return lane ? { ...lane, taskType: null } : null;
+}
+
+function validateTodo(value, taskIds) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = text(value.id);
+  const title = text(value.title);
+  const state = text(value.state);
+  const claimedBy = text(value.claimedBy);
+  const leaseExpiresAt = text(value.leaseExpiresAt);
+  if (!id || !title || !TODO_STATES.has(state)) return null;
+  if (claimedBy && !taskIds.has(claimedBy)) return null;
+  if (state === "claimed" && (!claimedBy || !leaseExpiresAt)) return null;
+  return {
+    id,
+    title,
+    state,
+    claimedBy,
+    claimedAt: text(value.claimedAt),
+    leaseExpiresAt,
+    writeScope: Array.isArray(value.writeScope) ? value.writeScope.map((item) => text(item)).filter(Boolean) : [],
+    nextAction: compact(value.nextAction, 80),
+    evidenceRef: compact(value.evidenceRef, 160),
+  };
+}
+
+async function readConfig(configPath, projectId, getLaneConfig) {
+  let project;
+  if (getLaneConfig) {
+    project = await getLaneConfig(projectId);
+  } else {
+    let parsed;
+    try {
+      parsed = JSON.parse(await readFile(configPath, "utf8"));
+    } catch {
+      throw new AgentLaneSnapshotError(
+        "AGENT_LANES_CONFIG_UNAVAILABLE",
+        "Agent lane configuration is unavailable.",
+      );
+    }
+    project = parsed?.version === 2 ? parsed.projects?.[projectId] : null;
+  }
+  const tasks = Array.isArray(project?.tasks) ? project.tasks.map(validateConfigTask) : [];
+  const adapters = Array.isArray(project?.adapters) ? project.adapters.map(validateConfigAdapter) : [];
+  const taskIds = tasks.flatMap((lane) => lane ? [lane.id] : []);
+  const adapterIds = adapters.flatMap((lane) => lane ? [lane.id] : []);
+  if (
+    tasks.length === 0
+    || tasks.some((lane) => lane === null)
+    || adapters.some((lane) => lane === null)
+    || new Set([...taskIds, ...adapterIds]).size !== taskIds.length + adapterIds.length
+    || !text(project?.rootTaskId)
+    || !tasks.some((task) => task.id === project.rootTaskId && task.taskType === "root_task")
+  ) {
+    throw new AgentLaneSnapshotError(
+      "AGENT_LANES_NOT_CONFIGURED",
+      `Project '${projectId}' has no valid Agent Lane mapping`,
+    );
+  }
+  return { rootTaskId: project.rootTaskId, tasks, adapters };
+}
+
+function actionFingerprint(value) {
+  const normalized = compact(value)?.toLowerCase();
+  return normalized ? createHash("sha256").update(normalized).digest("hex").slice(0, 16) : null;
+}
+
+function nextActionFrom(value) {
+  const body = text(value, "") ?? "";
+  const match = body.match(/(?:^|\n|[.!?。]\s+)\s*(?:next action|下一步|exact first (?:owner )?action)\s*[:：]\s*(.+)/i);
+  return compact(match?.[1], 240);
+}
+
+function continuityFor(lane) {
+  if (lane.connection === "not_connected") {
+    return { state: "adapter_off", reason: "Adapter is intentionally disabled." };
+  }
+  if (lane.status === "unavailable") {
+    return { state: "disconnected", reason: lane.blocker };
+  }
+  if (lane.freshness === "fresh") return { state: "healthy", reason: null };
+  return { state: "attention", reason: `Lane evidence is ${lane.freshness}.` };
+}
+
+function todoProjection(todo, projectId, taskLanes, now) {
+  const owner = todo.claimedBy ? taskLanes.find((lane) => lane.id === todo.claimedBy) : null;
+  const leaseDate = todo.leaseExpiresAt ? new Date(todo.leaseExpiresAt) : null;
+  const leaseExpired = leaseDate && !Number.isNaN(leaseDate.getTime()) && leaseDate <= now;
+  const leaseState = !todo.claimedBy ? "unclaimed" : leaseExpired ? "expired" : "active";
+  const route = leaseExpired
+    ? "replan_required"
+    : ({
+        ready: "ready_for_agent",
+        claimed: "wait",
+        waiting_user: "user_action_required",
+        blocked: "blocked",
+        validating: "wait",
+        completed: "validated_completion",
+      })[todo.state];
+  const attention = leaseExpired
+    ? "needs_coordinator"
+    : todo.state === "waiting_user"
+      ? "needs_user"
+      : todo.state === "ready"
+        ? "ready"
+        : todo.state === "blocked"
+          ? "blocked"
+          : todo.state === "completed"
+            ? "done"
+            : "watch";
+  const recoveryActionId = actionFingerprint(`${projectId}:${todo.id}:${todo.claimedBy ?? "unclaimed"}:${todo.leaseExpiresAt ?? "none"}`);
+  return {
+    ...todo,
+    claim: todo.claimedBy ? {
+      laneId: todo.claimedBy,
+      ownerStableIdentity: owner?.stableIdentity ?? null,
+      ownerLabel: owner?.label ?? todo.claimedBy,
+      claimedAt: todo.claimedAt,
+      leaseExpiresAt: todo.leaseExpiresAt,
+      leaseState,
+      writeScope: todo.writeScope,
+    } : null,
+    continuation: { route, attention },
+    recovery: {
+      mode: "manual_only",
+      eligible: leaseState === "expired",
+      actionId: recoveryActionId,
+      automaticExecution: false,
+    },
+  };
+}
+
+function taskTodoState(task) {
+  return ({
+    backlog: "ready",
+    todo: "ready",
+    in_progress: "claimed",
+    in_review: "validating",
+    blocked: task.labels.includes("waiting-user") ? "waiting_user" : "blocked",
+    done: "completed",
+    canceled: "completed",
+  })[task.status] ?? "blocked";
+}
+
+async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComments, generatedAt) {
+  const storedClaim = getClaim ? await getClaim(task.id) : null;
+  const claim = ["in_progress", "in_review"].includes(task.status) ? storedClaim : null;
+  const owner = claim?.agentPath
+    ? taskLanes.find((lane) => lane.threadId === claim.agentThreadId || lane.id === claim.agentPath.replace(/^\/root\//, ""))
+    : taskLanes.find((lane) => lane.threadId === task.threadId);
+  const comments = listComments ? await listComments(task.id) : [];
+  const latest = comments.at(-1) ?? null;
+  return todoProjection({
+    id: task.identifier,
+    title: task.title,
+    state: taskTodoState(task),
+    claimedBy: claim?.agentPath ?? owner?.id ?? null,
+    claimedAt: claim?.claimedAt ?? null,
+    leaseExpiresAt: null,
+    writeScope: task.labels,
+    nextAction: nextActionFrom(latest?.body) ?? compact(task.title, 80),
+    evidenceRef: latest ? `comment:${latest.id}` : `task:${task.identifier}`,
+  }, projectId, taskLanes, generatedAt);
+}
+
+async function workItemFor(taskLane, getTask, listComments) {
+  if (!taskLane.issueIdentifier || !getTask) return null;
+  const task = await getTask(taskLane.issueIdentifier);
+  if (!task) return null;
+  const comments = listComments ? await listComments(task.id) : [];
+  const latest = comments.at(-1) ?? null;
+  return {
+    identifier: task.identifier,
+    title: task.title,
+    status: task.status,
+    commentCount: comments.length,
+    latestWorkingLog: compact(latest?.body),
+    latestWorkingLogAt: text(latest?.createdAt),
+    latestWorkingLogThreadId: text(latest?.threadId),
+    relations: task.relations ?? null,
+    nextAction: nextActionFrom(latest?.body),
+  };
+}
+
+async function findSessionFile(directory, threadId) {
+  let entries;
+  try {
+    entries = await readdir(directory, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await findSessionFile(target, threadId);
+      if (nested) return nested;
+    } else if (entry.isFile() && entry.name.endsWith(`-${threadId}.jsonl`)) {
+      return target;
+    }
+  }
+  return null;
+}
+
+async function readTailLines(filename) {
+  const details = await stat(filename);
+  const length = Math.min(details.size, MAX_TAIL_BYTES);
+  const handle = await open(filename, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, details.size - length);
+    let value = buffer.toString("utf8");
+    if (details.size > length) value = value.slice(value.indexOf("\n") + 1);
+    return value.split("\n").filter(Boolean);
+  } finally {
+    await handle.close();
+  }
+}
+
+function eventSignal(entry) {
+  if (entry?.type === "turn_context") return { status: "running", action: null };
+  if (entry?.type !== "event_msg") return null;
+  const payload = entry.payload;
+  if (payload?.type === "task_complete") {
+    return { status: "idle", action: compact(payload.last_agent_message) };
+  }
+  if (payload?.type === "agent_message") {
+    return { status: payload.phase === "final_answer" ? "idle" : "running", action: compact(payload.message) };
+  }
+  if (payload?.type === "user_message") return { status: "running", action: null };
+  return null;
+}
+
+function extractEvidence(value) {
+  const content = text(value, "") ?? "";
+  const sha = content.match(/\b[0-9a-f]{40}\b/i)?.[0]?.toLowerCase() ?? null;
+  const branch = content.match(/\b(?:branch|head)\s*(?::|=|is)?\s*`?([a-z0-9][a-z0-9._/-]{2,})`?/i)?.[1] ?? null;
+  const checks = [...new Set(content.match(/\b\d+\/\d+\s*(?:PASS|passed)?\b/gi) ?? [])].slice(0, 4);
+  if (/TypeScript(?:\s+(?:clean|PASS|passed))?/i.test(content)) checks.push("TypeScript");
+  const blocker = content.split(/(?<=[.!?。])\s+/).find((sentence) => (
+    /\b(?:blocker|gate|first next action|target)\b/i.test(sentence)
+  ));
+  return { branch, sha, checks, blocker: compact(blocker, 240) };
+}
+
+function freshness(lastActivityAt, now) {
+  if (!lastActivityAt) return "unknown";
+  const age = now.getTime() - new Date(lastActivityAt).getTime();
+  if (!Number.isFinite(age)) return "unknown";
+  if (age <= 15 * 60_000) return "fresh";
+  if (age <= 60 * 60_000) return "aging";
+  return "stale";
+}
+
+async function readCodexTask(taskLane, resolveSessionFile, now) {
+  const sessionFile = await resolveSessionFile(taskLane.threadId);
+  if (!sessionFile) {
+    return {
+      ...taskLane,
+      status: "unavailable",
+      freshness: "unknown",
+      lastActivityAt: null,
+      lastActualAction: null,
+      branch: null,
+      sha: null,
+      checks: [],
+      blocker: "Configured Codex task session was not found.",
+      provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
+    };
+  }
+  const entries = [];
+  for (const line of await readTailLines(sessionFile)) {
+    try {
+      entries.push(JSON.parse(line));
+    } catch {}
+  }
+  let status = "idle";
+  let lastActualAction = null;
+  let lastActivityAt = null;
+  for (const entry of entries) {
+    const signal = eventSignal(entry);
+    if (!signal) continue;
+    status = signal.status;
+    if (signal.action) lastActualAction = signal.action;
+    if (typeof entry.timestamp === "string") lastActivityAt = entry.timestamp;
+  }
+  const evidence = extractEvidence(lastActualAction);
+  return {
+    ...taskLane,
+    status,
+    freshness: freshness(lastActivityAt, now),
+    lastActivityAt,
+    lastActualAction,
+    ...evidence,
+    provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
+  };
+}
+
+function subagentAction(payload) {
+  if (payload?.type !== "agent_message" || typeof payload.author !== "string" || !payload.author.startsWith("/root/")) {
+    return null;
+  }
+  const body = Array.isArray(payload.content)
+    ? payload.content.map((item) => text(item?.text)).filter(Boolean).join("\n")
+    : "";
+  return {
+    agentPath: payload.author,
+    action: compact(body),
+    completed: /Message Type:\s*FINAL_ANSWER/i.test(body),
+  };
+}
+
+function applySubagentLine(state, line) {
+  if (!line.includes("sub_agent_activity") && !line.includes('"author":"/root/') && !line.includes('"agent_status"')) return;
+  let entry;
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const at = text(entry.timestamp);
+  if (entry.type === "event_msg" && entry.payload?.type === "sub_agent_activity") {
+    const agentPath = text(entry.payload.agent_path);
+    if (!agentPath || agentPath === "/root") return;
+    const current = state.agents.get(agentPath) ?? {
+      agentPath,
+      agentThreadId: null,
+      lifecycleStatus: "idle",
+      startedAt: null,
+      lastActivityAt: null,
+      lastActualAction: null,
+    };
+    current.agentThreadId = text(entry.payload.agent_thread_id, current.agentThreadId);
+    current.lastActivityAt = at ?? current.lastActivityAt;
+    if (entry.payload.kind === "started") {
+      current.lifecycleStatus = "running";
+      current.startedAt ??= at;
+    } else if (entry.payload.kind === "interrupted") {
+      current.lifecycleStatus = "interrupted";
+    }
+    state.agents.set(agentPath, current);
+    return;
+  }
+  if (entry.type === "response_item") {
+    const action = subagentAction(entry.payload);
+    if (action) {
+      const current = state.agents.get(action.agentPath) ?? {
+        agentPath: action.agentPath,
+        agentThreadId: null,
+        lifecycleStatus: "idle",
+        startedAt: null,
+        lastActivityAt: null,
+        lastActualAction: null,
+      };
+      current.lastActivityAt = at ?? current.lastActivityAt;
+      current.lastActualAction = action.action ?? current.lastActualAction;
+      if (action.completed) current.lifecycleStatus = "completed";
+      state.agents.set(action.agentPath, current);
+      return;
+    }
+    if (entry.payload?.type === "function_call_output" && typeof entry.payload.output === "string") {
+      try {
+        const output = JSON.parse(entry.payload.output);
+        if (Array.isArray(output?.agents)) {
+          state.activeRegistry = new Set(output.agents
+            .filter((agent) => agent?.agent_status === "running" && agent.agent_name !== "/root")
+            .map((agent) => agent.agent_name));
+          state.registryObservedAt = at;
+        }
+      } catch {}
+    }
+  }
+}
+
+async function scanSubagents(filename, cached = null) {
+  const details = await stat(filename);
+  const reset = !cached || details.size < cached.offset;
+  const state = reset ? { offset: 0, agents: new Map(), activeRegistry: null, registryObservedAt: null } : cached;
+  if (details.size > state.offset) {
+    const input = createReadStream(filename, { start: state.offset, end: details.size - 1, encoding: "utf8" });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) applySubagentLine(state, line);
+    state.offset = details.size;
+  }
+  if (state.activeRegistry) {
+    for (const agent of state.agents.values()) {
+      if (state.activeRegistry.has(agent.agentPath)) agent.lifecycleStatus = "running";
+      else if (agent.lifecycleStatus === "running") agent.lifecycleStatus = "idle";
+    }
+  }
+  return state;
+}
+
+export function createAgentLaneSnapshotProvider({
+  configPath,
+  sessionsDirectory,
+  now = () => new Date(),
+  getLaneConfig = null,
+  listTasks = null,
+  getClaim = null,
+  recordCompletion = null,
+  getTask = null,
+  listComments = null,
+}) {
+  const sessionFilePromises = new Map();
+  const subagentStates = new Map();
+  const resolveSessionFile = (threadId) => {
+    let pending = sessionFilePromises.get(threadId);
+    if (!pending) {
+      pending = findSessionFile(sessionsDirectory, threadId).then((filename) => {
+        if (!filename) sessionFilePromises.delete(threadId);
+        return filename;
+      });
+      sessionFilePromises.set(threadId, pending);
+    }
+    return pending;
+  };
+  return {
+    async getProjectSnapshot(projectId) {
+      const configured = await readConfig(configPath, projectId, getLaneConfig);
+      const generatedAt = now();
+      const observedTasks = await Promise.all(configured.tasks.map((taskLane) => (
+        taskLane.connection === "connected" && taskLane.source === "codex"
+          ? readCodexTask(taskLane, resolveSessionFile, generatedAt)
+          : {
+              ...taskLane,
+              status: "unavailable",
+              freshness: "unknown",
+              lastActivityAt: null,
+              lastActualAction: null,
+              branch: null,
+              sha: null,
+              checks: [],
+              blocker: "Lane adapter is not connected in this phase.",
+              provenance: { kind: "not-connected", threadId: null },
+            }
+      )));
+      const taskLanes = [];
+      for (const taskLane of observedTasks) {
+        const workItem = await workItemFor(taskLane, getTask, listComments);
+        const actionId = actionFingerprint(taskLane.lastActualAction);
+        const duplicate = actionId
+          ? taskLanes.find((candidate) => candidate.provenance.threadId === taskLane.provenance.threadId && candidate.actionId === actionId)
+          : null;
+        taskLanes.push({
+          ...taskLane,
+          stableIdentity: `${projectId}:task:${taskLane.id}`,
+          actionId,
+          duplicateOfLaneId: duplicate?.id ?? null,
+          continuity: continuityFor(taskLane),
+          workItem,
+          nextAction: workItem?.nextAction ?? null,
+        });
+      }
+      const adapters = configured.adapters.map((adapter) => ({
+        ...adapter,
+        status: "unavailable",
+        freshness: "unknown",
+        lastActivityAt: null,
+        lastActualAction: null,
+        branch: null,
+        sha: null,
+        checks: [],
+        blocker: "Adapter is intentionally disabled in this phase.",
+        stableIdentity: `${projectId}:adapter:${adapter.id}`,
+        actionId: null,
+        duplicateOfLaneId: null,
+        continuity: { state: "adapter_off", reason: "Adapter is intentionally disabled." },
+        workItem: null,
+        nextAction: null,
+        provenance: { kind: "not-connected", threadId: null },
+      }));
+      const rootTask = configured.tasks.find((task) => task.id === configured.rootTaskId);
+      const rootSessionFile = await resolveSessionFile(rootTask.threadId);
+      let rootSubagents = [];
+      let observedSubagentCount = 0;
+      if (rootSessionFile) {
+        const state = await scanSubagents(rootSessionFile, subagentStates.get(rootSessionFile));
+        subagentStates.set(rootSessionFile, state);
+        const allSubagents = [...state.agents.values()].map((agent) => ({
+          ...agent,
+          label: agent.agentPath.split("/").at(-1),
+          parentTaskId: configured.rootTaskId,
+          stableIdentity: `${projectId}:subagent:${agent.agentThreadId ?? agent.agentPath}`,
+          provenance: { kind: "codex-collaboration-event", threadId: rootTask.threadId },
+        })).sort((left, right) => (right.lastActivityAt ?? "").localeCompare(left.lastActivityAt ?? ""));
+        observedSubagentCount = allSubagents.length;
+        rootSubagents = allSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
+      }
+      const projectTasks = listTasks ? await listTasks(projectId) : [];
+      const todoTasks = projectTasks.filter((task) => task.archivedAt === null && task.labels.includes("agent-todo"));
+      const todos = await Promise.all(todoTasks.map((task) => (
+        taskTodoProjection(task, projectId, taskLanes, getClaim, listComments, generatedAt)
+      )));
+      const currentCoordinator = taskLanes.find((lane) => lane.id === configured.rootTaskId) ?? null;
+      return {
+        version: AGENT_LANE_SNAPSHOT_VERSION,
+        projectId,
+        generatedAt: generatedAt.toISOString(),
+        readOnly: true,
+        automaticRecoveryEnabled: false,
+        coordination: {
+          model: "peer_todos_with_replaceable_coordinator",
+          coordinatorTaskId: configured.rootTaskId,
+          coordinatorStableIdentity: currentCoordinator?.stableIdentity ?? null,
+          replaceable: true,
+          stateAuthority: "self_learning_checkpoint",
+          workAuthority: "todo_claim_lease",
+          runtimeOwnership: "single_writer",
+        },
+        todos,
+        attentionQueue: todos
+          .filter((todo) => todo.continuation.attention !== "done")
+          .sort((left, right) => {
+            const rank = { needs_user: 0, needs_coordinator: 1, blocked: 2, ready: 3, watch: 4 };
+            return (rank[left.continuation.attention] ?? 9) - (rank[right.continuation.attention] ?? 9);
+          })
+          .map((todo) => todo.id),
+        taskLanes,
+        rootSubagents,
+        adapters,
+        subagentSummary: {
+          observed: observedSubagentCount,
+          active: rootSubagents.filter((agent) => agent.lifecycleStatus === "running").length,
+          shown: rootSubagents.length,
+        },
+      };
+    },
+    async reconcileProject(projectId) {
+      if (!recordCompletion) return { applied: 0 };
+      const snapshot = await this.getProjectSnapshot(projectId);
+      let applied = 0;
+      for (const agent of snapshot.rootSubagents) {
+        if (agent.lifecycleStatus !== "completed" || !agent.lastActualAction) continue;
+        const result = await recordCompletion({
+          eventId: createHash("sha256").update(`${projectId}:${agent.agentThreadId ?? agent.agentPath}:${agent.lastActualAction}`).digest("hex"),
+          projectId,
+          agentPath: agent.agentPath,
+          agentThreadId: agent.agentThreadId,
+          summary: completionSummary(agent.lastActualAction),
+        });
+        if (result?.applied) applied += 1;
+      }
+      return { applied };
+    },
+  };
+}

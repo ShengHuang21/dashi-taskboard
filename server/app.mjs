@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
@@ -18,6 +18,7 @@ import {
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { createAgentLaneSnapshotProvider } from "./agent-lane-snapshot.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -645,6 +646,24 @@ function parseMove(body) {
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseAgentClaim(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "agentPath", "agentThreadId"]));
+  const agentPath = stringField(body.agentPath, "agentPath", { required: true, maxLength: 240 });
+  if (!agentPath.startsWith("/root/")) {
+    throw new ApiError(400, "INVALID_FIELD", "'agentPath' must identify a Root Sub-Agent");
+  }
+  const agentThreadId = parseThreadId(body.agentThreadId);
+  if (!agentThreadId) {
+    throw new ApiError(400, "INVALID_FIELD", "'agentThreadId' is required");
+  }
+  return {
+    version: parseVersion(body.version),
+    agentPath,
+    agentThreadId,
   };
 }
 
@@ -1523,6 +1542,156 @@ async function scanDevelopmentContexts(workspacePath, processEnv = process.env) 
   }
 }
 
+async function discoverSkills(codexExecutable, workspacePath) {
+  const entries = await new Promise((resolve, reject) => {
+    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
+      cwd: workspacePath,
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    let settled = false;
+    let buffer = "";
+    const timeout = setTimeout(() => {
+      finish(new Error("Timed out while reading Codex skills"));
+    }, 10_000);
+
+    function finish(error, value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.stdin.end();
+      child.kill("SIGTERM");
+      if (error) reject(error);
+      else resolve(value);
+    }
+
+    function send(message) {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    }
+
+    function handleMessage(message) {
+      if (message?.id === 1) {
+        if (message.error) {
+          finish(new Error("Codex app-server rejected initialization"));
+          return;
+        }
+        send({ method: "initialized" });
+        send({
+          id: 2,
+          method: "skills/list",
+          params: { cwds: [workspacePath], forceReload: false },
+        });
+        return;
+      }
+      if (message?.id !== 2) return;
+      if (message.error) {
+        finish(new Error("Codex app-server could not list skills"));
+        return;
+      }
+      finish(null, Array.isArray(message.result?.data) ? message.result.data : []);
+    }
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex).trim();
+        buffer = buffer.slice(newlineIndex + 1);
+        if (line) {
+          try {
+            handleMessage(JSON.parse(line));
+          } catch {}
+        }
+        newlineIndex = buffer.indexOf("\n");
+      }
+    });
+    child.stdin.on("error", (error) => finish(error));
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code, signal) => {
+      if (!settled) {
+        finish(new Error(`Codex app-server exited before listing skills (${signal || code})`));
+      }
+    });
+    child.once("spawn", () => {
+      send({
+        id: 1,
+        method: "initialize",
+        params: {
+          clientInfo: { name: "codex-taskboard", version: "0.1.0" },
+          capabilities: { experimentalApi: true },
+        },
+      });
+    });
+  });
+
+  const unique = new Map();
+  for (const entry of entries) {
+    if (!Array.isArray(entry?.skills)) continue;
+    for (const skill of entry.skills) {
+      if (
+        !skill
+        || typeof skill !== "object"
+        || skill.enabled === false
+        || typeof skill.name !== "string"
+        || !skill.name.trim()
+      ) {
+        continue;
+      }
+      const id = skill.name.trim();
+      if (unique.has(id)) continue;
+      const displayName = typeof skill.interface?.displayName === "string"
+        ? skill.interface.displayName.trim()
+        : "";
+      unique.set(id, {
+        id,
+        label: displayName || id,
+        ...(typeof skill.description === "string" && skill.description.trim()
+          ? { description: skill.description.trim() }
+          : {}),
+        ...(typeof skill.path === "string" && skill.path.trim()
+          ? { path: skill.path.trim() }
+          : {}),
+        scope: ["user", "repo", "system", "admin"].includes(skill.scope)
+          ? skill.scope
+          : "user",
+      });
+    }
+  }
+  return [...unique.values()].sort((left, right) => left.label.localeCompare(right.label));
+}
+
+async function discoverMcpServers(codexExecutable) {
+  const result = await execFileAsync(codexExecutable, ["mcp", "list", "--json"], {
+    timeout: 8_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const entries = JSON.parse(result.stdout);
+  if (!Array.isArray(entries)) throw new Error("Codex returned an invalid MCP server list");
+  return entries
+    .filter((entry) => (
+      entry
+      && typeof entry === "object"
+      && typeof entry.name === "string"
+      && entry.name.trim()
+      && entry.enabled !== false
+    ))
+    .map((entry) => ({
+      id: entry.name.trim(),
+      label: entry.name.trim(),
+      transport: typeof entry.transport?.type === "string"
+        ? entry.transport.type
+        : "unknown",
+    }))
+    .sort((left, right) => left.label.localeCompare(right.label));
+}
+
+async function discoverWorkflowCapabilities(resolved, workspacePath) {
+  const [skills, mcpServers] = await Promise.all([
+    discoverSkills(resolved.codexExecutable, workspacePath),
+    discoverMcpServers(resolved.codexExecutable),
+  ]);
+  return { skills, mcpServers };
+}
 export function resolveServerOptions(options = {}) {
   const configuredDataDirectory = options.dataDirectory ?? process.env.CODEX_TASKBOARD_DATA_DIR;
   const dataDirectory = configuredDataDirectory
@@ -1562,6 +1731,11 @@ export function resolveServerOptions(options = {}) {
     version: String(
       options.version ?? process.env.CODEX_TASKBOARD_VERSION ?? "development",
     ).trim(),
+    codexSessionsDirectory: options.codexSessionsDirectory
+      ?? path.join(codexHome, "sessions"),
+    agentLaneConfigPath: options.agentLaneConfigPath
+      ?? process.env.CODEX_TASKBOARD_AGENT_LANE_CONFIG_PATH
+      ?? path.join(dataDirectory, "agent-lanes.json"),
   };
 }
 
@@ -1573,7 +1747,7 @@ export function resolvePort(value = process.env.CODEX_TASKBOARD_PORT ?? "47823")
   return port;
 }
 
-export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "0.0.0.0") {
+export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "127.0.0.1") {
   const host = String(value).trim();
   if (host !== "127.0.0.1" && host !== "0.0.0.0") {
     throw new Error("CODEX_TASKBOARD_HOST must be 127.0.0.1 or 0.0.0.0");
@@ -1782,6 +1956,39 @@ export function createTaskboardServer(options = {}) {
     processEnv: codexProcessEnvironment,
     workspacePath: PROJECT_ROOT,
   });
+  const agentLanes = createAgentLaneSnapshotProvider({
+    sessionsDirectory: resolved.codexSessionsDirectory,
+    getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
+    listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
+    getClaim: (taskId) => database.getAgentTaskClaim(taskId),
+    getTask: (identifier) => database.getTask(identifier),
+    listComments: (taskId) => database.listComments(taskId),
+    recordCompletion: async (completion) => {
+      const candidates = database.listTasks({ projectId: completion.projectId, archived: "false" }).filter((task) => {
+        const claim = database.getAgentTaskClaim(task.id);
+        return claim?.status === "active"
+          && claim.projectId === completion.projectId
+          && claim.agentThreadId === completion.agentThreadId
+          && claim.agentPath === completion.agentPath;
+      });
+      if (candidates.length !== 1) return { applied: false, reason: "claim_not_unique" };
+      return database.completeAgentTask(candidates[0].id, {
+        ...completion,
+        actor: CODEX_AGENT_ACTOR,
+      });
+    },
+  });
+  let agentLaneTimer = null;
+  let agentLaneReconcile = null;
+  const reconcileAgentLanes = async () => {
+    if (agentLaneReconcile) return agentLaneReconcile;
+    agentLaneReconcile = (async () => {
+      for (const projectId of database.listAgentLaneProjectIds()) {
+        await agentLanes.reconcileProject(projectId);
+      }
+    })().finally(() => { agentLaneReconcile = null; });
+    return agentLaneReconcile;
+  };
   const aiEventResponses = new Set();
   const codexSessionSearches = new Map();
   const codexSessionStateCache = new Map();
@@ -2075,6 +2282,28 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { runtime: hostRuntime });
         }
         return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      const agentLaneRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/agent-lanes$/);
+      if (agentLaneRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/projects/:id/agent-lanes");
+        const projectId = decodeRouteSegment(agentLaneRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (!database.getProject(projectId)) {
+          throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+        }
+        try {
+          return sendJson(response, 200, await agentLanes.getProjectSnapshot(projectId));
+        } catch (error) {
+          if (error?.code === "AGENT_LANES_NOT_CONFIGURED") {
+            throw new ApiError(404, error.code, error.message);
+          }
+          if (error?.code === "AGENT_LANES_CONFIG_UNAVAILABLE") {
+            throw new ApiError(503, error.code, error.message);
+          }
+          throw error;
+        }
       }
 
       if (pathname === "/api/local/cloud-session") {
@@ -2930,7 +3159,7 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
-      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
+      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|claim))?$/);
       if (taskRoute) {
         let id;
         try {
@@ -3062,6 +3291,12 @@ export function createTaskboardServer(options = {}) {
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });
         }
+        if (action === "claim" && request.method === "POST") {
+          const claim = parseAgentClaim(await readJson(request));
+          const result = database.claimAgentTask(id, claim.version, claim);
+          events.emit("task.claimed", result);
+          return sendJson(response, 200, result);
+        }
         if (action === "archive" && request.method === "POST") {
           const current = database.getTask(id);
           if (current?.source === "jira") {
@@ -3132,6 +3367,8 @@ export function createTaskboardServer(options = {}) {
   return {
     database,
     aiChat,
+    agentLanes,
+    reconcileAgentLanes,
     server,
     options: resolved,
     async listen({ host = "127.0.0.1", port = resolvePort(), fd = null } = {}) {
@@ -3156,6 +3393,11 @@ export function createTaskboardServer(options = {}) {
         else server.listen({ fd });
       });
       listening = true;
+      await reconcileAgentLanes();
+      agentLaneTimer = setInterval(() => {
+        reconcileAgentLanes().catch((error) => console.error("Agent lane reconcile failed", error));
+      }, options.agentLaneReconcileIntervalMs ?? 5_000);
+      agentLaneTimer.unref?.();
       return server.address();
     },
     async close() {
@@ -3165,6 +3407,8 @@ export function createTaskboardServer(options = {}) {
           })
         : Promise.resolve();
       events.close();
+      if (agentLaneTimer) clearInterval(agentLaneTimer);
+      agentLaneTimer = null;
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await aiChat.close();

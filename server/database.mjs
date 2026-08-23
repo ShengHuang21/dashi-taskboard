@@ -521,6 +521,29 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS task_activities_task_created
         ON task_activities(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS agent_lane_projects (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        config_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_task_claims (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        agent_path TEXT NOT NULL,
+        agent_thread_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'interrupted')),
+        claimed_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_event_receipts (
+        event_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        comment_id TEXT REFERENCES comments(id) ON DELETE SET NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1819,6 +1842,134 @@ export class TaskboardDatabase {
       activitiesByTask.get(row.id) ?? [],
       previewImagesByTask.get(row.id) ?? null,
     ));
+  }
+
+  getAgentLaneProject(projectId) {
+    const row = this.database.prepare(
+      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+    ).get(projectId);
+    return row ? JSON.parse(row.config_json) : null;
+  }
+
+  listAgentLaneProjectIds() {
+    return this.database.prepare("SELECT project_id FROM agent_lane_projects ORDER BY project_id")
+      .all().map((row) => row.project_id);
+  }
+
+  upsertAgentLaneProject(projectId, config) {
+    if (!this.getProject(projectId)) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    const timestamp = now();
+    this.database.prepare(`
+      INSERT INTO agent_lane_projects (project_id, config_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(project_id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at
+    `).run(projectId, JSON.stringify(config), timestamp);
+    return this.getAgentLaneProject(projectId);
+  }
+
+  getAgentTaskClaim(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    const row = this.database.prepare(
+      "SELECT * FROM agent_task_claims WHERE task_id = ?",
+    ).get(task.id);
+    return row ? {
+      taskId: row.task_id,
+      projectId: row.project_id,
+      agentPath: row.agent_path,
+      agentThreadId: row.agent_thread_id,
+      status: row.status,
+      claimedAt: row.claimed_at,
+      completedAt: row.completed_at,
+    } : null;
+  }
+
+  claimAgentTask(id, version, { agentPath, agentThreadId = null }) {
+    const current = this.#requireTask(id);
+    this.#requireVersion(current, version);
+    if (current.status !== "todo") {
+      throw new ApiError(409, "TASK_NOT_READY", "Only a To-Do task can be claimed");
+    }
+    if (!agentThreadId) {
+      throw new ApiError(400, "AGENT_THREAD_REQUIRED", "A durable Sub-Agent claim requires its thread id");
+    }
+    const timestamp = now();
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = this.database.prepare(`
+        UPDATE tasks SET status = 'in_progress', thread_id = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(agentThreadId, timestamp, current.id, version);
+      if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
+      this.database.prepare(`
+        INSERT INTO agent_task_claims (
+          task_id, project_id, agent_path, agent_thread_id, status, claimed_at, completed_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, NULL)
+        ON CONFLICT(task_id) DO UPDATE SET
+          agent_path = excluded.agent_path,
+          agent_thread_id = excluded.agent_thread_id,
+          status = 'active', claimed_at = excluded.claimed_at, completed_at = NULL
+      `).run(current.id, current.projectId, agentPath, agentThreadId, timestamp);
+      this.database.exec("COMMIT");
+      return { task: this.getTask(current.id), claim: this.getAgentTaskClaim(current.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  completeAgentTask(taskId, { eventId, agentThreadId, summary, actor }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTask(taskId);
+      if (current.status !== "in_progress") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "task_not_in_progress" };
+      }
+      const claim = this.getAgentTaskClaim(current.id);
+      if (!claim || claim.status !== "active") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "no_active_claim" };
+      }
+      if (!agentThreadId || claim.projectId !== current.projectId || claim.agentThreadId !== agentThreadId) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_mismatch" };
+      }
+      const timestamp = now();
+      const commentId = randomUUID();
+      if (this.database.prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "duplicate" };
+      }
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name,
+          author_avatar_url, version, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      `).run(
+        commentId, current.id, `Sub-Agent 完成：${summary}`, agentThreadId,
+        actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp,
+      );
+      this.database.prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(eventId, current.projectId, current.id, commentId, timestamp);
+      const transitioned = this.database.prepare(`
+        UPDATE agent_task_claims SET status = 'completed', completed_at = ?
+        WHERE task_id = ? AND status = 'active' AND agent_thread_id = ?
+      `).run(timestamp, current.id, agentThreadId);
+      if (transitioned.changes !== 1) throw new ApiError(409, "CLAIM_CONFLICT", "Agent claim changed during completion");
+      this.database.prepare(`
+        UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ? WHERE id = ?
+      `).run(timestamp, current.id);
+      this.database.exec("COMMIT");
+      return { applied: true, comment: this.listComments(current.id).at(-1), task: this.getTask(current.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getTask(id) {

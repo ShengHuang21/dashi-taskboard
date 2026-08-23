@@ -90,6 +90,7 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
+  ["issue claim", new Set(["agent-path", "thread-id", "if-version", "json"])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
@@ -304,7 +305,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/claim/archive/restore/relation, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -378,6 +379,9 @@ async function execute(parsed, overrides) {
     case "issue move":
       expectOperandCount(parsed, 1);
       return moveIssue(api, parsed.operands[0], parsed.options, overrides);
+    case "issue claim":
+      expectOperandCount(parsed, 1);
+      return claimIssue(api, parsed.operands[0], parsed.options, overrides);
     case "issue archive":
       expectOperandCount(parsed, 1);
       return archiveIssue(api, parsed.operands[0], parsed.options, overrides, "archive");
@@ -961,6 +965,16 @@ function threadBindingFromOptions(options) {
     throw usageError("--binding-workspace-path must be absolute");
   }
   return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
+async function claimIssue(api, taskId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (!agentPath.startsWith("/root/")) throw usageError("--agent-path must start with /root/");
+  return api.request("POST", `${taskPath(taskId)}/claim`, {
+    agentPath,
+    agentThreadId: resolveThreadId(options, overrides),
+    version: await resolveVersion(api, taskId, options["if-version"]),
+  });
 }
 
 async function archiveIssue(api, taskId, options, overrides, action) {

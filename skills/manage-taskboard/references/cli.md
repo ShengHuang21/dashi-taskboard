@@ -108,11 +108,15 @@ taskctl issue update ID \
   [--json]
 
 taskctl issue move ID --status STATUS [--thread-id ID] [--if-version N] [--json]
+
+taskctl issue claim ID --agent-path /root/NAME --thread-id AGENT_THREAD_ID [--if-version N] [--json]
 taskctl issue archive ID [--thread-id ID] [--if-version N] [--json]
 taskctl issue restore ID [--thread-id ID] [--if-version N] [--json]
 ```
 
 Use `issue move` to set `in_progress` before implementation and `in_review` after implementation and self-verification. Codex must not move work directly from `in_progress` to `done`; use `done` only after the user explicitly confirms acceptance or explicitly asks to mark the issue complete. Use `blocked` when work cannot continue and `canceled` when it will not continue. On a version conflict, fetch the issue again and reconcile before retrying.
+
+Use `issue claim` for a Root Sub-Agent. It records the Sub-Agent identity and moves a real `todo` issue to `in_progress` atomically; the completion reconciler later appends one short result comment and moves it to `in_review`.
 
 Use either `--git-branch` or `--worktree-path`/`--worktree-branch`; an issue has only one development context. Issue JSON stores it as `developmentContext`, either `{ "type": "branch", "branch": "..." }` or `{ "type": "worktree", "path": "...", "branch": "..." }`. Its singular `threadId` is the Codex conversation that most recently created or changed the issue itself. Recurrence requires a due date.
 

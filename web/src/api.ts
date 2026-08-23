@@ -1,5 +1,6 @@
 import type {
   ActorIdentity,
+  AgentLaneSnapshot,
   AiChatCatalog,
   AiChatAttachmentInput,
   AiChatRun,
@@ -187,6 +188,16 @@ export async function getProjectSummary(
 ): Promise<ProjectSummary> {
   return request<ProjectSummary>(
     `/api/local/projects/${encodeURIComponent(projectId)}/summary`,
+    { signal },
+  );
+}
+
+export async function getAgentLaneSnapshot(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<AgentLaneSnapshot> {
+  return request<AgentLaneSnapshot>(
+    `/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`,
     { signal },
   );
 }

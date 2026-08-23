@@ -61,6 +61,25 @@ ln -s /absolute/path/to/codex-taskboard/skills/manage-taskboard \
 
 The desktop app keeps this same directory synchronized with its bundled Skill. The Skill teaches Codex to inspect an issue, move it to `in_progress`, use optimistic versions, verify the work, and then move it to `in_review`; it moves the issue to `done` only after the user explicitly confirms acceptance or asks to mark it complete.
 
+## Read-only Agent Lanes
+
+Taskboard can expose a project-scoped development observatory at
+`GET /api/local/projects/:projectId/agent-lanes`. The endpoint reads local Codex
+session evidence using `.data/agent-lanes.json`; it does not send prompts, claim
+work, restart agents, or perform recovery.
+
+The version 2 configuration maps independent Codex tasks/windows and explicitly
+disabled external adapters. Root-internal Sub-Agents are not configured by hand:
+Snapshot v3 discovers their stable path, agent thread, lifecycle, and latest
+result from the Root task's local collaboration events. Prompts are never
+returned. The snapshot keeps `readOnly: true` and
+`automaticRecoveryEnabled: false`.
+
+For the current Capstone setup, the `capstone-dev` project opens the Agent Lanes
+view by default. Capstone Root, Visual, and Taskboard/Self Learning appear under
+Codex Tasks / Windows. A separate Root Sub-Agents section shows actual runtime
+children; Claude and Pi remain visibly adapter-off.
+
 ## Embed in Codex
 
 ### Manual: use a dedicated CDP port
@@ -178,7 +197,7 @@ To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the us
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_TASKBOARD_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` to disable LAN access |
+| `CODEX_TASKBOARD_HOST` | `127.0.0.1` | HTTP bind address; set `0.0.0.0` explicitly only when LAN access is intended |
 | `CODEX_TASKBOARD_PORT` | `47823` | Local HTTP port |
 | `CODEX_TASKBOARD_DATA_DIR` | `.data` | SQLite data directory |
 | `CODEX_TASKBOARD_URL` | `http://127.0.0.1:47823` | CLI API origin |
