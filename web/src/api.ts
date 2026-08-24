@@ -138,6 +138,11 @@ export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
   return data.projects;
 }
 
+export async function listAgentLaneProjectIds(signal?: AbortSignal): Promise<string[]> {
+  const data = await request<{ projectIds: string[] }>("/api/local/agent-lane-projects", { signal });
+  return data.projectIds;
+}
+
 export async function getJiraConnection(signal?: AbortSignal): Promise<JiraConnection> {
   try {
     const data = await request<{ connection: JiraConnection }>("/api/local/jira-connection", { signal });

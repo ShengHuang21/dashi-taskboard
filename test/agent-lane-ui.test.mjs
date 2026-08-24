@@ -6,13 +6,17 @@ const appSource = await readFile(new URL("../web/src/App.tsx", import.meta.url),
 const boardSource = await readFile(new URL("../web/src/components/AgentLaneBoard.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../web/src/api.ts", import.meta.url), "utf8");
 
-test("capstone-dev opens a dedicated Agent Lanes view", () => {
+test("every configured project opens its own Agent Lanes view", () => {
   assert.match(appSource, /type BoardView = [^;]*"lanes"/);
-  assert.match(appSource, /selectedProjectId === "capstone-dev"/);
-  assert.match(appSource, /routeProjectId === "capstone-dev"[\s\S]*?"lanes"/);
+  assert.match(appSource, /selectedProject\?\.agentLanesConfigured/);
+  assert.match(appSource, /listAgentLaneProjectIds/);
+  assert.match(appSource, /readProjectBoardView\(routeProjectId, routeProject\?\.agentLanesConfigured\)/);
   assert.match(appSource, />\s*Agent Lanes\s*<\/button>/);
-  assert.match(appSource, /boardView === "lanes"[\s\S]*?<AgentLaneBoard/);
+  assert.match(appSource, /boardView === "lanes" && selectedProject[\s\S]*?<AgentLaneBoard projectId=\{selectedProject\.id\} projectName=\{selectedProject\.name\}/);
   assert.match(apiSource, /getAgentLaneSnapshot[\s\S]*?\/api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);
+  assert.match(apiSource, /listAgentLaneProjectIds[\s\S]*?\/api\/local\/agent-lane-projects/);
+  assert.doesNotMatch(appSource, /capstone-dev/);
+  assert.doesNotMatch(boardSource, /Capstone Dev/);
 });
 
 test("the lane board keeps the owner view concise while synchronization stays automatic", () => {

@@ -30,6 +30,7 @@ import {
   getTaskboardRevision,
   getTaskboardMetadata,
   listArchivedTasks,
+  listAgentLaneProjectIds,
   listDevelopmentContexts,
   listDeviceWorkspaces,
   listProjects,
@@ -315,11 +316,21 @@ function readIssueActivityKeys(storageKey: string): Record<string, string> {
   }
 }
 
-function readProjectBoardView(projectId: string): BoardView {
+function readProjectBoardView(projectId: string, agentLanesConfigured = false): BoardView {
   const view = taskboardStorage.getItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`);
-  return view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
+  return view === "lanes" && agentLanesConfigured
     ? view
-    : "issues";
+    : view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
+      ? view
+      : agentLanesConfigured ? "lanes" : "issues";
+}
+
+function withAgentLaneConfiguration(projects: Project[], projectIds: string[]): Project[] {
+  const configuredProjects = new Set(projectIds);
+  return projects.map((project) => ({
+    ...project,
+    agentLanesConfigured: configuredProjects.has(project.id),
+  }));
 }
 
 function readBoardCardDisplay(): BoardCardDisplay {
@@ -1552,17 +1563,16 @@ export function App() {
       if (!routeIssueIdentifier) detailSourceProjectIdRef.current = null;
       setDetailTaskIdentifier(routeIssueIdentifier);
       if (routeProjectId === selectedProjectId) return;
+      const routeProject = projects.find((project) => project.id === routeProjectId);
       setBoardView(routeProjectId === ALL_PROJECTS_ID
         ? "issues"
-        : routeProjectId === "capstone-dev"
-          ? "lanes"
-          : readProjectBoardView(routeProjectId));
+        : readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
       setSelectedProjectId(routeProjectId);
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, selectedProjectId]);
+  }, [boardView, projects, selectedProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1782,10 +1792,11 @@ export function App() {
       current?.operation === "initial" ? { ...current, requestId } : current
     ));
     try {
-      const [nextProjects, metadata, workspaces] = await Promise.all([
+      const [nextProjects, metadata, workspaces, agentLaneProjectIds] = await Promise.all([
         listProjects(signal),
         getTaskboardMetadata(signal),
         listDeviceWorkspaces(signal),
+        listAgentLaneProjectIds(signal),
       ]);
       if (requestId !== projectsRequestRef.current) return;
       const [nextJiraConnection, nextTemporaryTasks] = await Promise.all([
@@ -1812,7 +1823,7 @@ export function App() {
         taskboardStorage.setItem(DEVICE_WORKSPACE_PATHS_KEY, JSON.stringify(next));
         return next;
       });
-      setProjects(nextProjects.map((project) => project.id === GLOBAL_PROJECT_ID
+      setProjects(withAgentLaneConfiguration(nextProjects, agentLaneProjectIds).map((project) => project.id === GLOBAL_PROJECT_ID
         ? {
             ...project,
             issueCount: nextTemporaryTasks.filter((task) => (
@@ -1853,8 +1864,9 @@ export function App() {
   }, [loadProjectList]);
 
   useEffect(() => {
-    if (selectedProjectId === "capstone-dev") setBoardView("lanes");
-  }, [selectedProjectId]);
+    if (!selectedProject) return;
+    setBoardView(readProjectBoardView(selectedProject.id, selectedProject.agentLanesConfigured));
+  }, [selectedProject]);
 
   const refreshProjectList = useCallback(async () => {
     const requestId = ++projectsRequestRef.current;
@@ -1862,12 +1874,13 @@ export function App() {
       current?.operation === "refresh" ? { ...current, requestId } : current
     ));
     try {
-      const [nextProjects, nextTemporaryTasks] = await Promise.all([
+      const [nextProjects, nextTemporaryTasks, agentLaneProjectIds] = await Promise.all([
         listProjects(),
         listTasks(GLOBAL_PROJECT_ID),
+        listAgentLaneProjectIds(),
       ]);
       if (requestId !== projectsRequestRef.current) return;
-      setProjects(nextProjects.map((project) => project.id === GLOBAL_PROJECT_ID
+      setProjects(withAgentLaneConfiguration(nextProjects, agentLaneProjectIds).map((project) => project.id === GLOBAL_PROJECT_ID
         ? {
             ...project,
             issueCount: nextTemporaryTasks.filter((task) => (
@@ -2983,11 +2996,10 @@ export function App() {
     setProjectMenuOpen(false);
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
+    const project = projects.find((candidate) => candidate.id === projectId);
     setBoardView(projectId === ALL_PROJECTS_ID
       ? "issues"
-      : projectId === "capstone-dev"
-        ? "lanes"
-        : readProjectBoardView(projectId));
+      : readProjectBoardView(projectId, project?.agentLanesConfigured));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -3012,12 +3024,17 @@ export function App() {
             name: choice.name,
             workspacePath: null,
           });
+          project = { ...project, agentLanesConfigured: false };
           setProjects((current) => [...current, project!]);
         } catch (error) {
           if (!(error instanceof ApiError) || error.code !== "PROJECT_EXISTS") throw error;
-          const nextProjects = await listProjects();
-          setProjects(nextProjects);
-          project = nextProjects.find((candidate) => candidate.id === choice.id) ?? null;
+          const [nextProjects, agentLaneProjectIds] = await Promise.all([
+            listProjects(),
+            listAgentLaneProjectIds(),
+          ]);
+          const configuredProjects = withAgentLaneConfiguration(nextProjects, agentLaneProjectIds);
+          setProjects(configuredProjects);
+          project = configuredProjects.find((candidate) => candidate.id === choice.id) ?? null;
           if (!project) throw error;
         }
       }
@@ -3055,9 +3072,12 @@ export function App() {
     setJiraError(null);
     try {
       const connection = await configureJiraConnection(input);
-      const nextProjects = await listProjects();
+      const [nextProjects, agentLaneProjectIds] = await Promise.all([
+        listProjects(),
+        listAgentLaneProjectIds(),
+      ]);
       setJiraConnection(connection);
-      setProjects(nextProjects);
+      setProjects(withAgentLaneConfiguration(nextProjects, agentLaneProjectIds));
       setJiraDialogOpen(false);
       changeProject(connection.projectId);
       await refreshTasks(connection.projectId);
@@ -3405,7 +3425,7 @@ export function App() {
                 {text("项目文档", "Project Docs")}
               </button>
             )}
-            {selectedProjectId === "capstone-dev" && (
+            {selectedProject?.agentLanesConfigured && (
               <button
                 className={`view-tab${boardView === "lanes" ? " active" : ""}`}
                 type="button"
@@ -3634,8 +3654,8 @@ export function App() {
               onUpdate={updateTaskProperties}
             />
           </Suspense>
-        ) : boardView === "lanes" ? (
-          <AgentLaneBoard projectId={selectedProject?.id ?? "capstone-dev"} />
+        ) : boardView === "lanes" && selectedProject ? (
+          <AgentLaneBoard projectId={selectedProject.id} projectName={selectedProject.name} />
         ) : (
           <div
             className={`issue-board-layout${otherTasksVisible ? " has-other-tasks" : ""}`}

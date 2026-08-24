@@ -2155,6 +2155,12 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "PUT"]);
       }
 
+      if (pathname === "/api/local/agent-lane-projects") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/agent-lane-projects");
+        return sendJson(response, 200, { projectIds: database.listAgentLaneProjectIds() });
+      }
+
       const agentLaneRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/agent-lanes$/);
       if (agentLaneRoute) {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);

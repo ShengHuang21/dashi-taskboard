@@ -10,6 +10,7 @@ import type {
 
 interface AgentLaneBoardProps {
   projectId: string;
+  projectName: string;
 }
 
 const STATUS_LABELS = {
@@ -151,7 +152,7 @@ function CompletedWorkGroup({ category, agents }: { category: string; agents: Ro
   );
 }
 
-export function AgentLaneBoard({ projectId }: AgentLaneBoardProps) {
+export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) {
   const [snapshot, setSnapshot] = useState<AgentLaneSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -194,7 +195,7 @@ export function AgentLaneBoard({ projectId }: AgentLaneBoardProps) {
       <header className="agent-lanes-heading">
         <div>
           <span className="agent-lanes-eyebrow">开发状态</span>
-          <h2 id="agent-lanes-title">Capstone Dev</h2>
+          <h2 id="agent-lanes-title">{projectName}</h2>
           <p>谁在工作、正在做什么、Sub-Agent 是否运行。</p>
         </div>
         <div className="agent-lanes-policy" aria-label="安全状态">
@@ -251,7 +252,12 @@ export function AgentLaneBoard({ projectId }: AgentLaneBoardProps) {
         ) : <p className="agent-lane-empty">暂无待办。</p>}
       </section>
 
-      <p className="agent-adapter-summary">Claude / Pi 未启用 · 自动恢复关闭</p>
+      <p className="agent-adapter-summary">
+        {snapshot.adapters.length > 0
+          ? snapshot.adapters.map((adapter) => `${adapter.label} ${STATUS_LABELS[adapter.status]}`).join(" · ")
+          : "未配置外部适配器"}
+        {" · 自动恢复关闭"}
+      </p>
     </section>
   );
 }

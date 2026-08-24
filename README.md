@@ -80,10 +80,10 @@ To migrate a version 2 JSON configuration, run
 The migration creates missing projects, converts legacy To-Dos into durable
 `agent-todo` issues, and is idempotent by legacy To-Do identifier.
 
-For the current Capstone setup, the `capstone-dev` project opens the Agent Lanes
-view by default. Capstone Root, Visual, and Taskboard/Self Learning appear under
-Codex Tasks / Windows. A separate Root Sub-Agents section shows actual runtime
-children; Claude and Pi remain visibly adapter-off.
+Any project with a durable Agent Lanes configuration exposes the Agent Lanes tab
+and opens that view by default. The board title, task lanes, runtime Sub-Agents,
+and optional adapters all come from the selected project's configuration; no
+project ID or adapter name is hard-coded in the UI.
 
 ## Embed in Codex
 

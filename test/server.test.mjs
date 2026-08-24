@@ -89,6 +89,9 @@ test("health and the default local project are available", async () => {
   assert.equal(result.body.projects[0].name, "全局");
   assert.equal(result.body.projects[0].workspacePath, null);
   assert.equal(result.body.projects[0].issueCount, 0);
+  const agentLaneProjects = await request(baseUrl, "/api/local/agent-lane-projects");
+  assert.equal(agentLaneProjects.response.status, 200);
+  assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
 });
 
 test("the default host is loopback-only", () => {
@@ -133,6 +136,10 @@ test("project Agent Lanes read durable database configuration through a local ro
   assert.equal(result.body.taskLanes.length, 3);
   assert.equal(result.body.rootSubagents.length, 0);
   assert.equal(result.body.adapters.length, 2);
+
+  const projects = await request(baseUrl, "/api/local/agent-lane-projects");
+  assert.equal(projects.response.status, 200);
+  assert.deepEqual(projects.body, { projectIds: ["local"] });
 
   const mutation = await request(baseUrl, "/api/local/projects/local/agent-lanes", {
     method: "POST",

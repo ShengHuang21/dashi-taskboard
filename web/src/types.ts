@@ -337,6 +337,7 @@ export interface Project {
   source: "local" | "jira";
   labels: string[];
   issueCount: number;
+  agentLanesConfigured?: boolean;
   createdAt: string;
   updatedAt: string;
 }
