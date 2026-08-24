@@ -43,6 +43,7 @@ async function setup() {
     listTasks: (projectId) => db.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => db.getAgentTaskClaim(taskId),
     listComments: (taskId) => db.listComments(taskId),
+    recordProgress: (progress) => db.recordAgentTaskProgress(task.id, { ...progress, actor }),
     recordCompletion: (completion) => db.completeAgentTask(task.id, { ...completion, actor }),
   });
   return { database, databasePath, task, rootFile, makeProvider };
@@ -61,7 +62,21 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
   assert.equal(claimed.task.status, "in_progress");
   await appendFile(fixture.rootFile, [
     JSON.stringify({ timestamp: "2026-08-24T01:01:00.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "acceptance-thread", agent_path: "/root/acceptance", kind: "started" } }),
-    JSON.stringify({ timestamp: "2026-08-24T01:02:00.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: Focused checks passed. token=must-not-leak AKIAABCDEFGHIJKLMNOP https://user:password@example.com/ ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef" }] } }),
+    JSON.stringify({ timestamp: "2026-08-24T01:01:30.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: MESSAGE\nPayload: Focused checks are running. token=progress-secret" }] } }),
+  ].join("\n") + "\n");
+
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 1 });
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 0 });
+  let comments = fixture.database.listComments(fixture.task.id);
+  assert.equal(comments.length, 1);
+  assert.match(comments[0].body, /^Sub-Agent 进展：/);
+  assert.match(comments[0].body, /Focused checks are running/);
+  assert.doesNotMatch(comments[0].body, /progress-secret/);
+  assert.equal(fixture.database.listCommentsAfter(fixture.task.id, { revision: 0 }).length, 1);
+  assert.equal(fixture.database.getTask(fixture.task.id).status, "in_progress");
+
+  await appendFile(fixture.rootFile, [
+    JSON.stringify({ timestamp: "2026-08-24T01:02:00.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: Focused checks passed. token=must-not-leak AKIAABCDEFGHIJKLMNOP https://user:password@example.com/ ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }] } }),
   ].join("\n") + "\n");
 
   assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 1 });
@@ -69,19 +84,40 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
   snapshot = await provider.getProjectSnapshot("capstone-dev");
   assert.equal(snapshot.rootSubagents[0].lifecycleStatus, "completed");
   assert.equal(snapshot.todos[0].state, "validating");
-  const comments = fixture.database.listComments(fixture.task.id);
-  assert.equal(comments.length, 1);
-  assert.match(comments[0].body, /^Sub-Agent 完成：/);
-  assert.match(comments[0].body, /Focused checks passed/);
-  assert.doesNotMatch(comments[0].body, /must-not-leak/);
-  assert.doesNotMatch(comments[0].body, /AKIA|user:password|ABCDEFGHIJKLMNOPQRSTUVWXYZ/);
-  assert.equal(comments[0].threadId, "acceptance-thread");
+  comments = fixture.database.listComments(fixture.task.id);
+  assert.equal(comments.length, 2);
+  assert.match(comments[1].body, /^Sub-Agent 完成：/);
+  assert.match(comments[1].body, /Focused checks passed/);
+  assert.doesNotMatch(comments[1].body, /must-not-leak/);
+  assert.doesNotMatch(comments[1].body, /AKIA|user:password|ABCDEFGHIJKLMNOPQRSTUVWXYZ|b{40}/);
+  assert.equal(comments[1].threadId, "acceptance-thread");
+  assert.equal(fixture.database.listCommentsAfter(fixture.task.id, { revision: 0 }).length, 2);
 
   fixture.database.close();
   const reopened = new TaskboardDatabase(fixture.databasePath);
   provider = fixture.makeProvider(reopened);
   assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 0 });
-  assert.equal(reopened.listComments(fixture.task.id).length, 1);
+  assert.equal(reopened.listComments(fixture.task.id).length, 2);
   assert.equal(reopened.getTask(fixture.task.id).status, "in_review");
   reopened.close();
+});
+
+test("one Sub-Agent thread cannot hold two active claims in a project", async () => {
+  const fixture = await setup();
+  const second = fixture.database.createTask({
+    projectId: "capstone-dev", title: "第二个任务", description: "", status: "todo",
+    priority: "medium", labels: ["agent-todo"], threadId: null, actor, assignee: actor,
+    developmentContext: null, startDate: null, dueDate: null, recurrence: null,
+  });
+  fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+  });
+  assert.throws(
+    () => fixture.database.claimAgentTask(second.id, second.version, {
+      agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    }),
+    (error) => error?.code === "AGENT_ALREADY_CLAIMED",
+  );
+  assert.equal(fixture.database.getTask(second.id).status, "todo");
+  fixture.database.close();
 });

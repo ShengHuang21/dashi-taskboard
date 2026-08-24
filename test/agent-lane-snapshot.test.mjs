@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
@@ -26,7 +26,7 @@ async function fixture() {
   const visualPath = path.join(sessionsDirectory, "rollout-visual-thread.jsonl");
   await writeFile(rootPath, [
     JSON.stringify({ timestamp: "2026-08-23T08:00:00.000Z", type: "session_meta", payload: { session_id: "root-thread" } }),
-    JSON.stringify({ timestamp: "2026-08-23T08:02:00.000Z", type: "event_msg", payload: { type: "agent_message", phase: "commentary", message: "Running focused checks on branch codex/support at 87e24ccd55a9b241e87d57204c94a856c0ef5726. api_key=must-not-leak" } }),
+    JSON.stringify({ timestamp: "2026-08-23T08:02:00.000Z", type: "event_msg", payload: { type: "agent_message", phase: "commentary", message: "Running focused checks on branch codex/support at commit: 87e24ccd55a9b241e87d57204c94a856c0ef5726. Unlabeled secret aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa. api_key=must-not-leak" } }),
     JSON.stringify({ timestamp: "2026-08-23T08:02:10.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "review-thread", agent_path: "/root/retrieval_review", kind: "started" } }),
     JSON.stringify({ timestamp: "2026-08-23T08:02:20.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/retrieval_review", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nRetrieval review passed." }] } }),
     JSON.stringify({ timestamp: "2026-08-23T08:02:30.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "ui-thread", agent_path: "/root/ui_review", kind: "started" } }),
@@ -56,6 +56,7 @@ async function fixture() {
   }));
   return {
     configPath,
+    rootPath,
     sessionsDirectory: path.join(directory, "sessions"),
     visualPath,
     now: () => new Date("2026-08-23T08:05:00.000Z"),
@@ -103,6 +104,7 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
   assert.match(root.workItem.latestWorkingLog, /focused checks passed/);
   assert.equal(root.nextAction, "connect the next Codex sub-agent lane.");
   assert.doesNotMatch(root.lastActualAction, /must-not-leak/);
+  assert.doesNotMatch(root.lastActualAction, /a{40}/);
   assert.match(root.lastActualAction, /\[redacted\]/);
 
   const active = snapshot.rootSubagents[0];
@@ -116,6 +118,30 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
 
   assert.equal(snapshot.adapters[0].connection, "not_connected");
   assert.equal(snapshot.adapters[0].continuity.state, "adapter_off");
+});
+
+test("reconciliation processes completed Sub-Agents beyond the display limit", async () => {
+  const paths = await fixture();
+  const events = [];
+  for (let index = 0; index < 13; index += 1) {
+    events.push(
+      JSON.stringify({ timestamp: `2026-08-23T08:${String(10 + index).padStart(2, "0")}:00.000Z`, type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: `batch-${index}`, agent_path: `/root/batch_${index}`, kind: "started" } }),
+      JSON.stringify({ timestamp: `2026-08-23T08:${String(10 + index).padStart(2, "0")}:30.000Z`, type: "response_item", payload: { type: "agent_message", author: `/root/batch_${index}`, recipient: "/root", content: [{ type: "input_text", text: `Message Type: FINAL_ANSWER\nPayload: batch ${index} complete` }] } }),
+    );
+  }
+  await appendFile(paths.rootPath, `\n${events.join("\n")}`);
+  const completed = [];
+  const provider = createAgentLaneSnapshotProvider({
+    ...paths,
+    recordCompletion: async (event) => {
+      if (event.agentPath.startsWith("/root/batch_")) completed.push(event.agentPath);
+      return { applied: event.agentPath.startsWith("/root/batch_") };
+    },
+  });
+  const snapshot = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.rootSubagents.length, 12);
+  await provider.reconcileProject("capstone-dev");
+  assert.equal(completed.length, 13);
 });
 
 test("marks a configured Codex lane disconnected when its session evidence disappears", async () => {

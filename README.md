@@ -64,9 +64,9 @@ The desktop app keeps this same directory synchronized with its bundled Skill. T
 ## Read-only Agent Lanes
 
 Taskboard can expose a project-scoped development observatory at
-`GET /api/local/projects/:projectId/agent-lanes`. The endpoint reads local Codex
-session evidence using `.data/agent-lanes.json`; it does not send prompts, claim
-work, restart agents, or perform recovery.
+`GET /api/local/projects/:projectId/agent-lanes`. Lane identity and claims are
+stored in SQLite; local Codex session evidence supplies runtime activity. The
+endpoint does not send prompts, claim work, restart agents, or perform recovery.
 
 The version 2 configuration maps independent Codex tasks/windows and explicitly
 disabled external adapters. Root-internal Sub-Agents are not configured by hand:
@@ -74,6 +74,11 @@ Snapshot v3 discovers their stable path, agent thread, lifecycle, and latest
 result from the Root task's local collaboration events. Prompts are never
 returned. The snapshot keeps `readOnly: true` and
 `automaticRecoveryEnabled: false`.
+
+To migrate a version 2 JSON configuration, run
+`node scripts/migrate-agent-lanes-to-db.mjs <taskboard.sqlite> <agent-lanes.json>`.
+The migration creates missing projects, converts legacy To-Dos into durable
+`agent-todo` issues, and is idempotent by legacy To-Do identifier.
 
 For the current Capstone setup, the `capstone-dev` project opens the Agent Lanes
 view by default. Capstone Root, Visual, and Taskboard/Self Learning appear under

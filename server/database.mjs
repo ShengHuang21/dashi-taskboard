@@ -537,6 +537,10 @@ export class TaskboardDatabase {
         completed_at TEXT
       );
 
+      CREATE UNIQUE INDEX IF NOT EXISTS agent_task_claims_one_active_thread
+        ON agent_task_claims(project_id, agent_thread_id)
+        WHERE status = 'active';
+
       CREATE TABLE IF NOT EXISTS agent_event_receipts (
         event_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -1887,17 +1891,28 @@ export class TaskboardDatabase {
   }
 
   claimAgentTask(id, version, { agentPath, agentThreadId = null }) {
-    const current = this.#requireTask(id);
-    this.#requireVersion(current, version);
-    if (current.status !== "todo") {
-      throw new ApiError(409, "TASK_NOT_READY", "Only a To-Do task can be claimed");
-    }
     if (!agentThreadId) {
       throw new ApiError(400, "AGENT_THREAD_REQUIRED", "A durable Sub-Agent claim requires its thread id");
     }
-    const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      const current = this.#requireTask(id);
+      this.#requireVersion(current, version);
+      if (current.status !== "todo") {
+        throw new ApiError(409, "TASK_NOT_READY", "Only a To-Do task can be claimed");
+      }
+      const existing = this.database.prepare(`
+        SELECT task_id FROM agent_task_claims
+        WHERE project_id = ? AND agent_thread_id = ? AND status = 'active' AND task_id <> ?
+      `).get(current.projectId, agentThreadId, current.id);
+      if (existing) {
+        throw new ApiError(
+          409,
+          "AGENT_ALREADY_CLAIMED",
+          "This Sub-Agent thread already has an active task claim",
+        );
+      }
+      const timestamp = now();
       const result = this.database.prepare(`
         UPDATE tasks SET status = 'in_progress', thread_id = ?, version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
@@ -1914,6 +1929,51 @@ export class TaskboardDatabase {
       `).run(current.id, current.projectId, agentPath, agentThreadId, timestamp);
       this.database.exec("COMMIT");
       return { task: this.getTask(current.id), claim: this.getAgentTaskClaim(current.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordAgentTaskProgress(taskId, { eventId, agentThreadId, summary, actor }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTask(taskId);
+      if (current.status !== "in_progress") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "task_not_in_progress" };
+      }
+      const claim = this.getAgentTaskClaim(current.id);
+      if (!claim || claim.status !== "active") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "no_active_claim" };
+      }
+      if (!agentThreadId || claim.projectId !== current.projectId || claim.agentThreadId !== agentThreadId) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_mismatch" };
+      }
+      if (this.database.prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "duplicate" };
+      }
+      const timestamp = now();
+      const commentId = randomUUID();
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name,
+          author_avatar_url, version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId, current.id, `Sub-Agent 进展：${summary}`, agentThreadId,
+        actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp, changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(eventId, current.projectId, current.id, commentId, timestamp);
+      this.database.exec("COMMIT");
+      return { applied: true, comment: this.listComments(current.id).at(-1), task: this.getTask(current.id) };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -1943,14 +2003,15 @@ export class TaskboardDatabase {
         this.database.exec("ROLLBACK");
         return { applied: false, reason: "duplicate" };
       }
+      const changeRevision = this.#nextCommentAttachmentRevision();
       this.database.prepare(`
         INSERT INTO comments (
           id, task_id, body, thread_id, author_type, author_id, author_name,
-          author_avatar_url, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+          author_avatar_url, version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
       `).run(
         commentId, current.id, `Sub-Agent 完成：${summary}`, agentThreadId,
-        actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp,
+        actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp, changeRevision,
       );
       this.database.prepare(`
         INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)

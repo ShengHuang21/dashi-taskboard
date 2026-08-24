@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
@@ -1542,156 +1542,6 @@ async function scanDevelopmentContexts(workspacePath, processEnv = process.env) 
   }
 }
 
-async function discoverSkills(codexExecutable, workspacePath) {
-  const entries = await new Promise((resolve, reject) => {
-    const child = spawn(codexExecutable, ["app-server", "--stdio"], {
-      cwd: workspacePath,
-      stdio: ["pipe", "pipe", "ignore"],
-    });
-    let settled = false;
-    let buffer = "";
-    const timeout = setTimeout(() => {
-      finish(new Error("Timed out while reading Codex skills"));
-    }, 10_000);
-
-    function finish(error, value) {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      child.stdin.end();
-      child.kill("SIGTERM");
-      if (error) reject(error);
-      else resolve(value);
-    }
-
-    function send(message) {
-      child.stdin.write(`${JSON.stringify(message)}\n`);
-    }
-
-    function handleMessage(message) {
-      if (message?.id === 1) {
-        if (message.error) {
-          finish(new Error("Codex app-server rejected initialization"));
-          return;
-        }
-        send({ method: "initialized" });
-        send({
-          id: 2,
-          method: "skills/list",
-          params: { cwds: [workspacePath], forceReload: false },
-        });
-        return;
-      }
-      if (message?.id !== 2) return;
-      if (message.error) {
-        finish(new Error("Codex app-server could not list skills"));
-        return;
-      }
-      finish(null, Array.isArray(message.result?.data) ? message.result.data : []);
-    }
-
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      buffer += chunk;
-      let newlineIndex = buffer.indexOf("\n");
-      while (newlineIndex >= 0) {
-        const line = buffer.slice(0, newlineIndex).trim();
-        buffer = buffer.slice(newlineIndex + 1);
-        if (line) {
-          try {
-            handleMessage(JSON.parse(line));
-          } catch {}
-        }
-        newlineIndex = buffer.indexOf("\n");
-      }
-    });
-    child.stdin.on("error", (error) => finish(error));
-    child.once("error", (error) => finish(error));
-    child.once("exit", (code, signal) => {
-      if (!settled) {
-        finish(new Error(`Codex app-server exited before listing skills (${signal || code})`));
-      }
-    });
-    child.once("spawn", () => {
-      send({
-        id: 1,
-        method: "initialize",
-        params: {
-          clientInfo: { name: "codex-taskboard", version: "0.1.0" },
-          capabilities: { experimentalApi: true },
-        },
-      });
-    });
-  });
-
-  const unique = new Map();
-  for (const entry of entries) {
-    if (!Array.isArray(entry?.skills)) continue;
-    for (const skill of entry.skills) {
-      if (
-        !skill
-        || typeof skill !== "object"
-        || skill.enabled === false
-        || typeof skill.name !== "string"
-        || !skill.name.trim()
-      ) {
-        continue;
-      }
-      const id = skill.name.trim();
-      if (unique.has(id)) continue;
-      const displayName = typeof skill.interface?.displayName === "string"
-        ? skill.interface.displayName.trim()
-        : "";
-      unique.set(id, {
-        id,
-        label: displayName || id,
-        ...(typeof skill.description === "string" && skill.description.trim()
-          ? { description: skill.description.trim() }
-          : {}),
-        ...(typeof skill.path === "string" && skill.path.trim()
-          ? { path: skill.path.trim() }
-          : {}),
-        scope: ["user", "repo", "system", "admin"].includes(skill.scope)
-          ? skill.scope
-          : "user",
-      });
-    }
-  }
-  return [...unique.values()].sort((left, right) => left.label.localeCompare(right.label));
-}
-
-async function discoverMcpServers(codexExecutable) {
-  const result = await execFileAsync(codexExecutable, ["mcp", "list", "--json"], {
-    timeout: 8_000,
-    maxBuffer: 2 * 1024 * 1024,
-  });
-  const entries = JSON.parse(result.stdout);
-  if (!Array.isArray(entries)) throw new Error("Codex returned an invalid MCP server list");
-  return entries
-    .filter((entry) => (
-      entry
-      && typeof entry === "object"
-      && typeof entry.name === "string"
-      && entry.name.trim()
-      && entry.enabled !== false
-    ))
-    .map((entry) => ({
-      id: entry.name.trim(),
-      label: entry.name.trim(),
-      transport: typeof entry.transport?.type === "string"
-        ? entry.transport.type
-        : "unknown",
-    }))
-    .sort((left, right) => left.label.localeCompare(right.label));
-}
-
-async function discoverWorkflowCapabilities(resolved, workspacePath) {
-  const [skills, mcpServers] = await Promise.all([
-    discoverSkills(resolved.codexExecutable, workspacePath),
-    discoverMcpServers(resolved.codexExecutable),
-  ]);
-  return { skills, mcpServers };
-}
 export function resolveServerOptions(options = {}) {
   const configuredDataDirectory = options.dataDirectory ?? process.env.CODEX_TASKBOARD_DATA_DIR;
   const dataDirectory = configuredDataDirectory
@@ -1963,6 +1813,22 @@ export function createTaskboardServer(options = {}) {
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
     getTask: (identifier) => database.getTask(identifier),
     listComments: (taskId) => database.listComments(taskId),
+    recordProgress: async (progress) => {
+      const candidates = database.listTasks({ projectId: progress.projectId, archived: "false" }).filter((task) => {
+        const claim = database.getAgentTaskClaim(task.id);
+        return claim?.status === "active"
+          && claim.projectId === progress.projectId
+          && claim.agentThreadId === progress.agentThreadId
+          && claim.agentPath === progress.agentPath;
+      });
+      if (candidates.length !== 1) return { applied: false, reason: "claim_not_unique" };
+      const result = database.recordAgentTaskProgress(candidates[0].id, {
+        ...progress,
+        actor: CODEX_AGENT_ACTOR,
+      });
+      if (result.applied) events.emit("comment.created", result);
+      return result;
+    },
     recordCompletion: async (completion) => {
       const candidates = database.listTasks({ projectId: completion.projectId, archived: "false" }).filter((task) => {
         const claim = database.getAgentTaskClaim(task.id);
@@ -1972,10 +1838,15 @@ export function createTaskboardServer(options = {}) {
           && claim.agentPath === completion.agentPath;
       });
       if (candidates.length !== 1) return { applied: false, reason: "claim_not_unique" };
-      return database.completeAgentTask(candidates[0].id, {
+      const result = database.completeAgentTask(candidates[0].id, {
         ...completion,
         actor: CODEX_AGENT_ACTOR,
       });
+      if (result.applied) {
+        events.emit("comment.created", result);
+        events.emit("task.moved", { task: result.task });
+      }
+      return result;
     },
   });
   let agentLaneTimer = null;
@@ -3293,8 +3164,16 @@ export function createTaskboardServer(options = {}) {
         }
         if (action === "claim" && request.method === "POST") {
           const claim = parseAgentClaim(await readJson(request));
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(
+              409,
+              "JIRA_CLAIM_UNAVAILABLE",
+              "Jira tasks cannot be claimed without a Jira transition",
+            );
+          }
           const result = database.claimAgentTask(id, claim.version, claim);
-          events.emit("task.claimed", result);
+          events.emit("task.moved", { task: result.task });
           return sendJson(response, 200, result);
         }
         if (action === "archive" && request.method === "POST") {

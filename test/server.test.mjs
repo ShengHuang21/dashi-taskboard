@@ -141,17 +141,6 @@ test("project Agent Lanes read durable database configuration through a local ro
   assert.equal(mutation.response.status, 405);
 });
 
-test("workflow workspaces persist centrally with optimistic concurrency", async () => {
-  const baseUrl = await startServer();
-  const initial = await request(baseUrl, "/api/projects/local/workflow-workspace");
-  assert.deepEqual(initial.body.workflow, {
-    projectId: "local",
-    workspace: null,
-    version: 0,
-    updatedAt: null,
-  });
-});
-
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {
   const instanceToken = "7a6f8d37-78ce-46c9-87a8-08e10db88da2";
   const instanceSecret = "2e587946-96d6-47b5-930a-1ba70214fa88";

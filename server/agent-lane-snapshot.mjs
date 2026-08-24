@@ -32,9 +32,7 @@ function compact(value, maxLength = 360) {
     ?.replace(/\b(api[_-]?key|token|password|secret)\s*[:=]\s*\S+/gi, "$1=[redacted]")
     .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
     .replace(/\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_]{16,}\b/g, "[redacted]")
-    .replace(/\b[A-Za-z0-9+/_=-]{32,}\b/g, (candidate) => (
-      /^[a-f0-9]{40}$/i.test(candidate) ? candidate : "[redacted]"
-    ))
+    .replace(/\b[A-Za-z0-9+/_=-]{32,}\b/g, "[redacted]")
     .replace(/\s+/g, " ") ?? null;
   if (!normalized || normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, maxLength - 1).trimEnd()}…`;
@@ -296,10 +294,18 @@ function eventSignal(entry) {
   if (entry?.type !== "event_msg") return null;
   const payload = entry.payload;
   if (payload?.type === "task_complete") {
-    return { status: "idle", action: compact(payload.last_agent_message) };
+    return {
+      status: "idle",
+      action: compact(payload.last_agent_message),
+      evidence: extractEvidence(payload.last_agent_message),
+    };
   }
   if (payload?.type === "agent_message") {
-    return { status: payload.phase === "final_answer" ? "idle" : "running", action: compact(payload.message) };
+    return {
+      status: payload.phase === "final_answer" ? "idle" : "running",
+      action: compact(payload.message),
+      evidence: extractEvidence(payload.message),
+    };
   }
   if (payload?.type === "user_message") return { status: "running", action: null };
   return null;
@@ -307,7 +313,9 @@ function eventSignal(entry) {
 
 function extractEvidence(value) {
   const content = text(value, "") ?? "";
-  const sha = content.match(/\b[0-9a-f]{40}\b/i)?.[0]?.toLowerCase() ?? null;
+  const sha = content.match(
+    /\b(?:commit|sha)(?:\s+(?:hash|id))?\s*(?::|=|is)?\s*`?([0-9a-f]{40})`?/i,
+  )?.[1]?.toLowerCase() ?? null;
   const branch = content.match(/\b(?:branch|head)\s*(?::|=|is)?\s*`?([a-z0-9][a-z0-9._/-]{2,})`?/i)?.[1] ?? null;
   const checks = [...new Set(content.match(/\b\d+\/\d+\s*(?:PASS|passed)?\b/gi) ?? [])].slice(0, 4);
   if (/TypeScript(?:\s+(?:clean|PASS|passed))?/i.test(content)) checks.push("TypeScript");
@@ -351,14 +359,17 @@ async function readCodexTask(taskLane, resolveSessionFile, now) {
   let status = "idle";
   let lastActualAction = null;
   let lastActivityAt = null;
+  let evidence = { branch: null, sha: null, checks: [], blocker: null };
   for (const entry of entries) {
     const signal = eventSignal(entry);
     if (!signal) continue;
     status = signal.status;
-    if (signal.action) lastActualAction = signal.action;
+    if (signal.action) {
+      lastActualAction = signal.action;
+      evidence = signal.evidence;
+    }
     if (typeof entry.timestamp === "string") lastActivityAt = entry.timestamp;
   }
-  const evidence = extractEvidence(lastActualAction);
   return {
     ...taskLane,
     status,
@@ -472,12 +483,14 @@ export function createAgentLaneSnapshotProvider({
   getLaneConfig = null,
   listTasks = null,
   getClaim = null,
+  recordProgress = null,
   recordCompletion = null,
   getTask = null,
   listComments = null,
 }) {
   const sessionFilePromises = new Map();
   const subagentStates = new Map();
+  const allRootSubagentsByProject = new Map();
   const resolveSessionFile = (threadId) => {
     let pending = sessionFilePromises.get(threadId);
     if (!pending) {
@@ -559,7 +572,10 @@ export function createAgentLaneSnapshotProvider({
           provenance: { kind: "codex-collaboration-event", threadId: rootTask.threadId },
         })).sort((left, right) => (right.lastActivityAt ?? "").localeCompare(left.lastActivityAt ?? ""));
         observedSubagentCount = allSubagents.length;
+        allRootSubagentsByProject.set(projectId, allSubagents);
         rootSubagents = allSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
+      } else {
+        allRootSubagentsByProject.set(projectId, []);
       }
       const projectTasks = listTasks ? await listTasks(projectId) : [];
       const todoTasks = projectTasks.filter((task) => task.archivedAt === null && task.labels.includes("agent-todo"));
@@ -601,18 +617,28 @@ export function createAgentLaneSnapshotProvider({
       };
     },
     async reconcileProject(projectId) {
-      if (!recordCompletion) return { applied: 0 };
+      if (!recordProgress && !recordCompletion) return { applied: 0 };
       const snapshot = await this.getProjectSnapshot(projectId);
       let applied = 0;
-      for (const agent of snapshot.rootSubagents) {
-        if (agent.lifecycleStatus !== "completed" || !agent.lastActualAction) continue;
-        const result = await recordCompletion({
-          eventId: createHash("sha256").update(`${projectId}:${agent.agentThreadId ?? agent.agentPath}:${agent.lastActualAction}`).digest("hex"),
+      const rootSubagents = allRootSubagentsByProject.get(projectId) ?? snapshot.rootSubagents;
+      for (const agent of rootSubagents) {
+        if (!agent.lastActualAction) continue;
+        const event = {
+          eventId: createHash("sha256").update([
+            projectId,
+            agent.agentThreadId ?? agent.agentPath,
+            agent.lastActivityAt ?? "unknown-time",
+            agent.lifecycleStatus,
+            agent.lastActualAction,
+          ].join(":")).digest("hex"),
           projectId,
           agentPath: agent.agentPath,
           agentThreadId: agent.agentThreadId,
           summary: completionSummary(agent.lastActualAction),
-        });
+        };
+        const result = agent.lifecycleStatus === "completed"
+          ? await recordCompletion?.(event)
+          : await recordProgress?.(event);
         if (result?.applied) applied += 1;
       }
       return { applied };
