@@ -11,6 +11,7 @@ import {
   TASK_STATUSES,
   isTaskPriority,
   isTaskStatus,
+  isWorkingLogStatus,
 } from "../shared/domain.mjs";
 
 export const SCHEMA_VERSION = 2;
@@ -22,7 +23,7 @@ const sourceRuntimeFile = path.resolve(
   ".data",
   "launcher-runtime.json",
 );
-const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "help"]);
+const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "clear-working-log", "help"]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
@@ -35,6 +36,7 @@ const COMMAND_OPTIONS = new Map([
   ["cloud logout", new Set(["json"])],
   ["issue list", new Set(["project", "status", "archived", "json"])],
   ["issue get", new Set(["json"])],
+  ["issue bootstrap", new Set(["json"])],
   [
     "issue create",
     new Set([
@@ -49,6 +51,8 @@ const COMMAND_OPTIONS = new Map([
       "git-branch",
       "worktree-path",
       "worktree-branch",
+      "working-log-path",
+      "working-log-status",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -66,10 +70,18 @@ const COMMAND_OPTIONS = new Map([
       "status",
       "priority",
       "labels",
-      "thread-id",
       "git-branch",
       "worktree-path",
       "worktree-branch",
+      "working-log-path",
+      "working-log-status",
+      "clear-working-log",
+      "binding-thread-id",
+      "binding-codex-project-id",
+      "binding-codex-project-kind",
+      "binding-codex-host-id",
+      "binding-workspace-path",
+      "clear-binding-thread",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -94,6 +106,9 @@ const COMMAND_OPTIONS = new Map([
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
+  ["run get", new Set(["json"])],
+  ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
     "body",
@@ -127,7 +142,7 @@ Commands:
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|create|update|move|archive|restore|relation
+  issue list|get|bootstrap|create|update|move|archive|restore|relation
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -143,27 +158,35 @@ Global options:
 
 Examples:
   taskctl issue get LOCAL-275 --json
+  taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
-Run taskctl issue --help for all issue arguments.`],
+Run taskctl issue --help or taskctl run --help for command arguments.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
 
 Actions:
   list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
   get ISSUE_ID [--json]
+  bootstrap ISSUE_ID [--json]
   create --project PROJECT_ID --title TITLE
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
     [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
+    [--working-log-path PATH --working-log-status planned|active|blocked|complete]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year] [--json]
   update ISSUE_ID
     [--project PROJECT_ID] [--title TITLE]
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
-    [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
+    [--working-log-path PATH --working-log-status planned|active|blocked|complete
+     | --clear-working-log]
+    [--binding-thread-id ID
+      [--binding-codex-project-id ID --binding-codex-project-kind local|remote
+       --binding-codex-host-id ID --binding-workspace-path PATH]
+     | --clear-binding-thread]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year]
     [--if-version N] [--json]
@@ -185,6 +208,18 @@ Priorities: none, urgent, high, medium, low
 
 Example:
   taskctl issue get LOCAL-275 --json`],
+  ["run", `Usage: taskctl run ACTION [arguments] [options]
+
+Actions:
+  get RUN_ID [--json]
+  checkpoint RUN_ID --summary TEXT --next-action TEXT
+    [--status active|blocked] --thread-id ID --if-version N [--json]
+  finish RUN_ID --status completed|failed|interrupted --summary TEXT --next-action TEXT
+    --thread-id ID --if-version N [--json]
+
+Examples:
+  taskctl run get RUN_ID --json
+  taskctl run checkpoint RUN_ID --summary "Focused checks passed" --next-action "Open the capsule" --if-version 2 --json`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -277,7 +312,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl issue, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl issue, taskctl run, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -307,7 +342,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/claim/archive/restore/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -372,6 +407,9 @@ async function execute(parsed, overrides) {
     case "issue get":
       expectOperandCount(parsed, 1);
       return api.request("GET", taskPath(parsed.operands[0]));
+    case "issue bootstrap":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
     case "issue create":
       expectOperandCount(parsed, 0);
       return createIssue(api, parsed.options, overrides);
@@ -399,6 +437,15 @@ async function execute(parsed, overrides) {
         parsed.options,
         overrides,
       );
+    case "run get":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", agentRunPath(parsed.operands[0]));
+    case "run checkpoint":
+      expectOperandCount(parsed, 1);
+      return checkpointAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "run finish":
+      expectOperandCount(parsed, 1);
+      return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
     case "comment list": {
       expectOperandCount(parsed, 1);
       const search = new URLSearchParams();
@@ -861,6 +908,7 @@ async function createIssue(api, options, overrides) {
   assertPriority(priority);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
+  const workingLog = workingLogFromOptions(options, overrides);
   const recurrence = recurrenceFromOptions(options);
   const threadId = resolveThreadId(options, overrides);
   return api.request("POST", "/api/tasks", {
@@ -872,6 +920,7 @@ async function createIssue(api, options, overrides) {
     labels: parseLabels(options.labels),
     threadId,
     ...optionalField("developmentContext", developmentContext),
+    ...optionalField("workingLog", workingLog),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
     ...optionalField("recurrence", recurrence),
@@ -883,8 +932,9 @@ async function updateIssue(api, taskId, options, overrides) {
   if (options.priority !== undefined) assertPriority(options.priority);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
+  const workingLog = workingLogFromOptions(options, overrides);
   const recurrence = recurrenceFromOptions(options);
-  const threadId = resolveThreadId(options, overrides);
+  const threadBinding = threadBindingFromOptions(options);
   const patch = {
     ...optionalField("projectId", options.project),
     ...optionalField("title", options.title),
@@ -892,6 +942,8 @@ async function updateIssue(api, taskId, options, overrides) {
     ...optionalField("priority", options.priority),
     ...optionalField("labels", options.labels === undefined ? undefined : parseLabels(options.labels)),
     ...optionalField("developmentContext", developmentContext),
+    ...optionalField("workingLog", workingLog),
+    ...optionalField("threadBinding", threadBinding),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
     ...optionalField("recurrence", recurrence),
@@ -903,7 +955,6 @@ async function updateIssue(api, taskId, options, overrides) {
   if (Object.keys(patch).length === 0) {
     throw usageError("issue update requires at least one field to update");
   }
-  patch.threadId = threadId;
   patch.version = await resolveVersion(api, taskId, options["if-version"]);
   return api.request("PATCH", taskPath(taskId), patch);
 }
@@ -987,6 +1038,39 @@ async function claimIssue(api, taskId, options, overrides) {
     leaseExpiresAt: new Date(Date.now() + leaseMinutes * 60_000).toISOString(),
     writeScope,
     version: await resolveVersion(api, taskId, options["if-version"]),
+  });
+}
+
+function agentRunPath(runId) {
+  if (!runId) throw usageError("Missing Agent Run id");
+  return `/api/runs/${encodeURIComponent(runId)}`;
+}
+
+async function checkpointAgentRun(api, runId, options, overrides) {
+  const status = options.status ?? "active";
+  if (status !== "active" && status !== "blocked") {
+    throw usageError("--status must be active or blocked for run checkpoint");
+  }
+  return api.request("POST", `${agentRunPath(runId)}/checkpoint`, {
+    agentThreadId: resolveThreadId(options, overrides),
+    summary: requiredOption(options, "summary"),
+    nextAction: requiredOption(options, "next-action"),
+    status,
+    version: explicitVersion(options["if-version"]),
+  });
+}
+
+async function finishAgentRun(api, runId, options, overrides) {
+  const status = requiredOption(options, "status");
+  if (!["completed", "failed", "interrupted"].includes(status)) {
+    throw usageError("--status must be completed, failed, or interrupted for run finish");
+  }
+  return api.request("POST", `${agentRunPath(runId)}/finish`, {
+    agentThreadId: resolveThreadId(options, overrides),
+    summary: requiredOption(options, "summary"),
+    nextAction: requiredOption(options, "next-action"),
+    status,
+    version: explicitVersion(options["if-version"]),
   });
 }
 
@@ -1104,6 +1188,28 @@ function developmentContextFromOptions(options, overrides) {
     };
   }
   return undefined;
+}
+
+function workingLogFromOptions(options, overrides) {
+  const workingLogPath = options["working-log-path"];
+  const status = options["working-log-status"];
+  if (options["clear-working-log"]) {
+    if (workingLogPath !== undefined || status !== undefined) {
+      throw usageError("--clear-working-log cannot be combined with working log options");
+    }
+    return null;
+  }
+  if (workingLogPath === undefined && status === undefined) return undefined;
+  if (workingLogPath === undefined || status === undefined) {
+    throw usageError("Use --working-log-path and --working-log-status together");
+  }
+  if (!isWorkingLogStatus(status)) {
+    throw usageError("--working-log-status must be planned, active, blocked, or complete");
+  }
+  if (!path.isAbsolute(workingLogPath)) {
+    throw usageError("--working-log-path must be absolute");
+  }
+  return { path: path.resolve(workingLogPath), status };
 }
 
 function recurrenceFromOptions(options) {

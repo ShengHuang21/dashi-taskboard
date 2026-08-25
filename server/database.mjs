@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
+import { createTaskCapsule } from "./task-capsule.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 
@@ -19,6 +20,90 @@ export class ApiError extends Error {
 
 function now() {
   return new Date().toISOString();
+}
+
+function normalizeWorkingLog(workingLog, developmentContext) {
+  if (!workingLog) return null;
+  if (developmentContext?.type !== "worktree" || !developmentContext.path) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "A Working Log requires a task worktree");
+  }
+  if (typeof workingLog.path !== "string" || !path.isAbsolute(workingLog.path)) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "Working Log path must be absolute");
+  }
+  if (!["planned", "active", "blocked", "complete"].includes(workingLog.status)) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "Working Log status is invalid");
+  }
+  const worktreePath = path.resolve(developmentContext.path);
+  const workingLogPath = path.resolve(workingLog.path);
+  const relative = path.relative(worktreePath, workingLogPath);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "Working Log path must be inside the task worktree");
+  }
+  return { path: workingLogPath, status: workingLog.status };
+}
+
+function normalizeAgentWriteScope(writeScope, worktreePath) {
+  const pathApi = path.win32.isAbsolute(worktreePath) && !path.posix.isAbsolute(worktreePath)
+    ? path.win32
+    : path.posix;
+  return [...new Set(writeScope.map((item) => {
+    const raw = item.trim();
+    if (
+      path.posix.isAbsolute(raw)
+      || path.win32.isAbsolute(raw)
+      || raw.split(/[\\/]+/).includes("..")
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_AGENT_WRITE_SCOPE",
+        "Agent write scope entries must be relative paths inside the task worktree",
+      );
+    }
+    const normalized = pathApi.normalize(raw.replace(/[\\/]+/g, pathApi.sep));
+    if (
+      normalized === "."
+      || normalized === ".."
+      || normalized.startsWith(`..${pathApi.sep}`)
+      || pathApi.isAbsolute(normalized)
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_AGENT_WRITE_SCOPE",
+        "Agent write scope entries must be relative paths inside the task worktree",
+      );
+    }
+    const resolved = pathApi.resolve(worktreePath, normalized);
+    const relative = pathApi.relative(worktreePath, resolved);
+    if (
+      !relative
+      || relative === ".."
+      || relative.startsWith(`..${pathApi.sep}`)
+      || pathApi.isAbsolute(relative)
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_AGENT_WRITE_SCOPE",
+        "Agent write scope entries must be relative paths inside the task worktree",
+      );
+    }
+    return relative;
+  }))];
+}
+
+function sameThreadBinding(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.threadId === right.threadId
+    && left.codexProjectId === right.codexProjectId
+    && left.codexProjectKind === right.codexProjectKind
+    && left.codexHostId === right.codexHostId
+    && left.workspacePath === right.workspacePath;
+}
+
+function sameDevelopmentContext(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.type === right.type && left.path === right.path && left.branch === right.branch;
 }
 
 function commentConversationTitle(body) {
@@ -243,6 +328,13 @@ function taskFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     developmentContext,
+    workingLog: row.working_log_path && row.working_log_status && row.working_log_updated_at
+      ? {
+        path: row.working_log_path,
+        status: row.working_log_status,
+        updatedAt: row.working_log_updated_at,
+      }
+      : null,
     startDate: row.start_date,
     dueDate: row.due_date,
     recurrence: row.recurrence_interval && row.recurrence_unit
@@ -263,6 +355,7 @@ function taskRelationSummaryFromRow(row) {
   return {
     id: row.id,
     identifier: row.identifier,
+    version: row.version,
     externalKey: row.external_key ?? null,
     projectId: row.project_id,
     title: row.title,
@@ -275,6 +368,30 @@ function taskRelationSummaryFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     archivedAt: row.archived_at,
+  };
+}
+
+function taskAgentRunFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    role: row.role,
+    status: row.status,
+    version: row.version,
+    rootThreadId: row.root_thread_id,
+    agentPath: row.agent_path,
+    agentThreadId: row.agent_thread_id,
+    worktree: {
+      path: row.worktree_path,
+      branch: row.worktree_branch,
+    },
+    writeScope: JSON.parse(row.write_scope_json ?? "[]"),
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+    finishedAt: row.finished_at,
+    summary: row.summary,
+    nextAction: row.next_action,
   };
 }
 
@@ -467,6 +584,9 @@ export class TaskboardDatabase {
         git_branch TEXT,
         worktree_path TEXT,
         worktree_branch TEXT,
+        working_log_path TEXT,
+        working_log_status TEXT CHECK (working_log_status IN ('planned', 'active', 'blocked', 'complete')),
+        working_log_updated_at TEXT,
         start_date TEXT,
         due_date TEXT,
         recurrence_interval INTEGER,
@@ -542,6 +662,31 @@ export class TaskboardDatabase {
       CREATE UNIQUE INDEX IF NOT EXISTS agent_task_claims_one_active_thread
         ON agent_task_claims(project_id, agent_thread_id)
         WHERE status = 'active';
+
+      CREATE TABLE IF NOT EXISTS task_agent_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('sub_agent')),
+        status TEXT NOT NULL CHECK (status IN (
+          'active', 'blocked', 'completed', 'failed', 'interrupted', 'expired'
+        )),
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        root_thread_id TEXT NOT NULL,
+        agent_path TEXT NOT NULL,
+        agent_thread_id TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        worktree_branch TEXT NOT NULL,
+        write_scope_json TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        summary TEXT,
+        next_action TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS task_agent_runs_task_updated
+        ON task_agent_runs(task_id, updated_at DESC, id DESC);
 
       CREATE TABLE IF NOT EXISTS agent_event_receipts (
         event_id TEXT PRIMARY KEY,
@@ -665,6 +810,39 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN write_scope_json TEXT NOT NULL DEFAULT '[]'");
     }
 
+    const taskAgentRunColumns = this.database.prepare("PRAGMA table_info(task_agent_runs)").all();
+    if (!taskAgentRunColumns.some((column) => column.name === "project_id")) {
+      this.database.exec("ALTER TABLE task_agent_runs ADD COLUMN project_id TEXT");
+      this.database.exec(`
+        UPDATE task_agent_runs
+        SET project_id = (
+          SELECT tasks.project_id FROM tasks WHERE tasks.id = task_agent_runs.task_id
+        )
+        WHERE project_id IS NULL
+      `);
+    }
+    this.database.exec("DROP INDEX IF EXISTS task_agent_runs_one_active_per_task");
+    const taskAgentRunMigrationTimestamp = now();
+    this.database.prepare(`
+      UPDATE task_agent_runs
+      SET status = 'interrupted', version = version + 1, updated_at = ?, finished_at = ?
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY task_id
+            ORDER BY updated_at DESC, id DESC
+          ) AS open_run_rank
+          FROM task_agent_runs
+          WHERE status IN ('active', 'blocked')
+        ) WHERE open_run_rank > 1
+      )
+    `).run(taskAgentRunMigrationTimestamp, taskAgentRunMigrationTimestamp);
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS task_agent_runs_one_open_per_task
+      ON task_agent_runs(task_id)
+      WHERE status IN ('active', 'blocked')
+    `);
+
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     const hasWorkflowId = taskColumns.some((column) => column.name === "workflow_id");
     if (hasWorkflowId) {
@@ -716,6 +894,15 @@ export class TaskboardDatabase {
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    if (!migratedTaskColumns.some((column) => column.name === "working_log_path")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_path TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "working_log_status")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_status TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "working_log_updated_at")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_updated_at TEXT");
+    }
     if (!migratedTaskColumns.some((column) => column.name === "creator_type")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN creator_type TEXT NOT NULL DEFAULT 'user'");
     }
@@ -1902,6 +2089,29 @@ export class TaskboardDatabase {
     } : null;
   }
 
+  getTaskAgentRun(id) {
+    const row = this.database.prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(id);
+    return row ? taskAgentRunFromRow(row) : null;
+  }
+
+  getActiveTaskAgentRun(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return this.#taskAgentRunForTask(task.id, ["active"]);
+  }
+
+  getOpenTaskAgentRun(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return this.#taskAgentRunForTask(task.id, ["active", "blocked"]);
+  }
+
+  getLatestTaskAgentRun(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return this.#taskAgentRunForTask(task.id);
+  }
+
   claimAgentTask(id, version, { agentPath, agentThreadId = null, leaseExpiresAt, writeScope }) {
     if (!agentThreadId) {
       throw new ApiError(400, "AGENT_THREAD_REQUIRED", "A durable Sub-Agent claim requires its thread id");
@@ -1918,11 +2128,12 @@ export class TaskboardDatabase {
     ) {
       throw new ApiError(400, "INVALID_AGENT_WRITE_SCOPE", "A durable Sub-Agent claim requires a bounded non-empty write scope");
     }
-    const normalizedWriteScope = [...new Set(writeScope.map((item) => item.trim()))];
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const current = this.#requireTask(id);
       this.#requireVersion(current, version);
+      const rootRun = this.#rootAgentRunBinding(current);
+      const normalizedWriteScope = normalizeAgentWriteScope(writeScope, rootRun.worktreePath);
       const currentClaim = this.getAgentTaskClaim(current.id);
       if (current.status === "in_progress" && currentClaim?.status === "active") {
         if (new Date(currentClaim.leaseExpiresAt) <= new Date()) {
@@ -1931,15 +2142,40 @@ export class TaskboardDatabase {
         if (currentClaim.agentPath !== agentPath || currentClaim.agentThreadId !== agentThreadId) {
           throw new ApiError(409, "CLAIM_CONFLICT", "The task is already claimed by another Sub-Agent");
         }
+        const timestamp = now();
         this.database.prepare(`
           UPDATE agent_task_claims SET lease_expires_at = ?, write_scope_json = ?
           WHERE task_id = ? AND status = 'active'
         `).run(leaseExpiresAt, JSON.stringify(normalizedWriteScope), current.id);
+        const openRun = this.getOpenTaskAgentRun(current.id);
+        if (openRun && (
+          openRun.agentPath !== agentPath || openRun.agentThreadId !== agentThreadId
+        )) {
+          throw new ApiError(409, "RUN_CONFLICT", "The task has a durable run owned by another Sub-Agent");
+        }
+        if (openRun) {
+          this.#assertTaskAgentRunBinding(openRun, current, rootRun);
+          this.database.prepare(`
+            UPDATE task_agent_runs
+            SET status = 'active', version = version + 1, updated_at = ?,
+              write_scope_json = ?, finished_at = NULL
+            WHERE id = ?
+          `).run(timestamp, JSON.stringify(normalizedWriteScope), openRun.id);
+        } else {
+          this.#createTaskAgentRun(current, rootRun, agentPath, agentThreadId, normalizedWriteScope, timestamp);
+        }
         this.database.exec("COMMIT");
-        return { task: this.getTask(current.id), claim: this.getAgentTaskClaim(current.id) };
+        return {
+          task: this.getTask(current.id),
+          claim: this.getAgentTaskClaim(current.id),
+          run: this.getActiveTaskAgentRun(current.id),
+        };
       }
       if (current.status !== "todo") {
         throw new ApiError(409, "TASK_NOT_READY", "Only a To-Do task can be claimed");
+      }
+      if (this.getOpenTaskAgentRun(current.id)) {
+        throw new ApiError(409, "RUN_CONFLICT", "The task has an unresolved durable Agent Run");
       }
       const existing = this.database.prepare(`
         SELECT task_id FROM agent_task_claims
@@ -1954,9 +2190,9 @@ export class TaskboardDatabase {
       }
       const timestamp = now();
       const result = this.database.prepare(`
-        UPDATE tasks SET status = 'in_progress', thread_id = ?, version = version + 1, updated_at = ?
+        UPDATE tasks SET status = 'in_progress', version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
-      `).run(agentThreadId, timestamp, current.id, version);
+      `).run(timestamp, current.id, version);
       if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
       this.database.prepare(`
         INSERT INTO agent_task_claims (
@@ -1970,8 +2206,82 @@ export class TaskboardDatabase {
           lease_expires_at = excluded.lease_expires_at,
           write_scope_json = excluded.write_scope_json, completed_at = NULL
       `).run(current.id, current.projectId, agentPath, agentThreadId, timestamp, leaseExpiresAt, JSON.stringify(normalizedWriteScope));
+      this.#createTaskAgentRun(current, rootRun, agentPath, agentThreadId, normalizedWriteScope, timestamp);
       this.database.exec("COMMIT");
-      return { task: this.getTask(current.id), claim: this.getAgentTaskClaim(current.id) };
+      return {
+        task: this.getTask(current.id),
+        claim: this.getAgentTaskClaim(current.id),
+        run: this.getActiveTaskAgentRun(current.id),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  checkpointTaskAgentRun(id, version, { agentThreadId, status, summary, nextAction }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTaskAgentRun(id);
+      this.#assertAgentRunThread(current, agentThreadId);
+      if (current.status === status && current.summary === summary && current.nextAction === nextAction) {
+        this.database.exec("COMMIT");
+        return { applied: false, run: current, task: this.getTask(current.taskId) };
+      }
+      if (!["active", "blocked"].includes(current.status)) {
+        throw new ApiError(409, "RUN_FINISHED", "A finished Agent Run cannot be checkpointed");
+      }
+      this.#requireAgentRunVersion(current, version);
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE task_agent_runs
+        SET status = ?, version = version + 1, updated_at = ?, summary = ?, next_action = ?
+        WHERE id = ? AND version = ?
+      `).run(status, timestamp, summary, nextAction, current.id, version);
+      this.database.exec("COMMIT");
+      return { applied: true, run: this.getTaskAgentRun(current.id), task: this.getTask(current.taskId) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishTaskAgentRun(id, version, { agentThreadId, status, summary, nextAction }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTaskAgentRun(id);
+      this.#assertAgentRunThread(current, agentThreadId);
+      if (current.status === status && current.summary === summary && current.nextAction === nextAction) {
+        this.database.exec("COMMIT");
+        return { applied: false, run: current, task: this.getTask(current.taskId) };
+      }
+      if (!["active", "blocked"].includes(current.status)) {
+        throw new ApiError(409, "RUN_FINISHED", "An Agent Run can only be finished once");
+      }
+      this.#requireAgentRunVersion(current, version);
+      const task = this.#requireTask(current.taskId);
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE task_agent_runs
+        SET status = ?, version = version + 1, updated_at = ?, finished_at = ?, summary = ?, next_action = ?
+        WHERE id = ? AND version = ?
+      `).run(status, timestamp, timestamp, summary, nextAction, current.id, version);
+      this.database.prepare(`
+        UPDATE agent_task_claims
+        SET status = ?, completed_at = ?
+        WHERE task_id = ? AND status = 'active' AND agent_thread_id = ?
+      `).run(status === "completed" ? "completed" : "interrupted", timestamp, task.id, agentThreadId);
+      if (status === "completed") {
+        const result = this.database.prepare(`
+          UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ?
+          WHERE id = ? AND status = 'in_progress'
+        `).run(timestamp, task.id);
+        if (result.changes !== 1) {
+          throw new ApiError(409, "TASK_NOT_IN_PROGRESS", "Only an in-progress task can be completed by an Agent Run");
+        }
+      }
+      this.database.exec("COMMIT");
+      return { applied: true, run: this.getTaskAgentRun(current.id), task: this.getTask(task.id) };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -2074,6 +2384,11 @@ export class TaskboardDatabase {
       `).run(timestamp, current.id, agentThreadId);
       if (transitioned.changes !== 1) throw new ApiError(409, "CLAIM_CONFLICT", "Agent claim changed during completion");
       this.database.prepare(`
+        UPDATE task_agent_runs
+        SET status = 'completed', version = version + 1, updated_at = ?, finished_at = ?, summary = ?
+        WHERE task_id = ? AND status IN ('active', 'blocked') AND agent_thread_id = ?
+      `).run(timestamp, timestamp, summary, current.id, agentThreadId);
+      this.database.prepare(`
         UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ? WHERE id = ?
       `).run(timestamp, current.id);
       this.database.exec("COMMIT");
@@ -2092,6 +2407,19 @@ export class TaskboardDatabase {
     const activities = this.#activitiesForTasks([task.id]).get(task.id) ?? [];
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
     return attachTaskActivity(task, comments, activities, previewImage);
+  }
+
+  getTaskCapsule(id) {
+    const task = this.getTask(id);
+    if (!task) return null;
+    return createTaskCapsule({
+      task,
+      comments: this.listComments(task.id),
+      attachments: this.listAttachments(task.id),
+      currentClaim: this.getAgentTaskClaim(task.id),
+      currentRun: this.getActiveTaskAgentRun(task.id),
+      latestRun: this.getLatestTaskAgentRun(task.id),
+    });
   }
 
   createTask(input) {
@@ -2127,6 +2455,7 @@ export class TaskboardDatabase {
       const identifier = `${prefix}-${number}`;
       const id = randomUUID();
       const timestamp = now();
+      const workingLog = normalizeWorkingLog(input.workingLog, input.developmentContext);
       let sortOrder = input.sortOrder;
       if (sortOrder === undefined) {
         const row = this.database.prepare(`
@@ -2153,9 +2482,10 @@ export class TaskboardDatabase {
           creator_type, creator_id, creator_name, creator_avatar_url,
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
           git_branch, worktree_path, worktree_branch,
+          working_log_path, working_log_status, working_log_updated_at,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -2178,6 +2508,9 @@ export class TaskboardDatabase {
         input.developmentContext?.type === "branch" ? input.developmentContext.branch : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.path : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.branch : null,
+        workingLog?.path ?? null,
+        workingLog?.status ?? null,
+        workingLog ? timestamp : null,
         input.startDate,
         input.dueDate,
         input.recurrence?.interval ?? null,
@@ -2196,6 +2529,16 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    const effectiveDevelopmentContext = Object.hasOwn(changes, "developmentContext")
+      ? changes.developmentContext
+      : current.developmentContext;
+    const effectiveWorkingLog = Object.hasOwn(changes, "workingLog")
+      ? changes.workingLog
+      : current.workingLog;
+    if (effectiveWorkingLog) {
+      const normalizedWorkingLog = normalizeWorkingLog(effectiveWorkingLog, effectiveDevelopmentContext);
+      if (Object.hasOwn(changes, "workingLog")) changes.workingLog = normalizedWorkingLog;
+    }
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
@@ -2244,6 +2587,7 @@ export class TaskboardDatabase {
     };
     const assignments = [];
     const values = [];
+    const timestamp = now();
     for (const [key, value] of Object.entries(changes)) {
       if (key === "developmentContext") {
         assignments.push("git_branch = ?", "worktree_path = ?", "worktree_branch = ?");
@@ -2257,6 +2601,15 @@ export class TaskboardDatabase {
       if (key === "recurrence") {
         assignments.push("recurrence_interval = ?", "recurrence_unit = ?");
         values.push(value?.interval ?? null, value?.unit ?? null);
+        continue;
+      }
+      if (key === "workingLog") {
+        assignments.push(
+          "working_log_path = ?",
+          "working_log_status = ?",
+          "working_log_updated_at = ?",
+        );
+        values.push(value?.path ?? null, value?.status ?? null, value ? timestamp : null);
         continue;
       }
       if (key === "assignee") {
@@ -2282,7 +2635,9 @@ export class TaskboardDatabase {
       assignments.push("sort_order = ?");
       values.push(row.minimum === null ? 1000 : row.minimum - 1000);
     }
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     if (storedBinding && !Object.hasOwn(changes, "projectId")) {
       assignments.push(
         "thread_id = ?",
@@ -2294,11 +2649,11 @@ export class TaskboardDatabase {
       values.push(...storedBinding);
     }
     assignments.push("version = version + 1", "updated_at = ?");
-    const timestamp = now();
     values.push(timestamp, current.id, version);
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, changes, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks SET ${assignments.join(", ")} WHERE id = ? AND version = ?
       `).run(...values);
@@ -2321,6 +2676,9 @@ export class TaskboardDatabase {
         this.database.prepare(`
           UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?
         `).run(JSON.stringify(mergedLabels), timestamp, destinationProjectId);
+      }
+      if (current.status === "in_progress" && changes.status && changes.status !== "in_progress") {
+        this.#interruptTaskAgentExecution(current.id, timestamp);
       }
       this.#recordTaskActivity(current.id, actor, activityChanges, timestamp);
       this.database.exec("COMMIT");
@@ -2354,13 +2712,16 @@ export class TaskboardDatabase {
     }
 
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks
         SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
@@ -2370,10 +2731,7 @@ export class TaskboardDatabase {
         this.#throwMissingOrConflict(id, version);
       }
       if (current.status === "in_progress" && status !== "in_progress") {
-        this.database.prepare(`
-          UPDATE agent_task_claims SET status = 'interrupted', completed_at = ?
-          WHERE task_id = ? AND status = 'active'
-        `).run(timestamp, current.id);
+        this.#interruptTaskAgentExecution(current.id, timestamp);
       }
       this.#recordTaskActivity(
         current.id,
@@ -2393,13 +2751,16 @@ export class TaskboardDatabase {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks
         SET archived_at = ?, ${threadAssignment} version = version + 1, updated_at = ?
@@ -2408,6 +2769,7 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.#interruptTaskAgentExecution(current.id, timestamp);
       this.#recordTaskActivity(
         current.id,
         actor,
@@ -2429,13 +2791,16 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
     }
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks
         SET archived_at = NULL, ${threadAssignment} version = version + 1, updated_at = ?
@@ -3094,7 +3459,12 @@ export class TaskboardDatabase {
   }
 
   #touchTask(id, version, threadId, threadBinding, timestamp) {
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const current = this.#requireTask(id);
+    this.#requireVersion(current, version);
+    this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -3106,6 +3476,127 @@ export class TaskboardDatabase {
     `).run(...(storedBinding ?? []), timestamp, id, version);
     if (result.changes !== 1) {
       this.#throwMissingOrConflict(id, version);
+    }
+  }
+
+  #rootAgentRunBinding(task) {
+    const binding = task.threadBinding;
+    if (!binding) {
+      throw new ApiError(409, "ROOT_THREAD_BINDING_REQUIRED", "A durable Agent Run requires a full task Root binding");
+    }
+    const worktree = task.developmentContext;
+    if (worktree?.type !== "worktree" || !worktree.path || !worktree.branch) {
+      throw new ApiError(409, "ROOT_WORKTREE_REQUIRED", "A durable Agent Run requires a task worktree and branch");
+    }
+    if (binding.workspacePath !== worktree.path) {
+      throw new ApiError(409, "ROOT_WORKTREE_MISMATCH", "Task Root binding and worktree must match before claiming");
+    }
+    return {
+      projectId: task.projectId,
+      rootThreadId: binding.threadId,
+      worktreePath: worktree.path,
+      worktreeBranch: worktree.branch,
+    };
+  }
+
+  #createTaskAgentRun(task, rootRun, agentPath, agentThreadId, writeScope, timestamp) {
+    this.database.prepare(`
+      INSERT INTO task_agent_runs (
+        id, task_id, project_id, role, status, version, root_thread_id, agent_path, agent_thread_id,
+        worktree_path, worktree_branch, write_scope_json, started_at, updated_at,
+        finished_at, summary, next_action
+      ) VALUES (?, ?, ?, 'sub_agent', 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+    `).run(
+      randomUUID(),
+      task.id,
+      rootRun.projectId,
+      rootRun.rootThreadId,
+      agentPath,
+      agentThreadId,
+      rootRun.worktreePath,
+      rootRun.worktreeBranch,
+      JSON.stringify(writeScope),
+      timestamp,
+      timestamp,
+    );
+  }
+
+  #taskAgentRunForTask(taskId, statuses = null) {
+    const statusClause = statuses ? ` AND status IN (${statuses.map(() => "?").join(", ")})` : "";
+    const row = this.database.prepare(`
+      SELECT * FROM task_agent_runs
+      WHERE task_id = ?${statusClause}
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `).get(taskId, ...(statuses ?? []));
+    return row ? taskAgentRunFromRow(row) : null;
+  }
+
+  #assertNoOpenTaskAgentRunRebinding(task, changes, threadBinding) {
+    const run = this.#taskAgentRunForTask(task.id, ["active", "blocked"]);
+    if (!run) return null;
+    const projectChanged = Object.hasOwn(changes, "projectId") && changes.projectId !== task.projectId;
+    const worktreeChanged = Object.hasOwn(changes, "developmentContext")
+      && !sameDevelopmentContext(changes.developmentContext, task.developmentContext);
+    const rootChanged = threadBinding !== undefined && !sameThreadBinding(threadBinding, task.threadBinding);
+    if (projectChanged || worktreeChanged || rootChanged) {
+      throw new ApiError(
+        409,
+        "RUN_REBIND_CONFLICT",
+        "Root, worktree, and project bindings cannot change while an Agent Run is open",
+      );
+    }
+    return run;
+  }
+
+  #assertTaskAgentRunBinding(run, task, rootRun) {
+    if (
+      run.taskId !== task.id
+      || run.projectId !== rootRun.projectId
+      || run.rootThreadId !== rootRun.rootThreadId
+      || run.worktree.path !== rootRun.worktreePath
+      || run.worktree.branch !== rootRun.worktreeBranch
+    ) {
+      throw new ApiError(
+        409,
+        "RUN_BINDING_STALE",
+        "The durable Agent Run no longer matches the task Root, worktree, or project binding",
+      );
+    }
+  }
+
+  #interruptTaskAgentExecution(taskId, timestamp) {
+    this.database.prepare(`
+      UPDATE agent_task_claims SET status = 'interrupted', completed_at = ?
+      WHERE task_id = ? AND status = 'active'
+    `).run(timestamp, taskId);
+    this.database.prepare(`
+      UPDATE task_agent_runs
+      SET status = 'interrupted', version = version + 1, updated_at = ?, finished_at = ?
+      WHERE task_id = ? AND status IN ('active', 'blocked')
+    `).run(timestamp, timestamp, taskId);
+  }
+
+  #requireTaskAgentRun(id) {
+    const run = this.getTaskAgentRun(id);
+    if (!run) {
+      throw new ApiError(404, "AGENT_RUN_NOT_FOUND", `Agent Run '${id}' does not exist`);
+    }
+    return run;
+  }
+
+  #assertAgentRunThread(run, agentThreadId) {
+    if (!agentThreadId || run.agentThreadId !== agentThreadId) {
+      throw new ApiError(409, "RUN_THREAD_MISMATCH", "Only the owning Agent thread can update this Agent Run");
+    }
+  }
+
+  #requireAgentRunVersion(run, expectedVersion) {
+    if (run.version !== expectedVersion) {
+      throw new ApiError(409, "RUN_VERSION_CONFLICT", "Agent Run was changed by another client", {
+        expectedVersion,
+        actualVersion: run.version,
+      });
     }
   }
 

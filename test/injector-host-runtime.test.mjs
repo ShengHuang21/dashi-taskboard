@@ -24,7 +24,7 @@ test("Agent Todo coordination steers an active Root turn", async () => {
       return {
         thread: {
           id: request.rootThreadId,
-          cwd: "/tmp/taskboard",
+          cwd: request.targetRoot,
           turns: [{ id: "turn-active", status: "inProgress" }],
         },
       };
@@ -35,6 +35,8 @@ test("Agent Todo coordination steers an active Root turn", async () => {
   assert.deepEqual(result, { delivery: "steered", turnId: "turn-active" });
   assert.equal(calls[1][0], "turn/steer");
   assert.equal(calls[1][1].expectedTurnId, "turn-active");
+  assert.match(calls[1][1].input[0].text, /^taskctl issue bootstrap TASKBOARD-17 --json/);
+  assert.match(calls[1][1].input[0].text, /readyWork\.eligible/);
   assert.match(calls[1][1].input[0].text, /Todo: TASKBOARD-17/);
   assert.match(calls[1][1].input[0].text, /spawn the smallest useful Sub-Agent/);
 });
@@ -51,7 +53,7 @@ test("Agent Todo coordination starts an idle Root turn", async () => {
   const result = await deliverTaskboardCoordination(request, async (method, params) => {
     calls.push([method, params]);
     if (method === "thread/read") {
-      return { thread: { id: request.rootThreadId, cwd: "/tmp/taskboard", turns: [] } };
+      return { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } };
     }
     if (method === "turn/start") return { turn: { id: "turn-new" } };
     return {};
@@ -91,7 +93,7 @@ test("the authenticated host binding accepts one bounded Agent Todo request", as
   ]);
 });
 
-test("Agent Todo coordination rejects a wrong workspace before any turn side effect", async () => {
+test("Agent Todo coordination rejects a Root cwd that is not exactly the Todo worktree", async () => {
   const calls = [];
   const request = {
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
@@ -102,9 +104,41 @@ test("Agent Todo coordination rejects a wrong workspace before any turn side eff
       calls.push(method);
       return { thread: { id: request.rootThreadId, cwd: "/tmp/taskboard", turns: [] } };
     }),
-    /workspace/i,
+    /exactly match/i,
   );
   assert.deepEqual(calls, ["thread/read"]);
+});
+
+test("Agent Todo delivery dedupe is scoped to the normalized Todo worktree", async () => {
+  const calls = [];
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local",
+    projectId: "taskboard-core",
+    todoId: "TASKBOARD-TARGET-IDENTITY",
+    targetRoot: "/tmp/right",
+  };
+  const rpc = async (method) => {
+    calls.push(method);
+    if (method === "thread/read") {
+      return { thread: { id: request.rootThreadId, cwd: "/tmp/right", turns: [] } };
+    }
+    if (method === "turn/start") return { turn: { id: "turn-right" } };
+    return {};
+  };
+
+  const first = await deliverTaskboardCoordination(request, rpc);
+  const duplicate = await deliverTaskboardCoordination({ ...request }, rpc);
+  assert.deepEqual(first, { delivery: "started", turnId: "turn-right" });
+  assert.deepEqual(duplicate, first);
+  assert.equal(calls.filter((method) => method === "thread/read").length, 1);
+
+  await assert.rejects(
+    deliverTaskboardCoordination({ ...request, targetRoot: "/tmp/wrong" }, rpc),
+    /exactly match/i,
+  );
+  assert.equal(calls.filter((method) => method === "thread/read").length, 2);
+  assert.equal(calls.filter((method) => method === "turn/start").length, 1);
 });
 
 test("Agent Todo coordination is idempotent and requires a turn receipt", async () => {
@@ -115,7 +149,7 @@ test("Agent Todo coordination is idempotent and requires a turn receipt", async 
   };
   const rpc = async (method) => {
     calls.push(method);
-    if (method === "thread/read") return { thread: { id: request.rootThreadId, cwd: "/tmp/taskboard", turns: [] } };
+    if (method === "thread/read") return { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } };
     if (method === "turn/start") return { turn: { id: "turn-once" } };
     return {};
   };
@@ -129,7 +163,7 @@ test("Agent Todo coordination is idempotent and requires a turn receipt", async 
   await assert.rejects(
     deliverTaskboardCoordination({ ...request, todoId: "TASKBOARD-NO-RECEIPT" }, async (method) => (
       method === "thread/read"
-        ? { thread: { id: request.rootThreadId, cwd: "/tmp/taskboard", turns: [] } }
+        ? { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } }
         : {}
     )),
     /turn receipt/i,
@@ -138,7 +172,7 @@ test("Agent Todo coordination is idempotent and requires a turn receipt", async 
   const retry = await deliverTaskboardCoordination(
     { ...request, todoId: "TASKBOARD-NO-RECEIPT" },
     async (method) => method === "thread/read"
-      ? { thread: { id: request.rootThreadId, cwd: "/tmp/taskboard", turns: [] } }
+      ? { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } }
       : { turn: { id: "turn-after-retry" } },
   );
   assert.deepEqual(retry, { delivery: "started", turnId: "turn-after-retry" });

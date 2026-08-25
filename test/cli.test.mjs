@@ -235,7 +235,6 @@ test("issue update sends an explicit optimistic concurrency version", async () =
   assert.equal(calls[0].url.pathname, "/api/tasks/TASK%2F1");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     title: "New title",
-    threadId: "thread-current",
     version: 7,
   });
 });
@@ -265,7 +264,6 @@ test("issue update binds one worktree context", async () => {
       path: worktreePath,
       branch: "worktree/taskboard",
     },
-    threadId: "thread-current",
     version: 4,
   });
 });
@@ -373,19 +371,82 @@ test("Root Sub-Agent claims a real To-Do with durable identity", async () => {
   });
 });
 
-test("an explicit --thread-id overrides CODEX_THREAD_ID on issue writes", async () => {
+test("run commands use durable lifecycle endpoints and agent thread attribution", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url, init });
+    return response({ run: { id: "RUN/1", version: 2 }, task: { id: "TASK-1" }, applied: true });
+  };
+
+  const checkpoint = await run(
+    [
+      "run", "checkpoint", "RUN/1", "--summary", "Checkpoint", "--next-action", "Resume",
+      "--status", "blocked", "--if-version", "1",
+    ],
+    fetchImplementation,
+  );
+  const finish = await run(
+    [
+      "run", "finish", "RUN/1", "--status", "completed", "--summary", "Finished",
+      "--next-action", "Review", "--if-version", "2",
+    ],
+    fetchImplementation,
+  );
+  const get = await run(["run", "get", "RUN/1"], fetchImplementation);
+
+  assert.equal(checkpoint.exitCode, 0);
+  assert.equal(finish.exitCode, 0);
+  assert.equal(get.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/runs/RUN%2F1/checkpoint");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    agentThreadId: "thread-current",
+    summary: "Checkpoint",
+    nextAction: "Resume",
+    status: "blocked",
+    version: 1,
+  });
+  assert.equal(calls[1].url.pathname, "/api/runs/RUN%2F1/finish");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    agentThreadId: "thread-current",
+    summary: "Finished",
+    nextAction: "Review",
+    status: "completed",
+    version: 2,
+  });
+  assert.equal(calls[2].url.pathname, "/api/runs/RUN%2F1");
+  assert.equal(calls[2].init.method, "GET");
+});
+
+test("issue update rebinds only with explicit binding identity", async () => {
   let requestBody;
   const result = await run(
-    ["issue", "update", "TASK-1", "--title", "Attributed", "--thread-id", "thread-9", "--if-version", "2"],
+    [
+      "issue", "update", "TASK-1", "--title", "Rebound", "--if-version", "2",
+      "--binding-thread-id", "thread-9",
+      "--binding-codex-project-id", "project-9",
+      "--binding-codex-project-kind", "local",
+      "--binding-codex-host-id", "local",
+      "--binding-workspace-path", "/work/rebound",
+    ],
     async (_url, init) => {
       requestBody = JSON.parse(init.body);
-      return response({ task: { id: "TASK-1", threadId: "thread-9", version: 3 } });
+      return response({ task: { id: "TASK-1", threadBinding: requestBody.threadBinding, version: 3 } });
     },
   );
 
   assert.equal(result.exitCode, 0);
-  assert.deepEqual(requestBody, { title: "Attributed", threadId: "thread-9", version: 2 });
-  assert.equal(result.stdout.task.threadId, "thread-9");
+  assert.deepEqual(requestBody, {
+    title: "Rebound",
+    threadBinding: {
+      threadId: "thread-9",
+      codexProjectId: "project-9",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/work/rebound",
+    },
+    version: 2,
+  });
+  assert.equal(result.stdout.task.threadBinding.threadId, "thread-9");
 });
 
 test("issue restore uses the mutation thread and optimistic version", async () => {
@@ -555,14 +616,18 @@ test("context current falls back to the local project", async () => {
   assert.equal(result.stdout.project.id, "local");
 });
 
-test("issue and comment writes require Codex conversation attribution", async () => {
+test("issue updates preserve the existing binding while comment writes require attribution", async () => {
+  let issueBody;
   const issueResult = await run(
     ["issue", "update", "TASK-1", "--title", "No attribution", "--if-version", "1"],
-    async () => assert.fail("fetch should not be called"),
+    async (_url, init) => {
+      issueBody = JSON.parse(init.body);
+      return response({ task: { id: "TASK-1", ...issueBody, version: 2 } });
+    },
     { env: {} },
   );
-  assert.equal(issueResult.exitCode, 2);
-  assert.match(issueResult.stderr.error.message, /--thread-id or CODEX_THREAD_ID/);
+  assert.equal(issueResult.exitCode, 0);
+  assert.deepEqual(issueBody, { title: "No attribution", version: 1 });
 
   const commentResult = await run(
     ["comment", "add", "TASK-1", "--body", "No attribution"],

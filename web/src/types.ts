@@ -635,6 +635,42 @@ export interface CoordinationTodoSnapshot {
     actionId: string | null;
     automaticExecution: false;
   };
+  dispatchTarget: CoordinationDispatchTarget | null;
+  workingLog: CoordinationWorkingLogSnapshot | null;
+  run: CoordinationRunSnapshot | null;
+  readyWork: CoordinationReadyWorkSnapshot;
+}
+
+export interface CoordinationDispatchTarget {
+  rootThreadId: string;
+  codexHostId: string;
+  worktreePath: string;
+}
+
+export interface CoordinationWorkingLogSnapshot {
+  path: string;
+  status: "planned" | "active" | "blocked" | "complete";
+  updatedAt: string;
+}
+
+export interface CoordinationRunSnapshot {
+  id: string;
+  state: "active" | "blocked" | "completed" | "failed" | "interrupted" | "expired" | "expired_unresolved";
+  durable: boolean;
+  agentPath: string | null;
+  agentThreadId: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  finishedAt: string | null;
+  writeScope: string[];
+  nextAction: string | null;
+}
+
+export interface CoordinationReadyWorkSnapshot {
+  state: "ready" | "not_ready";
+  eligible: boolean;
+  reasonCodes: string[];
+  nextAction: string | null;
 }
 
 export interface AgentLaneSnapshot {

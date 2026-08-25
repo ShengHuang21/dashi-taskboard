@@ -116,7 +116,8 @@ export async function deliverTaskboardCoordination(request, rpc) {
   for (const [key, entry] of coordinationDeliveries) {
     if (entry.expiresAt <= observedAt) coordinationDeliveries.delete(key);
   }
-  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.rootThreadId}`;
+  const targetRoot = path.resolve(request.targetRoot);
+  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.rootThreadId}:${targetRoot}`;
   const existing = coordinationDeliveries.get(deliveryKey);
   if (existing) return existing.promise;
   const delivery = deliverTaskboardCoordinationOnce(request, rpc);
@@ -138,14 +139,14 @@ async function deliverTaskboardCoordinationOnce(request, rpc) {
   }
   const rootCwd = typeof threadResult.thread.cwd === "string" ? path.resolve(threadResult.thread.cwd) : null;
   const targetRoot = path.resolve(request.targetRoot);
-  if (!rootCwd || (targetRoot !== rootCwd && !targetRoot.startsWith(`${rootCwd}${path.sep}`))) {
-    throw new Error("Configured Root workspace does not own the Taskboard project workspace");
+  if (!rootCwd || targetRoot !== rootCwd) {
+    throw new Error("Configured Root cwd must exactly match the Todo worktree");
   }
   const instruction = [
-    "Taskboard Agent collaboration request.",
+    `taskctl issue bootstrap ${request.todoId} --json`,
     `Project: ${request.projectId}`,
     `Todo: ${request.todoId}`,
-    "Read the exact Taskboard issue and its latest comments with taskctl before acting.",
+    "Read the returned Task Capsule and recheck readyWork.eligible. If it is false, stop and report its reasonCodes; do not claim, spawn, or dispatch work.",
     "Coordinate this work as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent for the bounded task, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
     "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",
   ].join("\n");

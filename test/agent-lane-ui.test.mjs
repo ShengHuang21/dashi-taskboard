@@ -30,19 +30,43 @@ test("connected Codex lanes use the local launcher instead of browser protocol n
 test("a ready Agent Todo can be delivered to the configured Root coordinator", () => {
   assert.match(boardSource, /交给 Root 协调/);
   assert.match(boardSource, /Root 已收到/);
-  assert.match(boardSource, /todo\.state === "ready" && rootThreadId !== null/);
+  assert.match(boardSource, /todo\.readyWork\.eligible && todo\.dispatchTarget !== null && !hasOpenRun/);
+  assert.match(boardSource, /todo\.dispatchTarget!/);
   assert.match(appSource, /type: "taskboard:coordinate-todo"/);
   assert.match(appSource, /onCoordinateTodo=\{coordinateAgentTodo\}/);
   assert.match(appSource, /taskboard:coordination-response/);
+  const coordinateSource = appSource.slice(
+    appSource.indexOf("async function coordinateAgentTodo"),
+    appSource.indexOf("function openTaskConversation"),
+  );
+  assert.match(coordinateSource, /rootThreadId: target\.rootThreadId/);
+  assert.match(coordinateSource, /codexHostId: target\.codexHostId/);
+  assert.match(coordinateSource, /targetRoot: target\.worktreePath/);
+  assert.doesNotMatch(coordinateSource, /automationProjectContext/);
 });
 
-test("Todo cards expose compact DB-backed ownership and attention without Working Log", () => {
-  for (const label of ["认领", "租约", "写入范围", "关注", "下一步"]) {
+test("a legacy Agent Todo backlog is not made dispatchable by its Root binding", () => {
+  const todoCardSource = boardSource.slice(
+    boardSource.indexOf("function TodoCard"),
+    boardSource.indexOf("function SubagentCard"),
+  );
+  assert.match(todoCardSource, /const canCoordinate = todo\.readyWork\.eligible && todo\.dispatchTarget !== null && !hasOpenRun/);
+  assert.match(todoCardSource, /todo\.readyWork\.eligible \? "等待领取" : "等待条件满足"/);
+  assert.doesNotMatch(todoCardSource, /todo\.state === "ready"/);
+});
+
+test("Todo cards expose Capsule-backed eligibility, Working Log, and durable Run state", () => {
+  for (const label of ["认领", "租约", "写入范围", "工作日志", "执行", "关注", "下一步"]) {
     assert.match(boardSource, new RegExp(label));
   }
   assert.match(boardSource, /todo\.claim\?\.ownerLabel/);
   assert.match(boardSource, /todo\.claim\.leaseState/);
   assert.match(boardSource, /todo\.writeScope/);
+  assert.match(boardSource, /todo\.workingLog/);
+  assert.match(boardSource, /todo\.run/);
+  assert.match(boardSource, /RUN_STATE_LABELS/);
+  assert.match(boardSource, /执行中/);
+  assert.match(boardSource, /交付回执/);
   assert.match(boardSource, /todo\.continuation\.attention/);
   assert.match(boardSource, /snapshot\.attentionQueue/);
   assert.match(boardSource, /setDeliveryState\("idle"\)/);
@@ -53,7 +77,7 @@ test("the lane board keeps the owner view concise while synchronization stays au
   for (const label of ["当前工作", "Sub-Agent", "最近完成", "其他任务", "待办", "自动同步"]) {
     assert.match(boardSource, new RegExp(label));
   }
-  assert.doesNotMatch(boardSource, /Working Log|latestWorkingLog|Owner|Branch|SHA|Continuity|最后一次实际动作/);
+  assert.doesNotMatch(boardSource, /latestWorkingLog|Owner|Branch|SHA|Continuity|最后一次实际动作/);
   assert.match(boardSource, /snapshot\.taskLanes/);
   assert.match(boardSource, /snapshot\.rootSubagents/);
   assert.match(boardSource, /Root 现在没有启动 Sub-Agent/);

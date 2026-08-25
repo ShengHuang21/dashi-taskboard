@@ -4,6 +4,7 @@ import { ApiError, getAgentLaneSnapshot } from "../api";
 import type {
   AgentLaneSnapshot,
   AgentTaskLaneSnapshot,
+  CoordinationDispatchTarget,
   CoordinationTodoSnapshot,
   RootSubagentSnapshot,
 } from "../types";
@@ -12,7 +13,7 @@ interface AgentLaneBoardProps {
   projectId: string;
   projectName: string;
   onOpenCodexThread: (threadId: string) => Promise<boolean>;
-  onCoordinateTodo: (todoId: string, rootThreadId: string) => Promise<boolean>;
+  onCoordinateTodo: (todoId: string, target: CoordinationDispatchTarget) => Promise<boolean>;
 }
 
 const STATUS_LABELS = {
@@ -38,6 +39,15 @@ const TODO_STATUS_LABELS = {
 } as const;
 
 const LEASE_LABELS = { active: "有效", expired: "已过期", completed: "已完成" } as const;
+const RUN_STATE_LABELS = {
+  active: "执行中",
+  blocked: "已阻塞",
+  completed: "已完成",
+  failed: "失败",
+  interrupted: "已中断",
+  expired: "已过期",
+  expired_unresolved: "租约待处理",
+} as const;
 const ATTENTION_LABELS = {
   needs_user: "需要你", needs_coordinator: "需要 Root", blocked: "已阻塞",
   ready: "可领取", watch: "进行中", done: "已完成",
@@ -148,17 +158,16 @@ function TaskLaneCard({
 
 function TodoCard({
   todo,
-  rootThreadId,
   onCoordinateTodo,
 }: {
   todo: CoordinationTodoSnapshot;
-  rootThreadId: string | null;
-  onCoordinateTodo: (todoId: string, rootThreadId: string) => Promise<boolean>;
+  onCoordinateTodo: (todoId: string, target: CoordinationDispatchTarget) => Promise<boolean>;
 }) {
   const [deliveryState, setDeliveryState] = useState<"idle" | "sending" | "sent">("idle");
-  const canCoordinate = todo.state === "ready" && rootThreadId !== null;
-  useEffect(() => setDeliveryState("idle"), [todo.id, todo.state, rootThreadId]);
-  const nextAction = activityKeyword(todo.nextAction, todo.state === "ready" ? "等待领取" : "继续当前任务");
+  const hasOpenRun = todo.run?.state === "active" || todo.run?.state === "blocked";
+  const canCoordinate = todo.readyWork.eligible && todo.dispatchTarget !== null && !hasOpenRun;
+  useEffect(() => setDeliveryState("idle"), [todo.id, todo.readyWork.eligible, todo.dispatchTarget?.rootThreadId, hasOpenRun]);
+  const nextAction = activityKeyword(todo.readyWork.nextAction ?? todo.nextAction, todo.readyWork.eligible ? "等待领取" : "等待条件满足");
   return (
     <article className={`agent-todo-card is-${todo.state}`} role="listitem">
       <div className="agent-lane-card-heading">
@@ -169,9 +178,14 @@ function TodoCard({
         <div><dt>认领</dt><dd>{todo.claim?.ownerLabel ?? "未认领"}</dd></div>
         <div><dt>租约</dt><dd>{todo.claim ? LEASE_LABELS[todo.claim.leaseState] : "未开始"}</dd></div>
         <div><dt>写入范围</dt><dd>{todo.writeScope.length ? todo.writeScope.join("、") : "无"}</dd></div>
+        <div><dt>工作日志</dt><dd>{todo.workingLog ? `${todo.workingLog.status}: ${todo.workingLog.path}` : "未记录"}</dd></div>
+        <div><dt>执行</dt><dd>{todo.run ? RUN_STATE_LABELS[todo.run.state] : "未启动"}</dd></div>
         <div><dt>关注</dt><dd>{ATTENTION_LABELS[todo.continuation.attention]}</dd></div>
       </dl>
       <p className="agent-lane-current-work"><span>下一步</span>{nextAction}</p>
+      {deliveryState === "sent" && !hasOpenRun && (
+        <p className="agent-lane-current-work"><span>交付回执</span>Root 已收到；尚未确认 durable Run 执行中。</p>
+      )}
       {canCoordinate && (
         <button
           className="agent-todo-coordinate"
@@ -179,7 +193,7 @@ function TodoCard({
           disabled={deliveryState !== "idle"}
           onClick={async () => {
             setDeliveryState("sending");
-            setDeliveryState(await onCoordinateTodo(todo.id, rootThreadId) ? "sent" : "idle");
+            setDeliveryState(await onCoordinateTodo(todo.id, todo.dispatchTarget!) ? "sent" : "idle");
           }}
         >
           {deliveryState === "sending" ? "正在交给 Root…" : deliveryState === "sent" ? "Root 已收到" : "交给 Root 协调"}
@@ -332,7 +346,6 @@ export function AgentLaneBoard({
               <TodoCard
                 key={todo.id}
                 todo={todo}
-                rootThreadId={rootLane?.source === "codex" && rootLane.connection === "connected" ? rootLane.threadId : null}
                 onCoordinateTodo={onCoordinateTodo}
               />
             ))}

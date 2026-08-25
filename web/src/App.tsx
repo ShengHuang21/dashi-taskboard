@@ -121,6 +121,7 @@ import {
   type AiChatThread,
   type CodexProjectIdentity,
   type CodexThreadBinding,
+  type CoordinationDispatchTarget,
   type DevelopmentScan,
   type HostContext,
   type IssueRelationOrigin,
@@ -2866,7 +2867,7 @@ export function App() {
     }
   }
 
-  async function coordinateAgentTodo(todoId: string, rootThreadId: string) {
+  async function coordinateAgentTodo(todoId: string, target: CoordinationDispatchTarget) {
     if (!embedded || window.parent === window) {
       setActionError(text(
         "请从 Codex 内的 Taskboard 面板发起 Agent 协作。",
@@ -2874,10 +2875,8 @@ export function App() {
       ));
       return false;
     }
-    const codexHostId = automationProjectContext.codexHostId;
-    const targetRoot = automationProjectContext.workspacePath;
-    if (!codexHostId || !targetRoot) {
-      setActionError(text("当前项目没有可用的 Codex 主机。", "This project has no available Codex host."));
+    if (!target.rootThreadId || !target.codexHostId || !target.worktreePath) {
+      setActionError(text("待办没有可用的 Root / worktree 交付目标。", "This Todo has no dispatchable Root/worktree target."));
       return false;
     }
     const requestId = window.crypto.randomUUID();
@@ -2898,9 +2897,9 @@ export function App() {
         requestId,
         projectId: selectedProjectId,
         todoId,
-        rootThreadId,
-        codexHostId,
-        targetRoot,
+        rootThreadId: target.rootThreadId,
+        codexHostId: target.codexHostId,
+        targetRoot: target.worktreePath,
       },
     });
     try {

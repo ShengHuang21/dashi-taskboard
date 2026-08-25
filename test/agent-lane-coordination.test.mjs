@@ -28,10 +28,22 @@ async function setup() {
     }],
     adapters: [],
   });
+  const rootBinding = {
+    threadId: "root-thread",
+    codexProjectId: "capstone-dev",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/agent-coordination-worktree",
+  };
+  const developmentContext = {
+    type: "worktree",
+    path: rootBinding.workspacePath,
+    branch: "codex/agent-coordination",
+  };
   const task = database.createTask({
     projectId: "capstone-dev", title: "验证真实交接", description: "", status: "todo",
-    priority: "high", labels: ["agent-todo"], threadId: null, actor, assignee: actor,
-    workflowId: null, developmentContext: null, startDate: null, dueDate: null, recurrence: null,
+    priority: "high", labels: ["agent-todo"], threadId: rootBinding.threadId, threadBinding: rootBinding,
+    actor, assignee: actor, workflowId: null, developmentContext, startDate: null, dueDate: null, recurrence: null,
   });
   const sessionsDirectory = path.join(directory, "sessions", "2026", "08", "24");
   await mkdir(sessionsDirectory, { recursive: true });
@@ -42,11 +54,12 @@ async function setup() {
     getLaneConfig: (projectId) => db.getAgentLaneProject(projectId),
     listTasks: (projectId) => db.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => db.getAgentTaskClaim(taskId),
+    getTaskCapsule: (taskId) => db.getTaskCapsule(taskId),
     listComments: (taskId) => db.listComments(taskId),
     recordProgress: (progress) => db.recordAgentTaskProgress(task.id, { ...progress, actor }),
     recordCompletion: (completion) => db.completeAgentTask(task.id, { ...completion, actor }),
   });
-  return { database, databasePath, task, rootFile, makeProvider };
+  return { database, databasePath, task, rootFile, rootBinding, developmentContext, makeProvider };
 }
 
 test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff", async () => {
@@ -54,7 +67,7 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
   let provider = fixture.makeProvider(fixture.database);
   let snapshot = await provider.getProjectSnapshot("capstone-dev");
   assert.deepEqual(snapshot.todos.map((todo) => todo.id), [fixture.task.identifier]);
-  assert.equal(snapshot.todos[0].state, "ready");
+  assert.equal(snapshot.todos[0].state, "blocked");
 
   const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
@@ -107,8 +120,9 @@ test("one Sub-Agent thread cannot hold two active claims in a project", async ()
   const fixture = await setup();
   const second = fixture.database.createTask({
     projectId: "capstone-dev", title: "第二个任务", description: "", status: "todo",
-    priority: "medium", labels: ["agent-todo"], threadId: null, actor, assignee: actor,
-    developmentContext: null, startDate: null, dueDate: null, recurrence: null,
+    priority: "medium", labels: ["agent-todo"], threadId: fixture.rootBinding.threadId,
+    threadBinding: fixture.rootBinding, actor, assignee: actor,
+    developmentContext: fixture.developmentContext, startDate: null, dueDate: null, recurrence: null,
   });
   fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
@@ -122,6 +136,82 @@ test("one Sub-Agent thread cannot hold two active claims in a project", async ()
     (error) => error?.code === "AGENT_ALREADY_CLAIMED",
   );
   assert.equal(fixture.database.getTask(second.id).status, "todo");
+  fixture.database.close();
+});
+
+test("projects Capsule eligibility, dispatch targets, Working Logs, and durable runs into Agent Todos", async () => {
+  const fixture = await setup();
+  const readyTask = fixture.database.createTask({
+    projectId: "capstone-dev", title: "Capsule-ready task", description: "", status: "todo",
+    priority: "medium", labels: [], threadId: fixture.rootBinding.threadId, threadBinding: fixture.rootBinding,
+    actor, assignee: actor, developmentContext: fixture.developmentContext,
+    workingLog: {
+      path: `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`,
+      status: "planned",
+    },
+    startDate: null, dueDate: null, recurrence: null,
+  });
+  const legacyBacklog = fixture.database.createTask({
+    projectId: "capstone-dev", title: "Legacy backlog", description: "", status: "backlog",
+    priority: "low", labels: ["agent-todo"], threadId: fixture.rootBinding.threadId,
+    threadBinding: fixture.rootBinding, actor, assignee: actor, developmentContext: fixture.developmentContext,
+    startDate: null, dueDate: null, recurrence: null,
+  });
+  let snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
+  const readyTodo = snapshot.todos.find((todo) => todo.id === readyTask.identifier);
+  const legacyTodo = snapshot.todos.find((todo) => todo.id === legacyBacklog.identifier);
+  assert.equal(readyTodo?.readyWork.eligible, true);
+  assert.equal(readyTodo?.state, "ready");
+  assert.equal(readyTodo?.claimedBy, null);
+  assert.equal(readyTodo?.claim, null);
+  assert.deepEqual(readyTodo?.continuation, { route: "ready_for_agent", attention: "ready" });
+  assert.equal(readyTodo?.recovery.eligible, false);
+  assert.deepEqual(readyTodo?.dispatchTarget, {
+    rootThreadId: fixture.rootBinding.threadId,
+    codexHostId: fixture.rootBinding.codexHostId,
+    worktreePath: fixture.developmentContext.path,
+  });
+  assert.equal(readyTodo?.workingLog?.path, `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`);
+  assert.equal(readyTodo?.workingLog?.status, "planned");
+  assert.match(readyTodo?.workingLog?.updatedAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(readyTodo?.run, null);
+  assert.equal(legacyTodo?.readyWork.eligible, false);
+  assert.match(legacyTodo?.readyWork.reasonCodes.join(",") ?? "", /BACKLOG_NOT_ELIGIBLE/);
+  assert.equal(legacyTodo?.state, "blocked");
+  assert.notEqual(legacyTodo?.continuation.attention, "ready");
+  assert.equal(legacyTodo?.continuation.route, "blocked");
+  assert.equal(legacyTodo?.recovery.eligible, false);
+
+  const claimed = fixture.database.claimAgentTask(readyTask.id, readyTask.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/agent-lane-snapshot.mjs"],
+  });
+  snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
+  const runningTodo = snapshot.todos.find((todo) => todo.id === readyTask.identifier);
+  assert.equal(runningTodo?.readyWork.eligible, false);
+  assert.equal(runningTodo?.run?.id, claimed.run.id);
+  assert.equal(runningTodo?.run?.state, "active");
+  assert.equal(runningTodo?.run?.durable, true);
+  fixture.database.close();
+});
+
+test("projects a durable legacy claim without treating the Root binding as ownership", async () => {
+  const fixture = await setup();
+  const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/agent-lane-snapshot.mjs"],
+  });
+  fixture.database.database.prepare("DELETE FROM task_agent_runs WHERE task_id = ?").run(fixture.task.id);
+
+  const snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
+  const todo = snapshot.todos.find((entry) => entry.id === fixture.task.identifier);
+  assert.equal(todo?.claimedBy, claimed.claim.agentPath);
+  assert.equal(todo?.claim?.ownerLabel, claimed.claim.agentPath);
+  assert.equal(todo?.claim?.leaseState, "active");
+  assert.equal(todo?.run?.durable, false);
+  assert.equal(todo?.run?.state, "active");
+  assert.deepEqual(todo?.continuation, { route: "wait", attention: "watch" });
+  assert.equal(todo?.recovery.eligible, false);
   fixture.database.close();
 });
 
@@ -195,6 +285,129 @@ test("manual move interrupts an active claim and expired projection remains manu
     eventId: "stale-agent", agentThreadId: "acceptance-thread", summary: "stale", actor,
   }), { applied: false, reason: "task_not_in_progress" });
   fixture.database.close();
+});
+
+test("leaving in-progress and archiving atomically interrupt open runs so a claim can be retried", async () => {
+  const fixture = await setup();
+  const first = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["./server/database.mjs"],
+  });
+  const blocked = fixture.database.checkpointTaskAgentRun(first.run.id, first.run.version, {
+    agentThreadId: "acceptance-thread", status: "blocked", summary: "waiting", nextAction: "resume",
+  });
+  assert.equal(blocked.run.status, "blocked");
+
+  const moved = fixture.database.updateTask(
+    fixture.task.id, first.task.version, { status: "todo" }, undefined, undefined, actor,
+  );
+  assert.equal(moved.status, "todo");
+  assert.equal(fixture.database.getAgentTaskClaim(fixture.task.id).status, "interrupted");
+  assert.equal(fixture.database.getLatestTaskAgentRun(fixture.task.id).status, "interrupted");
+  assert.equal(fixture.database.getOpenTaskAgentRun(fixture.task.id), null);
+
+  const retried = fixture.database.claimAgentTask(fixture.task.id, moved.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/./database.mjs"],
+  });
+  assert.deepEqual(retried.claim.writeScope, ["server/database.mjs"]);
+  assert.deepEqual(retried.run.writeScope, ["server/database.mjs"]);
+
+  fixture.database.archiveTask(retried.task.id, retried.task.version, undefined, undefined, actor);
+  assert.equal(fixture.database.getAgentTaskClaim(fixture.task.id).status, "interrupted");
+  assert.equal(fixture.database.getLatestTaskAgentRun(fixture.task.id).status, "interrupted");
+  assert.equal(fixture.database.getOpenTaskAgentRun(fixture.task.id), null);
+  fixture.database.close();
+});
+
+test("open runs protect bindings and require worktree-relative normalized write scopes", async () => {
+  const fixture = await setup();
+  const claimInput = {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+  };
+  for (const writeScope of [["/etc/passwd"], ["../outside"], ["server/../../outside"]]) {
+    assert.throws(
+      () => fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, { ...claimInput, writeScope }),
+      (error) => error?.code === "INVALID_AGENT_WRITE_SCOPE",
+    );
+  }
+
+  const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    ...claimInput,
+    writeScope: ["./server/database.mjs", "server/agent-lane-snapshot.mjs"],
+  });
+  assert.deepEqual(claimed.run.writeScope, ["server/database.mjs", "server/agent-lane-snapshot.mjs"]);
+  const blocked = fixture.database.checkpointTaskAgentRun(claimed.run.id, claimed.run.version, {
+    agentThreadId: claimInput.agentThreadId, status: "blocked", summary: "waiting", nextAction: "resume",
+  });
+  assert.equal(blocked.run.status, "blocked");
+  fixture.database.createProject({ id: "other-project", name: "Other", workspacePath: null });
+  const otherBinding = { ...fixture.rootBinding, threadId: "other-root" };
+  const otherWorktree = { ...fixture.developmentContext, path: "/tmp/other-worktree" };
+  for (const changes of [
+    { projectId: "other-project" },
+    { developmentContext: otherWorktree },
+  ]) {
+    assert.throws(
+      () => fixture.database.updateTask(
+        fixture.task.id, claimed.task.version, changes, undefined, undefined, actor,
+      ),
+      (error) => error?.code === "RUN_REBIND_CONFLICT",
+    );
+  }
+  assert.throws(
+    () => fixture.database.updateTask(
+      fixture.task.id, claimed.task.version, {}, undefined, otherBinding, actor,
+    ),
+    (error) => error?.code === "RUN_REBIND_CONFLICT",
+  );
+
+  fixture.database.database.prepare(
+    "UPDATE task_agent_runs SET project_id = ? WHERE id = ?",
+  ).run("other-project", claimed.run.id);
+  assert.throws(
+    () => fixture.database.claimAgentTask(fixture.task.id, claimed.task.version, {
+      ...claimInput, writeScope: ["server/database.mjs"],
+    }),
+    (error) => error?.code === "RUN_BINDING_STALE",
+  );
+  fixture.database.close();
+});
+
+test("migrates legacy active and blocked runs to one open writer", async () => {
+  const fixture = await setup();
+  const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/database.mjs"],
+  });
+  fixture.database.database.exec("DROP INDEX task_agent_runs_one_open_per_task");
+  fixture.database.database.prepare(
+    "UPDATE task_agent_runs SET status = 'blocked', updated_at = ? WHERE id = ?",
+  ).run("2001-01-01T00:00:00.000Z", claimed.run.id);
+  fixture.database.database.prepare(`
+    INSERT INTO task_agent_runs (
+      id, task_id, project_id, role, status, version, root_thread_id, agent_path, agent_thread_id,
+      worktree_path, worktree_branch, write_scope_json, started_at, updated_at,
+      finished_at, summary, next_action
+    )
+    SELECT ?, task_id, project_id, role, 'active', version, root_thread_id, agent_path, agent_thread_id,
+      worktree_path, worktree_branch, write_scope_json, started_at, ?,
+      NULL, summary, next_action
+    FROM task_agent_runs WHERE id = ?
+  `).run("legacy-active-run", "2099-01-01T00:00:00.000Z", claimed.run.id);
+  fixture.database.close();
+
+  const reopened = new TaskboardDatabase(fixture.databasePath);
+  const openRuns = reopened.database.prepare(`
+    SELECT id, status FROM task_agent_runs
+    WHERE task_id = ? AND status IN ('active', 'blocked')
+  `).all(fixture.task.id);
+  assert.deepEqual(openRuns.map((run) => ({ id: run.id, status: run.status })), [
+    { id: "legacy-active-run", status: "active" },
+  ]);
+  assert.equal(reopened.getTaskAgentRun(claimed.run.id).status, "interrupted");
+  reopened.close();
 });
 
 test("reconciliation requires a fresh Sub-Agent turn after the current claim", async () => {

@@ -15,6 +15,7 @@ import {
   TASK_STATUSES,
   isTaskPriority,
   isTaskStatus,
+  isWorkingLogStatus,
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
@@ -342,6 +343,23 @@ function parseDevelopmentContext(value) {
   throw new ApiError(400, "INVALID_FIELD", "'developmentContext.type' must be branch or worktree");
 }
 
+function parseWorkingLog(value) {
+  if (value === null) return null;
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["path", "status"]));
+  const workingLogPath = pathField(value.path, "workingLog.path");
+  if (!workingLogPath) {
+    throw new ApiError(400, "INVALID_FIELD", "'workingLog.path' is required");
+  }
+  if (!path.isAbsolute(workingLogPath)) {
+    throw new ApiError(400, "INVALID_FIELD", "'workingLog.path' must be absolute");
+  }
+  if (!isWorkingLogStatus(value.status)) {
+    throw new ApiError(400, "INVALID_FIELD", "'workingLog.status' must be planned, active, blocked, or complete");
+  }
+  return { path: path.resolve(workingLogPath), status: value.status };
+}
+
 function parseRecurrence(value) {
   if (value === null) return null;
   assertPlainObject(value);
@@ -583,7 +601,7 @@ function parseTaskCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "projectId", "title", "description", "status", "priority", "labels", "sortOrder", "threadId", "threadBinding",
-    "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
+    "assigneeTarget", "developmentContext", "workingLog", "startDate", "dueDate", "recurrence",
   ]));
   const projectId = validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID);
   const task = {
@@ -598,6 +616,7 @@ function parseTaskCreate(body) {
     threadBinding: parseThreadBinding(body.threadBinding),
     assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
     developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
+    workingLog: parseWorkingLog(body.workingLog ?? null),
     startDate: parseDueDate(body.startDate ?? null, "startDate"),
     dueDate: parseDueDate(body.dueDate ?? null),
     recurrence: parseRecurrence(body.recurrence ?? null),
@@ -612,11 +631,14 @@ function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "version", "projectId", "title", "description", "status", "priority", "labels", "threadId", "threadBinding",
-    "assigneeTarget", "developmentContext", "startDate", "dueDate", "recurrence",
+    "assigneeTarget", "developmentContext", "workingLog", "startDate", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
   const threadBinding = parseThreadBinding(body.threadBinding);
+  if (threadId !== undefined) {
+    throw new ApiError(400, "INVALID_FIELD", "Use 'threadBinding' to rebind a task root");
+  }
   const assigneeTarget = parseAssigneeTarget(body.assigneeTarget);
   const changes = {};
   if (body.projectId !== undefined) changes.projectId = validateProjectId(body.projectId);
@@ -626,13 +648,14 @@ function parseTaskPatch(body) {
   if (body.priority !== undefined) changes.priority = parsePriority(body.priority);
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
+  if (body.workingLog !== undefined) changes.workingLog = parseWorkingLog(body.workingLog);
   if (body.startDate !== undefined) changes.startDate = parseDueDate(body.startDate, "startDate");
   if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
   if (body.recurrence !== undefined) changes.recurrence = parseRecurrence(body.recurrence);
   if (changes.recurrence && body.dueDate === null) {
     throw new ApiError(400, "INVALID_FIELD", "A recurring issue requires 'dueDate'");
   }
-  if (Object.keys(changes).length === 0 && assigneeTarget === undefined) {
+  if (Object.keys(changes).length === 0 && assigneeTarget === undefined && threadBinding === undefined) {
     throw new ApiError(400, "INVALID_BODY", "PATCH requires at least one task field");
   }
   return { version, changes, threadId, threadBinding, assigneeTarget };
@@ -676,6 +699,37 @@ function parseAgentClaim(body) {
     agentThreadId,
     leaseExpiresAt: leaseDate.toISOString(),
     writeScope,
+  };
+}
+
+function parseAgentRunCheckpoint(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "agentThreadId", "summary", "nextAction", "status"]));
+  const status = body.status ?? "active";
+  if (!["active", "blocked"].includes(status)) {
+    throw new ApiError(400, "INVALID_FIELD", "'status' must be active or blocked for a checkpoint");
+  }
+  return {
+    version: parseVersion(body.version),
+    agentThreadId: stringField(body.agentThreadId, "agentThreadId", { required: true, maxLength: 256 }),
+    summary: stringField(body.summary, "summary", { required: true, maxLength: 10_000 }),
+    nextAction: stringField(body.nextAction, "nextAction", { required: true, maxLength: 2_000 }),
+    status,
+  };
+}
+
+function parseAgentRunFinish(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "agentThreadId", "summary", "nextAction", "status"]));
+  if (!["completed", "failed", "interrupted"].includes(body.status)) {
+    throw new ApiError(400, "INVALID_FIELD", "'status' must be completed, failed, or interrupted for a finish");
+  }
+  return {
+    version: parseVersion(body.version),
+    agentThreadId: stringField(body.agentThreadId, "agentThreadId", { required: true, maxLength: 256 }),
+    summary: stringField(body.summary, "summary", { required: true, maxLength: 10_000 }),
+    nextAction: stringField(body.nextAction, "nextAction", { required: true, maxLength: 2_000 }),
+    status: body.status,
   };
 }
 
@@ -1836,6 +1890,7 @@ export function createTaskboardServer(options = {}) {
     getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
+    getTaskCapsule: (taskId) => database.getTaskCapsule(taskId),
     getTask: (identifier) => database.getTask(identifier),
     listComments: (taskId) => database.listComments(taskId),
     recordProgress: async (progress) => {
@@ -2789,8 +2844,8 @@ export function createTaskboardServer(options = {}) {
         }
         const relationType = parseIssueRelationType(type);
         if (request.method === "POST") {
-          const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
-            parseRelationMutation(await readJson(request)),
+          const { version, threadId, threadBinding, origin } = parseRelationMutation(
+            await readJson(request),
           );
           const result = database.addTaskRelation(
             taskId,
@@ -2806,8 +2861,8 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, result);
         }
         if (request.method === "DELETE") {
-          const { version, threadId, threadBinding, origin } = resolveInputThreadBinding(
-            parseRelationMutation(await readJson(request)),
+          const { version, threadId, threadBinding, origin } = parseRelationMutation(
+            await readJson(request),
           );
           const result = database.removeTaskRelation(
             taskId,
@@ -3078,6 +3133,55 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
+      const taskAgentRunRoute = pathname.match(/^\/api\/runs\/([^/]+)(?:\/(checkpoint|finish))?$/);
+      if (taskAgentRunRoute) {
+        const id = decodeRouteSegment(taskAgentRunRoute[1], "Agent Run id");
+        const action = taskAgentRunRoute[2];
+        if (!action && request.method === "GET") {
+          if ([...url.searchParams.keys()].length > 0) {
+            throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/runs/:id does not accept query parameters");
+          }
+          const run = database.getTaskAgentRun(id);
+          if (!run) throw new ApiError(404, "AGENT_RUN_NOT_FOUND", `Agent Run '${id}' does not exist`);
+          return sendJson(response, 200, { run });
+        }
+        if (action === "checkpoint" && request.method === "POST") {
+          const checkpoint = parseAgentRunCheckpoint(await readJson(request));
+          const result = database.checkpointTaskAgentRun(id, checkpoint.version, checkpoint);
+          if (result.applied) events.emit("task.updated", { task: result.task });
+          return sendJson(response, 200, result);
+        }
+        if (action === "finish" && request.method === "POST") {
+          const finish = parseAgentRunFinish(await readJson(request));
+          const result = database.finishTaskAgentRun(id, finish.version, finish);
+          if (result.applied) {
+            events.emit(result.run.status === "completed" ? "task.moved" : "task.updated", { task: result.task });
+          }
+          return sendJson(response, 200, result);
+        }
+        return methodNotAllowed(response, action ? ["POST"] : ["GET"]);
+      }
+
+      const taskCapsuleRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/capsule$/);
+      if (taskCapsuleRoute) {
+        let id;
+        try {
+          id = decodeURIComponent(taskCapsuleRoute[1]);
+        } catch {
+          throw new ApiError(400, "INVALID_PATH", "Task id contains invalid encoding");
+        }
+        if (id.length === 0 || id.length > 128) {
+          throw new ApiError(400, "INVALID_PATH", "Task id is invalid");
+        }
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/tasks/:id/capsule does not accept query parameters");
+        }
+        const capsule = database.getTaskCapsule(id);
+        if (!capsule) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
+        return sendJson(response, 200, { capsule });
+      }
+
       const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|claim))?$/);
       if (taskRoute) {
         let id;
@@ -3106,7 +3210,7 @@ export function createTaskboardServer(options = {}) {
             threadId,
             threadBinding,
             assigneeTarget,
-          } = resolveInputThreadBinding(parseTaskPatch(await readJson(request)));
+          } = parseTaskPatch(await readJson(request));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           let jiraChanged = false;
@@ -3183,7 +3287,7 @@ export function createTaskboardServer(options = {}) {
           return sendEmpty(response, 204);
         }
         if (action === "move" && request.method === "POST") {
-          const move = resolveInputThreadBinding(parseMove(await readJson(request)));
+          const move = parseMove(await readJson(request));
           const current = database.getTask(id);
           if (!current) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
           if (current.source === "jira") {
@@ -3229,9 +3333,7 @@ export function createTaskboardServer(options = {}) {
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_ARCHIVE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动归档");
           }
-          const { version, threadId, threadBinding } = resolveInputThreadBinding(
-            parseArchive(await readJson(request)),
-          );
+          const { version, threadId, threadBinding } = parseArchive(await readJson(request));
           const task = database.archiveTask(
             id,
             version,
@@ -3247,9 +3349,7 @@ export function createTaskboardServer(options = {}) {
           if (current?.source === "jira") {
             throw new ApiError(409, "JIRA_RESTORE_UNAVAILABLE", "Jira 任务由同步范围自动管理，不能手动恢复");
           }
-          const { version, threadId, threadBinding } = resolveInputThreadBinding(
-            parseArchive(await readJson(request)),
-          );
+          const { version, threadId, threadBinding } = parseArchive(await readJson(request));
           const task = database.restoreTask(
             id,
             version,

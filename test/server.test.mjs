@@ -94,6 +94,102 @@ test("health and the default local project are available", async () => {
   assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
 });
 
+test("durable Agent Runs checkpoint, finish, and recover through the API", async () => {
+  const baseUrl = await startServer();
+  const rootBinding = {
+    threadId: "root-thread",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/durable-agent-run-worktree",
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: {
+      projectId: "local",
+      title: "Durable run task",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: [],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/durable-agent-run",
+      },
+      workingLog: { path: "/tmp/durable-agent-run-worktree/CAP-3-WORKING-LOG.md", status: "active" },
+    },
+  });
+  assert.equal(created.response.status, 201);
+  const claimed = await request(baseUrl, `/api/tasks/${created.body.task.id}/claim`, {
+    method: "POST",
+    body: {
+      version: created.body.task.version,
+      agentPath: "/root/server-test",
+      agentThreadId: "server-test-agent",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+      writeScope: ["server/database.mjs"],
+    },
+  });
+  assert.equal(claimed.response.status, 200);
+  assert.equal(claimed.body.run.status, "active");
+  const activeCapsule = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  assert.equal(activeCapsule.body.capsule.activeRun.id, claimed.body.run.id);
+  assert.equal(activeCapsule.body.capsule.latestRun.id, claimed.body.run.id);
+  const wrongThread = await request(baseUrl, `/api/runs/${claimed.body.run.id}/checkpoint`, {
+    method: "POST",
+    body: {
+      version: claimed.body.run.version,
+      agentThreadId: "other-agent",
+      summary: "Wrong thread",
+      nextAction: "Do not persist",
+      status: "active",
+    },
+  });
+  assert.equal(wrongThread.response.status, 409);
+  assert.equal(wrongThread.body.error.code, "RUN_THREAD_MISMATCH");
+  const checkpointed = await request(baseUrl, `/api/runs/${claimed.body.run.id}/checkpoint`, {
+    method: "POST",
+    body: {
+      version: claimed.body.run.version,
+      agentThreadId: "server-test-agent",
+      summary: "Checkpoint persisted",
+      nextAction: "Resume from API",
+      status: "blocked",
+    },
+  });
+  assert.equal(checkpointed.response.status, 200);
+  assert.equal(checkpointed.body.run.version, 2);
+  const capsule = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  assert.equal(capsule.body.capsule.latestRun.nextAction, "Resume from API");
+  const finished = await request(baseUrl, `/api/runs/${claimed.body.run.id}/finish`, {
+    method: "POST",
+    body: {
+      version: checkpointed.body.run.version,
+      agentThreadId: "server-test-agent",
+      summary: "Finished",
+      nextAction: "Review",
+      status: "completed",
+    },
+  });
+  assert.equal(finished.response.status, 200);
+  assert.equal(finished.body.task.status, "in_review");
+  const repeated = await request(baseUrl, `/api/runs/${claimed.body.run.id}/finish`, {
+    method: "POST",
+    body: {
+      version: checkpointed.body.run.version,
+      agentThreadId: "server-test-agent",
+      summary: "Finished",
+      nextAction: "Review",
+      status: "completed",
+    },
+  });
+  assert.equal(repeated.response.status, 200);
+  assert.equal(repeated.body.applied, false);
+});
+
 test("the default host is loopback-only", () => {
   assert.equal(resolveHost(undefined), "127.0.0.1");
   assert.equal(resolveHost("0.0.0.0"), "0.0.0.0");
@@ -124,6 +220,37 @@ test("project Agent Lanes read durable database configuration through a local ro
         { id: "pi", label: "Pi", owner: "Pi", source: "pi", connection: "not_connected" },
       ],
     });
+    const rootBinding = {
+      threadId: "root-thread",
+      codexProjectId: "local",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/local-agent-worktree",
+    };
+    database.createTask({
+      projectId: "local",
+      title: "Capsule-dispatchable lane task",
+      description: "",
+      status: "todo",
+      priority: "medium",
+      labels: [],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null },
+      assignee: { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null },
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/local-agent-lane",
+      },
+      workingLog: {
+        path: `${rootBinding.workspacePath}/CAP-LOCAL-WORKING-LOG.md`,
+        status: "planned",
+      },
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
     database.close();
     return { codexSessionsDirectory: path.join(directory, "sessions") };
   });
@@ -136,6 +263,15 @@ test("project Agent Lanes read durable database configuration through a local ro
   assert.equal(result.body.taskLanes.length, 3);
   assert.equal(result.body.rootSubagents.length, 0);
   assert.equal(result.body.adapters.length, 2);
+  const capsuleTodo = result.body.todos.find((todo) => todo.title === "Capsule-dispatchable lane task");
+  assert.equal(capsuleTodo.readyWork.eligible, true);
+  assert.deepEqual(capsuleTodo.dispatchTarget, {
+    rootThreadId: "root-thread",
+    codexHostId: "local",
+    worktreePath: "/tmp/local-agent-worktree",
+  });
+  assert.equal(capsuleTodo.workingLog.status, "planned");
+  assert.equal(capsuleTodo.run, null);
 
   const projects = await request(baseUrl, "/api/local/agent-lane-projects");
   assert.equal(projects.response.status, 200);

@@ -217,39 +217,104 @@ function todoProjection(todo, projectId, taskLanes, now) {
   };
 }
 
-function taskTodoState(task) {
-  return ({
-    backlog: "ready",
-    todo: "ready",
-    in_progress: "claimed",
-    in_review: "validating",
-    blocked: task.labels.includes("waiting-user") ? "waiting_user" : "blocked",
-    done: "completed",
-    canceled: "completed",
-  })[task.status] ?? "blocked";
+function taskTodoState(task, readyWork, claim, run) {
+  if (claim?.status === "active" || run?.state === "active") return "claimed";
+  if (run?.state === "blocked") return "blocked";
+  if (task.status === "in_review" && (claim?.status === "completed" || run?.state === "completed")) {
+    return "validating";
+  }
+  if (["done", "canceled"].includes(task.status)) return "completed";
+  if (task.status === "blocked") return task.labels.includes("waiting-user") ? "waiting_user" : "blocked";
+  return readyWork.eligible ? "ready" : "blocked";
 }
 
-async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComments, generatedAt) {
+function readyWorkForTodo(capsule) {
+  const readyWork = capsule?.readyWork;
+  return {
+    state: readyWork?.state === "ready" ? "ready" : "not_ready",
+    eligible: readyWork?.eligible === true,
+    reasonCodes: Array.isArray(readyWork?.reasonCodes)
+      ? readyWork.reasonCodes.filter((reason) => typeof reason === "string")
+      : ["TASK_CAPSULE_UNAVAILABLE"],
+    nextAction: compact(readyWork?.nextAction?.text, 80),
+  };
+}
+
+function dispatchTargetFor(capsule) {
+  const binding = capsule?.execution?.threadBinding;
+  const worktree = capsule?.worktree;
+  if (
+    !binding?.threadId
+    || !binding?.codexHostId
+    || worktree?.type !== "worktree"
+    || !worktree.path
+    || binding.workspacePath !== worktree.path
+  ) return null;
+  return {
+    rootThreadId: binding.threadId,
+    codexHostId: binding.codexHostId,
+    worktreePath: worktree.path,
+  };
+}
+
+function workingLogFor(capsule) {
+  const workingLog = capsule?.workingLog;
+  if (!workingLog?.path || !workingLog?.status || !workingLog?.updatedAt) return null;
+  return {
+    path: workingLog.path,
+    status: workingLog.status,
+    updatedAt: workingLog.updatedAt,
+  };
+}
+
+function runForTodo(capsule) {
+  const run = capsule?.activeRun ?? capsule?.latestRun;
+  if (!run?.id || !run?.state) return null;
+  return {
+    id: run.id,
+    state: run.state,
+    durable: run.role === "sub_agent",
+    agentPath: text(run.agentPath),
+    agentThreadId: text(run.agentThreadId),
+    startedAt: text(run.startedAt ?? run.claimedAt),
+    updatedAt: text(run.updatedAt ?? run.claimedAt),
+    finishedAt: text(run.finishedAt ?? run.completedAt),
+    writeScope: Array.isArray(run.writeScope) ? run.writeScope.map((item) => text(item)).filter(Boolean) : [],
+    nextAction: compact(run.nextAction, 80),
+  };
+}
+
+async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComments, generatedAt, capsule) {
   const storedClaim = getClaim ? await getClaim(task.id) : null;
   const claim = ["in_progress", "in_review"].includes(task.status) ? storedClaim : null;
+  const readyWork = readyWorkForTodo(capsule);
+  const run = runForTodo(capsule);
   const owner = claim?.agentPath
     ? taskLanes.find((lane) => lane.threadId === claim.agentThreadId || lane.id === claim.agentPath.replace(/^\/root\//, ""))
-    : taskLanes.find((lane) => lane.threadId === task.threadId);
-  const comments = listComments ? await listComments(task.id) : [];
+    : null;
+  const comments = Array.isArray(capsule?.comments)
+    ? capsule.comments
+    : listComments ? await listComments(task.id) : [];
   const latest = comments.at(-1) ?? null;
-  return todoProjection({
+  return {
+    ...todoProjection({
     id: task.identifier,
     title: task.title,
-    state: taskTodoState(task),
-    claimedBy: claim?.agentPath ?? owner?.id ?? null,
+    state: taskTodoState(task, readyWork, claim, run),
+    claimedBy: claim?.agentPath ?? null,
     claimedThreadId: claim?.agentThreadId ?? null,
     claimedAt: claim?.claimedAt ?? null,
     leaseExpiresAt: claim?.leaseExpiresAt ?? null,
     claimStatus: claim?.status ?? null,
-    writeScope: claim?.writeScope?.length ? claim.writeScope : task.labels,
-    nextAction: nextActionFrom(latest?.body) ?? compact(task.title, 80),
+    writeScope: run?.writeScope?.length ? run.writeScope : claim?.writeScope?.length ? claim.writeScope : task.labels,
+    nextAction: readyWork.nextAction ?? nextActionFrom(latest?.body) ?? compact(task.title, 80),
     evidenceRef: latest ? `comment:${latest.id}` : `task:${task.identifier}`,
-  }, projectId, taskLanes, generatedAt);
+    }, projectId, taskLanes, generatedAt),
+    dispatchTarget: dispatchTargetFor(capsule),
+    workingLog: workingLogFor(capsule),
+    run,
+    readyWork,
+  };
 }
 
 async function workItemFor(taskLane, getTask, listComments) {
@@ -500,6 +565,7 @@ export function createAgentLaneSnapshotProvider({
   getLaneConfig = null,
   listTasks = null,
   getClaim = null,
+  getTaskCapsule = null,
   recordProgress = null,
   recordCompletion = null,
   getTask = null,
@@ -595,10 +661,26 @@ export function createAgentLaneSnapshotProvider({
         allRootSubagentsByProject.set(projectId, []);
       }
       const projectTasks = listTasks ? await listTasks(projectId) : [];
-      const todoTasks = projectTasks.filter((task) => task.archivedAt === null && task.labels.includes("agent-todo"));
-      const todos = await Promise.all(todoTasks.map((task) => (
-        taskTodoProjection(task, projectId, taskLanes, getClaim, listComments, generatedAt)
-      )));
+      const todoEntries = await Promise.all(projectTasks
+        .filter((task) => task.archivedAt === null)
+        .map(async (task) => {
+          const capsule = getTaskCapsule ? await getTaskCapsule(task.id) : null;
+          return {
+            task,
+            capsule,
+            todo: await taskTodoProjection(
+              task, projectId, taskLanes, getClaim, listComments, generatedAt, capsule,
+            ),
+          };
+        }));
+      const todos = todoEntries
+        .filter(({ task, capsule }) => (
+          capsule?.readyWork?.eligible === true
+          || capsule?.activeRun !== null && capsule?.activeRun !== undefined
+          || capsule?.latestRun !== null && capsule?.latestRun !== undefined
+          || task.labels.includes("agent-todo")
+        ))
+        .map(({ todo }) => todo);
       const currentCoordinator = taskLanes.find((lane) => lane.id === configured.rootTaskId) ?? null;
       return {
         version: AGENT_LANE_SNAPSHOT_VERSION,
