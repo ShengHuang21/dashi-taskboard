@@ -11,6 +11,8 @@ import type {
 interface AgentLaneBoardProps {
   projectId: string;
   projectName: string;
+  onOpenCodexThread: (threadId: string) => Promise<boolean>;
+  onCoordinateTodo: (todoId: string, rootThreadId: string) => Promise<boolean>;
 }
 
 const STATUS_LABELS = {
@@ -33,6 +35,12 @@ const TODO_STATUS_LABELS = {
   blocked: "阻塞",
   validating: "验证中",
   completed: "已完成",
+} as const;
+
+const LEASE_LABELS = { active: "有效", expired: "已过期", completed: "已完成" } as const;
+const ATTENTION_LABELS = {
+  needs_user: "需要你", needs_coordinator: "需要 Root", blocked: "已阻塞",
+  ready: "可领取", watch: "进行中", done: "已完成",
 } as const;
 
 function activityKeyword(value: string | null, fallback: string) {
@@ -97,7 +105,20 @@ function groupCompletedSubagents(agents: RootSubagentSnapshot[]) {
   return [...groups].map(([category, items]) => ({ category, items }));
 }
 
-function TaskLaneCard({ lane, root = false }: { lane: AgentTaskLaneSnapshot; root?: boolean }) {
+function TaskLaneCard({
+  lane,
+  root = false,
+  onOpenCodexThread,
+}: {
+  lane: AgentTaskLaneSnapshot;
+  root?: boolean;
+  onOpenCodexThread: (threadId: string) => Promise<boolean>;
+}) {
+  const [openState, setOpenState] = useState<"idle" | "opening" | "opened">("idle");
+  const canOpenConversation = lane.source === "codex"
+    && lane.connection === "connected"
+    && lane.threadId !== null;
+
   return (
     <article
       className={`agent-lane-card agent-lane-simple-card${root ? " agent-lane-root-card" : ""} is-${lane.status}`}
@@ -108,18 +129,62 @@ function TaskLaneCard({ lane, root = false }: { lane: AgentTaskLaneSnapshot; roo
         <span className="agent-lane-status">{STATUS_LABELS[lane.status]}</span>
       </div>
       <p className="agent-lane-current-work"><span>正在做</span>{activityKeyword(lane.lastActualAction, lane.status === "running" ? "处理中" : "等待任务")}</p>
+      {canOpenConversation && (
+        <button
+          className="agent-lane-open-conversation"
+          type="button"
+          disabled={openState === "opening"}
+          onClick={async () => {
+            setOpenState("opening");
+            setOpenState(await onOpenCodexThread(lane.threadId!) ? "opened" : "idle");
+          }}
+        >
+          {openState === "opening" ? "正在打开…" : openState === "opened" ? "已在 Codex 打开" : "打开 Codex 对话"}
+        </button>
+      )}
     </article>
   );
 }
 
-function TodoCard({ todo }: { todo: CoordinationTodoSnapshot }) {
+function TodoCard({
+  todo,
+  rootThreadId,
+  onCoordinateTodo,
+}: {
+  todo: CoordinationTodoSnapshot;
+  rootThreadId: string | null;
+  onCoordinateTodo: (todoId: string, rootThreadId: string) => Promise<boolean>;
+}) {
+  const [deliveryState, setDeliveryState] = useState<"idle" | "sending" | "sent">("idle");
+  const canCoordinate = todo.state === "ready" && rootThreadId !== null;
+  useEffect(() => setDeliveryState("idle"), [todo.id, todo.state, rootThreadId]);
+  const nextAction = activityKeyword(todo.nextAction, todo.state === "ready" ? "等待领取" : "继续当前任务");
   return (
     <article className={`agent-todo-card is-${todo.state}`} role="listitem">
       <div className="agent-lane-card-heading">
         <h4>{todo.title}</h4>
         <span className="agent-lane-status">{TODO_STATUS_LABELS[todo.state]}</span>
       </div>
-      <p className="agent-lane-current-work"><span>现在</span>{todo.nextAction ?? "等待任务"}</p>
+      <dl className="agent-todo-facts">
+        <div><dt>认领</dt><dd>{todo.claim?.ownerLabel ?? "未认领"}</dd></div>
+        <div><dt>租约</dt><dd>{todo.claim ? LEASE_LABELS[todo.claim.leaseState] : "未开始"}</dd></div>
+        <div><dt>写入范围</dt><dd>{todo.writeScope.length ? todo.writeScope.join("、") : "无"}</dd></div>
+        <div><dt>关注</dt><dd>{ATTENTION_LABELS[todo.continuation.attention]}</dd></div>
+      </dl>
+      <p className="agent-lane-current-work"><span>下一步</span>{nextAction}</p>
+      {canCoordinate && (
+        <button
+          className="agent-todo-coordinate"
+          type="button"
+          disabled={deliveryState !== "idle"}
+          onClick={async () => {
+            setDeliveryState("sending");
+            setDeliveryState(await onCoordinateTodo(todo.id, rootThreadId) ? "sent" : "idle");
+          }}
+        >
+          {deliveryState === "sending" ? "正在交给 Root…" : deliveryState === "sent" ? "Root 已收到" : "交给 Root 协调"}
+        </button>
+      )}
     </article>
   );
 }
@@ -152,7 +217,12 @@ function CompletedWorkGroup({ category, agents }: { category: string; agents: Ro
   );
 }
 
-export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) {
+export function AgentLaneBoard({
+  projectId,
+  projectName,
+  onOpenCodexThread,
+  onCoordinateTodo,
+}: AgentLaneBoardProps) {
   const [snapshot, setSnapshot] = useState<AgentLaneSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -189,6 +259,11 @@ export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) 
   const completedGroups = groupCompletedSubagents(
     snapshot.rootSubagents.filter((agent) => agent.lifecycleStatus === "completed"),
   );
+  const todoById = new Map(snapshot.todos.map((todo) => [todo.id, todo]));
+  const orderedTodos = [
+    ...snapshot.attentionQueue.flatMap((id) => todoById.get(id) ? [todoById.get(id)!] : []),
+    ...snapshot.todos.filter((todo) => !snapshot.attentionQueue.includes(todo.id)),
+  ];
 
   return (
     <section className="agent-lanes" aria-labelledby="agent-lanes-title">
@@ -196,7 +271,7 @@ export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) 
         <div>
           <span className="agent-lanes-eyebrow">开发状态</span>
           <h2 id="agent-lanes-title">{projectName}</h2>
-          <p>谁在工作、正在做什么、Sub-Agent 是否运行。</p>
+          <p>由 Root 分工，Sub-Agent 执行，结果自动回到待办。</p>
         </div>
         <div className="agent-lanes-policy" aria-label="安全状态">
           <span>自动同步</span>
@@ -207,7 +282,11 @@ export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) 
         <div className="agent-lane-section-heading">
           <h3 id="root-status-title">当前工作</h3>
         </div>
-        {rootLane && <div className="agent-lane-grid" role="list"><TaskLaneCard lane={rootLane} root /></div>}
+        {rootLane && (
+          <div className="agent-lane-grid" role="list">
+            <TaskLaneCard lane={rootLane} root onOpenCodexThread={onOpenCodexThread} />
+          </div>
+        )}
       </section>
 
       <section className="agent-lane-section agent-subagent-section" aria-labelledby="root-subagents-title">
@@ -237,7 +316,9 @@ export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) 
           <h3 id="task-lanes-title">其他任务</h3>
         </div>
         <div className="agent-lane-grid" role="list">
-          {peerLanes.map((lane) => <TaskLaneCard key={lane.id} lane={lane} />)}
+          {peerLanes.map((lane) => (
+            <TaskLaneCard key={lane.id} lane={lane} onOpenCodexThread={onOpenCodexThread} />
+          ))}
         </div>
       </section>
 
@@ -245,9 +326,16 @@ export function AgentLaneBoard({ projectId, projectName }: AgentLaneBoardProps) 
         <div className="agent-lane-section-heading">
           <h3 id="agent-todos-title">待办</h3>
         </div>
-        {snapshot.todos.length > 0 ? (
+        {orderedTodos.length > 0 ? (
           <div className="agent-todo-grid" role="list">
-            {snapshot.todos.map((todo) => <TodoCard key={todo.id} todo={todo} />)}
+            {orderedTodos.map((todo) => (
+              <TodoCard
+                key={todo.id}
+                todo={todo}
+                rootThreadId={rootLane?.source === "codex" && rootLane.connection === "connected" ? rootLane.threadId : null}
+                onCoordinateTodo={onCoordinateTodo}
+              />
+            ))}
           </div>
         ) : <p className="agent-lane-empty">暂无待办。</p>}
       </section>

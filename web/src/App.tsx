@@ -36,6 +36,7 @@ import {
   listProjects,
   listTasks,
   moveTask as moveTaskRequest,
+  openCodexThread as openCodexThreadRequest,
   publishHostRuntime,
   removeTaskRelation,
   resolveTaskboardUrl,
@@ -283,6 +284,19 @@ interface AutomationHostResponse {
 
 interface PendingAutomationRequest {
   resolve: (response: AutomationHostResponse) => void;
+  reject: (error: Error) => void;
+  timeoutId: number;
+}
+
+interface CoordinationHostResponse {
+  requestId: string;
+  ok: boolean;
+  delivery?: "started" | "steered";
+  error?: string;
+}
+
+interface PendingCoordinationRequest {
+  resolve: (response: CoordinationHostResponse) => void;
   reject: (error: Error) => void;
   timeoutId: number;
 }
@@ -828,6 +842,7 @@ export function App() {
     );
   }
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
+  const pendingCoordinationRequestsRef = useRef(new Map<string, PendingCoordinationRequest>());
   const automationRequestInFlightRef = useRef<"list" | "save" | null>(null);
   const loadedAutomationProjectIdsRef = useRef(new Set<string>());
   const queuedAutomationSavesRef = useRef(new Map<string, QueuedProjectAutomationSave>());
@@ -1695,6 +1710,22 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:coordination-response" && message.payload) {
+        const payload = message.payload as Partial<CoordinationHostResponse>;
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingCoordinationRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingCoordinationRequestsRef.current.delete(payload.requestId);
+        if (payload.ok) pending.resolve(payload as CoordinationHostResponse);
+        else pending.reject(new Error(
+          typeof payload.error === "string"
+            ? payload.error
+            : textRef.current("Root 没有收到协作任务", "Root did not receive the coordination task"),
+        ));
+        return;
+      }
+
       if (message.type === "taskboard:theme" && isTheme(message.theme)) {
         setTheme(message.theme);
         return;
@@ -1745,6 +1776,14 @@ export function App() {
         )));
       }
       pendingAutomationRequestsRef.current.clear();
+      for (const pending of pendingCoordinationRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error(textRef.current(
+          "Taskboard 消息桥已关闭",
+          "The Taskboard host bridge was closed",
+        )));
+      }
+      pendingCoordinationRequestsRef.current.clear();
     };
   }, [embedded, host]);
 
@@ -2809,15 +2848,68 @@ export function App() {
     window.location.assign(`codex://threads/${encodeURIComponent(binding.threadId.trim())}`);
   }
 
-  function openLegacyLocalThread(threadId: string) {
+  async function openLegacyLocalThread(threadId: string) {
     if (embedded && window.parent !== window) {
       postEmbeddedHostMessage({
         type: "taskboard:open-thread",
         payload: { threadId, legacyLocal: true },
       });
-      return;
+      return true;
     }
-    window.location.assign(`codex://threads/${encodeURIComponent(threadId.trim())}`);
+    setActionError(null);
+    try {
+      await openCodexThreadRequest(threadId.trim());
+      return true;
+    } catch (error) {
+      setActionError(errorMessage(error));
+      return false;
+    }
+  }
+
+  async function coordinateAgentTodo(todoId: string, rootThreadId: string) {
+    if (!embedded || window.parent === window) {
+      setActionError(text(
+        "请从 Codex 内的 Taskboard 面板发起 Agent 协作。",
+        "Start Agent collaboration from the Taskboard panel inside Codex.",
+      ));
+      return false;
+    }
+    const codexHostId = automationProjectContext.codexHostId;
+    const targetRoot = automationProjectContext.workspacePath;
+    if (!codexHostId || !targetRoot) {
+      setActionError(text("当前项目没有可用的 Codex 主机。", "This project has no available Codex host."));
+      return false;
+    }
+    const requestId = window.crypto.randomUUID();
+    const response = new Promise<CoordinationHostResponse>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingCoordinationRequestsRef.current.delete(requestId);
+        reject(new Error(textRef.current(
+          "交付结果未确认，请先检查 Root 再决定是否重试。",
+          "Delivery is unconfirmed. Inspect Root before deciding whether to retry.",
+        )));
+      }, 35_000);
+      pendingCoordinationRequestsRef.current.set(requestId, { resolve, reject, timeoutId });
+    });
+    setActionError(null);
+    postEmbeddedHostMessage({
+      type: "taskboard:coordinate-todo",
+      payload: {
+        requestId,
+        projectId: selectedProjectId,
+        todoId,
+        rootThreadId,
+        codexHostId,
+        targetRoot,
+      },
+    });
+    try {
+      await response;
+      return true;
+    } catch (error) {
+      setActionError(errorMessage(error));
+      return false;
+    }
   }
 
   function openTaskConversation(conversation: TaskConversationItem) {
@@ -3655,7 +3747,12 @@ export function App() {
             />
           </Suspense>
         ) : boardView === "lanes" && selectedProject ? (
-          <AgentLaneBoard projectId={selectedProject.id} projectName={selectedProject.name} />
+          <AgentLaneBoard
+            projectId={selectedProject.id}
+            projectName={selectedProject.name}
+            onOpenCodexThread={openLegacyLocalThread}
+            onCoordinateTodo={coordinateAgentTodo}
+          />
         ) : (
           <div
             className={`issue-board-layout${otherTasksVisible ? " has-other-tasks" : ""}`}

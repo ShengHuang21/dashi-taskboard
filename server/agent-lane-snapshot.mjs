@@ -40,7 +40,11 @@ function compact(value, maxLength = 360) {
 
 function completionSummary(value) {
   const raw = text(value, "") ?? "";
-  const payload = raw.match(/(?:^|\s)Payload:\s*([\s\S]+)$/i)?.[1] ?? raw;
+  const payloadMatch = raw.match(/(?:^|\s)Payload:\s*([\s\S]*)$/i);
+  if (payloadMatch && !text(payloadMatch[1]) && /Message Type:\s*MESSAGE/i.test(raw)) {
+    return "Sub-Agent reported progress.";
+  }
+  const payload = payloadMatch?.[1] ?? raw;
   return compact(payload, 180);
 }
 
@@ -91,6 +95,7 @@ function validateTodo(value, taskIds) {
     claimedBy,
     claimedAt: text(value.claimedAt),
     leaseExpiresAt,
+    claimStatus: text(value.claimStatus),
     writeScope: Array.isArray(value.writeScope) ? value.writeScope.map((item) => text(item)).filter(Boolean) : [],
     nextAction: compact(value.nextAction, 80),
     evidenceRef: compact(value.evidenceRef, 160),
@@ -158,8 +163,17 @@ function continuityFor(lane) {
 function todoProjection(todo, projectId, taskLanes, now) {
   const owner = todo.claimedBy ? taskLanes.find((lane) => lane.id === todo.claimedBy) : null;
   const leaseDate = todo.leaseExpiresAt ? new Date(todo.leaseExpiresAt) : null;
-  const leaseExpired = leaseDate && !Number.isNaN(leaseDate.getTime()) && leaseDate <= now;
-  const leaseState = !todo.claimedBy ? "unclaimed" : leaseExpired ? "expired" : "active";
+  const validLease = leaseDate && !Number.isNaN(leaseDate.getTime());
+  const leaseExpired = Boolean(
+    todo.claimedBy
+    && todo.claimStatus !== "completed"
+    && (!validLease || leaseDate <= now),
+  );
+  const leaseState = !todo.claimedBy
+    ? "unclaimed"
+    : todo.claimStatus === "completed"
+      ? "completed"
+      : leaseExpired ? "expired" : "active";
   const route = leaseExpired
     ? "replan_required"
     : ({
@@ -228,9 +242,11 @@ async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComm
     title: task.title,
     state: taskTodoState(task),
     claimedBy: claim?.agentPath ?? owner?.id ?? null,
+    claimedThreadId: claim?.agentThreadId ?? null,
     claimedAt: claim?.claimedAt ?? null,
-    leaseExpiresAt: null,
-    writeScope: task.labels,
+    leaseExpiresAt: claim?.leaseExpiresAt ?? null,
+    claimStatus: claim?.status ?? null,
+    writeScope: claim?.writeScope?.length ? claim.writeScope : task.labels,
     nextAction: nextActionFrom(latest?.body) ?? compact(task.title, 80),
     evidenceRef: latest ? `comment:${latest.id}` : `task:${task.identifier}`,
   }, projectId, taskLanes, generatedAt);
@@ -417,9 +433,10 @@ function applySubagentLine(state, line) {
     };
     current.agentThreadId = text(entry.payload.agent_thread_id, current.agentThreadId);
     current.lastActivityAt = at ?? current.lastActivityAt;
-    if (entry.payload.kind === "started") {
+    if (entry.payload.kind === "started" || entry.payload.kind === "interacted") {
       current.lifecycleStatus = "running";
-      current.startedAt ??= at;
+      current.startedAt = at ?? current.startedAt;
+      current.lastActualAction = null;
     } else if (entry.payload.kind === "interrupted") {
       current.lifecycleStatus = "interrupted";
     }
@@ -623,6 +640,23 @@ export function createAgentLaneSnapshotProvider({
       const rootSubagents = allRootSubagentsByProject.get(projectId) ?? snapshot.rootSubagents;
       for (const agent of rootSubagents) {
         if (!agent.lastActualAction) continue;
+        const claimedTodo = snapshot.todos.find((todo) => (
+          todo.claimedBy === agent.agentPath
+          && todo.claim?.leaseState === "active"
+        ));
+        const claimedAtMs = Date.parse(claimedTodo?.claimedAt ?? "");
+        const startedAtMs = Date.parse(agent.startedAt ?? "");
+        const lastActivityAtMs = Date.parse(agent.lastActivityAt ?? "");
+        if (
+          agent.agentThreadId !== claimedTodo?.claimedThreadId
+          || !Number.isFinite(claimedAtMs)
+          || !Number.isFinite(startedAtMs)
+          || startedAtMs <= claimedAtMs
+          || !Number.isFinite(lastActivityAtMs)
+          || lastActivityAtMs < startedAtMs
+        ) {
+          continue;
+        }
         const event = {
           eventId: createHash("sha256").update([
             projectId,

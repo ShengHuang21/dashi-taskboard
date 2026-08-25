@@ -207,6 +207,13 @@ export async function getAgentLaneSnapshot(
   );
 }
 
+export async function openCodexThread(threadId: string): Promise<void> {
+  await request<{ opened: true }>(
+    `/api/local/codex-threads/${encodeURIComponent(threadId)}/open`,
+    { method: "POST" },
+  );
+}
+
 export async function getTaskboardMetadata(signal?: AbortSignal): Promise<TaskboardMetadata> {
   return request<TaskboardMetadata>("/api/meta", { signal });
 }

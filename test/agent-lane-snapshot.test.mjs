@@ -131,8 +131,30 @@ test("reconciliation processes completed Sub-Agents beyond the display limit", a
   }
   await appendFile(paths.rootPath, `\n${events.join("\n")}`);
   const completed = [];
+  const tasks = Array.from({ length: 13 }, (_, index) => ({
+    id: `batch-task-${index}`,
+    identifier: `BATCH-${index}`,
+    title: `Batch ${index}`,
+    status: "in_progress",
+    labels: ["agent-todo"],
+    archivedAt: null,
+    threadId: `batch-${index}`,
+  }));
   const provider = createAgentLaneSnapshotProvider({
     ...paths,
+    listTasks: async () => tasks,
+    getClaim: async (taskId) => {
+      const index = Number(taskId.replace("batch-task-", ""));
+      return {
+        agentPath: `/root/batch_${index}`,
+        agentThreadId: `batch-${index}`,
+        status: "active",
+        claimedAt: "2026-08-23T08:09:00.000Z",
+        leaseExpiresAt: "2026-08-23T09:00:00.000Z",
+        writeScope: [`test/batch-${index}.test.mjs`],
+      };
+    },
+    listComments: async () => [],
     recordCompletion: async (event) => {
       if (event.agentPath.startsWith("/root/batch_")) completed.push(event.agentPath);
       return { applied: event.agentPath.startsWith("/root/batch_") };

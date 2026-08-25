@@ -5142,6 +5142,44 @@ kbd {
   font-weight: 500;
 }
 
+.agent-lane-open-conversation,
+.agent-todo-coordinate {
+  align-self: flex-start;
+  margin-top: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  padding: 8px 11px;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.agent-lane-open-conversation:hover,
+.agent-todo-coordinate:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--surface-subtle);
+}
+
+.agent-lane-open-conversation:focus-visible,
+.agent-todo-coordinate:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.agent-todo-coordinate {
+  margin-top: auto;
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border-strong));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface-raised));
+}
+
+.agent-todo-coordinate:disabled {
+  cursor: default;
+  opacity: .7;
+}
+
 .agent-subagent-section {
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -5268,6 +5306,21 @@ kbd {
   font-size: 16px;
   line-height: 1.35;
 }
+
+.agent-todo-facts {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.agent-todo-facts > div {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.agent-todo-facts dt { color: var(--text-muted); font-size: 12px; }
+.agent-todo-facts dd { margin: 0; overflow-wrap: anywhere; font-size: 12px; }
 
 .agent-lane-facts {
   display: grid;

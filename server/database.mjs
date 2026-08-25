@@ -534,6 +534,8 @@ export class TaskboardDatabase {
         agent_thread_id TEXT,
         status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'interrupted')),
         claimed_at TEXT NOT NULL,
+        lease_expires_at TEXT,
+        write_scope_json TEXT NOT NULL DEFAULT '[]',
         completed_at TEXT
       );
 
@@ -653,6 +655,14 @@ export class TaskboardDatabase {
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
+    }
+
+    const agentClaimColumns = this.database.prepare("PRAGMA table_info(agent_task_claims)").all();
+    if (!agentClaimColumns.some((column) => column.name === "lease_expires_at")) {
+      this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN lease_expires_at TEXT");
+    }
+    if (!agentClaimColumns.some((column) => column.name === "write_scope_json")) {
+      this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN write_scope_json TEXT NOT NULL DEFAULT '[]'");
     }
 
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
@@ -1886,18 +1896,48 @@ export class TaskboardDatabase {
       agentThreadId: row.agent_thread_id,
       status: row.status,
       claimedAt: row.claimed_at,
+      leaseExpiresAt: row.lease_expires_at,
+      writeScope: JSON.parse(row.write_scope_json ?? "[]"),
       completedAt: row.completed_at,
     } : null;
   }
 
-  claimAgentTask(id, version, { agentPath, agentThreadId = null }) {
+  claimAgentTask(id, version, { agentPath, agentThreadId = null, leaseExpiresAt, writeScope }) {
     if (!agentThreadId) {
       throw new ApiError(400, "AGENT_THREAD_REQUIRED", "A durable Sub-Agent claim requires its thread id");
     }
+    const leaseDate = typeof leaseExpiresAt === "string" ? new Date(leaseExpiresAt) : null;
+    if (!leaseDate || Number.isNaN(leaseDate.getTime()) || leaseDate <= new Date()) {
+      throw new ApiError(400, "INVALID_AGENT_LEASE", "A durable Sub-Agent claim requires a future lease expiry");
+    }
+    if (
+      !Array.isArray(writeScope)
+      || writeScope.length === 0
+      || writeScope.length > 32
+      || writeScope.some((item) => typeof item !== "string" || !item.trim() || item.length > 240)
+    ) {
+      throw new ApiError(400, "INVALID_AGENT_WRITE_SCOPE", "A durable Sub-Agent claim requires a bounded non-empty write scope");
+    }
+    const normalizedWriteScope = [...new Set(writeScope.map((item) => item.trim()))];
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const current = this.#requireTask(id);
       this.#requireVersion(current, version);
+      const currentClaim = this.getAgentTaskClaim(current.id);
+      if (current.status === "in_progress" && currentClaim?.status === "active") {
+        if (new Date(currentClaim.leaseExpiresAt) <= new Date()) {
+          throw new ApiError(409, "CLAIM_EXPIRED", "The existing claim lease expired and requires coordinator review");
+        }
+        if (currentClaim.agentPath !== agentPath || currentClaim.agentThreadId !== agentThreadId) {
+          throw new ApiError(409, "CLAIM_CONFLICT", "The task is already claimed by another Sub-Agent");
+        }
+        this.database.prepare(`
+          UPDATE agent_task_claims SET lease_expires_at = ?, write_scope_json = ?
+          WHERE task_id = ? AND status = 'active'
+        `).run(leaseExpiresAt, JSON.stringify(normalizedWriteScope), current.id);
+        this.database.exec("COMMIT");
+        return { task: this.getTask(current.id), claim: this.getAgentTaskClaim(current.id) };
+      }
       if (current.status !== "todo") {
         throw new ApiError(409, "TASK_NOT_READY", "Only a To-Do task can be claimed");
       }
@@ -1920,13 +1960,16 @@ export class TaskboardDatabase {
       if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
       this.database.prepare(`
         INSERT INTO agent_task_claims (
-          task_id, project_id, agent_path, agent_thread_id, status, claimed_at, completed_at
-        ) VALUES (?, ?, ?, ?, 'active', ?, NULL)
+          task_id, project_id, agent_path, agent_thread_id, status, claimed_at,
+          lease_expires_at, write_scope_json, completed_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)
         ON CONFLICT(task_id) DO UPDATE SET
           agent_path = excluded.agent_path,
           agent_thread_id = excluded.agent_thread_id,
-          status = 'active', claimed_at = excluded.claimed_at, completed_at = NULL
-      `).run(current.id, current.projectId, agentPath, agentThreadId, timestamp);
+          status = 'active', claimed_at = excluded.claimed_at,
+          lease_expires_at = excluded.lease_expires_at,
+          write_scope_json = excluded.write_scope_json, completed_at = NULL
+      `).run(current.id, current.projectId, agentPath, agentThreadId, timestamp, leaseExpiresAt, JSON.stringify(normalizedWriteScope));
       this.database.exec("COMMIT");
       return { task: this.getTask(current.id), claim: this.getAgentTaskClaim(current.id) };
     } catch (error) {
@@ -1947,6 +1990,10 @@ export class TaskboardDatabase {
       if (!claim || claim.status !== "active") {
         this.database.exec("ROLLBACK");
         return { applied: false, reason: "no_active_claim" };
+      }
+      if (!claim.leaseExpiresAt || new Date(claim.leaseExpiresAt) <= new Date()) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_expired" };
       }
       if (!agentThreadId || claim.projectId !== current.projectId || claim.agentThreadId !== agentThreadId) {
         this.database.exec("ROLLBACK");
@@ -1992,6 +2039,10 @@ export class TaskboardDatabase {
       if (!claim || claim.status !== "active") {
         this.database.exec("ROLLBACK");
         return { applied: false, reason: "no_active_claim" };
+      }
+      if (!claim.leaseExpiresAt || new Date(claim.leaseExpiresAt) <= new Date()) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_expired" };
       }
       if (!agentThreadId || claim.projectId !== current.projectId || claim.agentThreadId !== agentThreadId) {
         this.database.exec("ROLLBACK");
@@ -2317,6 +2368,12 @@ export class TaskboardDatabase {
       `).run(status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
+      }
+      if (current.status === "in_progress" && status !== "in_progress") {
+        this.database.prepare(`
+          UPDATE agent_task_claims SET status = 'interrupted', completed_at = ?
+          WHERE task_id = ? AND status = 'active'
+        `).run(timestamp, current.id);
       }
       this.#recordTaskActivity(
         current.id,

@@ -58,11 +58,12 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
 
   const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/agent-lane-snapshot.mjs"],
   });
   assert.equal(claimed.task.status, "in_progress");
   await appendFile(fixture.rootFile, [
-    JSON.stringify({ timestamp: "2026-08-24T01:01:00.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "acceptance-thread", agent_path: "/root/acceptance", kind: "started" } }),
-    JSON.stringify({ timestamp: "2026-08-24T01:01:30.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: MESSAGE\nPayload: Focused checks are running. token=progress-secret" }] } }),
+    JSON.stringify({ timestamp: "2098-01-01T01:01:00.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "acceptance-thread", agent_path: "/root/acceptance", kind: "started" } }),
+    JSON.stringify({ timestamp: "2098-01-01T01:01:30.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: MESSAGE\nPayload: Focused checks are running. token=progress-secret" }] } }),
   ].join("\n") + "\n");
 
   assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 1 });
@@ -76,7 +77,7 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
   assert.equal(fixture.database.getTask(fixture.task.id).status, "in_progress");
 
   await appendFile(fixture.rootFile, [
-    JSON.stringify({ timestamp: "2026-08-24T01:02:00.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: Focused checks passed. token=must-not-leak AKIAABCDEFGHIJKLMNOP https://user:password@example.com/ ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }] } }),
+    JSON.stringify({ timestamp: "2098-01-01T01:02:00.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/acceptance", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: Focused checks passed. token=must-not-leak AKIAABCDEFGHIJKLMNOP https://user:password@example.com/ ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }] } }),
   ].join("\n") + "\n");
 
   assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 1 });
@@ -111,13 +112,142 @@ test("one Sub-Agent thread cannot hold two active claims in a project", async ()
   });
   fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/database.mjs"],
   });
   assert.throws(
     () => fixture.database.claimAgentTask(second.id, second.version, {
       agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/database.mjs"],
     }),
     (error) => error?.code === "AGENT_ALREADY_CLAIMED",
   );
   assert.equal(fixture.database.getTask(second.id).status, "todo");
+  fixture.database.close();
+});
+
+test("persists lease and write scope, renews the same claim, and rejects stale claim events", async () => {
+  const fixture = await setup();
+  assert.throws(
+    () => fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+      agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    }),
+    (error) => error?.code === "INVALID_AGENT_LEASE",
+  );
+
+  const first = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+    writeScope: ["server/database.mjs"],
+  });
+  assert.equal(first.claim.leaseExpiresAt, "2099-01-01T00:00:00.000Z");
+  assert.deepEqual(first.claim.writeScope, ["server/database.mjs"]);
+
+  const renewed = fixture.database.claimAgentTask(fixture.task.id, first.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-02T00:00:00.000Z",
+    writeScope: ["server/database.mjs", "test/agent-lane-coordination.test.mjs"],
+  });
+  assert.equal(renewed.task.version, first.task.version);
+  assert.equal(renewed.claim.leaseExpiresAt, "2099-01-02T00:00:00.000Z");
+
+  fixture.database.database.prepare(
+    "UPDATE agent_task_claims SET lease_expires_at = ? WHERE task_id = ?",
+  ).run("2000-01-01T00:00:00.000Z", fixture.task.id);
+  assert.deepEqual(fixture.database.recordAgentTaskProgress(fixture.task.id, {
+    eventId: "late-progress", agentThreadId: "acceptance-thread", summary: "too late", actor,
+  }), { applied: false, reason: "claim_expired" });
+  assert.deepEqual(fixture.database.completeAgentTask(fixture.task.id, {
+    eventId: "late-completion", agentThreadId: "acceptance-thread", summary: "too late", actor,
+  }), { applied: false, reason: "claim_expired" });
+
+  fixture.database.close();
+  const reopened = new TaskboardDatabase(fixture.databasePath);
+  assert.equal(reopened.getAgentTaskClaim(fixture.task.id).leaseExpiresAt, "2000-01-01T00:00:00.000Z");
+  assert.deepEqual(reopened.getAgentTaskClaim(fixture.task.id).writeScope, [
+    "server/database.mjs", "test/agent-lane-coordination.test.mjs",
+  ]);
+  reopened.close();
+});
+
+test("manual move interrupts an active claim and expired projection remains manual-only", async () => {
+  const fixture = await setup();
+  const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/database.mjs"],
+  });
+  fixture.database.database.prepare(
+    "UPDATE agent_task_claims SET lease_expires_at = ? WHERE task_id = ?",
+  ).run(null, fixture.task.id);
+  const provider = fixture.makeProvider(fixture.database);
+  const expired = (await provider.getProjectSnapshot("capstone-dev")).todos[0];
+  assert.equal(expired.continuation.route, "replan_required");
+  assert.equal(expired.continuation.attention, "needs_coordinator");
+  assert.equal(expired.recovery.mode, "manual_only");
+  assert.equal(expired.recovery.eligible, true);
+  const actionId = expired.recovery.actionId;
+  assert.equal((await provider.getProjectSnapshot("capstone-dev")).todos[0].recovery.actionId, actionId);
+
+  fixture.database.moveTask(
+    fixture.task.id, claimed.task.version, "todo", undefined, null, undefined, actor,
+  );
+  assert.equal(fixture.database.getAgentTaskClaim(fixture.task.id).status, "interrupted");
+  assert.deepEqual(fixture.database.recordAgentTaskProgress(fixture.task.id, {
+    eventId: "stale-agent", agentThreadId: "acceptance-thread", summary: "stale", actor,
+  }), { applied: false, reason: "task_not_in_progress" });
+  fixture.database.close();
+});
+
+test("reconciliation requires a fresh Sub-Agent turn after the current claim", async () => {
+  const fixture = await setup();
+  await appendFile(fixture.rootFile, `${JSON.stringify({
+    timestamp: "2020-01-01T00:00:00.000Z",
+    type: "event_msg",
+    payload: { type: "sub_agent_activity", agent_thread_id: "acceptance-thread", agent_path: "/root/acceptance", kind: "interacted" },
+  })}\n${JSON.stringify({
+    timestamp: "2020-01-01T00:01:00.000Z",
+    type: "response_item",
+    payload: { type: "agent_message", author: "/root/acceptance", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: stale completion" }] },
+  })}\n`);
+  fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {
+    agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["test/agent-lane-coordination.test.mjs"],
+  });
+  const provider = fixture.makeProvider(fixture.database);
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 0 });
+  assert.equal(fixture.database.getTask(fixture.task.id).status, "in_progress");
+
+  await appendFile(fixture.rootFile, `${JSON.stringify({
+    timestamp: "2098-01-01T00:01:00.000Z",
+    type: "response_item",
+    payload: { type: "agent_message", author: "/root/acceptance", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: late stale completion" }] },
+  })}\n`);
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 0 });
+  assert.equal(fixture.database.getTask(fixture.task.id).status, "in_progress");
+
+  await appendFile(fixture.rootFile, `${JSON.stringify({
+    timestamp: "2098-01-01T00:02:00.000Z",
+    type: "event_msg",
+    payload: { type: "sub_agent_activity", agent_thread_id: "acceptance-thread", agent_path: "/root/acceptance", kind: "interacted" },
+  })}\n`);
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 0 });
+  assert.equal(fixture.database.getTask(fixture.task.id).status, "in_progress");
+
+  await appendFile(fixture.rootFile, `${JSON.stringify({
+    timestamp: "2098-01-01T00:03:00.000Z",
+    type: "response_item",
+    payload: { type: "agent_message", author: "/root/acceptance", content: [{ type: "input_text", text: "Message Type: MESSAGE\nPayload:\n" }, { type: "encrypted_content", encrypted_content: "opaque" }] },
+  })}\n`);
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 1 });
+  assert.equal(fixture.database.getTask(fixture.task.id).status, "in_progress");
+  assert.match(fixture.database.listComments(fixture.task.id).at(-1).body, /Sub-Agent reported progress/);
+
+  await appendFile(fixture.rootFile, `${JSON.stringify({
+    timestamp: "2098-01-01T00:04:00.000Z",
+    type: "response_item",
+    payload: { type: "agent_message", author: "/root/acceptance", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload: current completion" }] },
+  })}\n`);
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 1 });
+  assert.equal(fixture.database.getTask(fixture.task.id).status, "in_review");
+  assert.match(fixture.database.listComments(fixture.task.id).at(-1).body, /current completion/);
   fixture.database.close();
 });

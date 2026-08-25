@@ -17,6 +17,7 @@ import {
   taskboardAutomationPolicyOperation,
 } from "../shared/taskboard-automation.mjs";
 import {
+  deliverTaskboardCoordination,
   findResidentInjectorPids,
   handleHostBindingPayload,
   reconcileInjectionRuntime,
@@ -1686,6 +1687,17 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
       ),
       startConversation: (request) => (
         getOrStartTaskConversation(cdp, undefined, request)
+      ),
+      coordinateAgentTodo: (request) => deliverTaskboardCoordination(
+        request,
+        (method, params) => requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          request.codexHostId,
+          method,
+          params,
+          10_000,
+        ),
       ),
       sendResponse: (executionContextId, response) => (
         sendHostResponse(cdp, executionContextId, response)

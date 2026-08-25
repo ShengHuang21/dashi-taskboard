@@ -148,6 +148,22 @@ test("project Agent Lanes read durable database configuration through a local ro
   assert.equal(mutation.response.status, 405);
 });
 
+test("connected Agent Lane opens its exact Codex thread through the local launcher", async () => {
+  const openedThreads = [];
+  const baseUrl = await startServer(() => ({
+    openCodexThread: async (threadId) => openedThreads.push(threadId),
+  }));
+  const threadId = "01a0035b-1d22-70b2-8233-d7a4ec283459";
+
+  const result = await request(baseUrl, `/api/local/codex-threads/${threadId}/open`, {
+    method: "POST",
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { opened: true });
+  assert.deepEqual(openedThreads, [threadId]);
+});
+
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {
   const instanceToken = "7a6f8d37-78ce-46c9-87a8-08e10db88da2";
   const instanceSecret = "2e587946-96d6-47b5-930a-1ba70214fa88";

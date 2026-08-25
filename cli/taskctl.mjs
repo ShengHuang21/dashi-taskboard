@@ -90,7 +90,7 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
-  ["issue claim", new Set(["agent-path", "thread-id", "if-version", "json"])],
+  ["issue claim", new Set(["agent-path", "thread-id", "if-version", "lease-minutes", "write-scope", "json"])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
@@ -174,6 +174,8 @@ Actions:
      | --clear-binding-thread]
     [--if-version N] [--json]
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
+  claim ISSUE_ID --agent-path /root/NAME --thread-id ID
+    --lease-minutes N --write-scope path[,path] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   relation add|remove ISSUE_ID --type parent|blocks|blocked_by|related
     --issue RELATED_ISSUE_ID [--thread-id ID] [--if-version N] [--json]
@@ -970,9 +972,20 @@ function threadBindingFromOptions(options) {
 async function claimIssue(api, taskId, options, overrides) {
   const agentPath = requiredOption(options, "agent-path");
   if (!agentPath.startsWith("/root/")) throw usageError("--agent-path must start with /root/");
+  const leaseMinutes = Number(requiredOption(options, "lease-minutes"));
+  if (!Number.isInteger(leaseMinutes) || leaseMinutes < 1 || leaseMinutes > 1440) {
+    throw usageError("--lease-minutes must be an integer from 1 to 1440");
+  }
+  const writeScope = requiredOption(options, "write-scope")
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  if (writeScope.length === 0 || writeScope.length > 32 || writeScope.some((value) => value.length > 240)) {
+    throw usageError("--write-scope must contain 1 to 32 comma-separated paths");
+  }
   return api.request("POST", `${taskPath(taskId)}/claim`, {
     agentPath,
     agentThreadId: resolveThreadId(options, overrides),
+    leaseExpiresAt: new Date(Date.now() + leaseMinutes * 60_000).toISOString(),
+    writeScope,
     version: await resolveVersion(api, taskId, options["if-version"]),
   });
 }

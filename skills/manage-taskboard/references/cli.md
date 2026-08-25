@@ -109,7 +109,7 @@ taskctl issue update ID \
 
 taskctl issue move ID --status STATUS [--thread-id ID] [--if-version N] [--json]
 
-taskctl issue claim ID --agent-path /root/NAME --thread-id AGENT_THREAD_ID [--if-version N] [--json]
+taskctl issue claim ID --agent-path /root/NAME --thread-id AGENT_THREAD_ID --lease-minutes N --write-scope PATH[,PATH] [--if-version N] [--json]
 taskctl issue archive ID [--thread-id ID] [--if-version N] [--json]
 taskctl issue restore ID [--thread-id ID] [--if-version N] [--json]
 ```

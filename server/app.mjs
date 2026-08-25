@@ -53,6 +53,7 @@ const INLINE_ATTACHMENT_TYPES = new Set([
   "text/plain",
 ]);
 const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const CODEX_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
 const CODEX_AGENT_ACTOR = {
   type: "agent",
@@ -651,7 +652,7 @@ function parseMove(body) {
 
 function parseAgentClaim(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "agentPath", "agentThreadId"]));
+  assertAllowedKeys(body, new Set(["version", "agentPath", "agentThreadId", "leaseExpiresAt", "writeScope"]));
   const agentPath = stringField(body.agentPath, "agentPath", { required: true, maxLength: 240 });
   if (!agentPath.startsWith("/root/")) {
     throw new ApiError(400, "INVALID_FIELD", "'agentPath' must identify a Root Sub-Agent");
@@ -660,10 +661,21 @@ function parseAgentClaim(body) {
   if (!agentThreadId) {
     throw new ApiError(400, "INVALID_FIELD", "'agentThreadId' is required");
   }
+  const leaseExpiresAt = stringField(body.leaseExpiresAt, "leaseExpiresAt", { required: true, maxLength: 64 });
+  const leaseDate = new Date(leaseExpiresAt);
+  if (Number.isNaN(leaseDate.getTime()) || leaseDate <= new Date()) {
+    throw new ApiError(400, "INVALID_FIELD", "'leaseExpiresAt' must be a future ISO timestamp");
+  }
+  if (!Array.isArray(body.writeScope) || body.writeScope.length === 0 || body.writeScope.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'writeScope' must contain 1 to 32 paths");
+  }
+  const writeScope = body.writeScope.map((value) => stringField(value, "writeScope", { required: true, maxLength: 240 }));
   return {
     version: parseVersion(body.version),
     agentPath,
     agentThreadId,
+    leaseExpiresAt: leaseDate.toISOString(),
+    writeScope,
   };
 }
 
@@ -1610,6 +1622,19 @@ export function createTaskboardServer(options = {}) {
   const codexProcessEnvironment = withoutTaskboardLauncherEnvironment(
     options.processEnv ?? process.env,
   );
+  const openCodexThread = options.openCodexThread ?? (async (threadId) => {
+    const deepLink = `codex://threads/${encodeURIComponent(threadId)}`;
+    const command = process.platform === "darwin"
+      ? { executable: "/usr/bin/open", args: [deepLink] }
+      : process.platform === "win32"
+        ? { executable: "rundll32.exe", args: ["url.dll,FileProtocolHandler", deepLink] }
+        : { executable: "xdg-open", args: [deepLink] };
+    await execFileAsync(command.executable, command.args, {
+      env: codexProcessEnvironment,
+      timeout: 10_000,
+      windowsHide: true,
+    });
+  });
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const events = new EventHub();
@@ -2086,7 +2111,7 @@ export function createTaskboardServer(options = {}) {
           value.trim().replace(/^(?:local|cloud):/i, "")
         )))];
         if (threadIds.length > 64 || threadIds.some((threadId) => (
-          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)
+          !CODEX_THREAD_ID_PATTERN.test(threadId)
         ))) {
           throw new ApiError(400, "INVALID_FIELD", "'threadId' must contain valid Codex thread IDs");
         }
@@ -2094,6 +2119,23 @@ export function createTaskboardServer(options = {}) {
           [threadId, await readCodexSessionState(threadId)]
         )));
         return sendJson(response, 200, { progress: Object.fromEntries(entries) });
+      }
+
+      const codexThreadOpenMatch = pathname.match(/^\/api\/local\/codex-threads\/([^/]+)\/open$/);
+      if (codexThreadOpenMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Codex thread open routes");
+        await assertEmptyRequestBody(request, "Codex thread open routes");
+        const threadId = decodeURIComponent(codexThreadOpenMatch[1]);
+        if (!CODEX_THREAD_ID_PATTERN.test(threadId)) {
+          throw new ApiError(400, "INVALID_FIELD", "'threadId' must be a valid Codex thread ID");
+        }
+        try {
+          await openCodexThread(threadId);
+        } catch {
+          throw new ApiError(503, "CODEX_OPEN_FAILED", "Could not open the Codex conversation");
+        }
+        return sendJson(response, 200, { opened: true });
       }
 
       if (pathname === "/api/local/host-runtime") {

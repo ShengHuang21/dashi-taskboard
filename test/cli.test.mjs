@@ -354,6 +354,7 @@ test("Root Sub-Agent claims a real To-Do with durable identity", async () => {
   const result = await run([
     "issue", "claim", "TASK-1", "--agent-path", "/root/review",
     "--thread-id", "agent-thread", "--if-version", "3",
+    "--lease-minutes", "30", "--write-scope", "server/database.mjs,test/cli.test.mjs",
   ], async (url, init) => {
     calls.push({ url, init });
     return response({ task: { id: "TASK-1", status: "in_progress", version: 4 } });
@@ -361,9 +362,13 @@ test("Root Sub-Agent claims a real To-Do with durable identity", async () => {
 
   assert.equal(result.exitCode, 0);
   assert.equal(String(calls[0].url), "http://127.0.0.1:47823/api/tasks/TASK-1/claim");
-  assert.deepEqual(JSON.parse(calls[0].init.body), {
+  const claimBody = JSON.parse(calls[0].init.body);
+  assert.match(claimBody.leaseExpiresAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...claimBody, leaseExpiresAt: "future" }, {
     agentPath: "/root/review",
     agentThreadId: "agent-thread",
+    leaseExpiresAt: "future",
+    writeScope: ["server/database.mjs", "test/cli.test.mjs"],
     version: 3,
   });
 });

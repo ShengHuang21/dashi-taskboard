@@ -622,7 +622,7 @@ export interface CoordinationTodoSnapshot {
     ownerLabel: string;
     claimedAt: string | null;
     leaseExpiresAt: string | null;
-    leaseState: "active" | "expired";
+    leaseState: "active" | "expired" | "completed";
     writeScope: string[];
   } | null;
   continuation: {

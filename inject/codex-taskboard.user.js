@@ -1188,6 +1188,39 @@
     }
   }
 
+  async function handleAgentTodoCoordination(payload) {
+    const requestId = typeof payload?.requestId === "string" ? payload.requestId : "";
+    if (!requestId) return;
+    try {
+      const response = await requestHost("coordinate-agent-todo", {
+        rootThreadId: payload?.rootThreadId,
+        codexHostId: payload?.codexHostId,
+        projectId: payload?.projectId,
+        todoId: payload?.todoId,
+        targetRoot: payload?.targetRoot,
+      }, 35_000);
+      postToFrame({
+        type: "taskboard:coordination-response",
+        payload: {
+          requestId,
+          ok: true,
+          delivery: response.delivery,
+        },
+      });
+    } catch (error) {
+      postToFrame({
+        type: "taskboard:coordination-response",
+        payload: {
+          requestId,
+          ok: false,
+          error: error instanceof Error
+            ? error.message
+            : hostText("Root 没有收到协作任务", "Root did not receive the coordination task"),
+        },
+      });
+    }
+  }
+
   function handleExternalOpen(payload) {
     try {
       const url = new URL(payload?.url);
@@ -1263,6 +1296,10 @@
     }
     if (message.type === "taskboard:automation-request") {
       void handleAutomationRequest(message.payload);
+      return;
+    }
+    if (message.type === "taskboard:coordinate-todo") {
+      void handleAgentTodoCoordination(message.payload);
       return;
     }
     if (message.type === "taskboard:open-external") {
