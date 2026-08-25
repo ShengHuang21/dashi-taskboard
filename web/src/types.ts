@@ -337,6 +337,7 @@ export interface Project {
   source: "local" | "jira";
   labels: string[];
   issueCount: number;
+  agentLanesConfigured?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -538,4 +539,127 @@ export interface TaskEvent {
   attachment?: Attachment;
   project?: Project;
   at: string;
+}
+
+export type AgentLaneConnection = "connected" | "not_connected";
+export type AgentLaneStatus = "running" | "idle" | "unavailable";
+export type AgentLaneFreshness = "fresh" | "aging" | "stale" | "unknown";
+export type AgentTaskLaneType = "root_task" | "peer_task" | "infrastructure_task";
+export type AgentLaneContinuity = "healthy" | "attention" | "disconnected" | "adapter_off";
+export type CoordinationTodoState = "ready" | "claimed" | "waiting_user" | "blocked" | "validating" | "completed";
+export type CoordinationAttention = "needs_user" | "needs_coordinator" | "ready" | "blocked" | "watch" | "done";
+export type CoordinationRoute = "ready_for_agent" | "replan_required" | "user_action_required" | "blocked" | "wait" | "validated_completion";
+
+export interface AgentTaskLaneSnapshot {
+  id: string;
+  label: string;
+  owner: string;
+  source: "codex" | "claude" | "pi" | string;
+  connection: AgentLaneConnection;
+  threadId: string | null;
+  roleNote: string | null;
+  stableIdentity: string;
+  taskType: AgentTaskLaneType | null;
+  issueIdentifier: string | null;
+  status: AgentLaneStatus;
+  freshness: AgentLaneFreshness;
+  lastActivityAt: string | null;
+  lastActualAction: string | null;
+  branch: string | null;
+  sha: string | null;
+  checks: string[];
+  blocker: string | null;
+  actionId: string | null;
+  duplicateOfLaneId: string | null;
+  continuity: { state: AgentLaneContinuity; reason: string | null };
+  workItem: {
+    identifier: string;
+    title: string;
+    status: string;
+    commentCount: number;
+    latestWorkingLog: string | null;
+    latestWorkingLogAt: string | null;
+    latestWorkingLogThreadId: string | null;
+    relations: unknown;
+    nextAction: string | null;
+  } | null;
+  nextAction: string | null;
+  provenance: {
+    kind: "codex-local-session" | "not-connected";
+    threadId: string | null;
+  };
+}
+
+export interface RootSubagentSnapshot {
+  agentPath: string;
+  agentThreadId: string | null;
+  label: string;
+  parentTaskId: string;
+  stableIdentity: string;
+  lifecycleStatus: "running" | "idle" | "completed" | "interrupted";
+  startedAt: string | null;
+  lastActivityAt: string | null;
+  lastActualAction: string | null;
+  provenance: {
+    kind: "codex-collaboration-event";
+    threadId: string;
+  };
+}
+
+export interface CoordinationTodoSnapshot {
+  id: string;
+  title: string;
+  state: CoordinationTodoState;
+  claimedBy: string | null;
+  claimedAt: string | null;
+  leaseExpiresAt: string | null;
+  writeScope: string[];
+  nextAction: string | null;
+  evidenceRef: string | null;
+  claim: {
+    laneId: string;
+    ownerStableIdentity: string | null;
+    ownerLabel: string;
+    claimedAt: string | null;
+    leaseExpiresAt: string | null;
+    leaseState: "active" | "expired" | "completed";
+    writeScope: string[];
+  } | null;
+  continuation: {
+    route: CoordinationRoute;
+    attention: CoordinationAttention;
+  };
+  recovery: {
+    mode: "manual_only";
+    eligible: boolean;
+    actionId: string | null;
+    automaticExecution: false;
+  };
+}
+
+export interface AgentLaneSnapshot {
+  version: 3;
+  projectId: string;
+  generatedAt: string;
+  readOnly: true;
+  automaticRecoveryEnabled: false;
+  coordination: {
+    model: "peer_todos_with_replaceable_coordinator";
+    coordinatorTaskId: string;
+    coordinatorStableIdentity: string | null;
+    replaceable: true;
+    stateAuthority: "self_learning_checkpoint";
+    workAuthority: "todo_claim_lease";
+    runtimeOwnership: "single_writer";
+  };
+  todos: CoordinationTodoSnapshot[];
+  attentionQueue: string[];
+  taskLanes: AgentTaskLaneSnapshot[];
+  rootSubagents: RootSubagentSnapshot[];
+  adapters: AgentTaskLaneSnapshot[];
+  subagentSummary: {
+    observed: number;
+    active: number;
+    shown: number;
+  };
 }

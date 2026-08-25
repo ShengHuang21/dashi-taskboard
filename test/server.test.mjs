@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 
-import { createTaskboardServer } from "../server/index.mjs";
+import { createTaskboardServer, resolveHost } from "../server/index.mjs";
+import { TaskboardDatabase } from "../server/database.mjs";
 
 const runningApps = [];
 
@@ -88,6 +89,79 @@ test("health and the default local project are available", async () => {
   assert.equal(result.body.projects[0].name, "全局");
   assert.equal(result.body.projects[0].workspacePath, null);
   assert.equal(result.body.projects[0].issueCount, 0);
+  const agentLaneProjects = await request(baseUrl, "/api/local/agent-lane-projects");
+  assert.equal(agentLaneProjects.response.status, 200);
+  assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
+});
+
+test("the default host is loopback-only", () => {
+  assert.equal(resolveHost(undefined), "127.0.0.1");
+  assert.equal(resolveHost("0.0.0.0"), "0.0.0.0");
+});
+
+test("project Agent Lanes read durable database configuration through a local route", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const sessionsDirectory = path.join(directory, "sessions", "2026", "08", "23");
+    await mkdir(sessionsDirectory, { recursive: true });
+    await writeFile(
+      path.join(sessionsDirectory, "rollout-root-thread.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-08-23T08:02:00.000Z",
+        type: "event_msg",
+        payload: { type: "task_complete", last_agent_message: "Root milestone complete." },
+      })}\n`,
+    );
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "root-thread", taskType: "peer_task" },
+        { id: "taskboard", label: "Taskboard", owner: "Codex Taskboard", source: "codex", threadId: "root-thread", taskType: "infrastructure_task" },
+      ],
+      adapters: [
+        { id: "claude", label: "Claude", owner: "Claude", source: "claude", connection: "not_connected" },
+        { id: "pi", label: "Pi", owner: "Pi", source: "pi", connection: "not_connected" },
+      ],
+    });
+    database.close();
+    return { codexSessionsDirectory: path.join(directory, "sessions") };
+  });
+
+  const result = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.readOnly, true);
+  assert.equal(result.body.automaticRecoveryEnabled, false);
+  assert.equal(result.body.version, 3);
+  assert.equal(result.body.taskLanes.length, 3);
+  assert.equal(result.body.rootSubagents.length, 0);
+  assert.equal(result.body.adapters.length, 2);
+
+  const projects = await request(baseUrl, "/api/local/agent-lane-projects");
+  assert.equal(projects.response.status, 200);
+  assert.deepEqual(projects.body, { projectIds: ["local"] });
+
+  const mutation = await request(baseUrl, "/api/local/projects/local/agent-lanes", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(mutation.response.status, 405);
+});
+
+test("connected Agent Lane opens its exact Codex thread through the local launcher", async () => {
+  const openedThreads = [];
+  const baseUrl = await startServer(() => ({
+    openCodexThread: async (threadId) => openedThreads.push(threadId),
+  }));
+  const threadId = "01a0035b-1d22-70b2-8233-d7a4ec283459";
+
+  const result = await request(baseUrl, `/api/local/codex-threads/${threadId}/open`, {
+    method: "POST",
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { opened: true });
+  assert.deepEqual(openedThreads, [threadId]);
 });
 
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {
@@ -96,7 +170,6 @@ test("launcher mode proves service identity and hides every route behind its ins
   const version = "0.2.0";
   const challenge = "8cbeea6e83e574def3f9d397cabddffc";
   const baseUrl = await startServer(() => ({ instanceToken, instanceSecret, version }));
-
   const unauthenticatedHealth = await request(baseUrl, "/health");
   assert.equal(unauthenticatedHealth.response.status, 401);
 

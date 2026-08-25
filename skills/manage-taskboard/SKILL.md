@@ -11,6 +11,27 @@ Open only the relevant section of [references/cli.md](references/cli.md) when co
 
 ## Select the CLI and active service
 
+## Work with issues safely
+
+1. Search for an existing issue before creating one. Use `context current`, then list the project issues and compare their identifiers, titles, descriptions, and status.
+   - If an issue already tracks the same requirement, append the new requirement or acceptance detail to that issue without discarding its existing scope.
+   - If the work depends on, blocks, is blocked by, or is closely related to another issue, add the matching issue relation.
+   - Use a parent/sub-issue relation when one requirement is a contained part of a larger issue. A child has one parent; a parent may have many sub-issues.
+   - Create a new issue only when no existing issue reasonably tracks the requirement.
+   - Do not create, append, or relate a tiny or trivial request that does not benefit from durable tracking.
+2. Before executing an issue, read the latest issue content and all comments. Treat comments as part of the current requirements, especially when completed work has been returned for changes.
+   - In a description or comment, `![alt](/api/attachments/<id>/content)` marks an inline image at that exact position in the text.
+   - When understanding that image is necessary, use `attachment download` to save it locally, then inspect the saved file with an available image-viewing tool.
+3. Create or update issues with the CLI; consume its JSON output.
+   Issues created through `taskctl` are assigned to Codex Agent by default. Later CLI updates do not change the assignee.
+4. Let `taskctl` attribute every issue, relation, or comment mutation to the current Codex conversation through `CODEX_THREAD_ID`. Outside Codex, pass the exact conversation id with `--thread-id`.
+5. To claim a `todo` issue as a Root Sub-Agent, use `issue claim`; it atomically records the durable claim, moves the issue to `in_progress`, and requires `--if-version` with the latest version. Pass `--agent-path /root/<name> --thread-id <agentThreadId> --lease-minutes 30 --write-scope <comma-separated-paths>`. Renew only the exact same task/agent/thread claim before its lease expires. For ordinary non-Sub-Agent work, move it to `in_progress` with the same optimistic version guard. On a version or claim conflict, skip the issue and do not implement it.
+6. Include `--if-version <version>` on every concurrent update, using the version returned by the latest read.
+7. Before requesting review, verify the requested work and acceptance criteria.
+8. After implementation and self-verification, add a comment summarizing the key changes, verification, result, and remaining risks; then move the issue to `in_review`. Never move it directly to `done`.
+9. Move an issue from `in_review` to `done` only when the user explicitly confirms acceptance or explicitly asks to mark it complete. Codex self-verification alone is not sufficient.
+10. Move work that cannot continue to `blocked`, and work that will not continue to `canceled`.
+
 - Use the exact `taskctl` binary and Taskboard URL supplied by the task or injected runtime. Do not replace them with a global CLI, the default port, or another board.
 - On macOS, when no binary is injected and the desktop app is installed, use `'/Applications/Codex Taskboard.app/Contents/Resources/bin/taskctl' issue get ID --json`. Keep the single quotes because the path contains a space. The packaged wrapper reads the active launcher runtime; do not search the filesystem for another CLI or reconstruct the tokenized URL.
 - On Linux, when no binary is injected and Codex was started by the desktop app, use `taskctl issue get ID --json`. The desktop app adds its packaged wrapper to the managed Codex `PATH`; do not search the filesystem for another CLI or reconstruct the tokenized URL.

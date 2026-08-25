@@ -1,5 +1,9 @@
+import path from "node:path";
+
 const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
+const coordinationDeliveries = new Map();
+const COORDINATION_DEDUPLICATION_MS = 60_000;
 
 function parseHostRequest(payload, parseAutomationRequest) {
   if (typeof payload !== "string" || payload.length > 4_194_304) {
@@ -87,7 +91,83 @@ function parseHostRequest(payload, parseAutomationRequest) {
   ) {
     return { id, request, error: null };
   }
+  if (
+    request.action === "coordinate-agent-todo"
+    && typeof request.rootThreadId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(request.rootThreadId)
+    && typeof request.codexHostId === "string"
+    && request.codexHostId.length > 0
+    && request.codexHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && typeof request.projectId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.projectId)
+    && typeof request.todoId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.todoId)
+    && typeof request.targetRoot === "string"
+    && request.targetRoot.length > 0
+    && request.targetRoot.length <= 4_096
+    && path.isAbsolute(request.targetRoot)
+  ) return { id, request, error: null };
   return { id, request: null, error: HOST_REQUEST_ERROR };
+}
+
+export async function deliverTaskboardCoordination(request, rpc) {
+  const observedAt = Date.now();
+  for (const [key, entry] of coordinationDeliveries) {
+    if (entry.expiresAt <= observedAt) coordinationDeliveries.delete(key);
+  }
+  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.rootThreadId}`;
+  const existing = coordinationDeliveries.get(deliveryKey);
+  if (existing) return existing.promise;
+  const delivery = deliverTaskboardCoordinationOnce(request, rpc);
+  const entry = { promise: delivery, expiresAt: observedAt + COORDINATION_DEDUPLICATION_MS };
+  coordinationDeliveries.set(deliveryKey, entry);
+  delivery.catch(() => {
+    if (coordinationDeliveries.get(deliveryKey) === entry) coordinationDeliveries.delete(deliveryKey);
+  });
+  return delivery;
+}
+
+async function deliverTaskboardCoordinationOnce(request, rpc) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.rootThreadId) {
+    throw new Error("Codex did not confirm the configured Root task");
+  }
+  const rootCwd = typeof threadResult.thread.cwd === "string" ? path.resolve(threadResult.thread.cwd) : null;
+  const targetRoot = path.resolve(request.targetRoot);
+  if (!rootCwd || (targetRoot !== rootCwd && !targetRoot.startsWith(`${rootCwd}${path.sep}`))) {
+    throw new Error("Configured Root workspace does not own the Taskboard project workspace");
+  }
+  const instruction = [
+    "Taskboard Agent collaboration request.",
+    `Project: ${request.projectId}`,
+    `Todo: ${request.todoId}`,
+    "Read the exact Taskboard issue and its latest comments with taskctl before acting.",
+    "Coordinate this work as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent for the bounded task, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
+    "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",
+  ].join("\n");
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
+  if (activeTurn?.id) {
+    await rpc("turn/steer", {
+      threadId: request.rootThreadId,
+      expectedTurnId: activeTurn.id,
+      input: [{ type: "text", text: instruction }],
+    });
+    return { delivery: "steered", turnId: activeTurn.id };
+  }
+  await rpc("thread/resume", { threadId: request.rootThreadId });
+  const started = await rpc("turn/start", {
+    threadId: request.rootThreadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a valid Root turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
 }
 
 export async function handleHostBindingPayload(params, handlers) {
@@ -122,6 +202,8 @@ export async function handleHostBindingPayload(params, handlers) {
       result = await handlers.openAttachment(parsed.request);
     } else if (parsed.request.action === "automation") {
       result = await handlers.runAutomation(parsed.request, params.executionContextId);
+    } else if (parsed.request.action === "coordinate-agent-todo") {
+      result = await handlers.coordinateAgentTodo(parsed.request, params.executionContextId);
     } else {
       result = await handlers.startConversation(parsed.request, params.executionContextId);
     }

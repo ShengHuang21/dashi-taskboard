@@ -30,11 +30,13 @@ import {
   getTaskboardRevision,
   getTaskboardMetadata,
   listArchivedTasks,
+  listAgentLaneProjectIds,
   listDevelopmentContexts,
   listDeviceWorkspaces,
   listProjects,
   listTasks,
   moveTask as moveTaskRequest,
+  openCodexThread as openCodexThreadRequest,
   publishHostRuntime,
   removeTaskRelation,
   resolveTaskboardUrl,
@@ -52,6 +54,7 @@ import {
 } from "./actors";
 import { BoardColumn } from "./components/BoardColumn";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
+import { AgentLaneBoard } from "./components/AgentLaneBoard";
 import { BoardCardDisplayMenu } from "./components/BoardCardDisplayMenu";
 import { DashboardView } from "./components/DashboardView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
@@ -135,7 +138,7 @@ import { createRevisionPoller, getRevisionPollingInterval } from "./revisionPoll
 
 type ConnectionState = "connecting" | "live" | "reconnecting";
 type Theme = "light" | "dark";
-type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt";
+type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt" | "lanes";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
   | { projectId: string; view: "list"; scrollTop: number };
@@ -285,6 +288,19 @@ interface PendingAutomationRequest {
   timeoutId: number;
 }
 
+interface CoordinationHostResponse {
+  requestId: string;
+  ok: boolean;
+  delivery?: "started" | "steered";
+  error?: string;
+}
+
+interface PendingCoordinationRequest {
+  resolve: (response: CoordinationHostResponse) => void;
+  reject: (error: Error) => void;
+  timeoutId: number;
+}
+
 const DEFAULT_USER_ACTOR: ActorIdentity = {
   type: "user",
   id: "local-user",
@@ -314,11 +330,21 @@ function readIssueActivityKeys(storageKey: string): Record<string, string> {
   }
 }
 
-function readProjectBoardView(projectId: string): BoardView {
+function readProjectBoardView(projectId: string, agentLanesConfigured = false): BoardView {
   const view = taskboardStorage.getItem(`${PROJECT_VIEW_KEY_PREFIX}${projectId}`);
-  return view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
+  return view === "lanes" && agentLanesConfigured
     ? view
-    : "issues";
+    : view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
+      ? view
+      : agentLanesConfigured ? "lanes" : "issues";
+}
+
+function withAgentLaneConfiguration(projects: Project[], projectIds: string[]): Project[] {
+  const configuredProjects = new Set(projectIds);
+  return projects.map((project) => ({
+    ...project,
+    agentLanesConfigured: configuredProjects.has(project.id),
+  }));
 }
 
 function readBoardCardDisplay(): BoardCardDisplay {
@@ -816,6 +842,7 @@ export function App() {
     );
   }
   const pendingAutomationRequestsRef = useRef(new Map<string, PendingAutomationRequest>());
+  const pendingCoordinationRequestsRef = useRef(new Map<string, PendingCoordinationRequest>());
   const automationRequestInFlightRef = useRef<"list" | "save" | null>(null);
   const loadedAutomationProjectIdsRef = useRef(new Set<string>());
   const queuedAutomationSavesRef = useRef(new Map<string, QueuedProjectAutomationSave>());
@@ -1551,13 +1578,16 @@ export function App() {
       if (!routeIssueIdentifier) detailSourceProjectIdRef.current = null;
       setDetailTaskIdentifier(routeIssueIdentifier);
       if (routeProjectId === selectedProjectId) return;
-      setBoardView(routeProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(routeProjectId));
+      const routeProject = projects.find((project) => project.id === routeProjectId);
+      setBoardView(routeProjectId === ALL_PROJECTS_ID
+        ? "issues"
+        : readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
       setSelectedProjectId(routeProjectId);
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, selectedProjectId]);
+  }, [boardView, projects, selectedProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1680,6 +1710,22 @@ export function App() {
         return;
       }
 
+      if (message.type === "taskboard:coordination-response" && message.payload) {
+        const payload = message.payload as Partial<CoordinationHostResponse>;
+        if (typeof payload.requestId !== "string") return;
+        const pending = pendingCoordinationRequestsRef.current.get(payload.requestId);
+        if (!pending) return;
+        window.clearTimeout(pending.timeoutId);
+        pendingCoordinationRequestsRef.current.delete(payload.requestId);
+        if (payload.ok) pending.resolve(payload as CoordinationHostResponse);
+        else pending.reject(new Error(
+          typeof payload.error === "string"
+            ? payload.error
+            : textRef.current("Root 没有收到协作任务", "Root did not receive the coordination task"),
+        ));
+        return;
+      }
+
       if (message.type === "taskboard:theme" && isTheme(message.theme)) {
         setTheme(message.theme);
         return;
@@ -1730,6 +1776,14 @@ export function App() {
         )));
       }
       pendingAutomationRequestsRef.current.clear();
+      for (const pending of pendingCoordinationRequestsRef.current.values()) {
+        window.clearTimeout(pending.timeoutId);
+        pending.reject(new Error(textRef.current(
+          "Taskboard 消息桥已关闭",
+          "The Taskboard host bridge was closed",
+        )));
+      }
+      pendingCoordinationRequestsRef.current.clear();
     };
   }, [embedded, host]);
 
@@ -1777,10 +1831,11 @@ export function App() {
       current?.operation === "initial" ? { ...current, requestId } : current
     ));
     try {
-      const [nextProjects, metadata, workspaces] = await Promise.all([
+      const [nextProjects, metadata, workspaces, agentLaneProjectIds] = await Promise.all([
         listProjects(signal),
         getTaskboardMetadata(signal),
         listDeviceWorkspaces(signal),
+        listAgentLaneProjectIds(signal),
       ]);
       if (requestId !== projectsRequestRef.current) return;
       const [nextJiraConnection, nextTemporaryTasks] = await Promise.all([
@@ -1807,7 +1862,7 @@ export function App() {
         taskboardStorage.setItem(DEVICE_WORKSPACE_PATHS_KEY, JSON.stringify(next));
         return next;
       });
-      setProjects(nextProjects.map((project) => project.id === GLOBAL_PROJECT_ID
+      setProjects(withAgentLaneConfiguration(nextProjects, agentLaneProjectIds).map((project) => project.id === GLOBAL_PROJECT_ID
         ? {
             ...project,
             issueCount: nextTemporaryTasks.filter((task) => (
@@ -1847,18 +1902,24 @@ export function App() {
     return () => controller.abort();
   }, [loadProjectList]);
 
+  useEffect(() => {
+    if (!selectedProject) return;
+    setBoardView(readProjectBoardView(selectedProject.id, selectedProject.agentLanesConfigured));
+  }, [selectedProject]);
+
   const refreshProjectList = useCallback(async () => {
     const requestId = ++projectsRequestRef.current;
     setProjectLoadError((current) => (
       current?.operation === "refresh" ? { ...current, requestId } : current
     ));
     try {
-      const [nextProjects, nextTemporaryTasks] = await Promise.all([
+      const [nextProjects, nextTemporaryTasks, agentLaneProjectIds] = await Promise.all([
         listProjects(),
         listTasks(GLOBAL_PROJECT_ID),
+        listAgentLaneProjectIds(),
       ]);
       if (requestId !== projectsRequestRef.current) return;
-      setProjects(nextProjects.map((project) => project.id === GLOBAL_PROJECT_ID
+      setProjects(withAgentLaneConfiguration(nextProjects, agentLaneProjectIds).map((project) => project.id === GLOBAL_PROJECT_ID
         ? {
             ...project,
             issueCount: nextTemporaryTasks.filter((task) => (
@@ -2787,15 +2848,68 @@ export function App() {
     window.location.assign(`codex://threads/${encodeURIComponent(binding.threadId.trim())}`);
   }
 
-  function openLegacyLocalThread(threadId: string) {
+  async function openLegacyLocalThread(threadId: string) {
     if (embedded && window.parent !== window) {
       postEmbeddedHostMessage({
         type: "taskboard:open-thread",
         payload: { threadId, legacyLocal: true },
       });
-      return;
+      return true;
     }
-    window.location.assign(`codex://threads/${encodeURIComponent(threadId.trim())}`);
+    setActionError(null);
+    try {
+      await openCodexThreadRequest(threadId.trim());
+      return true;
+    } catch (error) {
+      setActionError(errorMessage(error));
+      return false;
+    }
+  }
+
+  async function coordinateAgentTodo(todoId: string, rootThreadId: string) {
+    if (!embedded || window.parent === window) {
+      setActionError(text(
+        "请从 Codex 内的 Taskboard 面板发起 Agent 协作。",
+        "Start Agent collaboration from the Taskboard panel inside Codex.",
+      ));
+      return false;
+    }
+    const codexHostId = automationProjectContext.codexHostId;
+    const targetRoot = automationProjectContext.workspacePath;
+    if (!codexHostId || !targetRoot) {
+      setActionError(text("当前项目没有可用的 Codex 主机。", "This project has no available Codex host."));
+      return false;
+    }
+    const requestId = window.crypto.randomUUID();
+    const response = new Promise<CoordinationHostResponse>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        pendingCoordinationRequestsRef.current.delete(requestId);
+        reject(new Error(textRef.current(
+          "交付结果未确认，请先检查 Root 再决定是否重试。",
+          "Delivery is unconfirmed. Inspect Root before deciding whether to retry.",
+        )));
+      }, 35_000);
+      pendingCoordinationRequestsRef.current.set(requestId, { resolve, reject, timeoutId });
+    });
+    setActionError(null);
+    postEmbeddedHostMessage({
+      type: "taskboard:coordinate-todo",
+      payload: {
+        requestId,
+        projectId: selectedProjectId,
+        todoId,
+        rootThreadId,
+        codexHostId,
+        targetRoot,
+      },
+    });
+    try {
+      await response;
+      return true;
+    } catch (error) {
+      setActionError(errorMessage(error));
+      return false;
+    }
   }
 
   function openTaskConversation(conversation: TaskConversationItem) {
@@ -2974,7 +3088,10 @@ export function App() {
     setProjectMenuOpen(false);
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
-    setBoardView(projectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(projectId));
+    const project = projects.find((candidate) => candidate.id === projectId);
+    setBoardView(projectId === ALL_PROJECTS_ID
+      ? "issues"
+      : readProjectBoardView(projectId, project?.agentLanesConfigured));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -2999,12 +3116,17 @@ export function App() {
             name: choice.name,
             workspacePath: null,
           });
+          project = { ...project, agentLanesConfigured: false };
           setProjects((current) => [...current, project!]);
         } catch (error) {
           if (!(error instanceof ApiError) || error.code !== "PROJECT_EXISTS") throw error;
-          const nextProjects = await listProjects();
-          setProjects(nextProjects);
-          project = nextProjects.find((candidate) => candidate.id === choice.id) ?? null;
+          const [nextProjects, agentLaneProjectIds] = await Promise.all([
+            listProjects(),
+            listAgentLaneProjectIds(),
+          ]);
+          const configuredProjects = withAgentLaneConfiguration(nextProjects, agentLaneProjectIds);
+          setProjects(configuredProjects);
+          project = configuredProjects.find((candidate) => candidate.id === choice.id) ?? null;
           if (!project) throw error;
         }
       }
@@ -3042,9 +3164,12 @@ export function App() {
     setJiraError(null);
     try {
       const connection = await configureJiraConnection(input);
-      const nextProjects = await listProjects();
+      const [nextProjects, agentLaneProjectIds] = await Promise.all([
+        listProjects(),
+        listAgentLaneProjectIds(),
+      ]);
       setJiraConnection(connection);
-      setProjects(nextProjects);
+      setProjects(withAgentLaneConfiguration(nextProjects, agentLaneProjectIds));
       setJiraDialogOpen(false);
       changeProject(connection.projectId);
       await refreshTasks(connection.projectId);
@@ -3392,6 +3517,16 @@ export function App() {
                 {text("项目文档", "Project Docs")}
               </button>
             )}
+            {selectedProject?.agentLanesConfigured && (
+              <button
+                className={`view-tab${boardView === "lanes" ? " active" : ""}`}
+                type="button"
+                aria-pressed={boardView === "lanes"}
+                onClick={() => selectBoardView("lanes")}
+              >
+                Agent Lanes
+              </button>
+            )}
           </div>
           {(boardView === "issues" || boardView === "list" || boardView === "gantt") && <div className="toolbar-tools">
             <div className={`search-field${search ? " has-value" : ""}`} title={text("搜索议题 (/)", "Search issues (/)")}>
@@ -3611,6 +3746,13 @@ export function App() {
               onUpdate={updateTaskProperties}
             />
           </Suspense>
+        ) : boardView === "lanes" && selectedProject ? (
+          <AgentLaneBoard
+            projectId={selectedProject.id}
+            projectName={selectedProject.name}
+            onOpenCodexThread={openLegacyLocalThread}
+            onCoordinateTodo={coordinateAgentTodo}
+          />
         ) : (
           <div
             className={`issue-board-layout${otherTasksVisible ? " has-other-tasks" : ""}`}

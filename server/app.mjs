@@ -18,6 +18,7 @@ import {
 } from "../shared/domain.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { createAgentLaneSnapshotProvider } from "./agent-lane-snapshot.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -52,6 +53,7 @@ const INLINE_ATTACHMENT_TYPES = new Set([
   "text/plain",
 ]);
 const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+const CODEX_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRUSTED_EMBED_ORIGINS = new Set(["app://-"]);
 const CODEX_AGENT_ACTOR = {
   type: "agent",
@@ -645,6 +647,35 @@ function parseMove(body) {
     sortOrder: body.sortOrder === undefined ? undefined : parseSortOrder(body.sortOrder),
     threadId: parseThreadId(body.threadId),
     threadBinding: parseThreadBinding(body.threadBinding),
+  };
+}
+
+function parseAgentClaim(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "agentPath", "agentThreadId", "leaseExpiresAt", "writeScope"]));
+  const agentPath = stringField(body.agentPath, "agentPath", { required: true, maxLength: 240 });
+  if (!agentPath.startsWith("/root/")) {
+    throw new ApiError(400, "INVALID_FIELD", "'agentPath' must identify a Root Sub-Agent");
+  }
+  const agentThreadId = parseThreadId(body.agentThreadId);
+  if (!agentThreadId) {
+    throw new ApiError(400, "INVALID_FIELD", "'agentThreadId' is required");
+  }
+  const leaseExpiresAt = stringField(body.leaseExpiresAt, "leaseExpiresAt", { required: true, maxLength: 64 });
+  const leaseDate = new Date(leaseExpiresAt);
+  if (Number.isNaN(leaseDate.getTime()) || leaseDate <= new Date()) {
+    throw new ApiError(400, "INVALID_FIELD", "'leaseExpiresAt' must be a future ISO timestamp");
+  }
+  if (!Array.isArray(body.writeScope) || body.writeScope.length === 0 || body.writeScope.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'writeScope' must contain 1 to 32 paths");
+  }
+  const writeScope = body.writeScope.map((value) => stringField(value, "writeScope", { required: true, maxLength: 240 }));
+  return {
+    version: parseVersion(body.version),
+    agentPath,
+    agentThreadId,
+    leaseExpiresAt: leaseDate.toISOString(),
+    writeScope,
   };
 }
 
@@ -1562,6 +1593,11 @@ export function resolveServerOptions(options = {}) {
     version: String(
       options.version ?? process.env.CODEX_TASKBOARD_VERSION ?? "development",
     ).trim(),
+    codexSessionsDirectory: options.codexSessionsDirectory
+      ?? path.join(codexHome, "sessions"),
+    agentLaneConfigPath: options.agentLaneConfigPath
+      ?? process.env.CODEX_TASKBOARD_AGENT_LANE_CONFIG_PATH
+      ?? path.join(dataDirectory, "agent-lanes.json"),
   };
 }
 
@@ -1573,7 +1609,7 @@ export function resolvePort(value = process.env.CODEX_TASKBOARD_PORT ?? "47823")
   return port;
 }
 
-export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "0.0.0.0") {
+export function resolveHost(value = process.env.CODEX_TASKBOARD_HOST ?? "127.0.0.1") {
   const host = String(value).trim();
   if (host !== "127.0.0.1" && host !== "0.0.0.0") {
     throw new Error("CODEX_TASKBOARD_HOST must be 127.0.0.1 or 0.0.0.0");
@@ -1586,6 +1622,19 @@ export function createTaskboardServer(options = {}) {
   const codexProcessEnvironment = withoutTaskboardLauncherEnvironment(
     options.processEnv ?? process.env,
   );
+  const openCodexThread = options.openCodexThread ?? (async (threadId) => {
+    const deepLink = `codex://threads/${encodeURIComponent(threadId)}`;
+    const command = process.platform === "darwin"
+      ? { executable: "/usr/bin/open", args: [deepLink] }
+      : process.platform === "win32"
+        ? { executable: "rundll32.exe", args: ["url.dll,FileProtocolHandler", deepLink] }
+        : { executable: "xdg-open", args: [deepLink] };
+    await execFileAsync(command.executable, command.args, {
+      env: codexProcessEnvironment,
+      timeout: 10_000,
+      windowsHide: true,
+    });
+  });
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
   const events = new EventHub();
@@ -1782,6 +1831,60 @@ export function createTaskboardServer(options = {}) {
     processEnv: codexProcessEnvironment,
     workspacePath: PROJECT_ROOT,
   });
+  const agentLanes = createAgentLaneSnapshotProvider({
+    sessionsDirectory: resolved.codexSessionsDirectory,
+    getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
+    listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
+    getClaim: (taskId) => database.getAgentTaskClaim(taskId),
+    getTask: (identifier) => database.getTask(identifier),
+    listComments: (taskId) => database.listComments(taskId),
+    recordProgress: async (progress) => {
+      const candidates = database.listTasks({ projectId: progress.projectId, archived: "false" }).filter((task) => {
+        const claim = database.getAgentTaskClaim(task.id);
+        return claim?.status === "active"
+          && claim.projectId === progress.projectId
+          && claim.agentThreadId === progress.agentThreadId
+          && claim.agentPath === progress.agentPath;
+      });
+      if (candidates.length !== 1) return { applied: false, reason: "claim_not_unique" };
+      const result = database.recordAgentTaskProgress(candidates[0].id, {
+        ...progress,
+        actor: CODEX_AGENT_ACTOR,
+      });
+      if (result.applied) events.emit("comment.created", result);
+      return result;
+    },
+    recordCompletion: async (completion) => {
+      const candidates = database.listTasks({ projectId: completion.projectId, archived: "false" }).filter((task) => {
+        const claim = database.getAgentTaskClaim(task.id);
+        return claim?.status === "active"
+          && claim.projectId === completion.projectId
+          && claim.agentThreadId === completion.agentThreadId
+          && claim.agentPath === completion.agentPath;
+      });
+      if (candidates.length !== 1) return { applied: false, reason: "claim_not_unique" };
+      const result = database.completeAgentTask(candidates[0].id, {
+        ...completion,
+        actor: CODEX_AGENT_ACTOR,
+      });
+      if (result.applied) {
+        events.emit("comment.created", result);
+        events.emit("task.moved", { task: result.task });
+      }
+      return result;
+    },
+  });
+  let agentLaneTimer = null;
+  let agentLaneReconcile = null;
+  const reconcileAgentLanes = async () => {
+    if (agentLaneReconcile) return agentLaneReconcile;
+    agentLaneReconcile = (async () => {
+      for (const projectId of database.listAgentLaneProjectIds()) {
+        await agentLanes.reconcileProject(projectId);
+      }
+    })().finally(() => { agentLaneReconcile = null; });
+    return agentLaneReconcile;
+  };
   const aiEventResponses = new Set();
   const codexSessionSearches = new Map();
   const codexSessionStateCache = new Map();
@@ -2008,7 +2111,7 @@ export function createTaskboardServer(options = {}) {
           value.trim().replace(/^(?:local|cloud):/i, "")
         )))];
         if (threadIds.length > 64 || threadIds.some((threadId) => (
-          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(threadId)
+          !CODEX_THREAD_ID_PATTERN.test(threadId)
         ))) {
           throw new ApiError(400, "INVALID_FIELD", "'threadId' must contain valid Codex thread IDs");
         }
@@ -2016,6 +2119,23 @@ export function createTaskboardServer(options = {}) {
           [threadId, await readCodexSessionState(threadId)]
         )));
         return sendJson(response, 200, { progress: Object.fromEntries(entries) });
+      }
+
+      const codexThreadOpenMatch = pathname.match(/^\/api\/local\/codex-threads\/([^/]+)\/open$/);
+      if (codexThreadOpenMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Codex thread open routes");
+        await assertEmptyRequestBody(request, "Codex thread open routes");
+        const threadId = decodeURIComponent(codexThreadOpenMatch[1]);
+        if (!CODEX_THREAD_ID_PATTERN.test(threadId)) {
+          throw new ApiError(400, "INVALID_FIELD", "'threadId' must be a valid Codex thread ID");
+        }
+        try {
+          await openCodexThread(threadId);
+        } catch {
+          throw new ApiError(503, "CODEX_OPEN_FAILED", "Could not open the Codex conversation");
+        }
+        return sendJson(response, 200, { opened: true });
       }
 
       if (pathname === "/api/local/host-runtime") {
@@ -2075,6 +2195,34 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { runtime: hostRuntime });
         }
         return methodNotAllowed(response, ["GET", "PUT"]);
+      }
+
+      if (pathname === "/api/local/agent-lane-projects") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/agent-lane-projects");
+        return sendJson(response, 200, { projectIds: database.listAgentLaneProjectIds() });
+      }
+
+      const agentLaneRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/agent-lanes$/);
+      if (agentLaneRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/projects/:id/agent-lanes");
+        const projectId = decodeRouteSegment(agentLaneRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (!database.getProject(projectId)) {
+          throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+        }
+        try {
+          return sendJson(response, 200, await agentLanes.getProjectSnapshot(projectId));
+        } catch (error) {
+          if (error?.code === "AGENT_LANES_NOT_CONFIGURED") {
+            throw new ApiError(404, error.code, error.message);
+          }
+          if (error?.code === "AGENT_LANES_CONFIG_UNAVAILABLE") {
+            throw new ApiError(503, error.code, error.message);
+          }
+          throw error;
+        }
       }
 
       if (pathname === "/api/local/cloud-session") {
@@ -2930,7 +3078,7 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
-      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move))?$/);
+      const taskRoute = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(archive|restore|move|claim))?$/);
       if (taskRoute) {
         let id;
         try {
@@ -3062,6 +3210,20 @@ export function createTaskboardServer(options = {}) {
           events.emit("task.moved", { task });
           return sendJson(response, 200, { task });
         }
+        if (action === "claim" && request.method === "POST") {
+          const claim = parseAgentClaim(await readJson(request));
+          const current = database.getTask(id);
+          if (current?.source === "jira") {
+            throw new ApiError(
+              409,
+              "JIRA_CLAIM_UNAVAILABLE",
+              "Jira tasks cannot be claimed without a Jira transition",
+            );
+          }
+          const result = database.claimAgentTask(id, claim.version, claim);
+          events.emit("task.moved", { task: result.task });
+          return sendJson(response, 200, result);
+        }
         if (action === "archive" && request.method === "POST") {
           const current = database.getTask(id);
           if (current?.source === "jira") {
@@ -3132,6 +3294,8 @@ export function createTaskboardServer(options = {}) {
   return {
     database,
     aiChat,
+    agentLanes,
+    reconcileAgentLanes,
     server,
     options: resolved,
     async listen({ host = "127.0.0.1", port = resolvePort(), fd = null } = {}) {
@@ -3156,6 +3320,11 @@ export function createTaskboardServer(options = {}) {
         else server.listen({ fd });
       });
       listening = true;
+      await reconcileAgentLanes();
+      agentLaneTimer = setInterval(() => {
+        reconcileAgentLanes().catch((error) => console.error("Agent lane reconcile failed", error));
+      }, options.agentLaneReconcileIntervalMs ?? 5_000);
+      agentLaneTimer.unref?.();
       return server.address();
     },
     async close() {
@@ -3165,6 +3334,8 @@ export function createTaskboardServer(options = {}) {
           })
         : Promise.resolve();
       events.close();
+      if (agentLaneTimer) clearInterval(agentLaneTimer);
+      agentLaneTimer = null;
       for (const response of aiEventResponses) response.end();
       aiEventResponses.clear();
       await aiChat.close();
