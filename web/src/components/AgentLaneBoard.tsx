@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ApiError, getAgentLaneSnapshot } from "../api";
 import type {
@@ -12,6 +12,7 @@ import type {
 interface AgentLaneBoardProps {
   projectId: string;
   projectName: string;
+  coordinationAvailable: boolean;
   onOpenCodexThread: (threadId: string) => Promise<boolean>;
   onCoordinateTodo: (
     todoId: string,
@@ -274,11 +275,26 @@ function CompletedWorkGroup({ category, agents }: { category: string; agents: Ro
 export function AgentLaneBoard({
   projectId,
   projectName,
+  coordinationAvailable,
   onOpenCodexThread,
   onCoordinateTodo,
 }: AgentLaneBoardProps) {
   const [snapshot, setSnapshot] = useState<AgentLaneSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [autoCoordinationEnabled, setAutoCoordinationEnabled] = useState(false);
+  const [autoCoordinationState, setAutoCoordinationState] = useState<"off" | "watching" | "sending" | "sent" | "failed">("off");
+  const autoCoordinationLastKeyRef = useRef<string | null>(null);
+  const autoCoordinationBusyRef = useRef(false);
+  const autoCoordinationStorageKey = `taskboard:agent-lanes:auto-coordinate:${projectId}`;
+
+  useEffect(() => {
+    const enabled = coordinationAvailable
+      && window.localStorage.getItem(autoCoordinationStorageKey) === "enabled";
+    setAutoCoordinationEnabled(enabled);
+    setAutoCoordinationState(enabled ? "watching" : "off");
+    autoCoordinationLastKeyRef.current = window.localStorage.getItem(`${autoCoordinationStorageKey}:last`);
+    autoCoordinationBusyRef.current = false;
+  }, [autoCoordinationStorageKey, coordinationAvailable]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -299,6 +315,47 @@ export function AgentLaneBoard({
       window.clearInterval(timer);
     };
   }, [projectId]);
+
+  useEffect(() => {
+    if (!coordinationAvailable || !autoCoordinationEnabled || !snapshot || autoCoordinationBusyRef.current) return;
+    const todo = snapshot.todos.find((candidate) => {
+      const hasOpenRun = candidate.run?.state === "active" || candidate.run?.state === "blocked";
+      return candidate.readyWork.eligible
+        && candidate.dispatchTarget !== null
+        && candidate.readyWork.safeActions[0] !== undefined
+        && candidate.readyWork.resumeToken !== null
+        && !hasOpenRun;
+    });
+    if (!todo || !todo.dispatchTarget || !todo.readyWork.resumeToken) {
+      setAutoCoordinationState("watching");
+      return;
+    }
+    const safeAction = todo.readyWork.safeActions[0];
+    if (!safeAction) return;
+    const deliveryKey = `${todo.id}:${safeAction.id}:${todo.readyWork.resumeToken}`;
+    if (autoCoordinationLastKeyRef.current === deliveryKey) return;
+
+    autoCoordinationBusyRef.current = true;
+    autoCoordinationLastKeyRef.current = deliveryKey;
+    window.localStorage.setItem(`${autoCoordinationStorageKey}:last`, deliveryKey);
+    setAutoCoordinationState("sending");
+    void onCoordinateTodo(
+      todo.id,
+      todo.dispatchTarget,
+      safeAction.id,
+      todo.readyWork.resumeToken,
+    ).then((delivered) => {
+      setAutoCoordinationState(delivered ? "sent" : "failed");
+    }).finally(() => {
+      autoCoordinationBusyRef.current = false;
+    });
+  }, [
+    autoCoordinationEnabled,
+    autoCoordinationStorageKey,
+    coordinationAvailable,
+    onCoordinateTodo,
+    snapshot,
+  ]);
 
   if (error) {
     return <section className="agent-lanes-error" role="alert"><strong>Agent Lanes unavailable</strong><p>{error}</p></section>;
@@ -329,6 +386,29 @@ export function AgentLaneBoard({
         </div>
         <div className="agent-lanes-policy" aria-label="安全状态">
           <span>自动同步</span>
+          <button
+            type="button"
+            aria-pressed={autoCoordinationEnabled}
+            disabled={!coordinationAvailable}
+            onClick={() => {
+              const next = !autoCoordinationEnabled;
+              setAutoCoordinationEnabled(next);
+              setAutoCoordinationState(next ? "watching" : "off");
+              if (next) window.localStorage.setItem(autoCoordinationStorageKey, "enabled");
+              else window.localStorage.removeItem(autoCoordinationStorageKey);
+            }}
+            title={coordinationAvailable ? "仅派发 Task Capsule 允许的第一个安全动作" : "请在 Codex 内嵌 Taskboard 中启用"}
+          >
+            自动衔接：{!coordinationAvailable
+              ? "仅限 Codex"
+              : autoCoordinationState === "sending"
+                ? "派发中"
+                : autoCoordinationState === "sent"
+                  ? "已交付"
+                  : autoCoordinationState === "failed"
+                    ? "未确认"
+                    : autoCoordinationEnabled ? "监视中" : "关闭"}
+          </button>
         </div>
       </header>
 

@@ -3756,6 +3756,7 @@ export function App() {
           <AgentLaneBoard
             projectId={selectedProject.id}
             projectName={selectedProject.name}
+            coordinationAvailable={embedded && window.parent !== window}
             onOpenCodexThread={openLegacyLocalThread}
             onCoordinateTodo={coordinateAgentTodo}
           />

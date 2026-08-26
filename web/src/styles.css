@@ -5038,6 +5038,28 @@ kbd {
   font-size: 11px;
 }
 
+.agent-lanes-policy button {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-raised);
+  padding: 4px 8px;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.agent-lanes-policy button[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.agent-lanes-policy button:disabled {
+  cursor: not-allowed;
+  opacity: .62;
+}
+
 .agent-lane-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(260px, 1fr));

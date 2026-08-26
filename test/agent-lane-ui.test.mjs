@@ -49,6 +49,18 @@ test("a ready Agent Todo can be delivered to the configured Root coordinator", (
   assert.doesNotMatch(coordinateSource, /automationProjectContext/);
 });
 
+test("automatic continuation is opt-in, embedded-only, and resume-token deduplicated", () => {
+  assert.match(boardSource, /自动衔接/);
+  assert.match(boardSource, /coordinationAvailable/);
+  assert.match(boardSource, /autoCoordinationEnabled/);
+  assert.match(boardSource, /localStorage/);
+  assert.match(boardSource, /readyWork\.safeActions\[0\]/);
+  assert.match(boardSource, /readyWork\.resumeToken/);
+  assert.match(boardSource, /autoCoordinationLastKeyRef/);
+  assert.match(boardSource, /onCoordinateTodo\(/);
+  assert.match(appSource, /coordinationAvailable=\{embedded && window\.parent !== window\}/);
+});
+
 test("a legacy Agent Todo backlog is not made dispatchable by its Root binding", () => {
   const todoCardSource = boardSource.slice(
     boardSource.indexOf("function TodoCard"),
