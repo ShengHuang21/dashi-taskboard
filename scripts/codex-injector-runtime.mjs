@@ -4,6 +4,10 @@ const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后�
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 const coordinationDeliveries = new Map();
 const COORDINATION_DEDUPLICATION_MS = 60_000;
+const continuationMonitorRuns = new Map();
+const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
+const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
 
 function parseHostRequest(payload, parseAutomationRequest) {
   if (typeof payload !== "string" || payload.length > 4_194_304) {
@@ -131,6 +135,88 @@ export async function deliverTaskboardCoordination(request, rpc) {
     if (coordinationDeliveries.get(deliveryKey) === entry) coordinationDeliveries.delete(deliveryKey);
   });
   return delivery;
+}
+
+export async function runTaskboardContinuationMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  if (!policy || !COORDINATION_ID_PATTERN.test(policy.projectId ?? "")) {
+    return { delivered: false, reason: "invalid-policy" };
+  }
+  const existing = continuationMonitorRuns.get(policy.projectId);
+  if (existing) return existing;
+
+  const run = runTaskboardContinuationMonitorOnceUnlocked(options);
+  continuationMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (continuationMonitorRuns.get(policy.projectId) === run) {
+      continuationMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runTaskboardContinuationMonitorOnceUnlocked({
+  policy,
+  readSnapshot,
+  claimReceipt,
+  deliver,
+}) {
+  if (
+    typeof readSnapshot !== "function"
+    || typeof claimReceipt !== "function"
+    || typeof deliver !== "function"
+  ) return { delivered: false, reason: "invalid-monitor" };
+
+  const snapshot = await readSnapshot(policy.projectId);
+  if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
+    return { delivered: false, reason: "invalid-snapshot" };
+  }
+  const todo = snapshot.todos.find((candidate) => {
+    const target = candidate?.dispatchTarget;
+    const readyWork = candidate?.readyWork;
+    const safeAction = readyWork?.safeActions?.[0];
+    return (
+      COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+      && candidate?.run == null
+      && readyWork?.eligible === true
+      && Array.isArray(readyWork.safeActions)
+      && COORDINATION_ID_PATTERN.test(safeAction?.id ?? "")
+      && RESUME_TOKEN_PATTERN.test(readyWork?.resumeToken ?? "")
+      && THREAD_ID_PATTERN.test(target?.rootThreadId ?? "")
+      && typeof target?.codexHostId === "string"
+      && target.codexHostId.length > 0
+      && target.codexHostId.length <= 240
+      && !/[\u0000-\u001f\u007f]/.test(target.codexHostId)
+      && typeof target?.worktreePath === "string"
+      && path.isAbsolute(target.worktreePath)
+    );
+  });
+  if (!todo) return { delivered: false, reason: "no-eligible-work" };
+
+  const safeAction = todo.readyWork.safeActions[0];
+  const receiptKey = [
+    policy.projectId,
+    todo.id,
+    safeAction.id,
+    todo.readyWork.resumeToken,
+    todo.dispatchTarget.rootThreadId,
+    path.resolve(todo.dispatchTarget.worktreePath),
+  ].join(":");
+  if (!await claimReceipt(receiptKey)) {
+    return { delivered: false, reason: "already-delivered" };
+  }
+  await deliver({
+    projectId: policy.projectId,
+    todoId: todo.id,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    codexHostId: todo.dispatchTarget.codexHostId,
+    targetRoot: path.resolve(todo.dispatchTarget.worktreePath),
+    safeActionId: safeAction.id,
+    expectedResumeToken: todo.readyWork.resumeToken,
+  });
+  return { delivered: true, todoId: todo.id, actionId: safeAction.id };
 }
 
 async function deliverTaskboardCoordinationOnce(request, rpc) {

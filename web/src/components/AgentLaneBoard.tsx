@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { ApiError, getAgentLaneSnapshot } from "../api";
+import { readTaskboardServerStorage, writeTaskboardServerStorage } from "../storage";
 import type {
   AgentLaneSnapshot,
   AgentTaskLaneSnapshot,
@@ -286,15 +287,28 @@ export function AgentLaneBoard({
   const autoCoordinationLastKeyRef = useRef<string | null>(null);
   const autoCoordinationBusyRef = useRef(false);
   const autoCoordinationStorageKey = `taskboard:agent-lanes:auto-coordinate:${projectId}`;
+  const autoCoordinationPolicyKey = `taskboard:background-continuation:policy:${projectId}`;
 
   useEffect(() => {
-    const enabled = coordinationAvailable
-      && window.localStorage.getItem(autoCoordinationStorageKey) === "enabled";
-    setAutoCoordinationEnabled(enabled);
-    setAutoCoordinationState(enabled ? "watching" : "off");
+    let cancelled = false;
+    const loadPolicy = async () => {
+      try {
+        const entries = await readTaskboardServerStorage();
+        const enabled = coordinationAvailable && entries[autoCoordinationPolicyKey] === "enabled";
+        if (cancelled) return;
+        setAutoCoordinationEnabled(enabled);
+        setAutoCoordinationState(enabled ? "watching" : "off");
+      } catch {
+        if (cancelled) return;
+        setAutoCoordinationEnabled(false);
+        setAutoCoordinationState("failed");
+      }
+    };
+    void loadPolicy();
     autoCoordinationLastKeyRef.current = window.localStorage.getItem(`${autoCoordinationStorageKey}:last`);
     autoCoordinationBusyRef.current = false;
-  }, [autoCoordinationStorageKey, coordinationAvailable]);
+    return () => { cancelled = true; };
+  }, [autoCoordinationPolicyKey, autoCoordinationStorageKey, coordinationAvailable]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -389,13 +403,19 @@ export function AgentLaneBoard({
           <button
             type="button"
             aria-pressed={autoCoordinationEnabled}
-            disabled={!coordinationAvailable}
+            disabled={!coordinationAvailable || autoCoordinationState === "sending"}
             onClick={() => {
               const next = !autoCoordinationEnabled;
-              setAutoCoordinationEnabled(next);
-              setAutoCoordinationState(next ? "watching" : "off");
-              if (next) window.localStorage.setItem(autoCoordinationStorageKey, "enabled");
-              else window.localStorage.removeItem(autoCoordinationStorageKey);
+              setAutoCoordinationState("sending");
+              void writeTaskboardServerStorage(
+                autoCoordinationPolicyKey,
+                next ? "enabled" : null,
+              ).then(() => {
+                setAutoCoordinationEnabled(next);
+                setAutoCoordinationState(next ? "watching" : "off");
+                if (next) window.localStorage.setItem(autoCoordinationStorageKey, "enabled");
+                else window.localStorage.removeItem(autoCoordinationStorageKey);
+              }).catch(() => setAutoCoordinationState("failed"));
             }}
             title={coordinationAvailable ? "仅派发 Task Capsule 允许的第一个安全动作" : "请在 Codex 内嵌 Taskboard 中启用"}
           >

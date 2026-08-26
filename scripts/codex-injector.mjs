@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,7 @@ import {
   handleHostBindingPayload,
   reconcileInjectionRuntime,
   restartResidentInjector,
+  runTaskboardContinuationMonitorOnce,
 } from "./codex-injector-runtime.mjs";
 import { readCodexQuotaStatus } from "./codex-rate-limits.mjs";
 import { createTaskboardSupervisor } from "./taskboard-supervisor.mjs";
@@ -93,6 +94,12 @@ let codexAutomationRequestSequence = 0;
 let codexAppServerRequestSequence = 0;
 const taskConversationOperations = new Map();
 const taskConversationFailureTtlMs = 120_000;
+const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
+const backgroundContinuationIntervalMs = 15_000;
+const backgroundContinuationReceiptDirectory = path.join(
+  taskboardDataDirectory,
+  "background-continuation-receipts",
+);
 const quotaPolicyTimers = new Map();
 const quotaPolicyRecords = new Map();
 const quotaPolicyQueues = new Map();
@@ -1647,9 +1654,87 @@ async function sendHostResponse(cdp, executionContextId, response) {
   });
 }
 
+async function readTaskboardClientStorageEntries() {
+  const response = await fetch(`${taskboardBaseUrl}/api/client-storage`, { cache: "no-store" });
+  if (!response.ok) throw new Error(`Taskboard client storage returned HTTP ${response.status}`);
+  const payload = await response.json();
+  return payload?.entries && typeof payload.entries === "object" ? payload.entries : {};
+}
+
+async function readTaskboardAgentLaneSnapshot(projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`,
+    { cache: "no-store" },
+  );
+  if (!response.ok) throw new Error(`Taskboard Agent Lanes returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function claimBackgroundContinuationReceipt(deliveryKey) {
+  await mkdir(backgroundContinuationReceiptDirectory, { recursive: true, mode: 0o700 });
+  const digest = createHash("sha256").update(deliveryKey).digest("hex");
+  const receiptPath = path.join(backgroundContinuationReceiptDirectory, `${digest}.json`);
+  let descriptor;
+  try {
+    descriptor = await open(receiptPath, "wx", 0o600);
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    await descriptor.writeFile(`${JSON.stringify({ claimedAt: new Date().toISOString() })}\n`);
+  } finally {
+    await descriptor.close();
+  }
+  return true;
+}
+
+async function runBackgroundContinuationMonitor(cdp) {
+  const entries = await readTaskboardClientStorageEntries();
+  const projects = Object.entries(entries)
+    .filter(([key, value]) => key.startsWith(backgroundContinuationPolicyPrefix) && value === "enabled")
+    .map(([key]) => key.slice(backgroundContinuationPolicyPrefix.length))
+    .filter(Boolean)
+    .sort();
+  for (const projectId of projects) {
+    await runTaskboardContinuationMonitorOnce({
+      policy: { enabled: true, projectId },
+      readSnapshot: readTaskboardAgentLaneSnapshot,
+      claimReceipt: claimBackgroundContinuationReceipt,
+      deliver: (request) => deliverTaskboardCoordination(
+        request,
+        (method, params) => requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          request.codexHostId,
+          method,
+          params,
+          10_000,
+        ),
+      ),
+    });
+  }
+}
+
 function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   let activeContextId = null;
   let installInFlight = null;
+  let backgroundContinuationTimer = null;
+
+  const scheduleBackgroundContinuation = () => {
+    if (backgroundContinuationTimer || cdp.closed) return;
+    const tick = async () => {
+      if (cdp.closed) return;
+      try {
+        await runBackgroundContinuationMonitor(cdp);
+      } catch (error) {
+        console.error(`Taskboard background continuation check failed: ${error.message}`);
+      }
+    };
+    void tick();
+    backgroundContinuationTimer = setInterval(() => void tick(), backgroundContinuationIntervalMs);
+    backgroundContinuationTimer.unref?.();
+  };
 
   cdp.on("Runtime.bindingCalled", async (params) => {
     if (params.name !== hostBindingName) return;
@@ -1740,6 +1825,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         returnByValue: true,
       });
       await restoreQuotaPolicies(cdp);
+      scheduleBackgroundContinuation();
       return activeContextId;
     })();
     try {

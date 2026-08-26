@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import {
@@ -6,6 +7,7 @@ import {
   findResidentInjectorPids,
   handleHostBindingPayload,
   reconcileInjectionRuntime,
+  runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
 } from "../scripts/codex-injector-runtime.mjs";
 
@@ -13,6 +15,142 @@ const coordinationAuthorization = {
   safeActionId: "safe-action",
   expectedResumeToken: "a".repeat(64),
 };
+
+test("background continuation delivers one eligible first safe action without a mounted view", async () => {
+  const deliveries = [];
+  const receipts = new Set();
+  const todo = {
+    id: "TASKBOARD-BACKGROUND",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [{ id: "push", text: "Push later" }],
+      resumeToken: "b".repeat(64),
+    },
+  };
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo] }),
+    claimReceipt: async (key) => {
+      if (receipts.has(key)) return false;
+      receipts.add(key);
+      return true;
+    },
+    deliver: async (request) => {
+      deliveries.push(request);
+      return { delivery: "started", turnId: "turn-background" };
+    },
+  };
+
+  const first = await runTaskboardContinuationMonitorOnce(options);
+  const duplicate = await runTaskboardContinuationMonitorOnce(options);
+
+  assert.deepEqual(first, { delivered: true, todoId: todo.id, actionId: "safe-first" });
+  assert.deepEqual(duplicate, { delivered: false, reason: "already-delivered" });
+  assert.equal(deliveries.length, 1);
+  assert.deepEqual(deliveries[0], {
+    projectId: "taskboard-core",
+    todoId: todo.id,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    codexHostId: "local",
+    targetRoot: "/tmp/taskboard/project",
+    safeActionId: "safe-first",
+    expectedResumeToken: "b".repeat(64),
+  });
+});
+
+test("background continuation fails closed for disabled, open-run, or malformed work", async () => {
+  let delivered = 0;
+  const base = {
+    policy: { enabled: false, projectId: "taskboard-core" },
+    readSnapshot: async () => assert.fail("disabled monitor must not read"),
+    claimReceipt: async () => assert.fail("must not claim a receipt"),
+    deliver: async () => { delivered += 1; },
+  };
+  assert.deepEqual(
+    await runTaskboardContinuationMonitorOnce(base),
+    { delivered: false, reason: "disabled" },
+  );
+
+  const unsafeTodos = [
+    {
+      id: "OPEN-RUN", run: { state: "active" },
+      dispatchTarget: { rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local", worktreePath: "/tmp/project" },
+      readyWork: { eligible: true, safeActions: [{ id: "safe" }], resumeToken: "c".repeat(64) },
+    },
+    {
+      id: "NO-TOKEN", run: null,
+      dispatchTarget: { rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local", worktreePath: "/tmp/project" },
+      readyWork: { eligible: true, safeActions: [{ id: "safe" }], resumeToken: null },
+    },
+    {
+      id: "NO-SAFE-ACTION", run: null,
+      dispatchTarget: { rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local", worktreePath: "/tmp/project" },
+      readyWork: { eligible: true, safeActions: [], resumeToken: "d".repeat(64) },
+    },
+  ];
+  assert.deepEqual(
+    await runTaskboardContinuationMonitorOnce({
+      ...base,
+      policy: { enabled: true, projectId: "taskboard-core" },
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: unsafeTodos }),
+    }),
+    { delivered: false, reason: "no-eligible-work" },
+  );
+  assert.equal(delivered, 0);
+});
+
+test("background continuation reserves the durable receipt before an uncertain delivery", async () => {
+  let claimed = false;
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "UNCERTAIN",
+        run: null,
+        dispatchTarget: {
+          rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+          codexHostId: "local",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        readyWork: {
+          eligible: true,
+          safeActions: [{ id: "safe-first" }],
+          resumeToken: "e".repeat(64),
+        },
+      }],
+    }),
+    claimReceipt: async () => {
+      if (claimed) return false;
+      claimed = true;
+      return true;
+    },
+    deliver: async () => { throw new Error("receipt unknown"); },
+  };
+  await assert.rejects(runTaskboardContinuationMonitorOnce(options), /receipt unknown/);
+  assert.deepEqual(
+    await runTaskboardContinuationMonitorOnce(options),
+    { delivered: false, reason: "already-delivered" },
+  );
+});
+
+test("the resident authenticated host polls durable opt-in policies without the Agent Lanes view", async () => {
+  const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
+  assert.match(source, /taskboard:background-continuation:policy:/);
+  assert.match(source, /api\/client-storage/);
+  assert.match(source, /api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);
+  assert.match(source, /runTaskboardContinuationMonitorOnce/);
+  assert.match(source, /deliverTaskboardCoordination/);
+  assert.match(source, /open\(receiptPath, "wx", 0o600\)/);
+  assert.match(source, /setInterval\(\(\) => void tick\(\), backgroundContinuationIntervalMs\)/);
+});
 
 test("Agent Todo coordination steers an active Root turn", async () => {
   const calls = [];
