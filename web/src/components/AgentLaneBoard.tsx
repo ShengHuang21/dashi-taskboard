@@ -13,7 +13,12 @@ interface AgentLaneBoardProps {
   projectId: string;
   projectName: string;
   onOpenCodexThread: (threadId: string) => Promise<boolean>;
-  onCoordinateTodo: (todoId: string, target: CoordinationDispatchTarget) => Promise<boolean>;
+  onCoordinateTodo: (
+    todoId: string,
+    target: CoordinationDispatchTarget,
+    safeActionId: string,
+    resumeToken: string,
+  ) => Promise<boolean>;
 }
 
 const STATUS_LABELS = {
@@ -161,12 +166,29 @@ function TodoCard({
   onCoordinateTodo,
 }: {
   todo: CoordinationTodoSnapshot;
-  onCoordinateTodo: (todoId: string, target: CoordinationDispatchTarget) => Promise<boolean>;
+  onCoordinateTodo: (
+    todoId: string,
+    target: CoordinationDispatchTarget,
+    safeActionId: string,
+    resumeToken: string,
+  ) => Promise<boolean>;
 }) {
   const [deliveryState, setDeliveryState] = useState<"idle" | "sending" | "sent">("idle");
   const hasOpenRun = todo.run?.state === "active" || todo.run?.state === "blocked";
-  const canCoordinate = todo.readyWork.eligible && todo.dispatchTarget !== null && !hasOpenRun;
-  useEffect(() => setDeliveryState("idle"), [todo.id, todo.readyWork.eligible, todo.dispatchTarget?.rootThreadId, hasOpenRun]);
+  const safeAction = todo.readyWork.safeActions[0] ?? null;
+  const canCoordinate = todo.readyWork.eligible
+    && todo.dispatchTarget !== null
+    && safeAction !== null
+    && todo.readyWork.resumeToken !== null
+    && !hasOpenRun;
+  useEffect(() => setDeliveryState("idle"), [
+    todo.id,
+    todo.readyWork.eligible,
+    todo.dispatchTarget?.rootThreadId,
+    safeAction?.id,
+    todo.readyWork.resumeToken,
+    hasOpenRun,
+  ]);
   const nextAction = activityKeyword(todo.readyWork.nextAction ?? todo.nextAction, todo.readyWork.eligible ? "等待领取" : "等待条件满足");
   return (
     <article className={`agent-todo-card is-${todo.state}`} role="listitem">
@@ -182,7 +204,20 @@ function TodoCard({
         <div><dt>执行</dt><dd>{todo.run ? RUN_STATE_LABELS[todo.run.state] : "未启动"}</dd></div>
         <div><dt>关注</dt><dd>{ATTENTION_LABELS[todo.continuation.attention]}</dd></div>
       </dl>
+      {(todo.readyWork.safeActions.length > 0 || todo.readyWork.deferredActions.length > 0) && (
+        <div className="agent-todo-authorization-summary" aria-label="任务授权状态">
+          <span>安全工作 {todo.readyWork.safeActions.length}</span>
+          <span>延后动作 {todo.readyWork.deferredActions.length}</span>
+        </div>
+      )}
       <p className="agent-lane-current-work"><span>下一步</span>{nextAction}</p>
+      {todo.readyWork.approvalRequest?.message && (
+        <div className="agent-todo-approval-request" role="status">
+          <strong>授权请求</strong>
+          <p>{todo.readyWork.approvalRequest.message}</p>
+          {todo.readyWork.approvalRequest.scope && <small>范围：{todo.readyWork.approvalRequest.scope}</small>}
+        </div>
+      )}
       {deliveryState === "sent" && !hasOpenRun && (
         <p className="agent-lane-current-work"><span>交付回执</span>Root 已收到；尚未确认 durable Run 执行中。</p>
       )}
@@ -193,7 +228,12 @@ function TodoCard({
           disabled={deliveryState !== "idle"}
           onClick={async () => {
             setDeliveryState("sending");
-            setDeliveryState(await onCoordinateTodo(todo.id, todo.dispatchTarget!) ? "sent" : "idle");
+            setDeliveryState(await onCoordinateTodo(
+              todo.id,
+              todo.dispatchTarget!,
+              safeAction!.id,
+              todo.readyWork.resumeToken!,
+            ) ? "sent" : "idle");
           }}
         >
           {deliveryState === "sending" ? "正在交给 Root…" : deliveryState === "sent" ? "Root 已收到" : "交给 Root 协调"}

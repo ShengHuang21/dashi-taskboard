@@ -2867,7 +2867,12 @@ export function App() {
     }
   }
 
-  async function coordinateAgentTodo(todoId: string, target: CoordinationDispatchTarget) {
+  async function coordinateAgentTodo(
+    todoId: string,
+    target: CoordinationDispatchTarget,
+    safeActionId: string,
+    resumeToken: string,
+  ) {
     if (!embedded || window.parent === window) {
       setActionError(text(
         "请从 Codex 内的 Taskboard 面板发起 Agent 协作。",
@@ -2875,7 +2880,7 @@ export function App() {
       ));
       return false;
     }
-    if (!target.rootThreadId || !target.codexHostId || !target.worktreePath) {
+    if (!target.rootThreadId || !target.codexHostId || !target.worktreePath || !safeActionId || !resumeToken) {
       setActionError(text("待办没有可用的 Root / worktree 交付目标。", "This Todo has no dispatchable Root/worktree target."));
       return false;
     }
@@ -2900,6 +2905,8 @@ export function App() {
         rootThreadId: target.rootThreadId,
         codexHostId: target.codexHostId,
         targetRoot: target.worktreePath,
+        safeActionId,
+        expectedResumeToken: resumeToken,
       },
     });
     try {

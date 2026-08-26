@@ -9,6 +9,11 @@ import {
   restartResidentInjector,
 } from "../scripts/codex-injector-runtime.mjs";
 
+const coordinationAuthorization = {
+  safeActionId: "safe-action",
+  expectedResumeToken: "a".repeat(64),
+};
+
 test("Agent Todo coordination steers an active Root turn", async () => {
   const calls = [];
   const request = {
@@ -17,6 +22,7 @@ test("Agent Todo coordination steers an active Root turn", async () => {
     projectId: "taskboard-core",
     todoId: "TASKBOARD-17",
     targetRoot: "/tmp/taskboard/project",
+    ...coordinationAuthorization,
   };
   const result = await deliverTaskboardCoordination(request, async (method, params) => {
     calls.push([method, params]);
@@ -37,6 +43,8 @@ test("Agent Todo coordination steers an active Root turn", async () => {
   assert.equal(calls[1][1].expectedTurnId, "turn-active");
   assert.match(calls[1][1].input[0].text, /^taskctl issue bootstrap TASKBOARD-17 --json/);
   assert.match(calls[1][1].input[0].text, /readyWork\.eligible/);
+  assert.match(calls[1][1].input[0].text, /safeActions\[0\]\.id/);
+  assert.match(calls[1][1].input[0].text, /Never execute any readyWork\.deferredActions/);
   assert.match(calls[1][1].input[0].text, /Todo: TASKBOARD-17/);
   assert.match(calls[1][1].input[0].text, /spawn the smallest useful Sub-Agent/);
 });
@@ -49,6 +57,7 @@ test("Agent Todo coordination starts an idle Root turn", async () => {
     projectId: "taskboard-core",
     todoId: "TASKBOARD-18",
     targetRoot: "/tmp/taskboard/project",
+    ...coordinationAuthorization,
   };
   const result = await deliverTaskboardCoordination(request, async (method, params) => {
     calls.push([method, params]);
@@ -75,6 +84,7 @@ test("the authenticated host binding accepts one bounded Agent Todo request", as
       projectId: "taskboard-core",
       todoId: "TASKBOARD-19",
       targetRoot: "/tmp/taskboard/project",
+      ...coordinationAuthorization,
     }),
   }, {
     isAuthorizedContext: (id) => id === 12,
@@ -98,6 +108,7 @@ test("Agent Todo coordination rejects a Root cwd that is not exactly the Todo wo
   const request = {
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
     projectId: "taskboard-core", todoId: "TASKBOARD-WRONG", targetRoot: "/tmp/other/project",
+    ...coordinationAuthorization,
   };
   await assert.rejects(
     deliverTaskboardCoordination(request, async (method) => {
@@ -117,6 +128,7 @@ test("Agent Todo delivery dedupe is scoped to the normalized Todo worktree", asy
     projectId: "taskboard-core",
     todoId: "TASKBOARD-TARGET-IDENTITY",
     targetRoot: "/tmp/right",
+    ...coordinationAuthorization,
   };
   const rpc = async (method) => {
     calls.push(method);
@@ -146,6 +158,7 @@ test("Agent Todo coordination is idempotent and requires a turn receipt", async 
   const request = {
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
     projectId: "taskboard-core", todoId: "TASKBOARD-IDEMPOTENT", targetRoot: "/tmp/taskboard/project",
+    ...coordinationAuthorization,
   };
   const rpc = async (method) => {
     calls.push(method);

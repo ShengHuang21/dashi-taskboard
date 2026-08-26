@@ -195,6 +195,59 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
   fixture.database.close();
 });
 
+test("projects safe continuation and one exact authorization gate into Agent Todos", async () => {
+  const fixture = await setup();
+  const gatedTask = fixture.database.createTask({
+    projectId: "capstone-dev", title: "Authorization-aware task", description: "", status: "todo",
+    priority: "high", labels: ["agent-todo"], threadId: fixture.rootBinding.threadId, threadBinding: fixture.rootBinding,
+    actor, assignee: actor, developmentContext: fixture.developmentContext,
+    workingLog: {
+      path: `${fixture.rootBinding.workspacePath}/CAP-4-WORKING-LOG.md`,
+      status: "active",
+    },
+    startDate: null, dueDate: null, recurrence: null,
+  });
+  fixture.database.createComment(gatedTask.id, {
+    body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+      gates: [
+        { id: "local", kind: "test", state: "authorized", scope: "local tests", evidence: "Owner resumed", receipt: "turn:resume" },
+        { id: "push", kind: "push", state: "approval_required", scope: "exact commit", approver: "Owner", approvalRequest: "同意推送 exact commit" },
+      ],
+      actions: [
+        { id: "test", order: 10, text: "Run local acceptance", gate: "local", target: "candidate", status: "pending" },
+        { id: "push", order: 20, text: "Push exact commit", gate: "push", target: "origin", status: "pending" },
+      ],
+    })}\n\`\`\``,
+    threadId: fixture.rootBinding.threadId,
+    threadBinding: fixture.rootBinding,
+    actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+  });
+
+  let snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
+  let todo = snapshot.todos.find((entry) => entry.id === gatedTask.identifier);
+  assert.deepEqual(todo?.readyWork.safeActions.map((action) => action.id), ["test"]);
+  assert.deepEqual(todo?.readyWork.deferredActions.map((action) => action.id), ["push"]);
+  assert.equal(todo?.readyWork.approvalRequest, null);
+  assert.equal(todo?.readyWork.eligible, true);
+
+  const comment = fixture.database.listComments(gatedTask.id)[0];
+  fixture.database.updateComment(comment.id, comment.version, `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+    gates: [
+      { id: "push", kind: "push", state: "approval_required", scope: "exact commit", approver: "Owner", approvalRequest: "同意推送 exact commit" },
+    ],
+    actions: [
+      { id: "push", order: 20, text: "Push exact commit", gate: "push", target: "origin", status: "pending" },
+    ],
+  })}\n\`\`\``, fixture.rootBinding.threadId, fixture.rootBinding);
+
+  snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
+  todo = snapshot.todos.find((entry) => entry.id === gatedTask.identifier);
+  assert.equal(todo?.readyWork.eligible, false);
+  assert.equal(todo?.readyWork.approvalRequest?.message, "同意推送 exact commit");
+  assert.match(todo?.readyWork.approvalRequest?.expectedResumeToken ?? "", /^[a-f0-9]{64}$/);
+  fixture.database.close();
+});
+
 test("projects a durable legacy claim without treating the Root binding as ownership", async () => {
   const fixture = await setup();
   const claimed = fixture.database.claimAgentTask(fixture.task.id, fixture.task.version, {

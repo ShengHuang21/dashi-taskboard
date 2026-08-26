@@ -1197,6 +1197,8 @@
         codexHostId: payload?.codexHostId,
         projectId: payload?.projectId,
         todoId: payload?.todoId,
+        safeActionId: payload?.safeActionId,
+        expectedResumeToken: payload?.expectedResumeToken,
         targetRoot: payload?.targetRoot,
       }, 35_000);
       postToFrame({

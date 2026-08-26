@@ -671,6 +671,23 @@ export interface CoordinationReadyWorkSnapshot {
   eligible: boolean;
   reasonCodes: string[];
   nextAction: string | null;
+  safeActions: CoordinationActionSnapshot[];
+  deferredActions: CoordinationActionSnapshot[];
+  approvalRequest: CoordinationApprovalRequestSnapshot | null;
+  resumeToken: string | null;
+}
+
+export interface CoordinationActionSnapshot {
+  id: string;
+  text: string | null;
+}
+
+export interface CoordinationApprovalRequestSnapshot {
+  actionId: string;
+  approver: string | null;
+  message: string | null;
+  scope: string | null;
+  expectedResumeToken: string;
 }
 
 export interface AgentLaneSnapshot {

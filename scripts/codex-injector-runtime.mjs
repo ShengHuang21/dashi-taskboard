@@ -103,6 +103,10 @@ function parseHostRequest(payload, parseAutomationRequest) {
     && /^[a-z0-9._-]{1,128}$/i.test(request.projectId)
     && typeof request.todoId === "string"
     && /^[a-z0-9._-]{1,128}$/i.test(request.todoId)
+    && typeof request.safeActionId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.safeActionId)
+    && typeof request.expectedResumeToken === "string"
+    && /^[a-f0-9]{64}$/.test(request.expectedResumeToken)
     && typeof request.targetRoot === "string"
     && request.targetRoot.length > 0
     && request.targetRoot.length <= 4_096
@@ -117,7 +121,7 @@ export async function deliverTaskboardCoordination(request, rpc) {
     if (entry.expiresAt <= observedAt) coordinationDeliveries.delete(key);
   }
   const targetRoot = path.resolve(request.targetRoot);
-  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.rootThreadId}:${targetRoot}`;
+  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.safeActionId}:${request.expectedResumeToken}:${request.rootThreadId}:${targetRoot}`;
   const existing = coordinationDeliveries.get(deliveryKey);
   if (existing) return existing.promise;
   const delivery = deliverTaskboardCoordinationOnce(request, rpc);
@@ -146,8 +150,10 @@ async function deliverTaskboardCoordinationOnce(request, rpc) {
     `taskctl issue bootstrap ${request.todoId} --json`,
     `Project: ${request.projectId}`,
     `Todo: ${request.todoId}`,
-    "Read the returned Task Capsule and recheck readyWork.eligible. If it is false, stop and report its reasonCodes; do not claim, spawn, or dispatch work.",
-    "Coordinate this work as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent for the bounded task, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
+    `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
+    `Authorized safe action id: ${request.safeActionId}`,
+    "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
+    "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent if needed, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
     "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",
   ].join("\n");
   const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];

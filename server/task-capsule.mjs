@@ -1,9 +1,201 @@
 import { createHash } from "node:crypto";
 
 const CAPSULE_VERSION = "TaskCapsuleV1";
+const AUTHORIZATION_MARKER = "Task Authorization Envelope V1";
+const AUTHORIZATION_GATE_KINDS = new Set([
+  "inspect",
+  "edit",
+  "test",
+  "commit",
+  "push",
+  "pr",
+  "merge",
+  "deploy",
+  "secret",
+  "live_call",
+  "dependency_install",
+  "destructive",
+  "financial",
+  "shared_runtime",
+]);
+const AUTHORIZATION_GATE_STATES = new Set(["authorized", "approval_required", "denied", "forbidden"]);
+const AUTHORIZATION_ACTION_STATES = new Set(["pending", "completed"]);
 
 function hash(value) {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function hasDuplicateJsonKeys(source) {
+  let index = 0;
+  let duplicate = false;
+  const whitespace = () => {
+    while (/\s/.test(source[index] ?? "")) index += 1;
+  };
+  const string = () => {
+    const start = index;
+    index += 1;
+    while (index < source.length) {
+      if (source[index] === "\\") index += 2;
+      else if (source[index] === '"') {
+        index += 1;
+        return JSON.parse(source.slice(start, index));
+      } else index += 1;
+    }
+    throw new Error("Unterminated JSON string");
+  };
+  const value = () => {
+    whitespace();
+    if (source[index] === "{") {
+      index += 1;
+      whitespace();
+      const keys = new Set();
+      if (source[index] === "}") {
+        index += 1;
+        return;
+      }
+      while (index < source.length) {
+        whitespace();
+        if (source[index] !== '"') throw new Error("Expected JSON object key");
+        const key = string();
+        if (keys.has(key)) duplicate = true;
+        keys.add(key);
+        whitespace();
+        if (source[index] !== ":") throw new Error("Expected JSON colon");
+        index += 1;
+        value();
+        whitespace();
+        if (source[index] === "}") {
+          index += 1;
+          return;
+        }
+        if (source[index] !== ",") throw new Error("Expected JSON comma");
+        index += 1;
+      }
+      throw new Error("Unterminated JSON object");
+    }
+    if (source[index] === "[") {
+      index += 1;
+      whitespace();
+      if (source[index] === "]") {
+        index += 1;
+        return;
+      }
+      while (index < source.length) {
+        value();
+        whitespace();
+        if (source[index] === "]") {
+          index += 1;
+          return;
+        }
+        if (source[index] !== ",") throw new Error("Expected JSON array comma");
+        index += 1;
+      }
+      throw new Error("Unterminated JSON array");
+    }
+    if (source[index] === '"') {
+      string();
+      return;
+    }
+    const start = index;
+    while (index < source.length && !/[\s,}\]]/.test(source[index])) index += 1;
+    if (index === start) throw new Error("Expected JSON value");
+  };
+  try {
+    value();
+    whitespace();
+    return duplicate || index !== source.length;
+  } catch {
+    return true;
+  }
+}
+
+function authorizationFor(task, comments) {
+  const markerLinePattern = /(?:^|\n)Task Authorization Envelope V1[ \t]*(?:\n|$)/g;
+  const envelopePattern = /(?:^|\n)Task Authorization Envelope V1\s*```json\s*([\s\S]*?)\s*```/g;
+  const sources = comments.flatMap((comment) => (
+    [...comment.body.matchAll(markerLinePattern)].map(() => comment)
+  ));
+  if (sources.length === 0) return { state: "absent", envelope: null, source: null };
+  if (sources.length !== 1) return { state: "invalid", envelope: null, source: null };
+
+  const source = sources[0];
+  const matches = [...source.body.matchAll(envelopePattern)];
+  if (matches.length !== 1 || hasDuplicateJsonKeys(matches[0][1])) {
+    return { state: "invalid", envelope: null, source: null };
+  }
+  const match = matches[0];
+
+  let envelope;
+  try {
+    envelope = JSON.parse(match[1]);
+  } catch {
+    return { state: "invalid", envelope: null, source: null };
+  }
+  if (!envelope || !Array.isArray(envelope.gates) || !Array.isArray(envelope.actions)) {
+    return { state: "invalid", envelope: null, source: null };
+  }
+
+  const gateIds = new Set();
+  for (const gate of envelope.gates) {
+    if (!gate || !nonEmptyString(gate.id) || gateIds.has(gate.id)
+      || !AUTHORIZATION_GATE_KINDS.has(gate.kind)
+      || !AUTHORIZATION_GATE_STATES.has(gate.state)
+      || !nonEmptyString(gate.scope)) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    if (gate.state === "authorized" && (!nonEmptyString(gate.evidence) || !nonEmptyString(gate.receipt))) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    if (gate.state === "approval_required"
+      && (!nonEmptyString(gate.approver) || !nonEmptyString(gate.approvalRequest))) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    if (gate.state === "denied"
+      && (!nonEmptyString(gate.approver) || !nonEmptyString(gate.evidence) || !nonEmptyString(gate.receipt))) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    if (gate.expiresAt !== undefined
+      && (!nonEmptyString(gate.expiresAt) || Number.isNaN(new Date(gate.expiresAt).getTime()))) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    gateIds.add(gate.id);
+  }
+
+  const actionIds = new Set();
+  for (const action of envelope.actions) {
+    if (!action || !nonEmptyString(action.id) || actionIds.has(action.id)
+      || !Number.isInteger(action.order)
+      || !nonEmptyString(action.text)
+      || !nonEmptyString(action.target)
+      || !AUTHORIZATION_ACTION_STATES.has(action.status)
+      || !nonEmptyString(action.gate)
+      || !gateIds.has(action.gate)) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    actionIds.add(action.id);
+  }
+
+  const recordsDecision = envelope.gates.some((gate) => (
+    gate.state === "authorized" || gate.state === "denied"
+  ));
+  if (recordsDecision && (
+    source.authorType !== "user"
+    || !nonEmptyString(source.authorId)
+    || !task.threadBinding?.threadId
+    || source.threadId !== task.threadBinding.threadId
+  )) {
+    return { state: "invalid", envelope: null, source: null };
+  }
+
+  return {
+    state: "valid",
+    envelope,
+    source: { commentId: source.id, commentVersion: source.version },
+  };
 }
 
 function allAttachments(comments, attachments) {
@@ -167,7 +359,7 @@ function nextActionFor(task, comments, latestRun) {
   };
 }
 
-function readyWorkFor(task, claim, timestamp, execution, comments, latestRun) {
+function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, authorization, requirementsRevision) {
   const reasonCodes = [];
   if (task.archivedAt !== null) reasonCodes.push("TASK_ARCHIVED");
   if (task.status === "backlog") reasonCodes.push("BACKLOG_NOT_ELIGIBLE");
@@ -194,12 +386,83 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun) {
   const state = claimState(claim, timestamp);
   if (state === "active") reasonCodes.push("ACTIVE_CLAIM");
   if (state === "expired_unresolved") reasonCodes.push("EXPIRED_UNRESOLVED_CLAIM");
-  return {
+  const readyWork = {
     state: reasonCodes.length === 0 ? "ready" : "not_ready",
     eligible: reasonCodes.length === 0,
     reasonCodes,
     nextAction: nextActionFor(task, comments, latestRun),
+    safeActions: [],
+    deferredActions: [],
+    approvalRequest: null,
   };
+
+  if (authorization.state === "absent") return readyWork;
+  if (authorization.state === "invalid") {
+    readyWork.state = "not_ready";
+    readyWork.eligible = false;
+    readyWork.reasonCodes.push("AUTHORIZATION_ENVELOPE_INVALID");
+    return readyWork;
+  }
+
+  const gates = new Map(authorization.envelope.gates.map((gate) => {
+    const expired = gate.state === "authorized"
+      && gate.expiresAt
+      && new Date(gate.expiresAt) <= timestamp;
+    if (!expired) return [gate.id, gate];
+    return [gate.id, {
+      ...gate,
+      state: nonEmptyString(gate.approver) && nonEmptyString(gate.approvalRequest)
+        ? "approval_required"
+        : "forbidden",
+      expired: true,
+    }];
+  }));
+  const pendingActions = authorization.envelope.actions
+    .filter((action) => action.status === "pending")
+    .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
+  readyWork.safeActions = pendingActions.filter((action) => gates.get(action.gate).state === "authorized");
+  readyWork.deferredActions = pendingActions.filter((action) => gates.get(action.gate).state !== "authorized");
+
+  if (reasonCodes.length > 0) return readyWork;
+  if (pendingActions.length === 0) {
+    readyWork.state = "not_ready";
+    readyWork.eligible = false;
+    readyWork.reasonCodes.push("AUTHORIZATION_ACTIONS_EXHAUSTED");
+    return readyWork;
+  }
+  if (readyWork.safeActions.length > 0) {
+    readyWork.nextAction = {
+      text: readyWork.safeActions[0].text,
+      source: { type: "authorization_action", actionId: readyWork.safeActions[0].id },
+    };
+    return readyWork;
+  }
+
+  const approvalAction = readyWork.deferredActions.find((action) => (
+    gates.get(action.gate).state === "approval_required"
+  ));
+  if (approvalAction) {
+    const gate = gates.get(approvalAction.gate);
+    readyWork.state = "not_ready";
+    readyWork.eligible = false;
+    readyWork.reasonCodes.push("AUTHORIZATION_REQUIRED");
+    readyWork.approvalRequest = {
+      actionId: approvalAction.id,
+      gateId: gate.id,
+      approver: gate.approver,
+      message: gate.approvalRequest,
+      scope: gate.scope,
+      target: approvalAction.target,
+      expectedResumeToken: null,
+    };
+  } else if (readyWork.deferredActions.length > 0) {
+    readyWork.state = "not_ready";
+    readyWork.eligible = false;
+    readyWork.reasonCodes.push(readyWork.deferredActions.some((action) => (
+      gates.get(action.gate).state === "denied"
+    )) ? "AUTHORIZATION_DENIED" : "AUTHORIZATION_FORBIDDEN");
+  }
+  return readyWork;
 }
 
 export function createTaskCapsule({
@@ -221,10 +484,20 @@ export function createTaskCapsule({
     attachments: orderedAttachments.map((attachment) => [attachment.id, attachment.changeRevision ?? 0]),
   });
   const execution = executionFor(task);
+  const authorization = authorizationFor(task, orderedComments);
   const legacyRun = latestRun ? null : activeRunFor(task, currentClaim, now);
   const activeRun = currentRun ? durableRunFor(currentRun) : legacyRun;
   const projectedLatestRun = latestRun ? durableRunFor(latestRun) : legacyRun;
-  const readyWork = readyWorkFor(task, currentClaim, now, execution, orderedComments, projectedLatestRun);
+  const readyWork = readyWorkFor(
+    task,
+    currentClaim,
+    now,
+    execution,
+    orderedComments,
+    projectedLatestRun,
+    authorization,
+    requirementsRevision,
+  );
   const resumeToken = hash({
     requirementsRevision,
     relations: relationEvidence(task),
@@ -235,11 +508,15 @@ export function createTaskCapsule({
       nextAction: readyWork.nextAction,
       worktree: task.developmentContext,
       workingLog: task.workingLog,
+      authorization,
     },
     run: projectedLatestRun,
     legacyClaim: latestRun ? null : claimEvidence(currentClaim),
     threadBinding: execution.threadBinding,
   });
+  if (readyWork.approvalRequest) {
+    readyWork.approvalRequest.expectedResumeToken = resumeToken;
+  }
   return {
     capsuleVersion: CAPSULE_VERSION,
     requirementsRevision,
@@ -259,6 +536,7 @@ export function createTaskCapsule({
     execution,
     worktree: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     workingLog: task.workingLog,
+    authorization,
     activeRun,
     latestRun: projectedLatestRun,
     readyWork,

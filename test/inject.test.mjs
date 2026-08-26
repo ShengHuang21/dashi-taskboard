@@ -443,6 +443,11 @@ test("cleanup removes observers, listeners, timers and owned DOM", () => {
   assert.match(source, /delete window\[SENTINEL_KEY\]/);
 });
 
+test("coordination bridge forwards the authorized action frontier", () => {
+  assert.match(source, /safeActionId: payload\?\.safeActionId/);
+  assert.match(source, /expectedResumeToken: payload\?\.expectedResumeToken/);
+});
+
 test("host integration stays thin", () => {
   assert.match(source, /new MutationObserver\(scheduleRefresh\)/);
   assert.match(source, /type: "taskboard:host-context"/);

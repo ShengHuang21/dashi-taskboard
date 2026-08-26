@@ -30,7 +30,7 @@ test("connected Codex lanes use the local launcher instead of browser protocol n
 test("a ready Agent Todo can be delivered to the configured Root coordinator", () => {
   assert.match(boardSource, /交给 Root 协调/);
   assert.match(boardSource, /Root 已收到/);
-  assert.match(boardSource, /todo\.readyWork\.eligible && todo\.dispatchTarget !== null && !hasOpenRun/);
+  assert.match(boardSource, /todo\.readyWork\.eligible[\s\S]*?todo\.dispatchTarget !== null[\s\S]*?safeAction !== null[\s\S]*?!hasOpenRun/);
   assert.match(boardSource, /todo\.dispatchTarget!/);
   assert.match(appSource, /type: "taskboard:coordinate-todo"/);
   assert.match(appSource, /onCoordinateTodo=\{coordinateAgentTodo\}/);
@@ -42,6 +42,10 @@ test("a ready Agent Todo can be delivered to the configured Root coordinator", (
   assert.match(coordinateSource, /rootThreadId: target\.rootThreadId/);
   assert.match(coordinateSource, /codexHostId: target\.codexHostId/);
   assert.match(coordinateSource, /targetRoot: target\.worktreePath/);
+  assert.match(coordinateSource, /safeActionId/);
+  assert.match(coordinateSource, /expectedResumeToken: resumeToken/);
+  assert.match(boardSource, /safeAction\?\.id/);
+  assert.match(boardSource, /todo\.readyWork\.resumeToken/);
   assert.doesNotMatch(coordinateSource, /automationProjectContext/);
 });
 
@@ -50,7 +54,8 @@ test("a legacy Agent Todo backlog is not made dispatchable by its Root binding",
     boardSource.indexOf("function TodoCard"),
     boardSource.indexOf("function SubagentCard"),
   );
-  assert.match(todoCardSource, /const canCoordinate = todo\.readyWork\.eligible && todo\.dispatchTarget !== null && !hasOpenRun/);
+  assert.match(todoCardSource, /const safeAction = todo\.readyWork\.safeActions\[0\]/);
+  assert.match(todoCardSource, /const canCoordinate = todo\.readyWork\.eligible[\s\S]*?safeAction !== null[\s\S]*?!hasOpenRun/);
   assert.match(todoCardSource, /todo\.readyWork\.eligible \? "等待领取" : "等待条件满足"/);
   assert.doesNotMatch(todoCardSource, /todo\.state === "ready"/);
 });
@@ -71,6 +76,14 @@ test("Todo cards expose Capsule-backed eligibility, Working Log, and durable Run
   assert.match(boardSource, /snapshot\.attentionQueue/);
   assert.match(boardSource, /setDeliveryState\("idle"\)/);
   assert.doesNotMatch(boardSource, /todo\.evidenceRef|latestWorkingLog/);
+});
+
+test("Todo cards expose safe continuation and exactly one authorization request", () => {
+  assert.match(boardSource, /todo\.readyWork\.safeActions\.length/);
+  assert.match(boardSource, /todo\.readyWork\.deferredActions\.length/);
+  assert.match(boardSource, /todo\.readyWork\.approvalRequest\?\.message/);
+  assert.match(boardSource, /授权请求/);
+  assert.match(boardSource, /安全工作/);
 });
 
 test("the lane board keeps the owner view concise while synchronization stays automatic", () => {

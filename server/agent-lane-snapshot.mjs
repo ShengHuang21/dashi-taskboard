@@ -230,6 +230,11 @@ function taskTodoState(task, readyWork, claim, run) {
 
 function readyWorkForTodo(capsule) {
   const readyWork = capsule?.readyWork;
+  const action = (item) => ({
+    id: text(item?.id),
+    text: compact(item?.text, 120),
+  });
+  const request = readyWork?.approvalRequest;
   return {
     state: readyWork?.state === "ready" ? "ready" : "not_ready",
     eligible: readyWork?.eligible === true,
@@ -237,6 +242,22 @@ function readyWorkForTodo(capsule) {
       ? readyWork.reasonCodes.filter((reason) => typeof reason === "string")
       : ["TASK_CAPSULE_UNAVAILABLE"],
     nextAction: compact(readyWork?.nextAction?.text, 80),
+    safeActions: Array.isArray(readyWork?.safeActions)
+      ? readyWork.safeActions.map(action).filter((item) => item.id && item.text)
+      : [],
+    deferredActions: Array.isArray(readyWork?.deferredActions)
+      ? readyWork.deferredActions.map(action).filter((item) => item.id && item.text)
+      : [],
+    approvalRequest: request?.actionId && request?.message && request?.expectedResumeToken
+      ? {
+        actionId: text(request.actionId),
+        approver: text(request.approver),
+        message: compact(request.message, 240),
+        scope: compact(request.scope, 160),
+        expectedResumeToken: text(request.expectedResumeToken),
+      }
+      : null,
+    resumeToken: text(capsule?.resumeToken),
   };
 }
 
