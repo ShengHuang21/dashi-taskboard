@@ -117,6 +117,86 @@ test("standing authority CLI normalizes a narrow grant and supports list and rev
   assert.equal(calls[2].url, "http://127.0.0.1:47823/api/projects/personal/standing-authorities/authority-1/revoke");
 });
 
+test("coordinator CLI reads, acquires, renews, releases, and audits one exact lease", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({ coordination: { assignment: "unassigned", coordinatorTaskId: null } });
+    }
+    if (url.pathname.endsWith("/receipts")) return response({ receipts: [] });
+    return response({ lease: { id: "lease-1", status: "active" }, receipt: { action: "acquired" } });
+  };
+
+  const status = await run(["coordinator", "status", "personal"], fetchImplementation);
+  const acquired = await run([
+    "coordinator", "acquire", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "none", "--lease-seconds", "60",
+  ], fetchImplementation);
+  const replacedExpired = await run([
+    "coordinator", "acquire", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "expired-lease", "--lease-seconds", "60",
+  ], fetchImplementation);
+  const renewed = await run([
+    "coordinator", "renew", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "lease-1", "--lease-seconds", "120",
+  ], fetchImplementation);
+  const released = await run([
+    "coordinator", "release", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "lease-1",
+  ], fetchImplementation);
+  const receipts = await run(["coordinator", "receipts", "personal"], fetchImplementation);
+
+  for (const result of [status, acquired, replacedExpired, renewed, released, receipts]) {
+    assert.equal(result.exitCode, 0);
+  }
+  assert.deepEqual(status.stdout.coordination, { assignment: "unassigned", coordinatorTaskId: null });
+  assert.deepEqual(calls, [
+    { pathname: "/api/local/projects/personal/agent-lanes", method: "GET", body: null },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: null, leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: "expired-lease", leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: "lease-1", leaseDurationSeconds: 120 },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease/release", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: "lease-1" },
+    },
+    { pathname: "/api/local/projects/personal/coordinator-lease/receipts", method: "GET", body: null },
+  ]);
+});
+
+test("coordinator CLI rejects unsafe duration and incomplete lease identity before network access", async () => {
+  let called = false;
+  const fetchImplementation = async () => {
+    called = true;
+    return response({});
+  };
+  const invalidDuration = await run([
+    "coordinator", "acquire", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "none", "--lease-seconds", "10",
+  ], fetchImplementation);
+  const missingLease = await run([
+    "coordinator", "renew", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root", "--lease-seconds", "60",
+  ], fetchImplementation);
+  assert.equal(invalidDuration.exitCode, 2);
+  assert.equal(missingLease.exitCode, 2);
+  assert.equal(called, false);
+});
+
 test("standing authority CLI rejects unknown and duplicate actions before network access", async () => {
   let called = false;
   for (const actions of ["edit,deploy", "edit,edit"]) {
