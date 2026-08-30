@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { test } from "node:test";
 import vm from "node:vm";
 
@@ -24,6 +26,8 @@ test("the resident injector authenticates its launcher-managed Taskboard service
   assert.match(source, /proof/);
   assert.match(source, /taskboardInstanceSecret/);
   assert.match(source, /Page\.setDocumentContent/);
+  assert.match(source, /<base href=/);
+  assert.match(source, /__CODEX_TASKBOARD_FRAME_CAPABILITY__/);
   assert.match(runtimeSource, /request\.action === "load-frame"/);
   assert.match(supervisorSource, /ensureInFlight/);
   assert.match(supervisorSource, /await terminateManagedChild\(managedChild\)/);
@@ -36,6 +40,15 @@ test("the resident injector authenticates its launcher-managed Taskboard service
 
 test("the CDP bridge accepts service ensure and native task conversation start actions", () => {
   assert.match(source, /const hostBindingName = "__codexTaskboardHostV1"/);
+  assert.match(source, /hostRequestQueueName/);
+  assert.match(source, /async \(\) => \{[\s\S]*?queue\.splice\(0, queue\.length\)/);
+  assert.match(source, /setInterval\(\(\) => void pollHostRequestQueue\(\), 50\)/);
+  assert.match(source, /Fetch\.enable/);
+  assert.match(source, /requestUrl\.startsWith\(`\$\{taskboardBaseUrl\}\//);
+  assert.match(source, /Fetch\.fulfillRequest/);
+  assert.match(source, /access-control-allow-private-network/);
+  assert.match(source, /contextId: activeMainContextId/);
+  assert.match(source, /corsOrigin = browserOrigin === "app:\/\/-" \? "app:\/\/-" : "null"/);
   assert.match(runtimeSource, /request\.action === "ensure"/);
   assert.match(runtimeSource, /request\.action === "start-task-conversation"/);
   assert.match(runtimeSource, /request\.action === "open-external"/);
@@ -86,6 +99,65 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(source, /if \(keepAlive\) await hostBridge\.install\(\)/);
   assert.match(source, /hostBridge\.publishHeartbeat/);
   assert.match(source, /withoutTaskboardLauncherEnvironment\(process\.env\)/);
+});
+
+test("reinstalling the CDP host bridge preserves queued requests", () => {
+  const start = source.indexOf("function initializeHostRequestQueueExpression");
+  const end = source.indexOf("async function applyTaskboardAutomationPolicy", start);
+  assert.notEqual(start, -1, "host queue initializer must exist");
+  assert.notEqual(end, -1, "host queue initializer source boundary must exist");
+  const initializerSource = source.slice(start, end);
+  const initializeHostRequestQueueExpression = vm.runInNewContext(
+    `(() => { ${initializerSource}; return initializeHostRequestQueueExpression; })()`,
+  );
+  const window = {};
+  const context = vm.createContext({ window });
+  vm.runInContext(initializeHostRequestQueueExpression("__queue"), context);
+  window.__queue.push({ id: "queued-before-reinstall" });
+  vm.runInContext(initializeHostRequestQueueExpression("__queue"), context);
+  assert.equal(window.__queue.length, 1);
+  assert.equal(window.__queue[0].id, "queued-before-reinstall");
+});
+
+test("the CDP network proxy preserves arbitrary binary attachment bytes", async (t) => {
+  const start = source.indexOf("function taskboardRequestBody");
+  const end = source.indexOf("async function injectTarget", start);
+  assert.notEqual(start, -1, "binary-safe request body helper must exist");
+  assert.notEqual(end, -1, "proxy helper source boundary must exist");
+  const proxySource = source.slice(start, end);
+  const { proxyTaskboardRequest } = vm.runInNewContext(
+    `(() => { ${proxySource}; return { proxyTaskboardRequest }; })()`,
+    { Buffer, fetch },
+  );
+  const expected = Buffer.from([0x00, 0x7f, 0x80, 0xff, 0x0d, 0x0a, 0x41]);
+  let stored = Buffer.alloc(0);
+  const server = createServer(async (request, response) => {
+    if (request.method === "POST") {
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      stored = Buffer.concat(chunks);
+      response.writeHead(201, { "content-type": "application/octet-stream" });
+      response.end(stored);
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/octet-stream" });
+    response.end(stored);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => server.close());
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const url = `http://127.0.0.1:${address.port}/attachment`;
+  const upload = await proxyTaskboardRequest(url, {
+    method: "POST",
+    postData: expected.toString("utf8"),
+    postDataEntries: [{ bytes: expected.toString("base64") }],
+  }, [["content-type", "application/octet-stream"]]);
+  assert.equal(upload.status, 201);
+  assert.deepEqual(Buffer.from(await upload.arrayBuffer()), expected);
+  const download = await proxyTaskboardRequest(url, { method: "GET" }, []);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), expected);
 });
 
 test("the CDP bridge exposes only the fixed Taskboard automation operations", () => {
@@ -223,6 +295,9 @@ test("attach reconciles the renderer against a hashed current injection source",
   assert.match(source, /Page\.addScriptToEvaluateOnNewDocument/);
   assert.match(source, /reconcileInjectionRuntime/);
   assert.match(source, /expectedSourceHash/);
+  assert.match(source, /async function waitForHostHeartbeat/);
+  assert.match(source, /await waitForHostHeartbeat\(cdp, startupToken\)/);
+  assert.match(source, /if \(shouldRemainOpen && \(!status\.frameReady \|\| !frameLoaded\)\)[\s\S]*?hostBridge\.publishHeartbeat\(\)[\s\S]*?__codexTaskboardInjection__\?\.open\(\)/);
 });
 
 test("the injector ignores auxiliary Codex windows", () => {
@@ -244,4 +319,11 @@ test("the injected iframe follows the configured local service port", () => {
   assert.match(source, /const taskboardBaseUrl = `\$\{taskboardOrigin\}\/\$\{encodeURIComponent\(taskboardInstanceToken\)\}`/);
   assert.match(source, /const taskboardPageUrl = `\$\{taskboardBaseUrl\}\/\?host=codex`/);
   assert.match(source, /window\.__CODEX_TASKBOARD_URL__ = \$\{JSON\.stringify\(taskboardPageUrl\)\}/);
+});
+
+test("native Taskboard opening reuses protected live panel presence", () => {
+  assert.match(source, /createNativeTaskboardPanelOpener/);
+  assert.match(source, /`\$\{taskboardBaseUrl\}\/api\/local\/taskboard-panel-presence`/);
+  assert.match(source, /reusedTaskboardInExistingCodex/);
+  assert.doesNotMatch(source, /`\$\{taskboardOrigin\}\/api\/local\/taskboard-panel-presence`/);
 });

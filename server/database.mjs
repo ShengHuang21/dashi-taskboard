@@ -1,11 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
+import { createTaskCapsule } from "./task-capsule.mjs";
+import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
+const OWNER_DECISION_DELIVERY_TTL_MS = 30_000;
+const OWNER_DECISION_RESPONSE_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -19,6 +23,94 @@ export class ApiError extends Error {
 
 function now() {
   return new Date().toISOString();
+}
+
+function normalizeWorkingLog(workingLog, developmentContext) {
+  if (!workingLog) return null;
+  if (developmentContext?.type !== "worktree" || !developmentContext.path) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "A Working Log requires a task worktree");
+  }
+  if (typeof workingLog.path !== "string" || !path.isAbsolute(workingLog.path)) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "Working Log path must be absolute");
+  }
+  if (!["planned", "active", "blocked", "complete"].includes(workingLog.status)) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "Working Log status is invalid");
+  }
+  const worktreePath = path.resolve(developmentContext.path);
+  const workingLogPath = path.resolve(workingLog.path);
+  const relative = path.relative(worktreePath, workingLogPath);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new ApiError(400, "INVALID_WORKING_LOG", "Working Log path must be inside the task worktree");
+  }
+  return { path: workingLogPath, status: workingLog.status };
+}
+
+function normalizeAgentWriteScope(writeScope, worktreePath) {
+  const pathApi = path.win32.isAbsolute(worktreePath) && !path.posix.isAbsolute(worktreePath)
+    ? path.win32
+    : path.posix;
+  return [...new Set(writeScope.map((item) => {
+    const raw = item.trim();
+    if (
+      path.posix.isAbsolute(raw)
+      || path.win32.isAbsolute(raw)
+      || raw.split(/[\\/]+/).includes("..")
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_AGENT_WRITE_SCOPE",
+        "Agent write scope entries must be relative paths inside the task worktree",
+      );
+    }
+    const normalized = pathApi.normalize(raw.replace(/[\\/]+/g, pathApi.sep));
+    if (
+      normalized === "."
+      || normalized === ".."
+      || normalized.startsWith(`..${pathApi.sep}`)
+      || pathApi.isAbsolute(normalized)
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_AGENT_WRITE_SCOPE",
+        "Agent write scope entries must be relative paths inside the task worktree",
+      );
+    }
+    const resolved = pathApi.resolve(worktreePath, normalized);
+    const relative = pathApi.relative(worktreePath, resolved);
+    if (
+      !relative
+      || relative === ".."
+      || relative.startsWith(`..${pathApi.sep}`)
+      || pathApi.isAbsolute(relative)
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_AGENT_WRITE_SCOPE",
+        "Agent write scope entries must be relative paths inside the task worktree",
+      );
+    }
+    return relative;
+  }))];
+}
+
+function sameThreadBinding(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.threadId === right.threadId
+    && left.codexProjectId === right.codexProjectId
+    && left.codexProjectKind === right.codexProjectKind
+    && left.codexHostId === right.codexHostId
+    && left.workspacePath === right.workspacePath;
+}
+
+function sameDevelopmentContext(left, right) {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.type === right.type
+    && left.path === right.path
+    && left.branch === right.branch
+    && left.repository === right.repository
+    && left.repositoryVerifiedAt === right.repositoryVerifiedAt;
 }
 
 function commentConversationTitle(body) {
@@ -215,7 +307,15 @@ function parseAiChatTodoProgress(row) {
 
 function taskFromRow(row) {
   const developmentContext = row.worktree_path
-    ? { type: "worktree", path: row.worktree_path, branch: row.worktree_branch }
+    ? {
+      type: "worktree",
+      path: row.worktree_path,
+      branch: row.worktree_branch,
+      ...(row.worktree_repository ? { repository: row.worktree_repository } : {}),
+      ...(row.worktree_repository_verified_at
+        ? { repositoryVerifiedAt: row.worktree_repository_verified_at }
+        : {}),
+    }
     : row.git_branch
       ? { type: "branch", branch: row.git_branch }
       : null;
@@ -228,6 +328,7 @@ function taskFromRow(row) {
     status: row.status,
     priority: row.priority,
     labels: JSON.parse(row.labels),
+    workflowProfile: row.workflow_profile ?? "formal",
     sortOrder: row.sort_order,
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
@@ -243,6 +344,13 @@ function taskFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     developmentContext,
+    workingLog: row.working_log_path && row.working_log_status && row.working_log_updated_at
+      ? {
+        path: row.working_log_path,
+        status: row.working_log_status,
+        updatedAt: row.working_log_updated_at,
+      }
+      : null,
     startDate: row.start_date,
     dueDate: row.due_date,
     recurrence: row.recurrence_interval && row.recurrence_unit
@@ -259,15 +367,74 @@ function taskFromRow(row) {
   };
 }
 
+function standingAuthorityFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    repository: row.repository,
+    actions: JSON.parse(row.actions_json),
+    sourceTaskId: row.source_task_id,
+    sourceThreadId: row.source_thread_id,
+    evidence: row.evidence,
+    receipt: row.receipt,
+    recordedBy: { type: row.recorded_by_type, id: row.recorded_by_id, name: row.recorded_by_name },
+    grantedAt: row.granted_at,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    revocationEvidence: row.revocation_evidence,
+    revocationReceipt: row.revocation_receipt,
+    revokedBy: row.revoked_by_type ? {
+      type: row.revoked_by_type, id: row.revoked_by_id, name: row.revoked_by_name,
+    } : null,
+    version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function ownerDecisionReceiptFromRow(row) {
+  return {
+    id: row.id,
+    requestId: row.request_id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    actionId: row.action_id,
+    gateId: row.gate_id,
+    expectedResumeToken: row.expected_resume_token,
+    outcome: row.outcome,
+    rootTaskId: row.root_task_id,
+    rootThreadId: row.root_thread_id,
+    coordinatorEpoch: row.coordinator_epoch,
+    ownerTurnId: row.owner_turn_id,
+    rootDecisionTurnId: row.root_decision_turn_id,
+    evidence: row.evidence,
+    receipt: row.receipt,
+    decidedAt: row.decided_at,
+    deliveryId: row.delivery_id,
+    authorizationCommentId: row.authorization_comment_id,
+    authorizationCommentVersion: row.authorization_comment_version,
+    recordedBy: {
+      type: row.recorded_by_type,
+      id: row.recorded_by_id,
+      name: row.recorded_by_name,
+    },
+    createdAt: row.created_at,
+  };
+}
+
 function taskRelationSummaryFromRow(row) {
   return {
     id: row.id,
     identifier: row.identifier,
+    version: row.version,
     externalKey: row.external_key ?? null,
     projectId: row.project_id,
     title: row.title,
     status: row.status,
     priority: row.priority,
+    labels: JSON.parse(row.labels),
+    startDate: row.start_date,
+    dueDate: row.due_date,
     assignee: {
       type: row.assignee_type,
       id: row.assignee_id,
@@ -275,6 +442,30 @@ function taskRelationSummaryFromRow(row) {
       avatarUrl: row.assignee_avatar_url,
     },
     archivedAt: row.archived_at,
+  };
+}
+
+function taskAgentRunFromRow(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    role: row.role,
+    status: row.status,
+    version: row.version,
+    rootThreadId: row.root_thread_id,
+    agentPath: row.agent_path,
+    agentThreadId: row.agent_thread_id,
+    worktree: {
+      path: row.worktree_path,
+      branch: row.worktree_branch,
+    },
+    writeScope: JSON.parse(row.write_scope_json ?? "[]"),
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+    finishedAt: row.finished_at,
+    summary: row.summary,
+    nextAction: row.next_action,
   };
 }
 
@@ -297,6 +488,60 @@ function commentFromRow(row) {
   };
   Object.defineProperty(comment, "changeRevision", { value: row.change_revision });
   return comment;
+}
+
+function taskInboxDeliveryReceiptFromRow(row) {
+  return {
+    id: row.id,
+    deliveryId: row.delivery_id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    commentId: row.comment_id,
+    sourceThreadId: row.source_thread_id,
+    status: "queued",
+    executionDisposition: "current_execution_continues",
+    createdAt: row.created_at,
+  };
+}
+
+function coordinationAcknowledgementFromRow(row) {
+  return {
+    id: row.id,
+    acknowledgementId: row.acknowledgement_id,
+    eventId: row.event_id,
+    senderThreadId: row.sender_thread_id,
+    senderAgentPath: row.sender_agent_path,
+    createdAt: row.created_at,
+  };
+}
+
+function coordinationEventFromRow(row, acknowledgements = []) {
+  return {
+    eventId: row.event_id,
+    idempotencyKey: row.idempotency_key,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    commentId: row.comment_id,
+    envelope: JSON.parse(row.envelope_json),
+    acknowledgements,
+    createdAt: row.created_at,
+  };
+}
+
+function coordinationCommentBody(envelope) {
+  const evidence = envelope.evidenceRefs.length > 0
+    ? envelope.evidenceRefs.map((reference) => `- ${reference}`).join("\n")
+    : "- none";
+  return [
+    "Agent Handoff",
+    "",
+    `Summary: ${envelope.summary}`,
+    `Blocker: ${envelope.blocker ?? "none"}`,
+    `Next action: ${envelope.nextAction}`,
+    "Evidence:",
+    evidence,
+    `Event: ${envelope.eventId}`,
+  ].join("\n");
 }
 
 function attachmentFromRow(row) {
@@ -418,6 +663,20 @@ function projectPrefix(project) {
   return namePrefix || idPrefix.slice(0, 3);
 }
 
+function activationWorkflowProfileCandidate(row) {
+  return {
+    taskId: row.task_id,
+    identifier: row.identifier,
+    projectId: row.project_id,
+    taskVersion: row.task_version,
+    suggestedProfile: row.suggested_profile,
+    observedLabels: JSON.parse(row.observed_labels),
+    status: row.status,
+    detectedAt: row.detected_at,
+    appliedAt: row.applied_at,
+  };
+}
+
 export class TaskboardDatabase {
   constructor(filename) {
     mkdirSync(path.dirname(filename), { recursive: true });
@@ -450,6 +709,7 @@ export class TaskboardDatabase {
         )),
         priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
         labels TEXT NOT NULL DEFAULT '[]',
+        workflow_profile TEXT NOT NULL DEFAULT 'formal' CHECK (workflow_profile IN ('formal', 'vibe')),
         sort_order REAL NOT NULL,
         thread_id TEXT,
         thread_codex_project_id TEXT,
@@ -467,6 +727,11 @@ export class TaskboardDatabase {
         git_branch TEXT,
         worktree_path TEXT,
         worktree_branch TEXT,
+        worktree_repository TEXT,
+        worktree_repository_verified_at TEXT,
+        working_log_path TEXT,
+        working_log_status TEXT CHECK (working_log_status IN ('planned', 'active', 'blocked', 'complete')),
+        working_log_updated_at TEXT,
         start_date TEXT,
         due_date TEXT,
         recurrence_interval INTEGER,
@@ -482,8 +747,104 @@ export class TaskboardDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS task_activation_workflow_profile_candidates (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        task_version INTEGER NOT NULL CHECK (task_version > 0),
+        suggested_profile TEXT NOT NULL CHECK (suggested_profile = 'vibe'),
+        observed_labels TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied')),
+        detected_at TEXT NOT NULL,
+        applied_at TEXT,
+        applied_by_type TEXT,
+        applied_by_id TEXT,
+        applied_by_name TEXT,
+        task_version_after INTEGER
+      );
+
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at);
+
+      CREATE TABLE IF NOT EXISTS project_standing_authorities (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository TEXT NOT NULL,
+        actions_json TEXT NOT NULL,
+        source_task_id TEXT NOT NULL REFERENCES tasks(id),
+        source_thread_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        receipt TEXT NOT NULL UNIQUE,
+        recorded_by_type TEXT NOT NULL CHECK (recorded_by_type IN ('user', 'agent')),
+        recorded_by_id TEXT NOT NULL,
+        recorded_by_name TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        revocation_evidence TEXT,
+        revocation_receipt TEXT UNIQUE,
+        revoked_by_type TEXT CHECK (revoked_by_type IS NULL OR revoked_by_type IN ('user', 'agent')),
+        revoked_by_id TEXT,
+        revoked_by_name TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS standing_authorities_project_repository
+        ON project_standing_authorities(project_id, repository, revoked_at, expires_at);
+
+      CREATE TABLE IF NOT EXISTS owner_decision_deliveries (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        expected_resume_token TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        codex_host_id TEXT NOT NULL,
+        root_workspace_path TEXT NOT NULL,
+        route_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'delivered')),
+        reservation_expires_at TEXT NOT NULL,
+        decision_expires_at TEXT,
+        claimed_at TEXT NOT NULL,
+        delivered_at TEXT,
+        delivery_turn_id TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS owner_decision_deliveries_request
+        ON owner_decision_deliveries(project_id, request_id, claimed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS task_owner_decision_receipts (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        action_id TEXT NOT NULL,
+        gate_id TEXT NOT NULL,
+        expected_resume_token TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('authorized', 'denied')),
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        owner_turn_id TEXT NOT NULL,
+        root_decision_turn_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        receipt TEXT NOT NULL UNIQUE,
+        decided_at TEXT NOT NULL,
+        delivery_id TEXT NOT NULL UNIQUE REFERENCES owner_decision_deliveries(id),
+        authorization_comment_id TEXT NOT NULL REFERENCES comments(id),
+        authorization_comment_version INTEGER NOT NULL CHECK (authorization_comment_version > 0),
+        recorded_by_type TEXT NOT NULL CHECK (recorded_by_type = 'agent'),
+        recorded_by_id TEXT NOT NULL,
+        recorded_by_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS owner_decisions_task_created
+        ON task_owner_decision_receipts(task_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS owner_decisions_project_created
+        ON task_owner_decision_receipts(project_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
@@ -521,6 +882,110 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS task_activities_task_created
         ON task_activities(task_id, created_at, id);
 
+      CREATE TABLE IF NOT EXISTS agent_lane_projects (
+        project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+        config_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_coordinator_lease_receipts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        lease_id TEXT NOT NULL,
+        holder_task_id TEXT NOT NULL,
+        holder_thread_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('acquired', 'renewed', 'released')),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_coordinator_lease_receipts_project_created
+        ON agent_coordinator_lease_receipts(project_id, created_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS task_inbox_delivery_receipts (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+        source_thread_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, delivery_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS task_inbox_delivery_receipts_task_created
+        ON task_inbox_delivery_receipts(task_id, created_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS task_safe_action_receipts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        resume_token TEXT NOT NULL,
+        safe_action_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        UNIQUE(task_id, resume_token)
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_task_claims (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        agent_path TEXT NOT NULL,
+        agent_thread_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('active', 'completed', 'interrupted')),
+        claimed_at TEXT NOT NULL,
+        lease_expires_at TEXT,
+        write_scope_json TEXT NOT NULL DEFAULT '[]',
+        completed_at TEXT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS agent_task_claims_one_active_thread
+        ON agent_task_claims(project_id, agent_thread_id)
+        WHERE status = 'active';
+
+      CREATE TABLE IF NOT EXISTS task_agent_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('sub_agent')),
+        status TEXT NOT NULL CHECK (status IN (
+          'active', 'blocked', 'completed', 'failed', 'interrupted', 'expired'
+        )),
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        root_thread_id TEXT NOT NULL,
+        agent_path TEXT NOT NULL,
+        agent_thread_id TEXT NOT NULL,
+        worktree_path TEXT NOT NULL,
+        worktree_branch TEXT NOT NULL,
+        write_scope_json TEXT NOT NULL DEFAULT '[]',
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        summary TEXT,
+        next_action TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS task_agent_runs_task_updated
+        ON task_agent_runs(task_id, updated_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS agent_event_receipts (
+        event_id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        comment_id TEXT REFERENCES comments(id) ON DELETE SET NULL,
+        idempotency_key TEXT,
+        envelope_json TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_event_acknowledgements (
+        id TEXT PRIMARY KEY,
+        acknowledgement_id TEXT NOT NULL,
+        event_id TEXT NOT NULL REFERENCES agent_event_receipts(event_id) ON DELETE CASCADE,
+        sender_thread_id TEXT NOT NULL,
+        sender_agent_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(event_id, acknowledgement_id)
+      );
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -628,6 +1093,67 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
 
+    const ownerDecisionDeliveryColumns = this.database.prepare(
+      "PRAGMA table_info(owner_decision_deliveries)",
+    ).all();
+    if (!ownerDecisionDeliveryColumns.some((column) => column.name === "decision_expires_at")) {
+      this.database.exec("ALTER TABLE owner_decision_deliveries ADD COLUMN decision_expires_at TEXT");
+    }
+
+    const agentClaimColumns = this.database.prepare("PRAGMA table_info(agent_task_claims)").all();
+    if (!agentClaimColumns.some((column) => column.name === "lease_expires_at")) {
+      this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN lease_expires_at TEXT");
+    }
+    if (!agentClaimColumns.some((column) => column.name === "write_scope_json")) {
+      this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN write_scope_json TEXT NOT NULL DEFAULT '[]'");
+    }
+
+    const agentEventReceiptColumns = this.database.prepare("PRAGMA table_info(agent_event_receipts)").all();
+    if (!agentEventReceiptColumns.some((column) => column.name === "idempotency_key")) {
+      this.database.exec("ALTER TABLE agent_event_receipts ADD COLUMN idempotency_key TEXT");
+    }
+    if (!agentEventReceiptColumns.some((column) => column.name === "envelope_json")) {
+      this.database.exec("ALTER TABLE agent_event_receipts ADD COLUMN envelope_json TEXT");
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS agent_event_receipts_task_idempotency
+      ON agent_event_receipts(task_id, idempotency_key)
+      WHERE idempotency_key IS NOT NULL
+    `);
+
+    const taskAgentRunColumns = this.database.prepare("PRAGMA table_info(task_agent_runs)").all();
+    if (!taskAgentRunColumns.some((column) => column.name === "project_id")) {
+      this.database.exec("ALTER TABLE task_agent_runs ADD COLUMN project_id TEXT");
+      this.database.exec(`
+        UPDATE task_agent_runs
+        SET project_id = (
+          SELECT tasks.project_id FROM tasks WHERE tasks.id = task_agent_runs.task_id
+        )
+        WHERE project_id IS NULL
+      `);
+    }
+    this.database.exec("DROP INDEX IF EXISTS task_agent_runs_one_active_per_task");
+    const taskAgentRunMigrationTimestamp = now();
+    this.database.prepare(`
+      UPDATE task_agent_runs
+      SET status = 'interrupted', version = version + 1, updated_at = ?, finished_at = ?
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id, ROW_NUMBER() OVER (
+            PARTITION BY task_id
+            ORDER BY updated_at DESC, id DESC
+          ) AS open_run_rank
+          FROM task_agent_runs
+          WHERE status IN ('active', 'blocked')
+        ) WHERE open_run_rank > 1
+      )
+    `).run(taskAgentRunMigrationTimestamp, taskAgentRunMigrationTimestamp);
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS task_agent_runs_one_open_per_task
+      ON task_agent_runs(task_id)
+      WHERE status IN ('active', 'blocked')
+    `);
+
     const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
     const hasWorkflowId = taskColumns.some((column) => column.name === "workflow_id");
     if (hasWorkflowId) {
@@ -677,8 +1203,48 @@ export class TaskboardDatabase {
     if (!taskColumns.some((column) => column.name === "recurrence_unit")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN recurrence_unit TEXT");
     }
+    const legacyWorkflowProfileSchema = !taskColumns.some((column) => column.name === "workflow_profile");
+    if (legacyWorkflowProfileSchema) {
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        const detectedAt = now();
+        const insertCandidate = this.database.prepare(`
+          INSERT OR IGNORE INTO task_activation_workflow_profile_candidates (
+            task_id, task_version, suggested_profile, observed_labels, detected_at
+          ) VALUES (?, ?, 'vibe', ?, ?)
+        `);
+        for (const task of this.database.prepare("SELECT id, version, labels FROM tasks").all()) {
+          const labels = JSON.parse(task.labels);
+          if (labels.includes("vibe-coding") && labels.includes("no-working-log")) {
+            insertCandidate.run(task.id, task.version, JSON.stringify(labels), detectedAt);
+          }
+        }
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      }
+    }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    if (!migratedTaskColumns.some((column) => column.name === "worktree_repository")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN worktree_repository TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "worktree_repository_verified_at")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN worktree_repository_verified_at TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "working_log_path")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_path TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "workflow_profile")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN workflow_profile TEXT NOT NULL DEFAULT 'formal' CHECK (workflow_profile IN ('formal', 'vibe'))");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "working_log_status")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_status TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "working_log_updated_at")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_updated_at TEXT");
+    }
     if (!migratedTaskColumns.some((column) => column.name === "creator_type")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN creator_type TEXT NOT NULL DEFAULT 'user'");
     }
@@ -957,6 +1523,7 @@ export class TaskboardDatabase {
           )),
           priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
           labels TEXT NOT NULL DEFAULT '[]',
+          workflow_profile TEXT NOT NULL DEFAULT 'formal' CHECK (workflow_profile IN ('formal', 'vibe')),
           sort_order REAL NOT NULL,
           thread_id TEXT,
           thread_codex_project_id TEXT,
@@ -977,14 +1544,14 @@ export class TaskboardDatabase {
         );
 
         INSERT INTO tasks_status_migration (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
         )
         SELECT
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, 'formal',
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
@@ -1127,7 +1694,7 @@ export class TaskboardDatabase {
       }
       const insertTask = this.database.prepare(`
         INSERT INTO tasks (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
@@ -1138,7 +1705,7 @@ export class TaskboardDatabase {
           archived_at, version, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, NULL, NULL, NULL, NULL, NULL,
+          'formal', ?, NULL, NULL, NULL, NULL, NULL,
           ?, ?, ?, ?,
           ?, ?, ?, ?,
           NULL, NULL, NULL,
@@ -1775,6 +2342,126 @@ export class TaskboardDatabase {
     }
   }
 
+  getActivationReadiness() {
+    const workflowProfileCandidates = this.database.prepare(`
+      SELECT
+        candidate.*,
+        tasks.identifier,
+        tasks.project_id
+      FROM task_activation_workflow_profile_candidates AS candidate
+      JOIN tasks ON tasks.id = candidate.task_id
+      ORDER BY candidate.detected_at, tasks.identifier
+    `).all().map(activationWorkflowProfileCandidate);
+    const legacyRootBindings = this.database.prepare(`
+      SELECT id, identifier, project_id, version, thread_id
+      FROM tasks
+      WHERE thread_id IS NOT NULL
+        AND (
+          thread_codex_project_id IS NULL
+          OR thread_codex_project_kind IS NULL
+          OR thread_codex_host_id IS NULL
+          OR thread_workspace_path IS NULL
+        )
+      ORDER BY project_id, identifier
+    `).all().map((row) => ({
+      taskId: row.id,
+      identifier: row.identifier,
+      projectId: row.project_id,
+      taskVersion: row.version,
+      legacyLocalThreadId: row.thread_id,
+      repairAction: "coordinator repair-binding",
+    }));
+    return { workflowProfileCandidates, legacyRootBindings };
+  }
+
+  applyActivationWorkflowProfile(id, version, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const candidate = this.database.prepare(`
+        SELECT * FROM task_activation_workflow_profile_candidates WHERE task_id = ?
+      `).get(task.id);
+      if (!candidate) {
+        throw new ApiError(
+          409,
+          "ACTIVATION_CANDIDATE_MISSING",
+          "Workflow profile activation requires a recorded legacy migration candidate",
+        );
+      }
+      if (candidate.status === "applied") {
+        if (candidate.task_version !== version) {
+          throw new ApiError(409, "VERSION_CONFLICT", "Activation replay must use the original candidate version");
+        }
+        this.database.exec("COMMIT");
+        return {
+          applied: false,
+          task: this.getTask(task.id),
+          receipt: {
+            ...activationWorkflowProfileCandidate({
+              ...candidate,
+              identifier: task.identifier,
+              project_id: task.projectId,
+            }),
+            taskVersionBefore: candidate.task_version,
+            taskVersionAfter: candidate.task_version_after,
+            appliedBy: {
+              type: candidate.applied_by_type,
+              id: candidate.applied_by_id,
+              name: candidate.applied_by_name,
+            },
+          },
+        };
+      }
+      this.#requireVersion(task, version);
+      if (candidate.task_version !== version || task.workflowProfile !== "formal") {
+        throw new ApiError(409, "ACTIVATION_CANDIDATE_STALE", "Legacy workflow profile candidate is stale");
+      }
+      const labels = task.labels;
+      if (!labels.includes("vibe-coding") || !labels.includes("no-working-log")) {
+        throw new ApiError(409, "ACTIVATION_CANDIDATE_STALE", "Legacy workflow profile labels changed");
+      }
+      const timestamp = now();
+      const nextVersion = version + 1;
+      this.database.prepare(`
+        UPDATE tasks
+        SET workflow_profile = 'vibe', version = ?, updated_at = ?
+        WHERE id = ? AND version = ? AND workflow_profile = 'formal'
+      `).run(nextVersion, timestamp, task.id, version);
+      this.database.prepare(`
+        UPDATE task_activation_workflow_profile_candidates
+        SET status = 'applied', applied_at = ?, applied_by_type = ?, applied_by_id = ?,
+          applied_by_name = ?, task_version_after = ?
+        WHERE task_id = ? AND status = 'pending'
+      `).run(timestamp, actor.type, actor.id, actor.name, nextVersion, task.id);
+      this.#recordTaskActivity(task.id, actor, [{
+        field: "workflowProfile",
+        before: "formal",
+        after: "vibe",
+      }], timestamp);
+      const appliedCandidate = this.database.prepare(`
+        SELECT * FROM task_activation_workflow_profile_candidates WHERE task_id = ?
+      `).get(task.id);
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        task: this.getTask(task.id),
+        receipt: {
+          ...activationWorkflowProfileCandidate({
+            ...appliedCandidate,
+            identifier: task.identifier,
+            project_id: task.projectId,
+          }),
+          taskVersionBefore: appliedCandidate.task_version,
+          taskVersionAfter: appliedCandidate.task_version_after,
+          appliedBy: { type: actor.type, id: actor.id, name: actor.name },
+        },
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   listTasks(filters) {
     const where = [];
     const values = [];
@@ -1821,6 +2508,703 @@ export class TaskboardDatabase {
     ));
   }
 
+  getAgentLaneProject(projectId) {
+    const row = this.database.prepare(
+      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+    ).get(projectId);
+    return row ? JSON.parse(row.config_json) : null;
+  }
+
+  listAgentLaneProjectIds() {
+    return this.database.prepare("SELECT project_id FROM agent_lane_projects ORDER BY project_id")
+      .all().map((row) => row.project_id);
+  }
+
+  upsertAgentLaneProject(projectId, config) {
+    if (!this.getProject(projectId)) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    this.#assertNoActiveOwnerDecisionDelivery(projectId);
+    const timestamp = now();
+    this.database.prepare(`
+      INSERT INTO agent_lane_projects (project_id, config_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(project_id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at
+    `).run(projectId, JSON.stringify(config), timestamp);
+    return this.getAgentLaneProject(projectId);
+  }
+
+  claimAgentLaneCoordinator(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const config = JSON.parse(row.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId)
+        : null;
+      if (!holder || holder.threadId !== input.holderThreadId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_BINDING_MISMATCH",
+          "Coordinator lease holder must match one configured peer window",
+        );
+      }
+
+      const existing = config.coordinatorLease ?? null;
+      if ((existing?.id ?? null) !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_CONFLICT",
+          "Coordinator lease changed since it was read",
+          { actualLeaseId: existing?.id ?? null },
+        );
+      }
+      const timestamp = now();
+      const active = existing && Date.parse(existing.expiresAt) > Date.parse(timestamp);
+      if (active && existing.holderTaskId !== input.holderTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_ACTIVE",
+          "Another peer window holds the active coordinator lease",
+        );
+      }
+      if (!active) this.#assertNoActiveOwnerDecisionDelivery(projectId);
+
+      const requestedExpiresAt = new Date(
+        Date.parse(timestamp) + input.leaseDurationSeconds * 1000,
+      ).toISOString();
+      const ownerDecisionProtectionExpiresAt = active
+        ? this.#activeOwnerDecisionProtectionExpiresAt(projectId)
+        : null;
+      const expiresAt = ownerDecisionProtectionExpiresAt
+        && Date.parse(ownerDecisionProtectionExpiresAt) >= Date.parse(requestedExpiresAt)
+        ? new Date(Date.parse(ownerDecisionProtectionExpiresAt) + 5_000).toISOString()
+        : requestedExpiresAt;
+      const lease = {
+        id: active ? existing.id : randomUUID(),
+        holderTaskId: input.holderTaskId,
+        acquiredAt: active ? existing.acquiredAt : timestamp,
+        expiresAt,
+      };
+      this.database.prepare(`
+        UPDATE agent_lane_projects
+        SET config_json = ?, updated_at = ?
+        WHERE project_id = ?
+      `).run(JSON.stringify({ ...config, coordinatorLease: lease }), timestamp, projectId);
+      const receipt = this.#insertCoordinatorLeaseReceipt({
+        projectId,
+        leaseId: lease.id,
+        holderTaskId: input.holderTaskId,
+        holderThreadId: input.holderThreadId,
+        action: active ? "renewed" : "acquired",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { lease: { ...lease, status: "active" }, receipt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseAgentLaneCoordinator(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const config = JSON.parse(row.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId)
+        : null;
+      if (!holder || holder.threadId !== input.holderThreadId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_BINDING_MISMATCH",
+          "Coordinator lease holder must match one configured peer window",
+        );
+      }
+
+      const existing = config.coordinatorLease ?? null;
+      if ((existing?.id ?? null) !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_CONFLICT",
+          "Coordinator lease changed since it was read",
+          { actualLeaseId: existing?.id ?? null },
+        );
+      }
+      const timestamp = now();
+      const active = existing && Date.parse(existing.expiresAt) > Date.parse(timestamp);
+      if (!active) {
+        throw new ApiError(409, "COORDINATOR_LEASE_NOT_ACTIVE", "Coordinator lease is not active");
+      }
+      if (existing.holderTaskId !== input.holderTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_ACTIVE",
+          "Another peer window holds the active coordinator lease",
+        );
+      }
+      this.#assertNoActiveOwnerDecisionDelivery(projectId);
+
+      const lease = { ...existing, expiresAt: timestamp };
+      this.database.prepare(`
+        UPDATE agent_lane_projects
+        SET config_json = ?, updated_at = ?
+        WHERE project_id = ?
+      `).run(JSON.stringify({ ...config, coordinatorLease: lease }), timestamp, projectId);
+      const receipt = this.#insertCoordinatorLeaseReceipt({
+        projectId,
+        leaseId: lease.id,
+        holderTaskId: input.holderTaskId,
+        holderThreadId: input.holderThreadId,
+        action: "released",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { lease: { ...lease, status: "expired" }, receipt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  repairLegacyTaskRootBinding(projectId, input, threadBinding, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const laneRow = this.database.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!laneRow) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const config = JSON.parse(laneRow.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId)
+        : null;
+      if (!holder || holder.threadId !== input.holderThreadId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_BINDING_MISMATCH",
+          "Binding repair holder must match one configured peer window",
+        );
+      }
+      const lease = config.coordinatorLease ?? null;
+      if ((lease?.id ?? null) !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_CONFLICT",
+          "Coordinator lease changed since it was read",
+          { actualLeaseId: lease?.id ?? null },
+        );
+      }
+      const timestamp = now();
+      if (!lease || Date.parse(lease.expiresAt) <= Date.parse(timestamp)) {
+        throw new ApiError(409, "COORDINATOR_LEASE_NOT_ACTIVE", "Coordinator lease is not active");
+      }
+      if (lease.holderTaskId !== input.holderTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_ACTIVE",
+          "Another peer window holds the active coordinator lease",
+        );
+      }
+      if (threadBinding.threadId !== input.holderThreadId) {
+        throw new ApiError(409, "COORDINATOR_BINDING_MISMATCH", "Host identity does not match the coordinator thread");
+      }
+
+      const task = this.#requireTask(input.taskId);
+      if (task.projectId !== projectId) {
+        throw new ApiError(409, "TASK_PROJECT_MISMATCH", "Binding repair target belongs to another project");
+      }
+      this.#requireVersion(task, input.taskVersion);
+      if (task.threadBinding) {
+        throw new ApiError(409, "ROOT_BINDING_ALREADY_DURABLE", "Task already has a durable Root binding");
+      }
+      this.#assertNoOpenTaskAgentRunRebinding(task, {}, threadBinding);
+
+      const activityId = randomUUID();
+      const previousThreadId = task.legacyLocalThreadId;
+      const storedBinding = storedThreadBinding(threadBinding, threadBinding.threadId);
+      const updated = this.database.prepare(`
+        UPDATE tasks SET
+          thread_id = ?,
+          thread_codex_project_id = ?,
+          thread_codex_project_kind = ?,
+          thread_codex_host_id = ?,
+          thread_workspace_path = ?,
+          version = version + 1,
+          updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(...storedBinding, timestamp, task.id, input.taskVersion);
+      if (updated.changes !== 1) this.#throwMissingOrConflict(task.id, input.taskVersion);
+      const changes = [
+        { field: "threadBinding", before: null, after: threadBinding },
+        { field: "legacyLocalThreadId", before: previousThreadId, after: null },
+        { field: "coordinatorLeaseId", before: null, after: lease.id },
+      ];
+      this.database.prepare(`
+        INSERT INTO task_activities (
+          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        activityId,
+        task.id,
+        actor.type,
+        actor.id,
+        actor.name,
+        actor.avatarUrl,
+        JSON.stringify(changes),
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        task: this.getTask(task.id),
+        receipt: {
+          id: activityId,
+          taskId: task.id,
+          projectId,
+          leaseId: lease.id,
+          holderTaskId: input.holderTaskId,
+          holderThreadId: input.holderThreadId,
+          previousThreadId,
+          threadBinding,
+          createdAt: timestamp,
+        },
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listAgentLaneCoordinatorReceipts(projectId, limit = 50) {
+    if (!this.getAgentLaneProject(projectId)) {
+      throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+    }
+    return this.database.prepare(`
+      SELECT id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
+      FROM agent_coordinator_lease_receipts
+      WHERE project_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(projectId, limit).map((row) => ({
+      id: row.id,
+      projectId: row.project_id,
+      leaseId: row.lease_id,
+      holderTaskId: row.holder_task_id,
+      holderThreadId: row.holder_thread_id,
+      action: row.action,
+      createdAt: row.created_at,
+    }));
+  }
+
+  #insertCoordinatorLeaseReceipt(input) {
+    const receipt = { id: randomUUID(), ...input };
+    this.database.prepare(`
+      INSERT INTO agent_coordinator_lease_receipts (
+        id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      receipt.id,
+      receipt.projectId,
+      receipt.leaseId,
+      receipt.holderTaskId,
+      receipt.holderThreadId,
+      receipt.action,
+      receipt.createdAt,
+    );
+    return receipt;
+  }
+
+  #assertNoActiveOwnerDecisionDelivery(projectId) {
+    const active = this.database.prepare(`
+      SELECT delivery.id FROM owner_decision_deliveries AS delivery
+      WHERE delivery.project_id = ? AND (
+        (delivery.state = 'reserved' AND delivery.reservation_expires_at > ?)
+        OR (
+          delivery.state = 'delivered'
+          AND delivery.decision_expires_at > ?
+          AND NOT EXISTS (
+            SELECT 1 FROM task_owner_decision_receipts AS receipt
+            WHERE receipt.delivery_id = delivery.id
+          )
+        )
+      )
+      LIMIT 1
+    `).get(projectId, now(), now());
+    if (active) {
+      throw new ApiError(
+        409,
+        "OWNER_DECISION_DELIVERY_ACTIVE",
+        "Coordinator route cannot change while an Owner decision delivery is active or awaiting a response",
+      );
+    }
+  }
+
+  #activeOwnerDecisionProtectionExpiresAt(projectId) {
+    const row = this.database.prepare(`
+      SELECT MAX(
+        CASE
+          WHEN delivery.state = 'reserved' THEN delivery.reservation_expires_at
+          ELSE delivery.decision_expires_at
+        END
+      ) AS protected_until
+      FROM owner_decision_deliveries AS delivery
+      WHERE delivery.project_id = ?
+        AND (
+          (delivery.state = 'reserved' AND delivery.reservation_expires_at > ?)
+          OR (
+            delivery.state = 'delivered'
+            AND delivery.decision_expires_at > ?
+            AND NOT EXISTS (
+              SELECT 1 FROM task_owner_decision_receipts AS receipt
+              WHERE receipt.delivery_id = delivery.id
+            )
+          )
+        )
+    `).get(projectId, now(), now());
+    return row?.protected_until ?? null;
+  }
+
+  getAgentTaskClaim(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    const row = this.database.prepare(
+      "SELECT * FROM agent_task_claims WHERE task_id = ?",
+    ).get(task.id);
+    return row ? {
+      taskId: row.task_id,
+      projectId: row.project_id,
+      agentPath: row.agent_path,
+      agentThreadId: row.agent_thread_id,
+      status: row.status,
+      claimedAt: row.claimed_at,
+      leaseExpiresAt: row.lease_expires_at,
+      writeScope: JSON.parse(row.write_scope_json ?? "[]"),
+      completedAt: row.completed_at,
+    } : null;
+  }
+
+  getTaskAgentRun(id) {
+    const row = this.database.prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(id);
+    return row ? taskAgentRunFromRow(row) : null;
+  }
+
+  getActiveTaskAgentRun(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return this.#taskAgentRunForTask(task.id, ["active"]);
+  }
+
+  getOpenTaskAgentRun(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return this.#taskAgentRunForTask(task.id, ["active", "blocked"]);
+  }
+
+  getLatestTaskAgentRun(taskId) {
+    const task = this.getTask(taskId);
+    if (!task) return null;
+    return this.#taskAgentRunForTask(task.id);
+  }
+
+  claimAgentTask(id, version, { agentPath, agentThreadId = null, leaseExpiresAt, writeScope }) {
+    if (!agentThreadId) {
+      throw new ApiError(400, "AGENT_THREAD_REQUIRED", "A durable Sub-Agent claim requires its thread id");
+    }
+    const leaseDate = typeof leaseExpiresAt === "string" ? new Date(leaseExpiresAt) : null;
+    if (!leaseDate || Number.isNaN(leaseDate.getTime()) || leaseDate <= new Date()) {
+      throw new ApiError(400, "INVALID_AGENT_LEASE", "A durable Sub-Agent claim requires a future lease expiry");
+    }
+    if (
+      !Array.isArray(writeScope)
+      || writeScope.length === 0
+      || writeScope.length > 32
+      || writeScope.some((item) => typeof item !== "string" || !item.trim() || item.length > 240)
+    ) {
+      throw new ApiError(400, "INVALID_AGENT_WRITE_SCOPE", "A durable Sub-Agent claim requires a bounded non-empty write scope");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTask(id);
+      this.#requireVersion(current, version);
+      const rootRun = this.#rootAgentRunBinding(current);
+      const normalizedWriteScope = normalizeAgentWriteScope(writeScope, rootRun.worktreePath);
+      const currentClaim = this.getAgentTaskClaim(current.id);
+      if (current.status === "in_progress" && currentClaim?.status === "active") {
+        if (new Date(currentClaim.leaseExpiresAt) <= new Date()) {
+          throw new ApiError(409, "CLAIM_EXPIRED", "The existing claim lease expired and requires coordinator review");
+        }
+        if (currentClaim.agentPath !== agentPath || currentClaim.agentThreadId !== agentThreadId) {
+          throw new ApiError(409, "CLAIM_CONFLICT", "The task is already claimed by another Sub-Agent");
+        }
+        const timestamp = now();
+        this.database.prepare(`
+          UPDATE agent_task_claims SET lease_expires_at = ?, write_scope_json = ?
+          WHERE task_id = ? AND status = 'active'
+        `).run(leaseExpiresAt, JSON.stringify(normalizedWriteScope), current.id);
+        const openRun = this.getOpenTaskAgentRun(current.id);
+        if (openRun && (
+          openRun.agentPath !== agentPath || openRun.agentThreadId !== agentThreadId
+        )) {
+          throw new ApiError(409, "RUN_CONFLICT", "The task has a durable run owned by another Sub-Agent");
+        }
+        if (openRun) {
+          this.#assertTaskAgentRunBinding(openRun, current, rootRun);
+          this.database.prepare(`
+            UPDATE task_agent_runs
+            SET status = 'active', version = version + 1, updated_at = ?,
+              write_scope_json = ?, finished_at = NULL
+            WHERE id = ?
+          `).run(timestamp, JSON.stringify(normalizedWriteScope), openRun.id);
+        } else {
+          this.#createTaskAgentRun(current, rootRun, agentPath, agentThreadId, normalizedWriteScope, timestamp);
+        }
+        this.database.exec("COMMIT");
+        return {
+          task: this.getTask(current.id),
+          claim: this.getAgentTaskClaim(current.id),
+          run: this.getActiveTaskAgentRun(current.id),
+        };
+      }
+      if (current.status !== "todo") {
+        throw new ApiError(409, "TASK_NOT_READY", "Only a To-Do task can be claimed");
+      }
+      if (this.getOpenTaskAgentRun(current.id)) {
+        throw new ApiError(409, "RUN_CONFLICT", "The task has an unresolved durable Agent Run");
+      }
+      const existing = this.database.prepare(`
+        SELECT task_id FROM agent_task_claims
+        WHERE project_id = ? AND agent_thread_id = ? AND status = 'active' AND task_id <> ?
+      `).get(current.projectId, agentThreadId, current.id);
+      if (existing) {
+        throw new ApiError(
+          409,
+          "AGENT_ALREADY_CLAIMED",
+          "This Sub-Agent thread already has an active task claim",
+        );
+      }
+      const timestamp = now();
+      const result = this.database.prepare(`
+        UPDATE tasks SET status = 'in_progress', version = version + 1, updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(timestamp, current.id, version);
+      if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
+      this.database.prepare(`
+        INSERT INTO agent_task_claims (
+          task_id, project_id, agent_path, agent_thread_id, status, claimed_at,
+          lease_expires_at, write_scope_json, completed_at
+        ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)
+        ON CONFLICT(task_id) DO UPDATE SET
+          agent_path = excluded.agent_path,
+          agent_thread_id = excluded.agent_thread_id,
+          status = 'active', claimed_at = excluded.claimed_at,
+          lease_expires_at = excluded.lease_expires_at,
+          write_scope_json = excluded.write_scope_json, completed_at = NULL
+      `).run(current.id, current.projectId, agentPath, agentThreadId, timestamp, leaseExpiresAt, JSON.stringify(normalizedWriteScope));
+      this.#createTaskAgentRun(current, rootRun, agentPath, agentThreadId, normalizedWriteScope, timestamp);
+      this.database.exec("COMMIT");
+      return {
+        task: this.getTask(current.id),
+        claim: this.getAgentTaskClaim(current.id),
+        run: this.getActiveTaskAgentRun(current.id),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  checkpointTaskAgentRun(id, version, { agentThreadId, status, summary, nextAction }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTaskAgentRun(id);
+      this.#assertAgentRunThread(current, agentThreadId);
+      if (current.status === status && current.summary === summary && current.nextAction === nextAction) {
+        this.database.exec("COMMIT");
+        return { applied: false, run: current, task: this.getTask(current.taskId) };
+      }
+      if (!["active", "blocked"].includes(current.status)) {
+        throw new ApiError(409, "RUN_FINISHED", "A finished Agent Run cannot be checkpointed");
+      }
+      this.#requireAgentRunVersion(current, version);
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE task_agent_runs
+        SET status = ?, version = version + 1, updated_at = ?, summary = ?, next_action = ?
+        WHERE id = ? AND version = ?
+      `).run(status, timestamp, summary, nextAction, current.id, version);
+      this.database.exec("COMMIT");
+      return { applied: true, run: this.getTaskAgentRun(current.id), task: this.getTask(current.taskId) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  finishTaskAgentRun(id, version, { agentThreadId, status, summary, nextAction }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTaskAgentRun(id);
+      this.#assertAgentRunThread(current, agentThreadId);
+      if (current.status === status && current.summary === summary && current.nextAction === nextAction) {
+        this.database.exec("COMMIT");
+        return { applied: false, run: current, task: this.getTask(current.taskId) };
+      }
+      if (!["active", "blocked"].includes(current.status)) {
+        throw new ApiError(409, "RUN_FINISHED", "An Agent Run can only be finished once");
+      }
+      this.#requireAgentRunVersion(current, version);
+      const task = this.#requireTask(current.taskId);
+      const timestamp = now();
+      this.database.prepare(`
+        UPDATE task_agent_runs
+        SET status = ?, version = version + 1, updated_at = ?, finished_at = ?, summary = ?, next_action = ?
+        WHERE id = ? AND version = ?
+      `).run(status, timestamp, timestamp, summary, nextAction, current.id, version);
+      this.database.prepare(`
+        UPDATE agent_task_claims
+        SET status = ?, completed_at = ?
+        WHERE task_id = ? AND status = 'active' AND agent_thread_id = ?
+      `).run(status === "completed" ? "completed" : "interrupted", timestamp, task.id, agentThreadId);
+      if (status === "completed") {
+        const result = this.database.prepare(`
+          UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ?
+          WHERE id = ? AND status = 'in_progress'
+        `).run(timestamp, task.id);
+        if (result.changes !== 1) {
+          throw new ApiError(409, "TASK_NOT_IN_PROGRESS", "Only an in-progress task can be completed by an Agent Run");
+        }
+      }
+      this.database.exec("COMMIT");
+      return { applied: true, run: this.getTaskAgentRun(current.id), task: this.getTask(task.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordAgentTaskProgress(taskId, { eventId, agentThreadId, summary, actor }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTask(taskId);
+      if (current.status !== "in_progress") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "task_not_in_progress" };
+      }
+      const claim = this.getAgentTaskClaim(current.id);
+      if (!claim || claim.status !== "active") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "no_active_claim" };
+      }
+      if (!claim.leaseExpiresAt || new Date(claim.leaseExpiresAt) <= new Date()) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_expired" };
+      }
+      if (!agentThreadId || claim.projectId !== current.projectId || claim.agentThreadId !== agentThreadId) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_mismatch" };
+      }
+      if (this.database.prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "duplicate" };
+      }
+      const timestamp = now();
+      const commentId = randomUUID();
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name,
+          author_avatar_url, version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId, current.id, `Sub-Agent 进展：${summary}`, agentThreadId,
+        actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp, changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(eventId, current.projectId, current.id, commentId, timestamp);
+      this.database.exec("COMMIT");
+      return { applied: true, comment: this.listComments(current.id).at(-1), task: this.getTask(current.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  completeAgentTask(taskId, { eventId, agentThreadId, summary, actor }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.#requireTask(taskId);
+      if (current.status !== "in_progress") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "task_not_in_progress" };
+      }
+      const claim = this.getAgentTaskClaim(current.id);
+      if (!claim || claim.status !== "active") {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "no_active_claim" };
+      }
+      if (!claim.leaseExpiresAt || new Date(claim.leaseExpiresAt) <= new Date()) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_expired" };
+      }
+      if (!agentThreadId || claim.projectId !== current.projectId || claim.agentThreadId !== agentThreadId) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "claim_mismatch" };
+      }
+      const timestamp = now();
+      const commentId = randomUUID();
+      if (this.database.prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
+        this.database.exec("ROLLBACK");
+        return { applied: false, reason: "duplicate" };
+      }
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name,
+          author_avatar_url, version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId, current.id, `Sub-Agent 完成：${summary}`, agentThreadId,
+        actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp, changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(eventId, current.projectId, current.id, commentId, timestamp);
+      const transitioned = this.database.prepare(`
+        UPDATE agent_task_claims SET status = 'completed', completed_at = ?
+        WHERE task_id = ? AND status = 'active' AND agent_thread_id = ?
+      `).run(timestamp, current.id, agentThreadId);
+      if (transitioned.changes !== 1) throw new ApiError(409, "CLAIM_CONFLICT", "Agent claim changed during completion");
+      this.database.prepare(`
+        UPDATE task_agent_runs
+        SET status = 'completed', version = version + 1, updated_at = ?, finished_at = ?, summary = ?
+        WHERE task_id = ? AND status IN ('active', 'blocked') AND agent_thread_id = ?
+      `).run(timestamp, timestamp, summary, current.id, agentThreadId);
+      this.database.prepare(`
+        UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ? WHERE id = ?
+      `).run(timestamp, current.id);
+      this.database.exec("COMMIT");
+      return { applied: true, comment: this.listComments(current.id).at(-1), task: this.getTask(current.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getTask(id) {
     const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
     if (!row) return null;
@@ -1829,6 +3213,509 @@ export class TaskboardDatabase {
     const activities = this.#activitiesForTasks([task.id]).get(task.id) ?? [];
     const previewImage = this.#taskPreviewImages([task.id]).get(task.id) ?? null;
     return attachTaskActivity(task, comments, activities, previewImage);
+  }
+
+  recordTaskWorktreeRepository(taskId, { worktreePath, repository, verifiedAt }) {
+    const task = this.#requireTask(taskId);
+    if (task.developmentContext?.type !== "worktree" || task.developmentContext.path !== worktreePath) {
+      throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree changed during repository verification");
+    }
+    this.database.prepare(`
+      UPDATE tasks
+      SET worktree_repository = ?, worktree_repository_verified_at = ?
+      WHERE id = ? AND worktree_path = ?
+    `).run(repository, verifiedAt, task.id, worktreePath);
+    return this.getTask(task.id);
+  }
+
+  listProjectStandingAuthorities(projectId) {
+    if (!this.getProject(projectId)) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    return this.database.prepare(`
+      SELECT * FROM project_standing_authorities
+      WHERE project_id = ?
+      ORDER BY created_at, id
+    `).all(projectId).map(standingAuthorityFromRow);
+  }
+
+  grantProjectStandingAuthority(projectId, input, actor) {
+    const repository = normalizeRepository(input.repository);
+    const actions = normalizeStandingActions(input.actions);
+    if (!repository || !actions) {
+      throw new ApiError(400, "INVALID_STANDING_AUTHORITY", "Standing authority scope is invalid");
+    }
+    const grantedAt = Date.parse(input.grantedAt);
+    const expiresAt = input.expiresAt === null ? null : Date.parse(input.expiresAt);
+    if (Number.isNaN(grantedAt)
+      || grantedAt > Date.now() + 5 * 60 * 1_000
+      || (expiresAt !== null && (Number.isNaN(expiresAt) || expiresAt <= grantedAt))) {
+      throw new ApiError(400, "INVALID_STANDING_AUTHORITY", "Standing authority time bounds are invalid");
+    }
+    const sourceTask = this.getTask(input.sourceTaskId);
+    if (!sourceTask || sourceTask.projectId !== projectId) {
+      throw new ApiError(409, "STANDING_AUTHORITY_SOURCE_MISMATCH", "Source task must belong to the authority project");
+    }
+    if (!sourceTask.threadBinding || sourceTask.threadBinding.threadId !== input.sourceThreadId) {
+      throw new ApiError(409, "STANDING_AUTHORITY_ROOT_MISMATCH", "Source thread must be the task's confirmed Root");
+    }
+    const existing = this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE receipt = ?
+    `).get(input.receipt);
+    if (existing) {
+      const authority = standingAuthorityFromRow(existing);
+      if (authority.projectId === projectId
+        && authority.repository === repository
+        && JSON.stringify(authority.actions) === JSON.stringify(actions)
+        && authority.sourceTaskId === sourceTask.id
+        && authority.sourceThreadId === input.sourceThreadId
+        && authority.evidence === input.evidence
+        && authority.grantedAt === input.grantedAt
+        && authority.expiresAt === input.expiresAt) {
+        return { created: false, authority };
+      }
+      throw new ApiError(409, "STANDING_AUTHORITY_RECEIPT_CONFLICT", "Receipt is already bound to a different grant");
+    }
+    const id = randomUUID();
+    const timestamp = now();
+    this.database.prepare(`
+      INSERT INTO project_standing_authorities (
+        id, project_id, repository, actions_json, source_task_id, source_thread_id,
+        evidence, receipt, recorded_by_type, recorded_by_id, recorded_by_name,
+        granted_at, expires_at, version, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(
+      id, projectId, repository, JSON.stringify(actions), sourceTask.id, input.sourceThreadId,
+      input.evidence, input.receipt, actor.type, actor.id, actor.name,
+      input.grantedAt, input.expiresAt, timestamp, timestamp,
+    );
+    return { created: true, authority: standingAuthorityFromRow(this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE id = ?
+    `).get(id)) };
+  }
+
+  revokeProjectStandingAuthority(projectId, authorityId, input, actor) {
+    const row = this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE id = ? AND project_id = ?
+    `).get(authorityId, projectId);
+    if (!row) throw new ApiError(404, "STANDING_AUTHORITY_NOT_FOUND", "Standing authority does not exist");
+    const receiptOwner = this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE revocation_receipt = ?
+    `).get(input.receipt);
+    if (receiptOwner) {
+      const authority = standingAuthorityFromRow(receiptOwner);
+      if (authority.id === authorityId && authority.revocationEvidence === input.evidence) {
+        return { changed: false, authority };
+      }
+      throw new ApiError(409, "STANDING_AUTHORITY_RECEIPT_CONFLICT", "Receipt is already bound to a different revocation");
+    }
+    if (row.revoked_at !== null) {
+      throw new ApiError(409, "STANDING_AUTHORITY_ALREADY_REVOKED", "Standing authority is already revoked");
+    }
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE project_standing_authorities SET
+        revoked_at = ?, revocation_evidence = ?, revocation_receipt = ?,
+        revoked_by_type = ?, revoked_by_id = ?, revoked_by_name = ?,
+        version = version + 1, updated_at = ?
+      WHERE id = ? AND revoked_at IS NULL
+    `).run(timestamp, input.evidence, input.receipt, actor.type, actor.id, actor.name, timestamp, authorityId);
+    return { changed: true, authority: standingAuthorityFromRow(this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE id = ?
+    `).get(authorityId)) };
+  }
+
+  listTaskOwnerDecisionReceipts(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM task_owner_decision_receipts
+      WHERE task_id = ?
+      ORDER BY created_at, id
+    `).all(task.id).map(ownerDecisionReceiptFromRow);
+  }
+
+  claimOwnerDecisionDelivery(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(input.taskId);
+      if (task.projectId !== projectId) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision task is not in this project");
+      }
+      const capsule = this.getTaskCapsule(task.id);
+      const request = capsule.readyWork.ownerDecisionRequest;
+      if (!request
+        || request.requestId !== input.requestId
+        || request.expectedResumeToken !== input.expectedResumeToken
+        || request.actionId !== input.actionId) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision request is no longer current");
+      }
+      const route = this.#currentOwnerDecisionRoute(projectId);
+      if (route.coordinatorEpoch !== input.coordinatorEpoch
+        || route.rootTaskId !== input.route.rootTaskId
+        || route.rootThreadId !== input.route.rootThreadId) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before delivery");
+      }
+      const routeKey = createHash("sha256").update(JSON.stringify([
+        task.id,
+        input.requestId,
+        input.expectedResumeToken,
+        input.coordinatorEpoch,
+        input.route.rootTaskId,
+        input.route.rootThreadId,
+        input.route.codexHostId,
+        input.route.rootWorkspacePath,
+      ])).digest("hex");
+      const existing = this.database.prepare(`
+        SELECT * FROM owner_decision_deliveries WHERE route_key = ?
+      `).get(routeKey);
+      const observedAt = now();
+      if (existing?.state === "delivered") {
+        this.database.exec("COMMIT");
+        return {
+          claimed: false,
+          reason: "already-delivered",
+          receipt: { id: existing.id, deliveryTurnId: existing.delivery_turn_id },
+        };
+      }
+      if (existing && Date.parse(existing.reservation_expires_at) > Date.now()) {
+        this.database.exec("COMMIT");
+        return {
+          claimed: false,
+          reason: "reserved",
+          receipt: { id: existing.id, reservationExpiresAt: existing.reservation_expires_at },
+        };
+      }
+      const reservationExpiresAt = new Date(Date.now() + OWNER_DECISION_DELIVERY_TTL_MS).toISOString();
+      this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, reservationExpiresAt);
+      const id = existing?.id ?? randomUUID();
+      if (existing) {
+        this.database.prepare(`
+          UPDATE owner_decision_deliveries SET
+            state = 'reserved', reservation_expires_at = ?, claimed_at = ?,
+            delivered_at = NULL, delivery_turn_id = NULL
+          WHERE id = ?
+        `).run(reservationExpiresAt, observedAt, id);
+      } else {
+        this.database.prepare(`
+          INSERT INTO owner_decision_deliveries (
+            id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
+            root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+            state, reservation_expires_at, claimed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+        `).run(
+          id, input.requestId, task.id, projectId, input.expectedResumeToken,
+          input.coordinatorEpoch, input.route.rootTaskId, input.route.rootThreadId,
+          input.route.codexHostId, input.route.rootWorkspacePath, routeKey,
+          reservationExpiresAt, observedAt,
+        );
+      }
+      this.database.exec("COMMIT");
+      return {
+        claimed: true,
+        receipt: { id, reservationExpiresAt },
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  confirmOwnerDecisionDelivery(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(`
+        SELECT * FROM owner_decision_deliveries WHERE id = ? AND project_id = ?
+      `).get(input.deliveryId, projectId);
+      if (!row) throw new ApiError(409, "OWNER_DECISION_DELIVERY_MISMATCH", "Owner decision delivery does not exist");
+      if (row.state === "delivered") {
+        if (row.delivery_turn_id !== input.deliveryTurnId) {
+          throw new ApiError(409, "OWNER_DECISION_DELIVERY_CONFLICT", "Owner decision delivery is already bound to another Root turn");
+        }
+        if (!row.decision_expires_at) {
+          const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
+          this.#extendCoordinatorLeaseForOwnerDecision(projectId, {
+            coordinatorEpoch: row.coordinator_epoch,
+            rootTaskId: row.root_task_id,
+            rootThreadId: row.root_thread_id,
+          }, decisionExpiresAt);
+          this.database.prepare(`
+            UPDATE owner_decision_deliveries SET decision_expires_at = ? WHERE id = ?
+          `).run(decisionExpiresAt, row.id);
+        }
+        this.database.exec("COMMIT");
+        return { confirmed: true, reused: true, deliveryId: row.id };
+      }
+      if (Date.parse(row.reservation_expires_at) <= Date.now()) {
+        throw new ApiError(409, "OWNER_DECISION_DELIVERY_EXPIRED", "Owner decision delivery reservation expired before confirmation");
+      }
+      const route = this.#currentOwnerDecisionRoute(projectId);
+      if (route.coordinatorEpoch !== row.coordinator_epoch
+        || route.rootTaskId !== row.root_task_id
+        || route.rootThreadId !== row.root_thread_id) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before confirmation");
+      }
+      const timestamp = now();
+      const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
+      this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, decisionExpiresAt);
+      this.database.prepare(`
+        UPDATE owner_decision_deliveries
+        SET state = 'delivered', delivered_at = ?, delivery_turn_id = ?, decision_expires_at = ?
+        WHERE id = ? AND state = 'reserved'
+      `).run(timestamp, input.deliveryTurnId, decisionExpiresAt, row.id);
+      this.database.exec("COMMIT");
+      return { confirmed: true, reused: false, deliveryId: row.id };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #currentOwnerDecisionRoute(projectId) {
+    const config = this.getAgentLaneProject(projectId);
+    if (!config) throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Project has no Agent Lane coordinator");
+    const lease = config.coordinatorLease ?? null;
+    let rootTaskId;
+    let coordinatorEpoch;
+    if (lease) {
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Coordinator lease is not active");
+      }
+      rootTaskId = lease.holderTaskId;
+      coordinatorEpoch = `lease:${lease.id}`;
+    } else {
+      rootTaskId = config.rootTaskId;
+      coordinatorEpoch = `configured:${rootTaskId}`;
+    }
+    const rootLane = Array.isArray(config.tasks)
+      ? config.tasks.find((candidate) => candidate.id === rootTaskId)
+      : null;
+    if (!rootLane?.threadId) {
+      throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Coordinator Root has no confirmed thread route");
+    }
+    return { rootTaskId, rootThreadId: rootLane.threadId, coordinatorEpoch };
+  }
+
+  #extendCoordinatorLeaseForOwnerDecision(projectId, route, protectedUntil) {
+    if (!route.coordinatorEpoch.startsWith("lease:")) return;
+    const config = this.getAgentLaneProject(projectId);
+    const lease = config?.coordinatorLease ?? null;
+    if (!lease
+      || `lease:${lease.id}` !== route.coordinatorEpoch
+      || lease.holderTaskId !== route.rootTaskId) {
+      throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Coordinator lease changed before delivery reservation");
+    }
+    const leaseProtectedUntil = new Date(Date.parse(protectedUntil) + 5_000).toISOString();
+    if (Date.parse(lease.expiresAt) >= Date.parse(leaseProtectedUntil)) return;
+    const timestamp = now();
+    const extendedLease = { ...lease, expiresAt: leaseProtectedUntil };
+    this.database.prepare(`
+      UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
+    `).run(JSON.stringify({ ...config, coordinatorLease: extendedLease }), timestamp, projectId);
+    this.#insertCoordinatorLeaseReceipt({
+      projectId,
+      leaseId: lease.id,
+      holderTaskId: lease.holderTaskId,
+      holderThreadId: route.rootThreadId,
+      action: "renewed",
+      createdAt: timestamp,
+    });
+  }
+
+  recordTaskOwnerDecision(taskId, input, actor) {
+    if (actor.type !== "agent") {
+      throw new ApiError(403, "OWNER_DECISION_ROOT_REQUIRED", "Only the confirmed Codex Root may attest an Owner decision");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const delivery = this.database.prepare(`
+        SELECT * FROM owner_decision_deliveries WHERE id = ?
+      `).get(input.deliveryId);
+      if (!delivery
+        || delivery.state !== "delivered"
+        || delivery.task_id !== task.id
+        || delivery.request_id !== input.requestId
+        || delivery.expected_resume_token !== input.expectedResumeToken
+        || delivery.root_thread_id !== input.rootThreadId) {
+        throw new ApiError(409, "OWNER_DECISION_DELIVERY_REQUIRED", "Decision requires a host-observed exact Root delivery and Owner turn");
+      }
+      const existingRow = this.database.prepare(`
+        SELECT * FROM task_owner_decision_receipts WHERE request_id = ? OR receipt = ?
+      `).get(input.requestId, input.receipt);
+      if (existingRow) {
+        const existing = ownerDecisionReceiptFromRow(existingRow);
+        if (existing.requestId === input.requestId
+          && existing.taskId === task.id
+          && existing.expectedResumeToken === input.expectedResumeToken
+          && existing.outcome === input.outcome
+          && existing.deliveryId === input.deliveryId
+          && existing.rootThreadId === delivery.root_thread_id
+          && existing.coordinatorEpoch === delivery.coordinator_epoch
+          && existing.ownerTurnId === input.ownerTurnId
+          && existing.rootDecisionTurnId === input.rootDecisionTurnId
+          && existing.evidence === input.evidence
+          && existing.receipt === input.receipt
+          && existing.decidedAt === input.decidedAt) {
+          this.database.exec("COMMIT");
+          return { applied: false, receipt: existing, capsule: this.getTaskCapsule(task.id) };
+        }
+        throw new ApiError(409, "OWNER_DECISION_CONFLICT", "Decision request or receipt is already bound to different evidence");
+      }
+      if (!delivery.decision_expires_at || Date.parse(delivery.decision_expires_at) <= Date.now()) {
+        throw new ApiError(409, "OWNER_DECISION_DELIVERY_EXPIRED", "Owner decision response window has expired");
+      }
+      const currentRoute = this.#currentOwnerDecisionRoute(task.projectId);
+      if (currentRoute.rootTaskId !== delivery.root_task_id
+        || currentRoute.rootThreadId !== delivery.root_thread_id
+        || currentRoute.coordinatorEpoch !== delivery.coordinator_epoch) {
+        throw new ApiError(409, "OWNER_DECISION_ROOT_MISMATCH", "Decision delivery no longer matches the active Root route");
+      }
+      const capsule = this.getTaskCapsule(task.id);
+      const request = capsule.readyWork.ownerDecisionRequest;
+      if (!request
+        || request.requestId !== input.requestId
+        || request.expectedResumeToken !== input.expectedResumeToken) {
+        throw new ApiError(409, "OWNER_DECISION_STALE", "Owner decision request is no longer current");
+      }
+      const decidedAt = Date.parse(input.decidedAt);
+      if (Number.isNaN(decidedAt) || decidedAt > Date.now() + 5 * 60 * 1_000) {
+        throw new ApiError(400, "INVALID_OWNER_DECISION", "Decision time is invalid");
+      }
+      const id = randomUUID();
+      const timestamp = now();
+      this.database.prepare(`
+        INSERT INTO task_owner_decision_receipts (
+          id, request_id, task_id, project_id, action_id, gate_id, expected_resume_token,
+          outcome, root_task_id, root_thread_id, coordinator_epoch, owner_turn_id, root_decision_turn_id,
+          evidence, receipt, decided_at, delivery_id, authorization_comment_id, authorization_comment_version,
+          recorded_by_type, recorded_by_id, recorded_by_name, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id, request.requestId, task.id, task.projectId, request.actionId, request.gateId,
+        request.expectedResumeToken, input.outcome, currentRoute.rootTaskId, currentRoute.rootThreadId,
+        currentRoute.coordinatorEpoch, input.ownerTurnId, input.rootDecisionTurnId,
+        input.evidence, input.receipt, input.decidedAt,
+        input.deliveryId,
+        capsule.authorization.source.commentId, capsule.authorization.source.commentVersion,
+        actor.type, actor.id, actor.name, timestamp,
+      );
+      const recorded = ownerDecisionReceiptFromRow(this.database.prepare(`
+        SELECT * FROM task_owner_decision_receipts WHERE id = ?
+      `).get(id));
+      this.database.exec("COMMIT");
+      return { applied: true, receipt: recorded, capsule: this.getTaskCapsule(task.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskCapsule(id) {
+    const task = this.getTask(id);
+    if (!task) return null;
+    return createTaskCapsule({
+      task,
+      comments: this.listComments(task.id),
+      attachments: this.listAttachments(task.id),
+      inboxReceipts: this.listTaskInboxDeliveryReceipts(task.id),
+      coordinationEvents: this.listTaskCoordinationEvents(task.id),
+      currentClaim: this.getAgentTaskClaim(task.id),
+      currentRun: this.getActiveTaskAgentRun(task.id),
+      latestRun: this.getLatestTaskAgentRun(task.id),
+      standingAuthorities: this.listProjectStandingAuthorities(task.projectId),
+      ownerDecisionReceipts: this.listTaskOwnerDecisionReceipts(task.id),
+    });
+  }
+
+  claimTaskSafeAction(id, { rootThreadId, expectedResumeToken, safeActionId }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const capsule = this.getTaskCapsule(task.id);
+      if (capsule.execution.threadBinding?.threadId !== rootThreadId) {
+        throw new ApiError(409, "ROOT_THREAD_MISMATCH", "Bootstrap claim must match the exact configured Root thread");
+      }
+      if (capsule.resumeToken !== expectedResumeToken) {
+        throw new ApiError(409, "RESUME_TOKEN_MISMATCH", "Task Capsule changed before bootstrap claim");
+      }
+      if (capsule.readyWork.eligible !== true || capsule.readyWork.safeActions.length === 0) {
+        throw new ApiError(409, "SAFE_ACTION_NOT_READY", "Task Capsule has no eligible safe action");
+      }
+      if (capsule.readyWork.safeActions[0].id !== safeActionId) {
+        throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap claim must match the first authorized safe action");
+      }
+
+      const existing = this.database.prepare(`
+        SELECT * FROM task_safe_action_receipts
+        WHERE task_id = ? AND resume_token = ?
+      `).get(task.id, expectedResumeToken);
+      if (existing) {
+        this.database.exec("COMMIT");
+        return { receipt: this.#taskSafeActionReceipt(existing), reused: true };
+      }
+
+      const receipt = {
+        id: randomUUID(),
+        taskId: task.id,
+        projectId: task.projectId,
+        resumeToken: expectedResumeToken,
+        safeActionId,
+        rootThreadId,
+        claimedAt: now(),
+      };
+      this.database.prepare(`
+        INSERT INTO task_safe_action_receipts (
+          id, task_id, project_id, resume_token, safe_action_id, root_thread_id, claimed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        receipt.id,
+        receipt.taskId,
+        receipt.projectId,
+        receipt.resumeToken,
+        receipt.safeActionId,
+        receipt.rootThreadId,
+        receipt.claimedAt,
+      );
+      this.database.exec("COMMIT");
+      return { receipt, reused: false };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  confirmTaskSafeActionDelivery(id, { rootThreadId, expectedResumeToken, safeActionId }) {
+    const task = this.#requireTask(id);
+    const capsule = this.getTaskCapsule(task.id);
+    if (capsule.execution.threadBinding?.threadId !== rootThreadId) {
+      throw new ApiError(409, "ROOT_THREAD_MISMATCH", "Bootstrap delivery must match the exact configured Root thread");
+    }
+    if (capsule.resumeToken !== expectedResumeToken) {
+      throw new ApiError(409, "RESUME_TOKEN_MISMATCH", "Task Capsule changed before bootstrap delivery");
+    }
+    if (capsule.readyWork.eligible !== true || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
+      throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap delivery must match the current first safe action");
+    }
+    const row = this.database.prepare(`
+      SELECT * FROM task_safe_action_receipts
+      WHERE task_id = ? AND resume_token = ? AND safe_action_id = ? AND root_thread_id = ?
+    `).get(task.id, expectedResumeToken, safeActionId, rootThreadId);
+    if (!row) {
+      throw new ApiError(409, "SAFE_ACTION_RECEIPT_MISSING", "Bootstrap delivery requires an existing reservation receipt");
+    }
+    return { confirmed: true, receipt: this.#taskSafeActionReceipt(row) };
+  }
+
+  #taskSafeActionReceipt(row) {
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      projectId: row.project_id,
+      resumeToken: row.resume_token,
+      safeActionId: row.safe_action_id,
+      rootThreadId: row.root_thread_id,
+      claimedAt: row.claimed_at,
+    };
   }
 
   createTask(input) {
@@ -1864,6 +3751,7 @@ export class TaskboardDatabase {
       const identifier = `${prefix}-${number}`;
       const id = randomUUID();
       const timestamp = now();
+      const workingLog = normalizeWorkingLog(input.workingLog, input.developmentContext);
       let sortOrder = input.sortOrder;
       if (sortOrder === undefined) {
         const row = this.database.prepare(`
@@ -1884,15 +3772,16 @@ export class TaskboardDatabase {
       );
       this.database.prepare(`
         INSERT INTO tasks (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
-          git_branch, worktree_path, worktree_branch,
+          git_branch, worktree_path, worktree_branch, worktree_repository, worktree_repository_verified_at,
+          working_log_path, working_log_status, working_log_updated_at,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -1902,6 +3791,7 @@ export class TaskboardDatabase {
         input.status,
         input.priority,
         JSON.stringify(input.labels),
+        input.workflowProfile ?? "formal",
         sortOrder,
         ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
         input.actor.type,
@@ -1915,6 +3805,11 @@ export class TaskboardDatabase {
         input.developmentContext?.type === "branch" ? input.developmentContext.branch : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.path : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.branch : null,
+        input.developmentContext?.type === "worktree" ? input.developmentContext.repository ?? null : null,
+        input.developmentContext?.type === "worktree" ? input.developmentContext.repositoryVerifiedAt ?? null : null,
+        workingLog?.path ?? null,
+        workingLog?.status ?? null,
+        workingLog ? timestamp : null,
         input.startDate,
         input.dueDate,
         input.recurrence?.interval ?? null,
@@ -1933,6 +3828,16 @@ export class TaskboardDatabase {
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
+    const effectiveDevelopmentContext = Object.hasOwn(changes, "developmentContext")
+      ? changes.developmentContext
+      : current.developmentContext;
+    const effectiveWorkingLog = Object.hasOwn(changes, "workingLog")
+      ? changes.workingLog
+      : current.workingLog;
+    if (effectiveWorkingLog) {
+      const normalizedWorkingLog = normalizeWorkingLog(effectiveWorkingLog, effectiveDevelopmentContext);
+      if (Object.hasOwn(changes, "workingLog")) changes.workingLog = normalizedWorkingLog;
+    }
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
       ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
@@ -1976,24 +3881,43 @@ export class TaskboardDatabase {
       status: "status",
       priority: "priority",
       labels: "labels",
+      workflowProfile: "workflow_profile",
       startDate: "start_date",
       dueDate: "due_date",
     };
     const assignments = [];
     const values = [];
+    const timestamp = now();
     for (const [key, value] of Object.entries(changes)) {
       if (key === "developmentContext") {
-        assignments.push("git_branch = ?", "worktree_path = ?", "worktree_branch = ?");
+        assignments.push(
+          "git_branch = ?",
+          "worktree_path = ?",
+          "worktree_branch = ?",
+          "worktree_repository = ?",
+          "worktree_repository_verified_at = ?",
+        );
         values.push(
           value?.type === "branch" ? value.branch : null,
           value?.type === "worktree" ? value.path : null,
           value?.type === "worktree" ? value.branch : null,
+          value?.type === "worktree" ? value.repository ?? null : null,
+          value?.type === "worktree" ? value.repositoryVerifiedAt ?? null : null,
         );
         continue;
       }
       if (key === "recurrence") {
         assignments.push("recurrence_interval = ?", "recurrence_unit = ?");
         values.push(value?.interval ?? null, value?.unit ?? null);
+        continue;
+      }
+      if (key === "workingLog") {
+        assignments.push(
+          "working_log_path = ?",
+          "working_log_status = ?",
+          "working_log_updated_at = ?",
+        );
+        values.push(value?.path ?? null, value?.status ?? null, value ? timestamp : null);
         continue;
       }
       if (key === "assignee") {
@@ -2019,7 +3943,9 @@ export class TaskboardDatabase {
       assignments.push("sort_order = ?");
       values.push(row.minimum === null ? 1000 : row.minimum - 1000);
     }
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     if (storedBinding && !Object.hasOwn(changes, "projectId")) {
       assignments.push(
         "thread_id = ?",
@@ -2031,11 +3957,11 @@ export class TaskboardDatabase {
       values.push(...storedBinding);
     }
     assignments.push("version = version + 1", "updated_at = ?");
-    const timestamp = now();
     values.push(timestamp, current.id, version);
 
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, changes, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks SET ${assignments.join(", ")} WHERE id = ? AND version = ?
       `).run(...values);
@@ -2058,6 +3984,9 @@ export class TaskboardDatabase {
         this.database.prepare(`
           UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?
         `).run(JSON.stringify(mergedLabels), timestamp, destinationProjectId);
+      }
+      if (current.status === "in_progress" && changes.status && changes.status !== "in_progress") {
+        this.#interruptTaskAgentExecution(current.id, timestamp);
       }
       this.#recordTaskActivity(current.id, actor, activityChanges, timestamp);
       this.database.exec("COMMIT");
@@ -2091,13 +4020,16 @@ export class TaskboardDatabase {
     }
 
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks
         SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
@@ -2105,6 +4037,9 @@ export class TaskboardDatabase {
       `).run(status, sortOrder, ...(storedBinding ?? []), timestamp, current.id, version);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
+      }
+      if (current.status === "in_progress" && status !== "in_progress") {
+        this.#interruptTaskAgentExecution(current.id, timestamp);
       }
       this.#recordTaskActivity(
         current.id,
@@ -2124,13 +4059,16 @@ export class TaskboardDatabase {
     const current = this.#requireTask(id);
     this.#requireVersion(current, version);
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks
         SET archived_at = ?, ${threadAssignment} version = version + 1, updated_at = ?
@@ -2139,6 +4077,7 @@ export class TaskboardDatabase {
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
+      this.#interruptTaskAgentExecution(current.id, timestamp);
       this.#recordTaskActivity(
         current.id,
         actor,
@@ -2160,13 +4099,16 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be restored");
     }
     const timestamp = now();
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
       const result = this.database.prepare(`
         UPDATE tasks
         SET archived_at = NULL, ${threadAssignment} version = version + 1, updated_at = ?
@@ -2437,6 +4379,321 @@ export class TaskboardDatabase {
       throw error;
     }
     return this.getComment(id);
+  }
+
+  deliverTaskInboxMessage(taskId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const existing = this.database.prepare(`
+        SELECT * FROM task_inbox_delivery_receipts
+        WHERE task_id = ? AND delivery_id = ?
+      `).get(task.id, input.deliveryId);
+      if (existing) {
+        const receipt = taskInboxDeliveryReceiptFromRow(existing);
+        const comment = this.getComment(receipt.commentId);
+        const incomingBinding = storedThreadBinding(input.threadBinding, input.threadId);
+        const existingBinding = [
+          comment.threadBinding?.threadId ?? comment.threadId ?? comment.legacyLocalThreadId ?? null,
+          comment.threadBinding?.codexProjectId ?? null,
+          comment.threadBinding?.codexProjectKind ?? null,
+          comment.threadBinding?.codexHostId ?? null,
+          comment.threadBinding?.workspacePath ?? null,
+        ];
+        const actorMatches = (
+          comment.authorType === input.actor.type
+          && comment.authorId === input.actor.id
+          && comment.authorName === input.actor.name
+          && comment.authorAvatarUrl === input.actor.avatarUrl
+        );
+        if (
+          comment.body !== input.body
+          || receipt.sourceThreadId !== input.threadId
+          || JSON.stringify(existingBinding) !== JSON.stringify(incomingBinding)
+          || !actorMatches
+        ) {
+          throw new ApiError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            "Inbox delivery id is already bound to a different message",
+          );
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, receipt, comment };
+      }
+
+      const timestamp = now();
+      const commentId = randomUUID();
+      const receiptId = randomUUID();
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
+          thread_codex_host_id, thread_workspace_path,
+          author_type, author_id, author_name, author_avatar_url,
+          version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId,
+        task.id,
+        input.body,
+        ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
+        input.actor.type,
+        input.actor.id,
+        input.actor.name,
+        input.actor.avatarUrl,
+        timestamp,
+        timestamp,
+        changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO task_inbox_delivery_receipts (
+          id, delivery_id, task_id, project_id, comment_id, source_thread_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        receiptId,
+        input.deliveryId,
+        task.id,
+        task.projectId,
+        commentId,
+        input.threadId,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        receipt: this.getTaskInboxDeliveryReceipt(receiptId),
+        comment: this.getComment(commentId),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskInboxDeliveryReceipt(id) {
+    const row = this.database.prepare(
+      "SELECT * FROM task_inbox_delivery_receipts WHERE id = ?",
+    ).get(id);
+    return row ? taskInboxDeliveryReceiptFromRow(row) : null;
+  }
+
+  listTaskInboxDeliveryReceipts(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM task_inbox_delivery_receipts
+      WHERE task_id = ?
+      ORDER BY created_at DESC, rowid DESC
+    `).all(task.id).map(taskInboxDeliveryReceiptFromRow);
+  }
+
+  appendTaskCoordinationEvent(taskId, envelope, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const serializedEnvelope = JSON.stringify(envelope);
+      const existing = this.database.prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+        LIMIT 1
+      `).get(envelope.eventId, task.id, envelope.idempotencyKey);
+      if (existing) {
+        if (existing.task_id !== task.id || existing.envelope_json !== serializedEnvelope) {
+          throw new ApiError(
+            409,
+            "COORDINATION_EVENT_CONFLICT",
+            "The event or idempotency key is already bound to different handoff content",
+          );
+        }
+        const event = this.getTaskCoordinationEvent(existing.event_id);
+        this.database.exec("COMMIT");
+        return { applied: false, event, comment: this.getComment(existing.comment_id) };
+      }
+
+      const parentTaskId = task.relations.parent?.id ?? null;
+      if (envelope.parentTaskId !== parentTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATION_PARENT_MISMATCH",
+          "The envelope parent must match the task's durable parent relation",
+          { actualParentTaskId: parentTaskId },
+        );
+      }
+      const claim = this.getAgentTaskClaim(task.id);
+      if (
+        task.status !== "in_progress"
+        || claim?.status !== "active"
+        || !claim.leaseExpiresAt
+        || Date.parse(claim.leaseExpiresAt) <= Date.now()
+      ) {
+        throw new ApiError(409, "COORDINATION_CLAIM_NOT_ACTIVE", "A handoff requires an active execution claim");
+      }
+      if (
+        claim.agentThreadId !== envelope.senderThreadId
+        || claim.agentPath !== envelope.senderAgentPath
+      ) {
+        throw new ApiError(
+          409,
+          "COORDINATION_SENDER_MISMATCH",
+          "The handoff sender must match the active execution claim",
+        );
+      }
+      const previous = this.database.prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND envelope_json IS NOT NULL
+        ORDER BY created_at DESC, rowid DESC
+      `).all(task.id)
+        .map((row) => JSON.parse(row.envelope_json))
+        .find((candidate) => candidate.senderAgentPath === envelope.senderAgentPath);
+      if (previous && envelope.sequence <= previous.sequence) {
+        throw new ApiError(
+          409,
+          "COORDINATION_SEQUENCE_CONFLICT",
+          "The handoff sequence must advance for this sender",
+          { previousSequence: previous.sequence },
+        );
+      }
+
+      const timestamp = now();
+      const commentId = randomUUID();
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name,
+          author_avatar_url, version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId,
+        task.id,
+        coordinationCommentBody(envelope),
+        envelope.senderThreadId,
+        actor.type,
+        actor.id,
+        actor.name,
+        actor.avatarUrl,
+        timestamp,
+        timestamp,
+        changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO agent_event_receipts (
+          event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        envelope.eventId,
+        task.projectId,
+        task.id,
+        commentId,
+        envelope.idempotencyKey,
+        serializedEnvelope,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        event: this.getTaskCoordinationEvent(envelope.eventId),
+        comment: this.getComment(commentId),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskCoordinationEvent(eventId) {
+    const row = this.database.prepare(`
+      SELECT * FROM agent_event_receipts
+      WHERE event_id = ? AND envelope_json IS NOT NULL
+    `).get(eventId);
+    if (!row) return null;
+    const acknowledgements = this.database.prepare(`
+      SELECT * FROM agent_event_acknowledgements
+      WHERE event_id = ?
+      ORDER BY created_at, rowid
+    `).all(eventId).map(coordinationAcknowledgementFromRow);
+    return coordinationEventFromRow(row, acknowledgements);
+  }
+
+  listTaskCoordinationEvents(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM agent_event_receipts
+      WHERE task_id = ? AND envelope_json IS NOT NULL
+      ORDER BY created_at, rowid
+    `).all(task.id).map((row) => this.getTaskCoordinationEvent(row.event_id));
+  }
+
+  acknowledgeTaskCoordinationEvent(eventId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? AND envelope_json IS NOT NULL
+      `).get(eventId);
+      if (!row) {
+        throw new ApiError(404, "COORDINATION_EVENT_NOT_FOUND", `Coordination event '${eventId}' does not exist`);
+      }
+      const envelope = JSON.parse(row.envelope_json);
+      if (!envelope.requiresAck) {
+        throw new ApiError(409, "COORDINATION_ACK_NOT_REQUIRED", "This handoff does not require acknowledgement");
+      }
+      const task = this.#requireTask(row.task_id);
+      if (
+        input.senderAgentPath !== "/root"
+        || !task.threadBinding
+        || task.threadBinding.threadId !== input.senderThreadId
+      ) {
+        throw new ApiError(
+          409,
+          "COORDINATION_ACK_SENDER_MISMATCH",
+          "Acknowledgement must come from the task's exactly bound Root",
+        );
+      }
+      const existing = this.database.prepare(`
+        SELECT * FROM agent_event_acknowledgements WHERE event_id = ?
+      `).get(eventId);
+      if (existing) {
+        if (
+          existing.acknowledgement_id !== input.acknowledgementId
+          || existing.sender_thread_id !== input.senderThreadId
+          || existing.sender_agent_path !== input.senderAgentPath
+        ) {
+          throw new ApiError(
+            409,
+            "COORDINATION_ACK_CONFLICT",
+            "This handoff already has a different acknowledgement",
+          );
+        }
+        const acknowledgement = coordinationAcknowledgementFromRow(existing);
+        this.database.exec("COMMIT");
+        return { applied: false, acknowledgement };
+      }
+      const acknowledgement = {
+        id: randomUUID(),
+        acknowledgementId: input.acknowledgementId,
+        eventId,
+        senderThreadId: input.senderThreadId,
+        senderAgentPath: input.senderAgentPath,
+        createdAt: now(),
+      };
+      this.database.prepare(`
+        INSERT INTO agent_event_acknowledgements (
+          id, acknowledgement_id, event_id, sender_thread_id, sender_agent_path, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        acknowledgement.id,
+        acknowledgement.acknowledgementId,
+        acknowledgement.eventId,
+        acknowledgement.senderThreadId,
+        acknowledgement.senderAgentPath,
+        acknowledgement.createdAt,
+      );
+      this.database.exec("COMMIT");
+      return { applied: true, acknowledgement };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   getComment(id) {
@@ -2825,7 +5082,12 @@ export class TaskboardDatabase {
   }
 
   #touchTask(id, version, threadId, threadBinding, timestamp) {
-    const storedBinding = storedThreadBinding(threadBinding, threadId);
+    const current = this.#requireTask(id);
+    this.#requireVersion(current, version);
+    this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
+    const storedBinding = threadBinding === undefined
+      ? undefined
+      : storedThreadBinding(threadBinding, threadId);
     const threadAssignment = storedBinding
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
@@ -2837,6 +5099,125 @@ export class TaskboardDatabase {
     `).run(...(storedBinding ?? []), timestamp, id, version);
     if (result.changes !== 1) {
       this.#throwMissingOrConflict(id, version);
+    }
+  }
+
+  #rootAgentRunBinding(task) {
+    const binding = task.threadBinding;
+    if (!binding) {
+      throw new ApiError(409, "ROOT_THREAD_BINDING_REQUIRED", "A durable Agent Run requires a full task Root binding");
+    }
+    const worktree = task.developmentContext;
+    if (worktree?.type !== "worktree" || !worktree.path || !worktree.branch) {
+      throw new ApiError(409, "ROOT_WORKTREE_REQUIRED", "A durable Agent Run requires a task worktree and branch");
+    }
+    return {
+      projectId: task.projectId,
+      rootThreadId: binding.threadId,
+      rootWorkspacePath: binding.workspacePath,
+      worktreePath: worktree.path,
+      worktreeBranch: worktree.branch,
+    };
+  }
+
+  #createTaskAgentRun(task, rootRun, agentPath, agentThreadId, writeScope, timestamp) {
+    this.database.prepare(`
+      INSERT INTO task_agent_runs (
+        id, task_id, project_id, role, status, version, root_thread_id, agent_path, agent_thread_id,
+        worktree_path, worktree_branch, write_scope_json, started_at, updated_at,
+        finished_at, summary, next_action
+      ) VALUES (?, ?, ?, 'sub_agent', 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+    `).run(
+      randomUUID(),
+      task.id,
+      rootRun.projectId,
+      rootRun.rootThreadId,
+      agentPath,
+      agentThreadId,
+      rootRun.worktreePath,
+      rootRun.worktreeBranch,
+      JSON.stringify(writeScope),
+      timestamp,
+      timestamp,
+    );
+  }
+
+  #taskAgentRunForTask(taskId, statuses = null) {
+    const statusClause = statuses ? ` AND status IN (${statuses.map(() => "?").join(", ")})` : "";
+    const row = this.database.prepare(`
+      SELECT * FROM task_agent_runs
+      WHERE task_id = ?${statusClause}
+      ORDER BY updated_at DESC, id DESC
+      LIMIT 1
+    `).get(taskId, ...(statuses ?? []));
+    return row ? taskAgentRunFromRow(row) : null;
+  }
+
+  #assertNoOpenTaskAgentRunRebinding(task, changes, threadBinding) {
+    const run = this.#taskAgentRunForTask(task.id, ["active", "blocked"]);
+    if (!run) return null;
+    const projectChanged = Object.hasOwn(changes, "projectId") && changes.projectId !== task.projectId;
+    const worktreeChanged = Object.hasOwn(changes, "developmentContext")
+      && !sameDevelopmentContext(changes.developmentContext, task.developmentContext);
+    const rootChanged = threadBinding !== undefined && !sameThreadBinding(threadBinding, task.threadBinding);
+    if (projectChanged || worktreeChanged || rootChanged) {
+      throw new ApiError(
+        409,
+        "RUN_REBIND_CONFLICT",
+        "Root, worktree, and project bindings cannot change while an Agent Run is open",
+      );
+    }
+    return run;
+  }
+
+  #assertTaskAgentRunBinding(run, task, rootRun) {
+    if (
+      run.taskId !== task.id
+      || run.projectId !== rootRun.projectId
+      || run.rootThreadId !== rootRun.rootThreadId
+      || run.worktree.path !== rootRun.worktreePath
+      || run.worktree.branch !== rootRun.worktreeBranch
+    ) {
+      throw new ApiError(
+        409,
+        "RUN_BINDING_STALE",
+        "The durable Agent Run no longer matches the task Root, worktree, or project binding",
+      );
+    }
+  }
+
+  #interruptTaskAgentExecution(taskId, timestamp) {
+    this.database.prepare(`
+      UPDATE agent_task_claims SET status = 'interrupted', completed_at = ?
+      WHERE task_id = ? AND status = 'active'
+    `).run(timestamp, taskId);
+    this.database.prepare(`
+      UPDATE task_agent_runs
+      SET status = 'interrupted', version = version + 1, updated_at = ?, finished_at = ?
+      WHERE task_id = ? AND status IN ('active', 'blocked')
+    `).run(timestamp, timestamp, taskId);
+  }
+
+  #requireTaskAgentRun(id) {
+    const run = this.getTaskAgentRun(id);
+    if (!run) {
+      throw new ApiError(404, "AGENT_RUN_NOT_FOUND", `Agent Run '${id}' does not exist`);
+    }
+    return run;
+  }
+
+  #assertAgentRunThread(run, agentThreadId) {
+    if (!agentThreadId || run.agentThreadId !== agentThreadId) {
+      throw new ApiError(409, "RUN_THREAD_MISMATCH", "Only the owning Agent thread can update this Agent Run");
+    }
+  }
+
+  #requireAgentRunVersion(run, expectedVersion) {
+    if (run.version !== expectedVersion) {
+      throw new ApiError(409, "RUN_VERSION_CONFLICT", "Agent Run was changed by another client", {
+        expectedVersion,
+        actualVersion: run.version,
+      });
     }
   }
 

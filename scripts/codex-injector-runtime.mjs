@@ -1,5 +1,79 @@
+import path from "node:path";
+
 const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
+const coordinationDeliveries = new Map();
+const COORDINATION_DEDUPLICATION_MS = 60_000;
+const continuationMonitorRuns = new Map();
+const ownerDecisionMonitorRuns = new Map();
+const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
+const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
+const OWNER_DECISION_MARKER = "TASKBOARD_OWNER_DECISION_V1";
+
+function collectStringValues(value, output = []) {
+  if (typeof value === "string") output.push(value);
+  else if (Array.isArray(value)) value.forEach((entry) => collectStringValues(entry, output));
+  else if (value && typeof value === "object") {
+    Object.values(value).forEach((entry) => collectStringValues(entry, output));
+  }
+  return output;
+}
+
+function normalizedMessageRole(value) {
+  const role = typeof value?.role === "string" ? value.role.toLowerCase() : "";
+  const type = typeof value?.type === "string"
+    ? value.type.toLowerCase().replaceAll(/[^a-z]/g, "")
+    : "";
+  if (role === "user" || type.includes("usermessage")) return "user";
+  if (role === "assistant" || role === "agent"
+    || type.includes("assistantmessage") || type.includes("agentmessage")) return "assistant";
+  return null;
+}
+
+function turnTextsForRole(turn, role) {
+  const output = [];
+  if (role === "user" && turn?.input !== undefined) collectStringValues(turn.input, output);
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (normalizedMessageRole(value) === role) {
+      collectStringValues(value.content ?? value.text ?? value.message ?? value.input, output);
+      return;
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(turn?.items ?? turn?.messages ?? turn?.output);
+  return output;
+}
+
+function deliveryMarker(deliveryId) {
+  return `Taskboard Owner decision delivery id: ${deliveryId}`;
+}
+
+function findDeliveryTurn(turns, deliveryId) {
+  const marker = deliveryMarker(deliveryId);
+  return turns.find((turn) => collectStringValues(turn).some((text) => text.includes(marker))) ?? null;
+}
+
+function parseOwnerDecisionMarker(text, requestId) {
+  const markerIndex = text.indexOf(OWNER_DECISION_MARKER);
+  if (markerIndex < 0) return null;
+  const payloadText = text.slice(markerIndex + OWNER_DECISION_MARKER.length).trim().split(/\r?\n/, 1)[0];
+  let payload;
+  try {
+    payload = JSON.parse(payloadText);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || Object.keys(payload).some((key) => !["requestId", "outcome", "evidence"].includes(key))
+    || payload.requestId !== requestId
+    || !["authorized", "denied"].includes(payload.outcome)
+    || typeof payload.evidence !== "string"
+    || !payload.evidence.trim()
+    || payload.evidence.length > 4_096) return null;
+  return { outcome: payload.outcome, evidence: payload.evidence.trim() };
+}
 
 function parseHostRequest(payload, parseAutomationRequest) {
   if (typeof payload !== "string" || payload.length > 4_194_304) {
@@ -87,7 +161,394 @@ function parseHostRequest(payload, parseAutomationRequest) {
   ) {
     return { id, request, error: null };
   }
+  if (
+    request.action === "coordinate-agent-todo"
+    && typeof request.rootThreadId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(request.rootThreadId)
+    && typeof request.codexHostId === "string"
+    && request.codexHostId.length > 0
+    && request.codexHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && typeof request.projectId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.projectId)
+    && typeof request.todoId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.todoId)
+    && typeof request.safeActionId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.safeActionId)
+    && typeof request.expectedResumeToken === "string"
+    && /^[a-f0-9]{64}$/.test(request.expectedResumeToken)
+    && typeof request.rootWorkspacePath === "string"
+    && request.rootWorkspacePath.length > 0
+    && request.rootWorkspacePath.length <= 4_096
+    && path.isAbsolute(request.rootWorkspacePath)
+    && typeof request.targetRoot === "string"
+    && request.targetRoot.length > 0
+    && request.targetRoot.length <= 4_096
+    && path.isAbsolute(request.targetRoot)
+  ) return { id, request, error: null };
   return { id, request: null, error: HOST_REQUEST_ERROR };
+}
+
+export async function deliverTaskboardCoordination(request, rpc, validateExecutionTarget) {
+  if (typeof validateExecutionTarget !== "function") {
+    throw new Error("Execution worktree validator is required");
+  }
+  const observedAt = Date.now();
+  for (const [key, entry] of coordinationDeliveries) {
+    if (entry.expiresAt <= observedAt) coordinationDeliveries.delete(key);
+  }
+  const rootWorkspacePath = path.resolve(request.rootWorkspacePath);
+  const targetRoot = path.resolve(request.targetRoot);
+  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.safeActionId}:${request.expectedResumeToken}:${request.rootThreadId}:${rootWorkspacePath}:${targetRoot}`;
+  const existing = coordinationDeliveries.get(deliveryKey);
+  if (existing) return existing.promise;
+  const delivery = deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget);
+  const entry = { promise: delivery, expiresAt: observedAt + COORDINATION_DEDUPLICATION_MS };
+  coordinationDeliveries.set(deliveryKey, entry);
+  delivery.catch(() => {
+    if (coordinationDeliveries.get(deliveryKey) === entry) coordinationDeliveries.delete(deliveryKey);
+  });
+  return delivery;
+}
+
+export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = false } = {}) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.route.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.route.rootThreadId
+    || path.resolve(threadResult.thread.cwd ?? "") !== path.resolve(request.route.rootWorkspacePath)) {
+    throw new Error("Owner decision delivery must match the exact confirmed Root thread and workspace");
+  }
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const observedDelivery = findDeliveryTurn(turns, request.deliveryReceipt.id);
+  if (observedDelivery?.id) {
+    return { delivery: "observed", turnId: observedDelivery.id };
+  }
+  if (readOnly) return null;
+  const instruction = [
+    `taskctl issue bootstrap ${request.identifier} --json`,
+    `Owner decision request id: ${request.requestId}`,
+    `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
+    `Coordinator epoch: ${request.coordinatorEpoch}`,
+    deliveryMarker(request.deliveryReceipt.id),
+    `Ask the Owner exactly this one question in this Root window: ${request.message}`,
+    "Do not approve it yourself and do not send the Owner to Taskboard comments. Child agents must only checkpoint or hand off to Root.",
+    `After the Owner answers, bootstrap the issue again. If the request id and token are still exact, answer the Owner normally and include exactly one machine-readable line: ${OWNER_DECISION_MARKER} {"requestId":"${request.requestId}","outcome":"authorized","evidence":"brief actual Owner answer"}. Use outcome "denied" when the Owner denies it. Do not emit this marker before an actual Owner reply.`,
+  ].join("\n");
+  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
+  if (activeTurn?.id) {
+    await rpc("turn/steer", {
+      threadId: request.route.rootThreadId,
+      expectedTurnId: activeTurn.id,
+      input: [{ type: "text", text: instruction }],
+    });
+    return { delivery: "steered", turnId: activeTurn.id };
+  }
+  await rpc("thread/resume", { threadId: request.route.rootThreadId });
+  const started = await rpc("turn/start", {
+    threadId: request.route.rootThreadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a valid Root turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
+}
+
+export async function observeTaskboardOwnerDecision(request, receipt, rpc) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.route.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.route.rootThreadId
+    || path.resolve(threadResult.thread.cwd ?? "") !== path.resolve(request.route.rootWorkspacePath)) {
+    throw new Error("Owner decision observation must match the exact confirmed Root thread and workspace");
+  }
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const deliveryIndex = turns.findIndex((turn) => (
+    turn?.id === receipt.deliveryTurnId
+    || collectStringValues(turn).some((text) => text.includes(deliveryMarker(receipt.id)))
+  ));
+  if (deliveryIndex < 0) return null;
+  let ownerTurn = null;
+  for (let index = deliveryIndex + 1; index < turns.length; index += 1) {
+    const turn = turns[index];
+    const userTexts = turnTextsForRole(turn, "user").filter((text) => (
+      !text.includes(deliveryMarker(receipt.id)) && !text.includes(OWNER_DECISION_MARKER)
+    ));
+    if (userTexts.some((text) => text.trim())) ownerTurn = turn;
+    const marker = turnTextsForRole(turn, "assistant")
+      .map((text) => parseOwnerDecisionMarker(text, request.requestId))
+      .find(Boolean);
+    if (marker && ownerTurn?.id && turn?.id) {
+      return {
+        ...marker,
+        ownerTurnId: ownerTurn.id,
+        rootDecisionTurnId: turn.id,
+        rootThreadId: request.route.rootThreadId,
+      };
+    }
+  }
+  return null;
+}
+
+export async function runOwnerDecisionMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
+    || typeof options?.readSnapshot !== "function"
+    || typeof options?.claimDelivery !== "function"
+    || typeof options?.confirmDelivery !== "function"
+    || typeof options?.deliver !== "function"
+    || typeof options?.observeDecision !== "function"
+    || typeof options?.recordDecision !== "function") {
+    return { delivered: false, reason: "invalid-monitor" };
+  }
+  const existing = ownerDecisionMonitorRuns.get(policy.projectId);
+  if (existing) return existing;
+  const run = runOwnerDecisionMonitorOnceUnlocked(options);
+  ownerDecisionMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (ownerDecisionMonitorRuns.get(policy.projectId) === run) {
+      ownerDecisionMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runOwnerDecisionMonitorOnceUnlocked({
+  policy,
+  readSnapshot,
+  claimDelivery,
+  confirmDelivery,
+  deliver,
+  observeDecision,
+  recordDecision,
+}) {
+  const snapshot = await readSnapshot(policy.projectId);
+  const request = snapshot?.coordination?.ownerDecisionRequest;
+  if (snapshot?.projectId !== policy.projectId
+    || !request
+    || !RESUME_TOKEN_PATTERN.test(request.requestId ?? "")
+    || !RESUME_TOKEN_PATTERN.test(request.expectedResumeToken ?? "")
+    || !COORDINATION_ID_PATTERN.test(request.identifier ?? "")
+    || !COORDINATION_ID_PATTERN.test(request.actionId ?? "")
+    || typeof request.message !== "string"
+    || !request.message.trim()
+    || typeof request.coordinatorEpoch !== "string"
+    || !request.coordinatorEpoch
+    || !THREAD_ID_PATTERN.test(request.route?.rootThreadId ?? "")
+    || typeof request.route?.rootWorkspacePath !== "string"
+    || !path.isAbsolute(request.route.rootWorkspacePath)) {
+    return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  const claim = await claimDelivery(request);
+  if (!claim?.receipt || typeof claim.receipt.id !== "string") {
+    if (claim?.claimed !== true && !["reserved", "already-delivered"].includes(claim?.reason)) {
+      return { delivered: false, reason: claim?.reason ?? "reservation-rejected" };
+    }
+    return { delivered: false, reason: "invalid-reservation" };
+  }
+  let deliveryResult = null;
+  let deliveryReceipt = claim.receipt;
+  if (claim.claimed === true) {
+    deliveryResult = await deliver({ ...request, deliveryReceipt });
+  } else if (claim.reason === "reserved") {
+    deliveryResult = await deliver({ ...request, deliveryReceipt }, { readOnly: true });
+    if (!deliveryResult?.turnId) return { delivered: false, reason: "reserved" };
+  } else if (claim.reason !== "already-delivered") {
+    return { delivered: false, reason: claim.reason ?? "reservation-rejected" };
+  }
+  if (deliveryResult) {
+    const confirmation = await confirmDelivery({
+      deliveryId: deliveryReceipt.id,
+      deliveryTurnId: deliveryResult.turnId,
+    });
+    if (confirmation?.confirmed !== true) {
+      return { delivered: false, reason: "delivery-not-confirmed" };
+    }
+    deliveryReceipt = { ...deliveryReceipt, deliveryTurnId: deliveryResult.turnId };
+  }
+  const decision = await observeDecision(request, deliveryReceipt);
+  if (decision) {
+    const recorded = await recordDecision({
+      taskId: request.identifier,
+      requestId: request.requestId,
+      expectedResumeToken: request.expectedResumeToken,
+      deliveryId: deliveryReceipt.id,
+      ...decision,
+    });
+    if (recorded?.applied !== true && recorded?.applied !== false) {
+      return { delivered: false, reason: "decision-not-recorded" };
+    }
+    return {
+      delivered: claim.claimed === true,
+      requestId: request.requestId,
+      delivery: deliveryResult?.delivery ?? null,
+      decisionRecorded: true,
+    };
+  }
+  return {
+    delivered: claim.claimed === true,
+    requestId: request.requestId,
+    delivery: deliveryResult?.delivery ?? null,
+    awaitingOwner: true,
+  };
+}
+
+export async function runTaskboardContinuationMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  if (!policy || !COORDINATION_ID_PATTERN.test(policy.projectId ?? "")) {
+    return { delivered: false, reason: "invalid-policy" };
+  }
+  const existing = continuationMonitorRuns.get(policy.projectId);
+  if (existing) return existing;
+
+  const run = runTaskboardContinuationMonitorOnceUnlocked(options);
+  continuationMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (continuationMonitorRuns.get(policy.projectId) === run) {
+      continuationMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runTaskboardContinuationMonitorOnceUnlocked({
+  policy,
+  readSnapshot,
+  claimReceipt,
+  confirmDelivery,
+  deliver,
+}) {
+  if (
+    typeof readSnapshot !== "function"
+    || typeof claimReceipt !== "function"
+    || typeof confirmDelivery !== "function"
+    || typeof deliver !== "function"
+  ) return { delivered: false, reason: "invalid-monitor" };
+
+  const snapshot = await readSnapshot(policy.projectId);
+  if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
+    return { delivered: false, reason: "invalid-snapshot" };
+  }
+  const todo = snapshot.todos.find((candidate) => {
+    const target = candidate?.dispatchTarget;
+    const readyWork = candidate?.readyWork;
+    const safeAction = readyWork?.safeActions?.[0];
+    return (
+      COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+      && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
+      && candidate?.run == null
+      && readyWork?.eligible === true
+      && Array.isArray(readyWork.safeActions)
+      && COORDINATION_ID_PATTERN.test(safeAction?.id ?? "")
+      && RESUME_TOKEN_PATTERN.test(readyWork?.resumeToken ?? "")
+      && THREAD_ID_PATTERN.test(target?.rootThreadId ?? "")
+      && typeof target?.codexHostId === "string"
+      && target.codexHostId.length > 0
+      && target.codexHostId.length <= 240
+      && !/[\u0000-\u001f\u007f]/.test(target.codexHostId)
+      && typeof target?.rootWorkspacePath === "string"
+      && path.isAbsolute(target.rootWorkspacePath)
+      && typeof target?.worktreePath === "string"
+      && path.isAbsolute(target.worktreePath)
+    );
+  });
+  if (!todo) return { delivered: false, reason: "no-eligible-work" };
+
+  const safeAction = todo.readyWork.safeActions[0];
+  const authorization = {
+    todoId: todo.id,
+    taskId: todo.taskId,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    safeActionId: safeAction.id,
+    expectedResumeToken: todo.readyWork.resumeToken,
+  };
+  if (!await claimReceipt(authorization)) {
+    return { delivered: false, reason: "reservation-unavailable" };
+  }
+  const executionIdentity = await confirmDelivery(authorization);
+  const standingAuthority = safeAction.standingAuthority === true;
+  if (!executionIdentity
+    || typeof executionIdentity.worktreePath !== "string"
+    || path.resolve(executionIdentity.worktreePath) !== path.resolve(todo.dispatchTarget.worktreePath)
+    || typeof executionIdentity.branch !== "string"
+    || !executionIdentity.branch
+    || (standingAuthority && (
+      typeof executionIdentity.repository !== "string"
+      || !/^(?:github\.com|gitlab\.com)\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(executionIdentity.repository)
+    ))) {
+    return { delivered: false, reason: "delivery-unavailable" };
+  }
+  await deliver({
+    projectId: policy.projectId,
+    todoId: todo.id,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    codexHostId: todo.dispatchTarget.codexHostId,
+    rootWorkspacePath: path.resolve(todo.dispatchTarget.rootWorkspacePath),
+    targetRoot: path.resolve(todo.dispatchTarget.worktreePath),
+    safeActionId: safeAction.id,
+    expectedResumeToken: todo.readyWork.resumeToken,
+    executionIdentity: { ...executionIdentity, standingAuthority },
+  });
+  return { delivered: true, todoId: todo.id, actionId: safeAction.id };
+}
+
+async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.rootThreadId) {
+    throw new Error("Codex did not confirm the configured Root task");
+  }
+  const rootCwd = typeof threadResult.thread.cwd === "string" ? path.resolve(threadResult.thread.cwd) : null;
+  const rootWorkspacePath = path.resolve(request.rootWorkspacePath);
+  const targetRoot = path.resolve(request.targetRoot);
+  if (!rootCwd || rootWorkspacePath !== rootCwd) {
+    throw new Error("Configured Root cwd must exactly match the coordination workspace");
+  }
+  await validateExecutionTarget(targetRoot, request.executionIdentity);
+  const instruction = [
+    `taskctl issue bootstrap ${request.todoId} --json`,
+    `Project: ${request.projectId}`,
+    `Todo: ${request.todoId}`,
+    `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
+    `Authorized safe action id: ${request.safeActionId}`,
+    `Exact execution worktree: ${targetRoot}`,
+    ...(request.executionIdentity ? [
+      `Verified execution repository: ${request.executionIdentity.repository ?? "not-required"}`,
+      `Verified execution branch: ${request.executionIdentity.branch}`,
+    ] : []),
+    "Before editing or testing, verify the exact execution worktree is a Git worktree and use it for all repository commands. The Root coordination cwd may be different and must not be treated as the execution worktree.",
+    "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
+    "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent if needed, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
+    "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",
+  ].join("\n");
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
+  if (activeTurn?.id) {
+    await rpc("turn/steer", {
+      threadId: request.rootThreadId,
+      expectedTurnId: activeTurn.id,
+      input: [{ type: "text", text: instruction }],
+    });
+    return { delivery: "steered", turnId: activeTurn.id };
+  }
+  await rpc("thread/resume", { threadId: request.rootThreadId });
+  const started = await rpc("turn/start", {
+    threadId: request.rootThreadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a valid Root turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
 }
 
 export async function handleHostBindingPayload(params, handlers) {
@@ -122,6 +583,8 @@ export async function handleHostBindingPayload(params, handlers) {
       result = await handlers.openAttachment(parsed.request);
     } else if (parsed.request.action === "automation") {
       result = await handlers.runAutomation(parsed.request, params.executionContextId);
+    } else if (parsed.request.action === "coordinate-agent-todo") {
+      result = await handlers.coordinateAgentTodo(parsed.request, params.executionContextId);
     } else {
       result = await handlers.startConversation(parsed.request, params.executionContextId);
     }

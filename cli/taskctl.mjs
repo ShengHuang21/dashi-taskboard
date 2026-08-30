@@ -6,11 +6,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { normalizeCloudUrl } from "../server/cloud-config.mjs";
+import { normalizeRepository, normalizeStandingActions } from "../server/standing-authority.mjs";
 import {
   DEFAULT_PROJECT_ID,
   TASK_STATUSES,
   isTaskPriority,
   isTaskStatus,
+  isWorkingLogStatus,
 } from "../shared/domain.mjs";
 
 export const SCHEMA_VERSION = 2;
@@ -22,7 +24,7 @@ const sourceRuntimeFile = path.resolve(
   ".data",
   "launcher-runtime.json",
 );
-const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "help"]);
+const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "clear-working-log", "help"]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
@@ -30,11 +32,34 @@ const COMMAND_OPTIONS = new Map([
   ["project create", new Set(["id", "name", "workspace-path", "json"])],
   ["project map", new Set(["workspace-path", "json"])],
   ["project readme", new Set(["content", "file", "if-version", "json"])],
+  ["authority list", new Set(["json"])],
+  ["authority grant", new Set([
+    "repository", "actions", "source-task", "source-thread-id", "evidence", "receipt",
+    "granted-at", "expires-at", "json",
+  ])],
+  ["authority revoke", new Set(["evidence", "receipt", "json"])],
+  ["coordinator status", new Set(["json"])],
+  ["coordinator acquire", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
+  ])],
+  ["coordinator renew", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
+  ])],
+  ["coordinator release", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "json",
+  ])],
+  ["coordinator repair-binding", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "if-version", "json",
+  ])],
+  ["coordinator receipts", new Set(["json"])],
+  ["activation audit", new Set(["json"])],
+  ["activation apply-workflow-profile", new Set(["if-version", "json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
   ["cloud status", new Set(["json"])],
   ["cloud logout", new Set(["json"])],
   ["issue list", new Set(["project", "status", "archived", "json"])],
   ["issue get", new Set(["json"])],
+  ["issue bootstrap", new Set(["json"])],
   [
     "issue create",
     new Set([
@@ -49,6 +74,9 @@ const COMMAND_OPTIONS = new Map([
       "git-branch",
       "worktree-path",
       "worktree-branch",
+      "working-log-path",
+      "working-log-status",
+      "workflow-profile",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -66,10 +94,19 @@ const COMMAND_OPTIONS = new Map([
       "status",
       "priority",
       "labels",
-      "thread-id",
       "git-branch",
       "worktree-path",
       "worktree-branch",
+      "working-log-path",
+      "working-log-status",
+      "clear-working-log",
+      "workflow-profile",
+      "binding-thread-id",
+      "binding-codex-project-id",
+      "binding-codex-project-kind",
+      "binding-codex-host-id",
+      "binding-workspace-path",
+      "clear-binding-thread",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -90,9 +127,20 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
+  ["issue claim", new Set(["agent-path", "thread-id", "if-version", "lease-minutes", "write-scope", "json"])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
+  ["run get", new Set(["json"])],
+  ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["handoff list", new Set(["json"])],
+  ["handoff add", new Set([
+    "event-id", "idempotency-key", "parent-task", "agent-path", "thread-id", "sequence",
+    "timestamp", "summary", "evidence-ref", "blocker", "next-action", "requires-ack",
+    "causation-id", "correlation-id", "json",
+  ])],
+  ["handoff ack", new Set(["acknowledgement-id", "agent-path", "thread-id", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
     "body",
@@ -124,9 +172,30 @@ Commands:
   project map PROJECT_ID --workspace-path PATH
   project readme get [PROJECT_ID]
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
+  authority list PROJECT_ID
+  authority grant PROJECT_ID --repository HOST/OWNER/REPO --actions ACTION[,ACTION]
+    --source-task ISSUE_ID --source-thread-id ID --evidence TEXT --receipt ID
+    --granted-at ISO [--expires-at ISO]
+  authority revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID
+  coordinator status PROJECT_ID
+  coordinator acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id none|ID --lease-seconds N
+  coordinator renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --lease-seconds N
+  coordinator release PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID
+  coordinator repair-binding PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --if-version N
+  coordinator receipts PROJECT_ID
+  activation audit
+  activation apply-workflow-profile ISSUE_ID --if-version N
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|create|update|move|archive|restore|relation
+  issue list|get|bootstrap|create|update|move|archive|restore|relation
+  handoff list ISSUE_ID
+  handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
+    --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
+  handoff ack EVENT_ID --acknowledgement-id ID --agent-path /root
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -141,28 +210,38 @@ Global options:
   --help               Show help for a supported command level
 
 Examples:
-  taskctl issue get LOCAL-275 --json
+  taskctl issue bootstrap LOCAL-275 --json
+  taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
-Run taskctl issue --help for all issue arguments.`],
+Run taskctl issue --help, taskctl coordinator --help, taskctl activation --help, or taskctl run --help for command arguments.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
 
 Actions:
   list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
   get ISSUE_ID [--json]
+  bootstrap ISSUE_ID [--json]
   create --project PROJECT_ID --title TITLE
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
     [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
+    [--working-log-path PATH --working-log-status planned|active|blocked|complete]
+    [--workflow-profile formal|vibe]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year] [--json]
   update ISSUE_ID
     [--project PROJECT_ID] [--title TITLE]
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
-    [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
+    [--working-log-path PATH --working-log-status planned|active|blocked|complete
+     | --clear-working-log]
+    [--workflow-profile formal|vibe]
+    [--binding-thread-id ID
+      [--binding-codex-project-id ID --binding-codex-project-kind local|remote
+       --binding-codex-host-id ID --binding-workspace-path PATH]
+     | --clear-binding-thread]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year]
     [--if-version N] [--json]
@@ -173,6 +252,8 @@ Actions:
      | --clear-binding-thread]
     [--if-version N] [--json]
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
+  claim ISSUE_ID --agent-path /root/NAME --thread-id ID
+    --lease-minutes N --write-scope path[,path] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   relation add|remove ISSUE_ID --type parent|blocks|blocked_by|related
     --issue RELATED_ISSUE_ID [--thread-id ID] [--if-version N] [--json]
@@ -181,7 +262,68 @@ Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
 
 Example:
-  taskctl issue get LOCAL-275 --json`],
+  taskctl issue bootstrap LOCAL-275 --json`],
+  ["run", `Usage: taskctl run ACTION [arguments] [options]
+
+Actions:
+  get RUN_ID [--json]
+  checkpoint RUN_ID --summary TEXT --next-action TEXT
+    [--status active|blocked] --thread-id ID --if-version N [--json]
+  finish RUN_ID --status completed|failed|interrupted --summary TEXT --next-action TEXT
+    --thread-id ID --if-version N [--json]
+
+Examples:
+  taskctl run get RUN_ID --json
+  taskctl run checkpoint RUN_ID --summary "Focused checks passed" --next-action "Open the capsule" --if-version 2 --json`],
+  ["authority", `Usage: taskctl authority ACTION [arguments] [options]
+
+Actions:
+  list PROJECT_ID [--json]
+  grant PROJECT_ID --repository HOST/OWNER/REPO --actions ACTION[,ACTION]
+    --source-task ISSUE_ID --source-thread-id ID --evidence TEXT --receipt ID
+    --granted-at ISO [--expires-at ISO] [--json]
+  revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID [--json]
+
+Actions: edit, test, scoped_delete, commit, ordinary_push, draft_pr`],
+  ["coordinator", `Usage: taskctl coordinator ACTION PROJECT_ID [options]
+
+Actions:
+  status PROJECT_ID [--json]
+  acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id none|ID --lease-seconds 30..3600 [--json]
+  renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --lease-seconds 30..3600 [--json]
+  release PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID [--json]
+  repair-binding PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --if-version N [--json]
+  receipts PROJECT_ID [--json]
+
+The holder task and thread must already be one exact configured Agent Lane binding.
+Binding repair derives host identity from the protected current Codex runtime; callers never supply it.
+Coordinator ownership does not grant task execution ownership.`],
+  ["activation", `Usage: taskctl activation ACTION [arguments] [options]
+
+Actions:
+  audit [--json]
+  apply-workflow-profile ISSUE_ID --if-version N [--json]
+
+Audit is read-only. Apply accepts only one recorded legacy candidate and is
+optimistic and idempotent. Legacy Root bindings remain a separate coordinator
+repair-binding action.`],
+  ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
+
+Actions:
+  list ISSUE_ID [--json]
+  add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
+    --sequence N [--timestamp ISO] --summary TEXT [--evidence-ref REF[,REF]]
+    [--blocker TEXT] --next-action TEXT --requires-ack true|false
+    [--parent-task ISSUE_ID] [--causation-id ID] [--correlation-id ID]
+    [--thread-id ID] [--json]
+  ack EVENT_ID --acknowledgement-id ID --agent-path /root [--thread-id ID] [--json]
+
+Handoff add uses CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
+when the durable task has no parent relation.`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -274,7 +416,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl issue, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -304,7 +446,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/repair-binding/receipts, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -313,7 +455,10 @@ async function execute(parsed, overrides) {
   const env = parsed.options["runtime-file"] === undefined
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
-  const usesCompanionControl = command.startsWith("cloud ") || command === "project map";
+  const usesCompanionControl = command.startsWith("cloud ")
+    || command === "project map"
+    || command.startsWith("coordinator ")
+    || command.startsWith("activation ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
       ? await resolveCompanionUrl(env, overrides)
@@ -349,6 +494,85 @@ async function execute(parsed, overrides) {
       );
     case "project readme":
       return executeProjectReadme(api, parsed, overrides);
+    case "authority list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", projectStandingAuthoritiesPath(parsed.operands[0]));
+    case "authority grant": {
+      expectOperandCount(parsed, 1);
+      const repository = normalizeRepository(requiredOption(parsed.options, "repository"));
+      const actions = normalizeStandingActions(
+        requiredOption(parsed.options, "actions").split(",").map((value) => value.trim()),
+      );
+      if (!repository || !actions) {
+        throw usageError("Standing authority requires a normalized repository and unique supported actions");
+      }
+      return api.request("POST", projectStandingAuthoritiesPath(parsed.operands[0]), {
+        repository,
+        actions,
+        sourceTaskId: requiredOption(parsed.options, "source-task"),
+        sourceThreadId: requiredOption(parsed.options, "source-thread-id"),
+        evidence: requiredOption(parsed.options, "evidence"),
+        receipt: requiredOption(parsed.options, "receipt"),
+        grantedAt: requiredOption(parsed.options, "granted-at"),
+        ...optionalField("expiresAt", parsed.options["expires-at"]),
+      });
+    }
+    case "authority revoke":
+      expectOperandCount(parsed, 2);
+      return api.request(
+        "POST",
+        `${projectStandingAuthoritiesPath(parsed.operands[0])}/${encodeURIComponent(parsed.operands[1])}/revoke`,
+        {
+          evidence: requiredOption(parsed.options, "evidence"),
+          receipt: requiredOption(parsed.options, "receipt"),
+        },
+      );
+    case "coordinator status": {
+      expectOperandCount(parsed, 1);
+      const projectId = parsed.operands[0];
+      const snapshot = await api.request("GET", agentLaneProjectPath(projectId));
+      return { projectId, coordination: snapshot.coordination ?? null };
+    }
+    case "coordinator acquire":
+      expectOperandCount(parsed, 1);
+      return mutateCoordinatorLease(
+        api,
+        parsed.operands[0],
+        parsed.options,
+        expectedCoordinatorLeaseId(parsed.options, { allowNone: true }),
+      );
+    case "coordinator renew":
+      expectOperandCount(parsed, 1);
+      return mutateCoordinatorLease(
+        api,
+        parsed.operands[0],
+        parsed.options,
+        expectedCoordinatorLeaseId(parsed.options),
+      );
+    case "coordinator release":
+      expectOperandCount(parsed, 1);
+      return releaseCoordinatorLease(api, parsed.operands[0], parsed.options);
+    case "coordinator repair-binding":
+      expectOperandCount(parsed, 2);
+      return repairLegacyRootBinding(
+        api,
+        parsed.operands[0],
+        parsed.operands[1],
+        parsed.options,
+      );
+    case "coordinator receipts":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${coordinatorLeasePath(parsed.operands[0])}/receipts`);
+    case "activation audit":
+      expectOperandCount(parsed, 0);
+      return api.request("GET", "/api/local/activation-readiness");
+    case "activation apply-workflow-profile":
+      expectOperandCount(parsed, 1);
+      return api.request(
+        "POST",
+        `/api/local/activation-readiness/workflow-profiles/${encodeURIComponent(parsed.operands[0])}`,
+        { version: explicitVersion(parsed.options["if-version"]) },
+      );
     case "cloud login":
       expectOperandCount(parsed, 0);
       return cloudLogin(
@@ -369,6 +593,9 @@ async function execute(parsed, overrides) {
     case "issue get":
       expectOperandCount(parsed, 1);
       return api.request("GET", taskPath(parsed.operands[0]));
+    case "issue bootstrap":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
     case "issue create":
       expectOperandCount(parsed, 0);
       return createIssue(api, parsed.options, overrides);
@@ -378,6 +605,9 @@ async function execute(parsed, overrides) {
     case "issue move":
       expectOperandCount(parsed, 1);
       return moveIssue(api, parsed.operands[0], parsed.options, overrides);
+    case "issue claim":
+      expectOperandCount(parsed, 1);
+      return claimIssue(api, parsed.operands[0], parsed.options, overrides);
     case "issue archive":
       expectOperandCount(parsed, 1);
       return archiveIssue(api, parsed.operands[0], parsed.options, overrides, "archive");
@@ -393,6 +623,24 @@ async function execute(parsed, overrides) {
         parsed.options,
         overrides,
       );
+    case "run get":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", agentRunPath(parsed.operands[0]));
+    case "run checkpoint":
+      expectOperandCount(parsed, 1);
+      return checkpointAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "run finish":
+      expectOperandCount(parsed, 1);
+      return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);
+    case "handoff add":
+      expectOperandCount(parsed, 1);
+      return addTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff ack":
+      expectOperandCount(parsed, 1);
+      return acknowledgeTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
     case "comment list": {
       expectOperandCount(parsed, 1);
       const search = new URLSearchParams();
@@ -853,8 +1101,10 @@ async function createIssue(api, options, overrides) {
   const priority = options.priority ?? "none";
   assertStatus(status);
   assertPriority(priority);
+  if (options["workflow-profile"] !== undefined) assertWorkflowProfile(options["workflow-profile"]);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
+  const workingLog = workingLogFromOptions(options, overrides);
   const recurrence = recurrenceFromOptions(options);
   const threadId = resolveThreadId(options, overrides);
   return api.request("POST", "/api/tasks", {
@@ -864,8 +1114,10 @@ async function createIssue(api, options, overrides) {
     status,
     priority,
     labels: parseLabels(options.labels),
+    ...optionalField("workflowProfile", options["workflow-profile"]),
     threadId,
     ...optionalField("developmentContext", developmentContext),
+    ...optionalField("workingLog", workingLog),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
     ...optionalField("recurrence", recurrence),
@@ -875,10 +1127,12 @@ async function createIssue(api, options, overrides) {
 async function updateIssue(api, taskId, options, overrides) {
   if (options.status !== undefined) assertStatus(options.status);
   if (options.priority !== undefined) assertPriority(options.priority);
+  if (options["workflow-profile"] !== undefined) assertWorkflowProfile(options["workflow-profile"]);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
+  const workingLog = workingLogFromOptions(options, overrides);
   const recurrence = recurrenceFromOptions(options);
-  const threadId = resolveThreadId(options, overrides);
+  const threadBinding = threadBindingFromOptions(options);
   const patch = {
     ...optionalField("projectId", options.project),
     ...optionalField("title", options.title),
@@ -886,6 +1140,9 @@ async function updateIssue(api, taskId, options, overrides) {
     ...optionalField("priority", options.priority),
     ...optionalField("labels", options.labels === undefined ? undefined : parseLabels(options.labels)),
     ...optionalField("developmentContext", developmentContext),
+    ...optionalField("workingLog", workingLog),
+    ...optionalField("workflowProfile", options["workflow-profile"]),
+    ...optionalField("threadBinding", threadBinding),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
     ...optionalField("recurrence", recurrence),
@@ -897,7 +1154,6 @@ async function updateIssue(api, taskId, options, overrides) {
   if (Object.keys(patch).length === 0) {
     throw usageError("issue update requires at least one field to update");
   }
-  patch.threadId = threadId;
   patch.version = await resolveVersion(api, taskId, options["if-version"]);
   return api.request("PATCH", taskPath(taskId), patch);
 }
@@ -961,6 +1217,191 @@ function threadBindingFromOptions(options) {
     throw usageError("--binding-workspace-path must be absolute");
   }
   return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
+async function claimIssue(api, taskId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (!agentPath.startsWith("/root/")) throw usageError("--agent-path must start with /root/");
+  const leaseMinutes = Number(requiredOption(options, "lease-minutes"));
+  if (!Number.isInteger(leaseMinutes) || leaseMinutes < 1 || leaseMinutes > 1440) {
+    throw usageError("--lease-minutes must be an integer from 1 to 1440");
+  }
+  const writeScope = requiredOption(options, "write-scope")
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  if (writeScope.length === 0 || writeScope.length > 32 || writeScope.some((value) => value.length > 240)) {
+    throw usageError("--write-scope must contain 1 to 32 comma-separated paths");
+  }
+  return api.request("POST", `${taskPath(taskId)}/claim`, {
+    agentPath,
+    agentThreadId: resolveThreadId(options, overrides),
+    leaseExpiresAt: new Date(Date.now() + leaseMinutes * 60_000).toISOString(),
+    writeScope,
+    version: await resolveVersion(api, taskId, options["if-version"]),
+  });
+}
+
+function agentLaneProjectPath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`;
+}
+
+function coordinatorLeasePath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/coordinator-lease`;
+}
+
+function coordinatorHolder(options) {
+  const holderTaskId = requiredOption(options, "holder-task").trim();
+  const holderThreadId = requiredOption(options, "holder-thread-id").trim();
+  if (!holderTaskId || holderTaskId.length > 256) {
+    throw usageError("--holder-task must contain 1 to 256 characters");
+  }
+  if (!holderThreadId || holderThreadId.length > 256) {
+    throw usageError("--holder-thread-id must contain 1 to 256 characters");
+  }
+  return { holderTaskId, holderThreadId };
+}
+
+function expectedCoordinatorLeaseId(options, { allowNone = false } = {}) {
+  const value = requiredOption(options, "expected-lease-id").trim();
+  if (allowNone && value === "none") return null;
+  if (!value || value === "none" || value.length > 256) {
+    throw usageError(`--expected-lease-id must contain ${allowNone ? "none or " : ""}1 to 256 characters`);
+  }
+  return value;
+}
+
+function mutateCoordinatorLease(api, projectId, options, expectedLeaseId) {
+  const leaseDurationSeconds = Number(requiredOption(options, "lease-seconds"));
+  if (!Number.isInteger(leaseDurationSeconds)
+    || leaseDurationSeconds < 30
+    || leaseDurationSeconds > 3600) {
+    throw usageError("--lease-seconds must be an integer from 30 to 3600");
+  }
+  return api.request("POST", coordinatorLeasePath(projectId), {
+    ...coordinatorHolder(options),
+    expectedLeaseId,
+    leaseDurationSeconds,
+  });
+}
+
+function releaseCoordinatorLease(api, projectId, options) {
+  const expectedLeaseId = expectedCoordinatorLeaseId(options);
+  return api.request("POST", `${coordinatorLeasePath(projectId)}/release`, {
+    ...coordinatorHolder(options),
+    expectedLeaseId,
+  });
+}
+
+function repairLegacyRootBinding(api, projectId, taskId, options) {
+  return api.request("POST", `${coordinatorLeasePath(projectId)}/repair-binding`, {
+    taskId,
+    taskVersion: explicitVersion(options["if-version"]),
+    ...coordinatorHolder(options),
+    expectedLeaseId: expectedCoordinatorLeaseId(options),
+  });
+}
+
+function agentRunPath(runId) {
+  if (!runId) throw usageError("Missing Agent Run id");
+  return `/api/runs/${encodeURIComponent(runId)}`;
+}
+
+async function checkpointAgentRun(api, runId, options, overrides) {
+  const status = options.status ?? "active";
+  if (status !== "active" && status !== "blocked") {
+    throw usageError("--status must be active or blocked for run checkpoint");
+  }
+  return api.request("POST", `${agentRunPath(runId)}/checkpoint`, {
+    agentThreadId: resolveThreadId(options, overrides),
+    summary: requiredOption(options, "summary"),
+    nextAction: requiredOption(options, "next-action"),
+    status,
+    version: explicitVersion(options["if-version"]),
+  });
+}
+
+async function finishAgentRun(api, runId, options, overrides) {
+  const status = requiredOption(options, "status");
+  if (!["completed", "failed", "interrupted"].includes(status)) {
+    throw usageError("--status must be completed, failed, or interrupted for run finish");
+  }
+  return api.request("POST", `${agentRunPath(runId)}/finish`, {
+    agentThreadId: resolveThreadId(options, overrides),
+    summary: requiredOption(options, "summary"),
+    nextAction: requiredOption(options, "next-action"),
+    status,
+    version: explicitVersion(options["if-version"]),
+  });
+}
+
+function parsePositiveIntegerOption(options, name) {
+  const value = Number(requiredOption(options, name));
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw usageError(`--${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseBooleanOption(options, name) {
+  const raw = requiredOption(options, name);
+  if (raw !== "true" && raw !== "false") {
+    throw usageError(`--${name} must be true or false`);
+  }
+  return raw === "true";
+}
+
+function parseEvidenceRefs(raw) {
+  if (raw === undefined || raw === "") return [];
+  const references = raw.split(",").map((value) => value.trim()).filter(Boolean);
+  if (references.length > 32 || new Set(references).size !== references.length) {
+    throw usageError("--evidence-ref must contain at most 32 unique comma-separated references");
+  }
+  return references;
+}
+
+async function addTaskHandoff(api, taskId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (!agentPath.startsWith("/root/")) {
+    throw usageError("--agent-path must identify a Root Sub-Agent and start with /root/");
+  }
+  const timestamp = options.timestamp ?? new Date().toISOString();
+  if (Number.isNaN(Date.parse(timestamp))) {
+    throw usageError("--timestamp must be an ISO timestamp");
+  }
+  return api.request("POST", `${taskPath(taskId)}/coordination-events`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    parentTaskId: options["parent-task"] ?? null,
+    senderThreadId: resolveThreadId(options, overrides),
+    senderAgentPath: agentPath,
+    eventType: "handoff",
+    sequence: parsePositiveIntegerOption(options, "sequence"),
+    timestamp,
+    summary: requiredOption(options, "summary"),
+    evidenceRefs: parseEvidenceRefs(options["evidence-ref"]),
+    blocker: options.blocker ?? null,
+    nextAction: requiredOption(options, "next-action"),
+    requiresAck: parseBooleanOption(options, "requires-ack"),
+    causationId: options["causation-id"] ?? null,
+    correlationId: options["correlation-id"] ?? null,
+  });
+}
+
+async function acknowledgeTaskHandoff(api, eventId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (agentPath !== "/root") {
+    throw usageError("handoff ack --agent-path must be /root");
+  }
+  return api.request(
+    "POST",
+    `/api/coordination-events/${encodeURIComponent(eventId)}/acknowledgements`,
+    {
+      acknowledgementId: requiredOption(options, "acknowledgement-id"),
+      senderThreadId: resolveThreadId(options, overrides),
+      senderAgentPath: agentPath,
+    },
+  );
 }
 
 async function archiveIssue(api, taskId, options, overrides, action) {
@@ -1079,6 +1520,28 @@ function developmentContextFromOptions(options, overrides) {
   return undefined;
 }
 
+function workingLogFromOptions(options, overrides) {
+  const workingLogPath = options["working-log-path"];
+  const status = options["working-log-status"];
+  if (options["clear-working-log"]) {
+    if (workingLogPath !== undefined || status !== undefined) {
+      throw usageError("--clear-working-log cannot be combined with working log options");
+    }
+    return null;
+  }
+  if (workingLogPath === undefined && status === undefined) return undefined;
+  if (workingLogPath === undefined || status === undefined) {
+    throw usageError("Use --working-log-path and --working-log-status together");
+  }
+  if (!isWorkingLogStatus(status)) {
+    throw usageError("--working-log-status must be planned, active, blocked, or complete");
+  }
+  if (!path.isAbsolute(workingLogPath)) {
+    throw usageError("--working-log-path must be absolute");
+  }
+  return { path: path.resolve(workingLogPath), status };
+}
+
 function recurrenceFromOptions(options) {
   const rawInterval = options["recurrence-interval"];
   const unit = options["recurrence-unit"];
@@ -1153,9 +1616,20 @@ function assertPriority(priority) {
   }
 }
 
+function assertWorkflowProfile(profile) {
+  if (profile !== "formal" && profile !== "vibe") {
+    throw usageError(`Invalid workflow profile: ${profile}. Expected formal or vibe`);
+  }
+}
+
 function taskPath(taskId) {
   if (!taskId) throw usageError("Missing issue id");
   return `/api/tasks/${encodeURIComponent(taskId)}`;
+}
+
+function projectStandingAuthoritiesPath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/projects/${encodeURIComponent(projectId)}/standing-authorities`;
 }
 
 function commentPath(commentId) {

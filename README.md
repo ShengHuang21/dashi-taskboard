@@ -48,6 +48,14 @@ npm run taskctl -- issue create \
   --labels product,mvp
 ```
 
+For a fresh or memoryless Codex window, recover an existing task with one read before deciding whether work may start:
+
+```bash
+taskctl issue bootstrap ISSUE_ID --json
+```
+
+The returned Task Capsule includes the task and relations, comments, attachments, inbox, handoffs, active/latest execution state, authorization frontier, safe actions, and `resumeToken`. This read is the durable recovery source; another window's chat summary is not a substitute and the command does not grant execution or Git authority.
+
 Use `npm link` if you want `taskctl` on your shell path. Set `CODEX_TASKBOARD_URL` to point the CLI at another local or LAN service. Cloud deployments are configured through the **loopback companion** (device-local loopback service for auth and path mapping—not a chat persona) with `taskctl cloud login`.
 
 ## Install the Codex Skill
@@ -60,6 +68,71 @@ ln -s /absolute/path/to/codex-taskboard/skills/manage-taskboard \
 ```
 
 The desktop app keeps this same directory synchronized with its bundled Skill. The Skill teaches Codex to inspect an issue, move it to `in_progress`, use optimistic versions, verify the work, and then move it to `in_review`; it moves the issue to `done` only after the user explicitly confirms acceptance or asks to mark it complete.
+
+## Read-only Agent Lanes
+
+Taskboard can expose a project-scoped development observatory at
+`GET /api/local/projects/:projectId/agent-lanes`. Lane identity and claims are
+stored in SQLite; local Codex session evidence supplies runtime activity. The
+endpoint does not send prompts, claim work, restart agents, or perform recovery.
+
+The version 2 configuration maps independent Codex tasks/windows and explicitly
+disabled external adapters. Window-internal Sub-Agents are not configured by
+hand: Snapshot v3 discovers their stable path, agent thread, lifecycle, and
+latest result independently for every configured Codex window. The
+`windowSubagentTrees` projection keeps each window's ownership boundary explicit;
+the existing `rootSubagents` field remains the coordinator-window compatibility
+view. Prompts are never returned. The snapshot keeps `readOnly: true` and
+`automaticRecoveryEnabled: false`.
+
+To migrate a version 2 JSON configuration, run
+`node scripts/migrate-agent-lanes-to-db.mjs <taskboard.sqlite> <agent-lanes.json>`.
+The migration creates missing projects, converts legacy To-Dos into durable
+`agent-todo` issues, and is idempotent by legacy To-Do identifier.
+
+Any project with a durable Agent Lanes configuration exposes the Agent Lanes tab
+and opens that view by default. The board title, task lanes, runtime Sub-Agents,
+and optional adapters all come from the selected project's configuration; no
+project ID or adapter name is hard-coded in the UI.
+
+### Talking Windows and conversation scope
+
+A Codex window may be a discussion and coordination context without being an
+execution owner. Task Capsules project this explicitly as `conversation.scope`
+plus a deduplicated `conversation.talkingWindows` list derived from the issue and
+comment thread bindings. An ordinary issue has `work_item` scope. One durable,
+non-dispatchable issue labeled `project-inbox` may act as the project-level
+conversation inbox and has `project` scope. A Talking Window never receives Git
+or Ready Work authority from that association; execution still requires the
+existing worktree, Working Log, authorization, and claim gates.
+
+Project coordination may be assigned by a time-bounded `coordinatorLease` to
+any configured peer window. An active lease selects only the coordination
+window; it does not grant Git execution authority. An expired lease fails
+closed with no coordinator instead of silently restoring the legacy fixed
+`rootTaskId`. Projects without a lease retain the legacy configured coordinator
+contract until they are migrated.
+
+Task Capsules project a `planning` contract only for issues explicitly labeled
+`feature` or `workstream`. It carries milestone dates, the exact parent Feature,
+sorted child Workstream identifiers, and a status rollup. Unlabeled children are
+counted separately instead of being silently classified as Workstreams;
+ordinary issues return `planning: null`.
+
+Before a coordinator dispatches work, it may reserve the current safe frontier
+with `POST /api/tasks/:id/bootstrap-claim`. The server compares the exact
+Task Capsule `resumeToken`, first `safeActionId`, and configured Root thread in
+one SQLite transaction and returns an idempotent durable receipt. This receipt
+only prevents stale or duplicate coordination; it does not claim the execution
+Ticket, grant Git authority, or replace the Sub-Agent claim lease.
+
+External providers use a provider-neutral adapter projection. Until a separately
+authorized callable adapter exists, every configured adapter must remain
+`not_connected` and exposes a versioned disabled contract with no transport and
+all inspect, dispatch, wait, and checkpoint-receipt capabilities set to false.
+Declaring an unimplemented external adapter connected invalidates the Agent Lanes
+mapping instead of creating apparent authority. Provider names do not change
+this fail-closed behavior.
 
 ## Embed in Codex
 
@@ -178,7 +251,7 @@ To use a different UI origin, set `window.__CODEX_TASKBOARD_URL__` before the us
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `CODEX_TASKBOARD_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` to disable LAN access |
+| `CODEX_TASKBOARD_HOST` | `127.0.0.1` | HTTP bind address; set `0.0.0.0` explicitly only when LAN access is intended |
 | `CODEX_TASKBOARD_PORT` | `47823` | Local HTTP port |
 | `CODEX_TASKBOARD_DATA_DIR` | `.data` | SQLite data directory |
 | `CODEX_TASKBOARD_URL` | `http://127.0.0.1:47823` | CLI API origin |

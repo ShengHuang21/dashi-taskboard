@@ -8,6 +8,7 @@ export const TASK_STATUSES = [
   "canceled",
 ];
 export const TASK_PRIORITIES = ["none", "urgent", "high", "medium", "low"];
+export const WORKING_LOG_STATUSES = ["planned", "active", "blocked", "complete"];
 
 export const DEFAULT_PROJECT_ID = "local";
 export const JIRA_PROJECT_ID = "jira-my-tasks";
@@ -31,4 +32,8 @@ export function isTaskStatus(value) {
 
 export function isTaskPriority(value) {
   return TASK_PRIORITIES.includes(value);
+}
+
+export function isWorkingLogStatus(value) {
+  return WORKING_LOG_STATUSES.includes(value);
 }
