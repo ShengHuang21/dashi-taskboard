@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { normalizeCloudUrl } from "../server/cloud-config.mjs";
+import { normalizeRepository, normalizeStandingActions } from "../server/standing-authority.mjs";
 import {
   DEFAULT_PROJECT_ID,
   TASK_STATUSES,
@@ -31,6 +32,12 @@ const COMMAND_OPTIONS = new Map([
   ["project create", new Set(["id", "name", "workspace-path", "json"])],
   ["project map", new Set(["workspace-path", "json"])],
   ["project readme", new Set(["content", "file", "if-version", "json"])],
+  ["authority list", new Set(["json"])],
+  ["authority grant", new Set([
+    "repository", "actions", "source-task", "source-thread-id", "evidence", "receipt",
+    "granted-at", "expires-at", "json",
+  ])],
+  ["authority revoke", new Set(["evidence", "receipt", "json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
   ["cloud status", new Set(["json"])],
   ["cloud logout", new Set(["json"])],
@@ -149,6 +156,11 @@ Commands:
   project map PROJECT_ID --workspace-path PATH
   project readme get [PROJECT_ID]
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
+  authority list PROJECT_ID
+  authority grant PROJECT_ID --repository HOST/OWNER/REPO --actions ACTION[,ACTION]
+    --source-task ISSUE_ID --source-thread-id ID --evidence TEXT --receipt ID
+    --granted-at ISO [--expires-at ISO]
+  authority revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|bootstrap|create|update|move|archive|restore|relation
@@ -235,6 +247,16 @@ Actions:
 Examples:
   taskctl run get RUN_ID --json
   taskctl run checkpoint RUN_ID --summary "Focused checks passed" --next-action "Open the capsule" --if-version 2 --json`],
+  ["authority", `Usage: taskctl authority ACTION [arguments] [options]
+
+Actions:
+  list PROJECT_ID [--json]
+  grant PROJECT_ID --repository HOST/OWNER/REPO --actions ACTION[,ACTION]
+    --source-task ISSUE_ID --source-thread-id ID --evidence TEXT --receipt ID
+    --granted-at ISO [--expires-at ISO] [--json]
+  revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID [--json]
+
+Actions: edit, test, scoped_delete, commit, ordinary_push, draft_pr`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
@@ -340,7 +362,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl authority, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -370,7 +392,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -415,6 +437,39 @@ async function execute(parsed, overrides) {
       );
     case "project readme":
       return executeProjectReadme(api, parsed, overrides);
+    case "authority list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", projectStandingAuthoritiesPath(parsed.operands[0]));
+    case "authority grant": {
+      expectOperandCount(parsed, 1);
+      const repository = normalizeRepository(requiredOption(parsed.options, "repository"));
+      const actions = normalizeStandingActions(
+        requiredOption(parsed.options, "actions").split(",").map((value) => value.trim()),
+      );
+      if (!repository || !actions) {
+        throw usageError("Standing authority requires a normalized repository and unique supported actions");
+      }
+      return api.request("POST", projectStandingAuthoritiesPath(parsed.operands[0]), {
+        repository,
+        actions,
+        sourceTaskId: requiredOption(parsed.options, "source-task"),
+        sourceThreadId: requiredOption(parsed.options, "source-thread-id"),
+        evidence: requiredOption(parsed.options, "evidence"),
+        receipt: requiredOption(parsed.options, "receipt"),
+        grantedAt: requiredOption(parsed.options, "granted-at"),
+        ...optionalField("expiresAt", parsed.options["expires-at"]),
+      });
+    }
+    case "authority revoke":
+      expectOperandCount(parsed, 2);
+      return api.request(
+        "POST",
+        `${projectStandingAuthoritiesPath(parsed.operands[0])}/${encodeURIComponent(parsed.operands[1])}/revoke`,
+        {
+          evidence: requiredOption(parsed.options, "evidence"),
+          receipt: requiredOption(parsed.options, "receipt"),
+        },
+      );
     case "cloud login":
       expectOperandCount(parsed, 0);
       return cloudLogin(
@@ -1405,6 +1460,11 @@ function assertWorkflowProfile(profile) {
 function taskPath(taskId) {
   if (!taskId) throw usageError("Missing issue id");
   return `/api/tasks/${encodeURIComponent(taskId)}`;
+}
+
+function projectStandingAuthoritiesPath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/projects/${encodeURIComponent(projectId)}/standing-authorities`;
 }
 
 function commentPath(commentId) {

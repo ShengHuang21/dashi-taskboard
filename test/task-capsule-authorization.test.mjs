@@ -824,3 +824,283 @@ test("an Agent or wrong thread cannot record its own authorization decision", ()
   assert.equal(agentForbidden.authorization.state, "invalid");
   assert.equal(agentForbidden.readyWork.eligible, false);
 });
+
+test("matching standing authority upgrades only explicit narrow approval gates", () => {
+  const comments = [envelopeComment(envelope({
+    repository: "github.com/ShengHuang21/dashi-taskboard",
+    useStandingAuthority: true,
+    gates: [
+      gate("edit", "edit", "approval_required", { approver: "Owner", approvalRequest: "Approve edit" }),
+      gate("push", "push", "approval_required", { approver: "Owner", approvalRequest: "Approve push" }),
+    ],
+    actions: [
+      action("edit-source", 10, "edit", "Edit source", {
+        standingScope: { kind: "edit", paths: ["server/task-capsule.mjs"] },
+      }),
+      action("push-wide", 20, "push", "Push without narrow semantics"),
+    ],
+  }))];
+  const standingAuthorities = [{
+    id: "policy-1",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["edit", "ordinary_push"],
+    grantedAt: "2026-08-25T00:00:00.000Z",
+    expiresAt: null,
+    revokedAt: null,
+  }];
+  const result = capsule(comments, {
+    developmentContext: {
+      type: "worktree",
+      path: WORKTREE,
+      branch: "codex/cap-4",
+      repository: "github.com/shenghuang21/dashi-taskboard",
+      repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+    },
+  }, { standingAuthorities });
+
+  assert.equal(result.standingAuthority.state, "matched");
+  assert.deepEqual(result.standingAuthority.authorizedActionIds, ["edit-source"]);
+  assert.deepEqual(result.readyWork.safeActions.map((item) => item.id), ["edit-source"]);
+  assert.deepEqual(result.readyWork.deferredActions.map((item) => item.id), ["push-wide"]);
+});
+
+test("standing authority fails closed on mismatch expiry revocation and unsafe deletion", () => {
+  const comments = [envelopeComment(envelope({
+    repository: "github.com/ShengHuang21/dashi-taskboard",
+    useStandingAuthority: true,
+    gates: [gate("delete", "scoped_delete", "approval_required", {
+      approver: "Owner", approvalRequest: "Approve delete",
+    })],
+    actions: [action("delete", 10, "delete", "Delete", { target: "../outside" })],
+  }))];
+  const policy = (overrides = {}) => ({
+    id: "policy-1",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["scoped_delete"],
+    expiresAt: null,
+    revokedAt: null,
+    ...overrides,
+  });
+  for (const standingAuthorities of [
+    [policy({ repository: "github.com/shenghuang21/other" })],
+    [policy({ expiresAt: "2026-08-25T00:00:00.000Z" })],
+    [policy({ revokedAt: "2026-08-25T00:00:00.000Z" })],
+    [policy()],
+  ]) {
+    const result = capsule(comments, {}, { standingAuthorities });
+    assert.deepEqual(result.readyWork.safeActions, []);
+    assert.equal(result.readyWork.approvalRequest?.actionId, "delete");
+  }
+});
+
+test("standing authority rejects semantic disguises without a kind-specific structured scope", () => {
+  const standingAuthorities = [{
+    id: "policy-1",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["ordinary_push", "draft_pr", "edit", "test", "commit"],
+    grantedAt: "2026-08-25T00:00:00.000Z",
+    expiresAt: null,
+    revokedAt: null,
+  }];
+  for (const [kind, text, target] of [
+    ["ordinary_push", "Force-push main", "origin main --force"],
+    ["draft_pr", "Merge the pull request", "main"],
+    ["edit", "Deploy production", "production"],
+    ["test", "Restart shared runtime", "canonical-47823"],
+    ["commit", "Commit and deploy", "production"],
+  ]) {
+    const result = capsule([envelopeComment(envelope({
+      repository: "github.com/shenghuang21/dashi-taskboard",
+      useStandingAuthority: true,
+      gates: [gate("standing", kind, "approval_required", {
+        approver: "Owner", approvalRequest: "Approve action",
+      })],
+      actions: [action("unsafe", 10, "standing", text, { target })],
+    }))], {
+      developmentContext: {
+        type: "worktree",
+        path: WORKTREE,
+        branch: "codex/cap-4",
+        repository: "github.com/shenghuang21/dashi-taskboard",
+        repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+      },
+    }, { standingAuthorities });
+    assert.deepEqual(result.readyWork.safeActions, [], kind);
+  }
+});
+
+test("standing authority projects canonical execution text from structured scope, not prose", () => {
+  const result = capsule([envelopeComment(envelope({
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    useStandingAuthority: true,
+    gates: [gate("push", "ordinary_push", "approval_required", {
+      approver: "Owner", approvalRequest: "Approve push",
+    })],
+    actions: [action("push", 10, "push", "Force-push main and deploy", {
+      target: "origin main --force",
+      standingScope: {
+        kind: "ordinary_push", remote: "origin", branch: "codex/cap-4", force: false,
+      },
+    })],
+  }))], {
+    developmentContext: {
+      type: "worktree",
+      path: WORKTREE,
+      branch: "codex/cap-4",
+      repository: "github.com/shenghuang21/dashi-taskboard",
+      repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+    },
+  }, { standingAuthorities: [{
+    id: "policy-1",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["ordinary_push"],
+    grantedAt: "2026-08-25T00:00:00.000Z",
+    expiresAt: null,
+    revokedAt: null,
+  }] });
+  assert.equal(result.readyWork.safeActions[0].text, "Ordinary push codex/cap-4 to origin without force");
+  assert.equal(result.readyWork.safeActions[0].standingScope.force, false);
+  assert.equal(result.authorization.envelope.actions[0].text, "Force-push main and deploy");
+});
+
+test("canonical standing actions discard every unknown Envelope field", () => {
+  const result = capsule([envelopeComment(envelope({
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    useStandingAuthority: true,
+    gates: [gate("push", "ordinary_push", "approval_required", {
+      approver: "Owner", approvalRequest: "Approve push",
+    })],
+    actions: [action("push", 10, "push", "Push branch", {
+      command: "git push --force origin topic:main",
+      after: "merge and deploy",
+      standingScope: {
+        kind: "ordinary_push", remote: "origin", branch: "codex/cap-4", force: false,
+      },
+    })],
+  }))], {
+    developmentContext: {
+      type: "worktree", path: WORKTREE, branch: "codex/cap-4",
+      repository: "github.com/shenghuang21/dashi-taskboard",
+      repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+    },
+  }, { standingAuthorities: [{
+    id: "policy-1", projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["ordinary_push"], grantedAt: "2026-08-25T00:00:00.000Z",
+    expiresAt: null, revokedAt: null,
+  }] });
+  assert.deepEqual(result.readyWork.safeActions, []);
+  assert.equal(result.authorization.envelope.actions[0].command, "git push --force origin topic:main");
+});
+
+test("standing authority requires the verified execution repository to match policy and Envelope", () => {
+  const result = capsule([envelopeComment(envelope({
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    useStandingAuthority: true,
+    gates: [gate("push", "ordinary_push", "approval_required", {
+      approver: "Owner", approvalRequest: "Approve push",
+    })],
+    actions: [action("push", 10, "push", "Push branch", {
+      standingScope: {
+        kind: "ordinary_push", remote: "origin", branch: "codex/cap-4", force: false,
+      },
+    })],
+  }))], {
+    developmentContext: {
+      type: "worktree",
+      path: "/unrelated-company-repo",
+      branch: "codex/cap-4",
+      repository: "github.com/company/unrelated",
+      repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+    },
+  }, { standingAuthorities: [{
+    id: "policy-1",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["ordinary_push"],
+    grantedAt: "2026-08-25T00:00:00.000Z",
+    expiresAt: null,
+    revokedAt: null,
+  }] });
+  assert.deepEqual(result.readyWork.safeActions, []);
+});
+
+test("scoped delete rejects shell expansion and command substitution targets", () => {
+  const standingAuthorities = [{
+    id: "policy-1",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["scoped_delete"],
+    grantedAt: "2026-08-25T00:00:00.000Z",
+    expiresAt: null,
+    revokedAt: null,
+  }];
+  for (const target of ["~", "*", "$HOME", "$(pwd)", "foo/**", "foo;echo-owned"]) {
+    const result = capsule([envelopeComment(envelope({
+      repository: "github.com/shenghuang21/dashi-taskboard",
+      useStandingAuthority: true,
+      gates: [gate("delete", "scoped_delete", "approval_required", {
+        approver: "Owner", approvalRequest: "Approve delete",
+      })],
+      actions: [action("delete", 10, "delete", "Delete file", {
+        target,
+        standingScope: { kind: "scoped_delete", paths: [target], recursive: false },
+      })],
+    }))], {
+      developmentContext: {
+        type: "worktree",
+        path: WORKTREE,
+        branch: "codex/cap-4",
+        repository: "github.com/shenghuang21/dashi-taskboard",
+        repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+      },
+    }, { standingAuthorities });
+    assert.deepEqual(result.readyWork.safeActions, [], target);
+  }
+});
+
+test("future grants stay inactive until grantedAt and change the resume token at activation", () => {
+  const comments = [envelopeComment(envelope({
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    useStandingAuthority: true,
+    gates: [gate("edit", "edit", "approval_required", {
+      approver: "Owner", approvalRequest: "Approve edit",
+    })],
+    actions: [action("edit", 10, "edit", "Edit source", {
+      standingScope: { kind: "edit", paths: ["server/app.mjs"] },
+    })],
+  }))];
+  const taskOverrides = {
+    developmentContext: {
+      type: "worktree",
+      path: WORKTREE,
+      branch: "codex/cap-4",
+      repository: "github.com/shenghuang21/dashi-taskboard",
+      repositoryVerifiedAt: "2026-08-26T00:59:00.000Z",
+    },
+  };
+  const standingAuthorities = [{
+    id: "policy-future",
+    projectId: "capstone-dev",
+    repository: "github.com/shenghuang21/dashi-taskboard",
+    actions: ["edit"],
+    grantedAt: "2026-08-26T02:00:00.000Z",
+    expiresAt: null,
+    revokedAt: null,
+  }];
+  const before = createTaskCapsule({
+    task: task(taskOverrides), comments, attachments: [], currentClaim: null,
+    standingAuthorities, now: new Date("2026-08-26T01:00:00.000Z"),
+  });
+  const after = createTaskCapsule({
+    task: task(taskOverrides), comments, attachments: [], currentClaim: null,
+    standingAuthorities, now: new Date("2026-08-26T02:00:00.000Z"),
+  });
+  assert.deepEqual(before.readyWork.safeActions, []);
+  assert.deepEqual(after.readyWork.safeActions.map((item) => item.id), ["edit"]);
+  assert.notEqual(before.resumeToken, after.resumeToken);
+});

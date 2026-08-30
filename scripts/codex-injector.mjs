@@ -2,6 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
+import { lstatSync, realpathSync } from "node:fs";
 import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { createInterface } from "node:readline";
@@ -9,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { resolvePort } from "../server/app.mjs";
+import { normalizeRepository } from "../server/standing-authority.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import {
@@ -1709,17 +1711,129 @@ async function claimBackgroundContinuationReceipt(claim) {
   return result.reused === false;
 }
 
-function validateGitExecutionTarget(targetRoot) {
-  const result = spawnSync(
+async function confirmBackgroundContinuationDelivery(claim) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-delivery`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootThreadId: claim.rootThreadId,
+        expectedResumeToken: claim.expectedResumeToken,
+        safeActionId: claim.safeActionId,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return null;
+  if (!response.ok) throw new Error(`Taskboard bootstrap delivery returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.confirmed !== true
+    || result?.receipt?.taskId !== claim.taskId
+    || result.receipt.rootThreadId !== claim.rootThreadId
+    || result.receipt.resumeToken !== claim.expectedResumeToken
+    || result.receipt.safeActionId !== claim.safeActionId) {
+    throw new Error("Taskboard returned an invalid bootstrap delivery receipt");
+  }
+  return result.executionIdentity;
+}
+
+function assertResolvedTargetInsideWorktree(worktreePath, resolvedTarget, message) {
+  const relative = path.relative(worktreePath, resolvedTarget);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error(message);
+  }
+}
+
+function validateStandingDeliveryPaths(targetRoot, scope) {
+  if (!scope || !["edit", "scoped_delete"].includes(scope.kind)) return;
+  const worktreePath = realpathSync(targetRoot);
+  for (const relativePath of scope.paths) {
+    const targetPath = path.resolve(worktreePath, relativePath);
+    if (scope.kind === "scoped_delete") {
+      const targetStat = lstatSync(targetPath);
+      if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+        throw new Error("Delivery-scoped delete target must be one real worktree file");
+      }
+      assertResolvedTargetInsideWorktree(
+        worktreePath,
+        realpathSync(targetPath),
+        "Delivery-scoped delete target escaped the exact worktree",
+      );
+      continue;
+    }
+    try {
+      const targetStat = lstatSync(targetPath);
+      if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+        throw new Error("Delivery edit target must be one real worktree file");
+      }
+      assertResolvedTargetInsideWorktree(
+        worktreePath,
+        realpathSync(targetPath),
+        "Delivery edit target escaped the exact worktree",
+      );
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      let parent = path.dirname(targetPath);
+      while (true) {
+        try {
+          const parentStat = lstatSync(parent);
+          if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+            throw new Error("Delivery edit target requires one real directory parent");
+          }
+          const resolvedParent = realpathSync(parent);
+          if (resolvedParent !== worktreePath) {
+            assertResolvedTargetInsideWorktree(
+              worktreePath,
+              resolvedParent,
+              "Delivery edit target parent escaped the exact worktree",
+            );
+          }
+          break;
+        } catch (parentError) {
+          if (parentError.code !== "ENOENT") throw parentError;
+        }
+        const next = path.dirname(parent);
+        if (next === parent) throw new Error("Delivery edit target has no worktree parent");
+        parent = next;
+      }
+    }
+  }
+}
+
+function validateGitExecutionTarget(targetRoot, expectedIdentity) {
+  const topLevelResult = spawnSync(
     "git",
     ["-C", targetRoot, "rev-parse", "--show-toplevel"],
     { encoding: "utf8", timeout: 3_000 },
   );
-  const resolvedTopLevel = result.status === 0 && typeof result.stdout === "string"
-    ? path.resolve(result.stdout.trim())
+  const branchResult = spawnSync(
+    "git",
+    ["-C", targetRoot, "branch", "--show-current"],
+    { encoding: "utf8", timeout: 3_000 },
+  );
+  const remoteResult = spawnSync(
+    "git",
+    ["-C", targetRoot, "remote", "get-url", "origin"],
+    { encoding: "utf8", timeout: 3_000 },
+  );
+  const resolvedTopLevel = topLevelResult.status === 0 && typeof topLevelResult.stdout === "string"
+    ? path.resolve(topLevelResult.stdout.trim())
     : null;
-  if (resolvedTopLevel !== path.resolve(targetRoot)) {
-    throw new Error("Execution target must be the exact root of an available Git worktree");
+  const branch = branchResult.status === 0 ? branchResult.stdout.trim() : null;
+  const repository = remoteResult.status === 0 ? normalizeRepository(remoteResult.stdout.trim()) : null;
+  const standingMismatch = expectedIdentity?.standingAuthority === true
+    && (branch !== expectedIdentity.branch || repository !== expectedIdentity.repository);
+  const identityPathMismatch = expectedIdentity
+    && path.resolve(expectedIdentity.worktreePath ?? "") !== path.resolve(targetRoot);
+  if (resolvedTopLevel !== path.resolve(targetRoot)
+    || identityPathMismatch
+    || standingMismatch) {
+    throw new Error("Execution target must match the delivery-verified Git worktree, branch, and origin repository");
+  }
+  if (expectedIdentity?.standingAuthority === true) {
+    validateStandingDeliveryPaths(targetRoot, expectedIdentity.standingScope);
   }
 }
 
@@ -1735,6 +1849,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       policy: { enabled: true, projectId },
       readSnapshot: readTaskboardAgentLaneSnapshot,
       claimReceipt: claimBackgroundContinuationReceipt,
+      confirmDelivery: confirmBackgroundContinuationDelivery,
       deliver: (request) => deliverTaskboardCoordination(
         request,
         (method, params) => requestCodexAppServerViaCdp(

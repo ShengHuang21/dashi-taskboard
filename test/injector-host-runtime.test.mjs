@@ -19,6 +19,11 @@ const coordinationAuthorization = {
 const deliverCoordination = (request, rpc, validateExecutionTarget = async () => {}) => (
   deliverTaskboardCoordination(request, rpc, validateExecutionTarget)
 );
+const confirmedIdentity = {
+  worktreePath: "/tmp/taskboard/project",
+  branch: "codex/test",
+  repository: null,
+};
 
 test("background continuation delivers one eligible first safe action without a mounted view", async () => {
   const deliveries = [];
@@ -56,6 +61,7 @@ test("background continuation delivers one eligible first safe action without a 
       receipts.add(key);
       return true;
     },
+    confirmDelivery: async () => confirmedIdentity,
     deliver: async (request) => {
       deliveries.push(request);
       return { delivery: "started", turnId: "turn-background" };
@@ -77,6 +83,7 @@ test("background continuation delivers one eligible first safe action without a 
     targetRoot: "/tmp/taskboard/project",
     safeActionId: "safe-first",
     expectedResumeToken: "b".repeat(64),
+    executionIdentity: { ...confirmedIdentity, standingAuthority: false },
   });
 });
 
@@ -86,6 +93,7 @@ test("background continuation fails closed for disabled, open-run, or malformed 
     policy: { enabled: false, projectId: "taskboard-core" },
     readSnapshot: async () => assert.fail("disabled monitor must not read"),
     claimReceipt: async () => assert.fail("must not claim a receipt"),
+    confirmDelivery: async () => assert.fail("must not confirm delivery"),
     deliver: async () => { delivered += 1; },
   };
   assert.deepEqual(
@@ -149,6 +157,7 @@ test("background continuation reserves the durable receipt before an uncertain d
       claimed = true;
       return true;
     },
+    confirmDelivery: async () => confirmedIdentity,
     deliver: async () => { throw new Error("receipt unknown"); },
   };
   await assert.rejects(runTaskboardContinuationMonitorOnce(options), /receipt unknown/);
@@ -182,6 +191,7 @@ test("background continuation fails closed when the authoritative reservation is
       }],
     }),
     claimReceipt: async () => false,
+    confirmDelivery: async () => assert.fail("rejected reservations must not confirm delivery"),
     deliver: async () => { delivered = true; },
   });
 
@@ -195,6 +205,8 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /api\/client-storage/);
   assert.match(source, /api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);
   assert.match(source, /api\/tasks\/\$\{encodeURIComponent\(claim\.todoId\)\}\/bootstrap-claim/);
+  assert.match(source, /api\/tasks\/\$\{encodeURIComponent\(claim\.todoId\)\}\/bootstrap-delivery/);
+  assert.match(source, /validateGitExecutionTarget/);
   assert.match(source, /runTaskboardContinuationMonitorOnce/);
   assert.match(source, /deliverTaskboardCoordination/);
   assert.doesNotMatch(source, /background-continuation-receipts/);
