@@ -639,6 +639,7 @@ export interface CoordinationTodoSnapshot {
   id: string;
   taskId: string;
   title: string;
+  priority: TaskPriority;
   state: CoordinationTodoState;
   claimedBy: string | null;
   claimedAt: string | null;
@@ -726,15 +727,33 @@ export interface CoordinationActionSnapshot {
 }
 
 export interface CoordinationApprovalRequestSnapshot {
+  requestId: string;
   actionId: string;
+  gateId: string;
+  gateKind: string;
   approver: string | null;
   message: string | null;
   scope: string | null;
+  target: string | null;
+  requestedAt: string | null;
   expectedResumeToken: string;
 }
 
+export interface CoordinationOwnerDecisionRequest extends CoordinationApprovalRequestSnapshot {
+  taskId: string;
+  identifier: string;
+  priority: TaskPriority;
+  coordinatorEpoch: string;
+  route: {
+    rootTaskId: string;
+    rootThreadId: string;
+    codexHostId: string;
+    rootWorkspacePath: string;
+  };
+}
+
 export interface AgentLaneSnapshot {
-  version: 3;
+  version: 4;
   projectId: string;
   generatedAt: string;
   readOnly: true;
@@ -757,6 +776,7 @@ export interface AgentLaneSnapshot {
     stateAuthority: "self_learning_checkpoint";
     workAuthority: "todo_claim_lease";
     runtimeOwnership: "single_writer";
+    ownerDecisionRequest: CoordinationOwnerDecisionRequest | null;
   };
   todos: CoordinationTodoSnapshot[];
   attentionQueue: string[];

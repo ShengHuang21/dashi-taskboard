@@ -287,11 +287,37 @@ test("projects safe continuation and one exact authorization gate into Agent Tod
     ],
   })}\n\`\`\``, fixture.rootBinding.threadId, fixture.rootBinding);
 
+  const urgentTask = fixture.database.createTask({
+    projectId: "capstone-dev", title: "Urgent Root-only decision", description: "", status: "todo",
+    priority: "urgent", labels: [], workflowProfile: "vibe",
+    threadId: fixture.rootBinding.threadId, threadBinding: fixture.rootBinding,
+    actor, assignee: actor, developmentContext: fixture.developmentContext,
+    workingLog: null, startDate: null, dueDate: null, recurrence: null,
+  });
+  fixture.database.createComment(urgentTask.id, {
+    body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+      gates: [{
+        id: "deploy", kind: "deploy", state: "approval_required", scope: "exact environment",
+        approver: "Owner", approvalRequest: "同意 exact deployment",
+      }],
+      actions: [{
+        id: "deploy", order: 10, text: "Deploy exact candidate", gate: "deploy",
+        target: "environment", status: "pending",
+      }],
+    })}\n\`\`\``,
+    threadId: fixture.rootBinding.threadId,
+    threadBinding: fixture.rootBinding,
+    actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+  });
+
   snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
   todo = snapshot.todos.find((entry) => entry.id === gatedTask.identifier);
   assert.equal(todo?.readyWork.eligible, false);
   assert.equal(todo?.readyWork.approvalRequest?.message, "同意推送 exact commit");
   assert.match(todo?.readyWork.approvalRequest?.expectedResumeToken ?? "", /^[a-f0-9]{64}$/);
+  assert.equal(snapshot.coordination.ownerDecisionRequest.identifier, urgentTask.identifier);
+  assert.equal(snapshot.coordination.ownerDecisionRequest.message, "同意 exact deployment");
+  assert.equal(snapshot.coordination.ownerDecisionRequest.route.rootThreadId, fixture.rootBinding.threadId);
   fixture.database.close();
 });
 

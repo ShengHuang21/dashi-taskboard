@@ -4,9 +4,12 @@ import { test } from "node:test";
 
 import {
   deliverTaskboardCoordination,
+  deliverTaskboardOwnerDecision,
   findResidentInjectorPids,
   handleHostBindingPayload,
+  observeTaskboardOwnerDecision,
   reconcileInjectionRuntime,
+  runOwnerDecisionMonitorOnce,
   runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
 } from "../scripts/codex-injector-runtime.mjs";
@@ -84,6 +87,235 @@ test("background continuation delivers one eligible first safe action without a 
     safeActionId: "safe-first",
     expectedResumeToken: "b".repeat(64),
     executionIdentity: { ...confirmedIdentity, standingAuthority: false },
+  });
+});
+
+test("one project Owner decision is delivered only to its exact confirmed Root window", async () => {
+  const request = {
+    requestId: "d".repeat(64),
+    expectedResumeToken: "e".repeat(64),
+    identifier: "CAP-10",
+    actionId: "push",
+    message: "同意 ordinary push exact commit",
+    coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root",
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  const calls = [];
+  const deliver = (current) => deliverTaskboardOwnerDecision(current, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") {
+      return { thread: { id: request.route.rootThreadId, cwd: request.route.rootWorkspacePath, turns: [{ id: "turn-active", status: "inProgress" }] } };
+    }
+    if (method === "turn/steer") return {};
+    throw new Error(`Unexpected method: ${method}`);
+  });
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: { ownerDecisionRequest: request },
+    }),
+    claimDelivery: async () => ({
+      claimed: true,
+      receipt: { id: "delivery-1" },
+    }),
+    confirmDelivery: async () => ({ confirmed: true }),
+    deliver,
+    observeDecision: async () => null,
+    recordDecision: async () => assert.fail("no Owner decision was observed"),
+  };
+
+  assert.deepEqual(await runOwnerDecisionMonitorOnce(options), {
+    delivered: true,
+    requestId: request.requestId,
+    delivery: "steered",
+    awaitingOwner: true,
+  });
+  assert.equal(calls[0][0], "thread/read");
+  assert.equal(calls[1][0], "turn/steer");
+  assert.match(calls[1][1].input[0].text, /Ask the Owner exactly this one question in this Root window/);
+  assert.match(calls[1][1].input[0].text, /Do not approve it yourself/);
+  assert.match(calls[1][1].input[0].text, /delivery-1/);
+  assert.doesNotMatch(calls[1][1].input[0].text, /attestation token/i);
+});
+
+test("Owner decision observation requires an actual Owner turn in the exact Root thread", async () => {
+  const request = {
+    requestId: "9".repeat(64), expectedResumeToken: "8".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  const receipt = { id: "delivery-observe", deliveryTurnId: "delivery-turn" };
+  const marker = `TASKBOARD_OWNER_DECISION_V1 ${JSON.stringify({
+    requestId: request.requestId,
+    outcome: "authorized",
+    evidence: "Owner explicitly approved",
+  })}`;
+  const read = (turns) => observeTaskboardOwnerDecision(request, receipt, async () => ({
+    thread: { id: request.route.rootThreadId, cwd: request.route.rootWorkspacePath, turns },
+  }));
+  assert.equal(await read([{
+    id: "delivery-turn",
+    input: [{ type: "text", text: `Taskboard Owner decision delivery id: ${receipt.id}` }],
+    items: [{ type: "agent_message", role: "assistant", content: marker }],
+  }]), null);
+  assert.deepEqual(await read([
+    {
+      id: "delivery-turn",
+      input: [{ type: "text", text: `Taskboard Owner decision delivery id: ${receipt.id}` }],
+    },
+    {
+      id: "owner-turn",
+      input: [{ type: "text", text: "Yes, approve this exact action" }],
+      items: [{ type: "agent_message", role: "assistant", content: marker }],
+    },
+  ]), {
+    outcome: "authorized",
+    evidence: "Owner explicitly approved",
+    ownerTurnId: "owner-turn",
+    rootDecisionTurnId: "owner-turn",
+    rootThreadId: request.route.rootThreadId,
+  });
+});
+
+test("an uncertain Owner delivery is read back by id before any retry side effect", async () => {
+  const request = {
+    requestId: "7".repeat(64), expectedResumeToken: "6".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
+    },
+    deliveryReceipt: { id: "delivery-uncertain" },
+  };
+  const activeTurn = { id: "active-turn", status: "inProgress", input: [] };
+  let steerCalls = 0;
+  const rpc = async (method, params) => {
+    if (method === "thread/read") {
+      return { thread: { id: request.route.rootThreadId, cwd: request.route.rootWorkspacePath, turns: [activeTurn] } };
+    }
+    if (method === "turn/steer") {
+      steerCalls += 1;
+      activeTurn.input = params.input;
+      throw new Error("confirmation channel lost after Root accepted the steer");
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  };
+  await assert.rejects(deliverTaskboardOwnerDecision(request, rpc), /confirmation channel lost/);
+  assert.deepEqual(await deliverTaskboardOwnerDecision(request, rpc), {
+    delivery: "observed",
+    turnId: "active-turn",
+  });
+  assert.equal(steerCalls, 1);
+});
+
+test("Owner decision delivery uses an atomic durable reservation before any Root call", async () => {
+  const request = {
+    requestId: "a".repeat(64), expectedResumeToken: "b".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  let claims = 0;
+  let deliveries = 0;
+  let release;
+  const barrier = new Promise((resolve) => { release = resolve; });
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    claimDelivery: async () => {
+      claims += 1;
+      if (claims > 1) return { claimed: false, reason: "reserved" };
+      return { claimed: true, receipt: { id: "delivery-atomic" } };
+    },
+    deliver: async () => { deliveries += 1; await barrier; return { delivery: "steered", turnId: "turn-1" }; },
+    confirmDelivery: async () => ({ confirmed: true }),
+    observeDecision: async () => null,
+    recordDecision: async () => assert.fail("no Owner decision was observed"),
+  };
+  const first = runOwnerDecisionMonitorOnce(options);
+  const second = runOwnerDecisionMonitorOnce(options);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deliveries, 1);
+  release();
+  assert.equal((await first).delivered, true);
+  assert.equal((await second).delivered, true);
+});
+
+test("Owner decision monitor stops when the service rejects a stale coordinator route", async () => {
+  const request = {
+    requestId: "3".repeat(64), expectedResumeToken: "4".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "lease:old",
+    route: {
+      rootTaskId: "old-root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/old-root",
+    },
+  };
+  let delivered = 0;
+  const result = await runOwnerDecisionMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    claimDelivery: async () => ({ claimed: false, reason: "stale-route" }),
+    deliver: async () => { delivered += 1; },
+    confirmDelivery: async () => assert.fail("stale route must not confirm"),
+    observeDecision: async () => assert.fail("stale route must not be observed"),
+    recordDecision: async () => assert.fail("stale route must not record"),
+  });
+  assert.deepEqual(result, { delivered: false, reason: "stale-route" });
+  assert.equal(delivered, 0);
+});
+
+test("a durable delivered request is recorded only from the exact Root observation", async () => {
+  const request = {
+    requestId: "5".repeat(64), expectedResumeToken: "4".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  let recorded;
+  const result = await runOwnerDecisionMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    claimDelivery: async () => ({
+      claimed: false,
+      reason: "already-delivered",
+      receipt: { id: "delivery-record", deliveryTurnId: "delivery-turn" },
+    }),
+    deliver: async () => assert.fail("delivered receipt must not deliver again"),
+    confirmDelivery: async () => assert.fail("delivered receipt must not confirm again"),
+    observeDecision: async () => ({
+      outcome: "authorized",
+      evidence: "Owner approved exact scope",
+      ownerTurnId: "owner-turn",
+      rootDecisionTurnId: "root-decision-turn",
+      rootThreadId: request.route.rootThreadId,
+    }),
+    recordDecision: async (value) => { recorded = value; return { applied: true }; },
+  });
+  assert.equal(result.decisionRecorded, true);
+  assert.equal(result.delivered, false);
+  assert.deepEqual(recorded, {
+    taskId: "CAP-10",
+    requestId: request.requestId,
+    expectedResumeToken: request.expectedResumeToken,
+    deliveryId: "delivery-record",
+    outcome: "authorized",
+    evidence: "Owner approved exact scope",
+    ownerTurnId: "owner-turn",
+    rootDecisionTurnId: "root-decision-turn",
+    rootThreadId: request.route.rootThreadId,
   });
 });
 

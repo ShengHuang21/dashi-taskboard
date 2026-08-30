@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -8,6 +8,8 @@ import { createTaskCapsule } from "./task-capsule.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
+const OWNER_DECISION_DELIVERY_TTL_MS = 30_000;
+const OWNER_DECISION_RESPONSE_TTL_MS = 24 * 60 * 60 * 1_000;
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -390,6 +392,36 @@ function standingAuthorityFromRow(row) {
   };
 }
 
+function ownerDecisionReceiptFromRow(row) {
+  return {
+    id: row.id,
+    requestId: row.request_id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    actionId: row.action_id,
+    gateId: row.gate_id,
+    expectedResumeToken: row.expected_resume_token,
+    outcome: row.outcome,
+    rootTaskId: row.root_task_id,
+    rootThreadId: row.root_thread_id,
+    coordinatorEpoch: row.coordinator_epoch,
+    ownerTurnId: row.owner_turn_id,
+    rootDecisionTurnId: row.root_decision_turn_id,
+    evidence: row.evidence,
+    receipt: row.receipt,
+    decidedAt: row.decided_at,
+    deliveryId: row.delivery_id,
+    authorizationCommentId: row.authorization_comment_id,
+    authorizationCommentVersion: row.authorization_comment_version,
+    recordedBy: {
+      type: row.recorded_by_type,
+      id: row.recorded_by_id,
+      name: row.recorded_by_name,
+    },
+    createdAt: row.created_at,
+  };
+}
+
 function taskRelationSummaryFromRow(row) {
   return {
     id: row.id,
@@ -732,6 +764,60 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS standing_authorities_project_repository
         ON project_standing_authorities(project_id, repository, revoked_at, expires_at);
 
+      CREATE TABLE IF NOT EXISTS owner_decision_deliveries (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        expected_resume_token TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        codex_host_id TEXT NOT NULL,
+        root_workspace_path TEXT NOT NULL,
+        route_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'delivered')),
+        reservation_expires_at TEXT NOT NULL,
+        decision_expires_at TEXT,
+        claimed_at TEXT NOT NULL,
+        delivered_at TEXT,
+        delivery_turn_id TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS owner_decision_deliveries_request
+        ON owner_decision_deliveries(project_id, request_id, claimed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS task_owner_decision_receipts (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        action_id TEXT NOT NULL,
+        gate_id TEXT NOT NULL,
+        expected_resume_token TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('authorized', 'denied')),
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        owner_turn_id TEXT NOT NULL,
+        root_decision_turn_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        receipt TEXT NOT NULL UNIQUE,
+        decided_at TEXT NOT NULL,
+        delivery_id TEXT NOT NULL UNIQUE REFERENCES owner_decision_deliveries(id),
+        authorization_comment_id TEXT NOT NULL REFERENCES comments(id),
+        authorization_comment_version INTEGER NOT NULL CHECK (authorization_comment_version > 0),
+        recorded_by_type TEXT NOT NULL CHECK (recorded_by_type = 'agent'),
+        recorded_by_id TEXT NOT NULL,
+        recorded_by_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS owner_decisions_task_created
+        ON task_owner_decision_receipts(task_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS owner_decisions_project_created
+        ON task_owner_decision_receipts(project_id, created_at DESC);
+
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -977,6 +1063,13 @@ export class TaskboardDatabase {
     const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
+    }
+
+    const ownerDecisionDeliveryColumns = this.database.prepare(
+      "PRAGMA table_info(owner_decision_deliveries)",
+    ).all();
+    if (!ownerDecisionDeliveryColumns.some((column) => column.name === "decision_expires_at")) {
+      this.database.exec("ALTER TABLE owner_decision_deliveries ADD COLUMN decision_expires_at TEXT");
     }
 
     const agentClaimColumns = this.database.prepare("PRAGMA table_info(agent_task_claims)").all();
@@ -2261,6 +2354,7 @@ export class TaskboardDatabase {
     if (!this.getProject(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
+    this.#assertNoActiveOwnerDecisionDelivery(projectId);
     const timestamp = now();
     this.database.prepare(`
       INSERT INTO agent_lane_projects (project_id, config_json, updated_at)
@@ -2309,12 +2403,23 @@ export class TaskboardDatabase {
           "Another peer window holds the active coordinator lease",
         );
       }
+      if (!active) this.#assertNoActiveOwnerDecisionDelivery(projectId);
 
+      const requestedExpiresAt = new Date(
+        Date.parse(timestamp) + input.leaseDurationSeconds * 1000,
+      ).toISOString();
+      const ownerDecisionProtectionExpiresAt = active
+        ? this.#activeOwnerDecisionProtectionExpiresAt(projectId)
+        : null;
+      const expiresAt = ownerDecisionProtectionExpiresAt
+        && Date.parse(ownerDecisionProtectionExpiresAt) >= Date.parse(requestedExpiresAt)
+        ? new Date(Date.parse(ownerDecisionProtectionExpiresAt) + 5_000).toISOString()
+        : requestedExpiresAt;
       const lease = {
         id: active ? existing.id : randomUUID(),
         holderTaskId: input.holderTaskId,
         acquiredAt: active ? existing.acquiredAt : timestamp,
-        expiresAt: new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString(),
+        expiresAt,
       };
       this.database.prepare(`
         UPDATE agent_lane_projects
@@ -2379,6 +2484,7 @@ export class TaskboardDatabase {
           "Another peer window holds the active coordinator lease",
         );
       }
+      this.#assertNoActiveOwnerDecisionDelivery(projectId);
 
       const lease = { ...existing, expiresAt: timestamp };
       this.database.prepare(`
@@ -2439,6 +2545,56 @@ export class TaskboardDatabase {
       receipt.createdAt,
     );
     return receipt;
+  }
+
+  #assertNoActiveOwnerDecisionDelivery(projectId) {
+    const active = this.database.prepare(`
+      SELECT delivery.id FROM owner_decision_deliveries AS delivery
+      WHERE delivery.project_id = ? AND (
+        (delivery.state = 'reserved' AND delivery.reservation_expires_at > ?)
+        OR (
+          delivery.state = 'delivered'
+          AND delivery.decision_expires_at > ?
+          AND NOT EXISTS (
+            SELECT 1 FROM task_owner_decision_receipts AS receipt
+            WHERE receipt.delivery_id = delivery.id
+          )
+        )
+      )
+      LIMIT 1
+    `).get(projectId, now(), now());
+    if (active) {
+      throw new ApiError(
+        409,
+        "OWNER_DECISION_DELIVERY_ACTIVE",
+        "Coordinator route cannot change while an Owner decision delivery is active or awaiting a response",
+      );
+    }
+  }
+
+  #activeOwnerDecisionProtectionExpiresAt(projectId) {
+    const row = this.database.prepare(`
+      SELECT MAX(
+        CASE
+          WHEN delivery.state = 'reserved' THEN delivery.reservation_expires_at
+          ELSE delivery.decision_expires_at
+        END
+      ) AS protected_until
+      FROM owner_decision_deliveries AS delivery
+      WHERE delivery.project_id = ?
+        AND (
+          (delivery.state = 'reserved' AND delivery.reservation_expires_at > ?)
+          OR (
+            delivery.state = 'delivered'
+            AND delivery.decision_expires_at > ?
+            AND NOT EXISTS (
+              SELECT 1 FROM task_owner_decision_receipts AS receipt
+              WHERE receipt.delivery_id = delivery.id
+            )
+          )
+        )
+    `).get(projectId, now(), now());
+    return row?.protected_until ?? null;
   }
 
   getAgentTaskClaim(taskId) {
@@ -2890,6 +3046,291 @@ export class TaskboardDatabase {
     `).get(authorityId)) };
   }
 
+  listTaskOwnerDecisionReceipts(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM task_owner_decision_receipts
+      WHERE task_id = ?
+      ORDER BY created_at, id
+    `).all(task.id).map(ownerDecisionReceiptFromRow);
+  }
+
+  claimOwnerDecisionDelivery(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(input.taskId);
+      if (task.projectId !== projectId) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision task is not in this project");
+      }
+      const capsule = this.getTaskCapsule(task.id);
+      const request = capsule.readyWork.ownerDecisionRequest;
+      if (!request
+        || request.requestId !== input.requestId
+        || request.expectedResumeToken !== input.expectedResumeToken
+        || request.actionId !== input.actionId) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision request is no longer current");
+      }
+      const route = this.#currentOwnerDecisionRoute(projectId);
+      if (route.coordinatorEpoch !== input.coordinatorEpoch
+        || route.rootTaskId !== input.route.rootTaskId
+        || route.rootThreadId !== input.route.rootThreadId) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before delivery");
+      }
+      const routeKey = createHash("sha256").update(JSON.stringify([
+        task.id,
+        input.requestId,
+        input.expectedResumeToken,
+        input.coordinatorEpoch,
+        input.route.rootTaskId,
+        input.route.rootThreadId,
+        input.route.codexHostId,
+        input.route.rootWorkspacePath,
+      ])).digest("hex");
+      const existing = this.database.prepare(`
+        SELECT * FROM owner_decision_deliveries WHERE route_key = ?
+      `).get(routeKey);
+      const observedAt = now();
+      if (existing?.state === "delivered") {
+        this.database.exec("COMMIT");
+        return {
+          claimed: false,
+          reason: "already-delivered",
+          receipt: { id: existing.id, deliveryTurnId: existing.delivery_turn_id },
+        };
+      }
+      if (existing && Date.parse(existing.reservation_expires_at) > Date.now()) {
+        this.database.exec("COMMIT");
+        return {
+          claimed: false,
+          reason: "reserved",
+          receipt: { id: existing.id, reservationExpiresAt: existing.reservation_expires_at },
+        };
+      }
+      const reservationExpiresAt = new Date(Date.now() + OWNER_DECISION_DELIVERY_TTL_MS).toISOString();
+      this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, reservationExpiresAt);
+      const id = existing?.id ?? randomUUID();
+      if (existing) {
+        this.database.prepare(`
+          UPDATE owner_decision_deliveries SET
+            state = 'reserved', reservation_expires_at = ?, claimed_at = ?,
+            delivered_at = NULL, delivery_turn_id = NULL
+          WHERE id = ?
+        `).run(reservationExpiresAt, observedAt, id);
+      } else {
+        this.database.prepare(`
+          INSERT INTO owner_decision_deliveries (
+            id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
+            root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+            state, reservation_expires_at, claimed_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+        `).run(
+          id, input.requestId, task.id, projectId, input.expectedResumeToken,
+          input.coordinatorEpoch, input.route.rootTaskId, input.route.rootThreadId,
+          input.route.codexHostId, input.route.rootWorkspacePath, routeKey,
+          reservationExpiresAt, observedAt,
+        );
+      }
+      this.database.exec("COMMIT");
+      return {
+        claimed: true,
+        receipt: { id, reservationExpiresAt },
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  confirmOwnerDecisionDelivery(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(`
+        SELECT * FROM owner_decision_deliveries WHERE id = ? AND project_id = ?
+      `).get(input.deliveryId, projectId);
+      if (!row) throw new ApiError(409, "OWNER_DECISION_DELIVERY_MISMATCH", "Owner decision delivery does not exist");
+      if (row.state === "delivered") {
+        if (row.delivery_turn_id !== input.deliveryTurnId) {
+          throw new ApiError(409, "OWNER_DECISION_DELIVERY_CONFLICT", "Owner decision delivery is already bound to another Root turn");
+        }
+        if (!row.decision_expires_at) {
+          const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
+          this.#extendCoordinatorLeaseForOwnerDecision(projectId, {
+            coordinatorEpoch: row.coordinator_epoch,
+            rootTaskId: row.root_task_id,
+            rootThreadId: row.root_thread_id,
+          }, decisionExpiresAt);
+          this.database.prepare(`
+            UPDATE owner_decision_deliveries SET decision_expires_at = ? WHERE id = ?
+          `).run(decisionExpiresAt, row.id);
+        }
+        this.database.exec("COMMIT");
+        return { confirmed: true, reused: true, deliveryId: row.id };
+      }
+      if (Date.parse(row.reservation_expires_at) <= Date.now()) {
+        throw new ApiError(409, "OWNER_DECISION_DELIVERY_EXPIRED", "Owner decision delivery reservation expired before confirmation");
+      }
+      const route = this.#currentOwnerDecisionRoute(projectId);
+      if (route.coordinatorEpoch !== row.coordinator_epoch
+        || route.rootTaskId !== row.root_task_id
+        || route.rootThreadId !== row.root_thread_id) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before confirmation");
+      }
+      const timestamp = now();
+      const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
+      this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, decisionExpiresAt);
+      this.database.prepare(`
+        UPDATE owner_decision_deliveries
+        SET state = 'delivered', delivered_at = ?, delivery_turn_id = ?, decision_expires_at = ?
+        WHERE id = ? AND state = 'reserved'
+      `).run(timestamp, input.deliveryTurnId, decisionExpiresAt, row.id);
+      this.database.exec("COMMIT");
+      return { confirmed: true, reused: false, deliveryId: row.id };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #currentOwnerDecisionRoute(projectId) {
+    const config = this.getAgentLaneProject(projectId);
+    if (!config) throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Project has no Agent Lane coordinator");
+    const lease = config.coordinatorLease ?? null;
+    let rootTaskId;
+    let coordinatorEpoch;
+    if (lease) {
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Coordinator lease is not active");
+      }
+      rootTaskId = lease.holderTaskId;
+      coordinatorEpoch = `lease:${lease.id}`;
+    } else {
+      rootTaskId = config.rootTaskId;
+      coordinatorEpoch = `configured:${rootTaskId}`;
+    }
+    const rootLane = Array.isArray(config.tasks)
+      ? config.tasks.find((candidate) => candidate.id === rootTaskId)
+      : null;
+    if (!rootLane?.threadId) {
+      throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Coordinator Root has no confirmed thread route");
+    }
+    return { rootTaskId, rootThreadId: rootLane.threadId, coordinatorEpoch };
+  }
+
+  #extendCoordinatorLeaseForOwnerDecision(projectId, route, protectedUntil) {
+    if (!route.coordinatorEpoch.startsWith("lease:")) return;
+    const config = this.getAgentLaneProject(projectId);
+    const lease = config?.coordinatorLease ?? null;
+    if (!lease
+      || `lease:${lease.id}` !== route.coordinatorEpoch
+      || lease.holderTaskId !== route.rootTaskId) {
+      throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Coordinator lease changed before delivery reservation");
+    }
+    const leaseProtectedUntil = new Date(Date.parse(protectedUntil) + 5_000).toISOString();
+    if (Date.parse(lease.expiresAt) >= Date.parse(leaseProtectedUntil)) return;
+    const timestamp = now();
+    const extendedLease = { ...lease, expiresAt: leaseProtectedUntil };
+    this.database.prepare(`
+      UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
+    `).run(JSON.stringify({ ...config, coordinatorLease: extendedLease }), timestamp, projectId);
+    this.#insertCoordinatorLeaseReceipt({
+      projectId,
+      leaseId: lease.id,
+      holderTaskId: lease.holderTaskId,
+      holderThreadId: route.rootThreadId,
+      action: "renewed",
+      createdAt: timestamp,
+    });
+  }
+
+  recordTaskOwnerDecision(taskId, input, actor) {
+    if (actor.type !== "agent") {
+      throw new ApiError(403, "OWNER_DECISION_ROOT_REQUIRED", "Only the confirmed Codex Root may attest an Owner decision");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const delivery = this.database.prepare(`
+        SELECT * FROM owner_decision_deliveries WHERE id = ?
+      `).get(input.deliveryId);
+      if (!delivery
+        || delivery.state !== "delivered"
+        || delivery.task_id !== task.id
+        || delivery.request_id !== input.requestId
+        || delivery.expected_resume_token !== input.expectedResumeToken
+        || delivery.root_thread_id !== input.rootThreadId) {
+        throw new ApiError(409, "OWNER_DECISION_DELIVERY_REQUIRED", "Decision requires a host-observed exact Root delivery and Owner turn");
+      }
+      const existingRow = this.database.prepare(`
+        SELECT * FROM task_owner_decision_receipts WHERE request_id = ? OR receipt = ?
+      `).get(input.requestId, input.receipt);
+      if (existingRow) {
+        const existing = ownerDecisionReceiptFromRow(existingRow);
+        if (existing.requestId === input.requestId
+          && existing.taskId === task.id
+          && existing.expectedResumeToken === input.expectedResumeToken
+          && existing.outcome === input.outcome
+          && existing.deliveryId === input.deliveryId
+          && existing.rootThreadId === delivery.root_thread_id
+          && existing.coordinatorEpoch === delivery.coordinator_epoch
+          && existing.ownerTurnId === input.ownerTurnId
+          && existing.rootDecisionTurnId === input.rootDecisionTurnId
+          && existing.evidence === input.evidence
+          && existing.receipt === input.receipt
+          && existing.decidedAt === input.decidedAt) {
+          this.database.exec("COMMIT");
+          return { applied: false, receipt: existing, capsule: this.getTaskCapsule(task.id) };
+        }
+        throw new ApiError(409, "OWNER_DECISION_CONFLICT", "Decision request or receipt is already bound to different evidence");
+      }
+      if (!delivery.decision_expires_at || Date.parse(delivery.decision_expires_at) <= Date.now()) {
+        throw new ApiError(409, "OWNER_DECISION_DELIVERY_EXPIRED", "Owner decision response window has expired");
+      }
+      const currentRoute = this.#currentOwnerDecisionRoute(task.projectId);
+      if (currentRoute.rootTaskId !== delivery.root_task_id
+        || currentRoute.rootThreadId !== delivery.root_thread_id
+        || currentRoute.coordinatorEpoch !== delivery.coordinator_epoch) {
+        throw new ApiError(409, "OWNER_DECISION_ROOT_MISMATCH", "Decision delivery no longer matches the active Root route");
+      }
+      const capsule = this.getTaskCapsule(task.id);
+      const request = capsule.readyWork.ownerDecisionRequest;
+      if (!request
+        || request.requestId !== input.requestId
+        || request.expectedResumeToken !== input.expectedResumeToken) {
+        throw new ApiError(409, "OWNER_DECISION_STALE", "Owner decision request is no longer current");
+      }
+      const decidedAt = Date.parse(input.decidedAt);
+      if (Number.isNaN(decidedAt) || decidedAt > Date.now() + 5 * 60 * 1_000) {
+        throw new ApiError(400, "INVALID_OWNER_DECISION", "Decision time is invalid");
+      }
+      const id = randomUUID();
+      const timestamp = now();
+      this.database.prepare(`
+        INSERT INTO task_owner_decision_receipts (
+          id, request_id, task_id, project_id, action_id, gate_id, expected_resume_token,
+          outcome, root_task_id, root_thread_id, coordinator_epoch, owner_turn_id, root_decision_turn_id,
+          evidence, receipt, decided_at, delivery_id, authorization_comment_id, authorization_comment_version,
+          recorded_by_type, recorded_by_id, recorded_by_name, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id, request.requestId, task.id, task.projectId, request.actionId, request.gateId,
+        request.expectedResumeToken, input.outcome, currentRoute.rootTaskId, currentRoute.rootThreadId,
+        currentRoute.coordinatorEpoch, input.ownerTurnId, input.rootDecisionTurnId,
+        input.evidence, input.receipt, input.decidedAt,
+        input.deliveryId,
+        capsule.authorization.source.commentId, capsule.authorization.source.commentVersion,
+        actor.type, actor.id, actor.name, timestamp,
+      );
+      const recorded = ownerDecisionReceiptFromRow(this.database.prepare(`
+        SELECT * FROM task_owner_decision_receipts WHERE id = ?
+      `).get(id));
+      this.database.exec("COMMIT");
+      return { applied: true, receipt: recorded, capsule: this.getTaskCapsule(task.id) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getTaskCapsule(id) {
     const task = this.getTask(id);
     if (!task) return null;
@@ -2903,6 +3344,7 @@ export class TaskboardDatabase {
       currentRun: this.getActiveTaskAgentRun(task.id),
       latestRun: this.getLatestTaskAgentRun(task.id),
       standingAuthorities: this.listProjectStandingAuthorities(task.projectId),
+      ownerDecisionReceipts: this.listTaskOwnerDecisionReceipts(task.id),
     });
   }
 

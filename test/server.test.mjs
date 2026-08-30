@@ -696,7 +696,7 @@ test("project Agent Lanes read durable database configuration through a local ro
   assert.equal(result.response.status, 200);
   assert.equal(result.body.readOnly, true);
   assert.equal(result.body.automaticRecoveryEnabled, false);
-  assert.equal(result.body.version, 3);
+  assert.equal(result.body.version, 4);
   assert.equal(result.body.taskLanes.length, 3);
   assert.equal(result.body.rootSubagents.length, 0);
   assert.equal(result.body.adapters.length, 2);
@@ -720,6 +720,256 @@ test("project Agent Lanes read durable database configuration through a local ro
     body: {},
   });
   assert.equal(mutation.response.status, 405);
+});
+
+test("Root records one immutable Owner decision receipt from the project-level request", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const instanceSecret = "b".repeat(64);
+  let task;
+  let dataDirectory;
+  let baseUrl = await startServer(async (directory) => {
+    dataDirectory = directory;
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{
+        id: "root", label: "Root", owner: "Codex Root", source: "codex",
+        threadId: rootThreadId, taskType: "root_task",
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "owner-decision-lease",
+        holderTaskId: "root",
+        acquiredAt: new Date(Date.now() - 1_000).toISOString(),
+        expiresAt: new Date(Date.now() + 15_000).toISOString(),
+      },
+    });
+    const binding = {
+      threadId: rootThreadId,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/root-owner-decision",
+    };
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    task = database.createTask({
+      projectId: "local", title: "Ask exactly one Owner question", description: "", status: "todo",
+      priority: "urgent", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: rootThreadId, threadBinding: binding, actor, assignee: actor,
+      developmentContext: { type: "worktree", path: binding.workspacePath, branch: "codex/decision" },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "push", kind: "push", state: "approval_required", scope: "exact commit",
+          approver: "Owner", approvalRequest: "同意 ordinary push exact commit",
+        }],
+        actions: [{
+          id: "push", order: 10, text: "Push exact commit", gate: "push",
+          target: "origin", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootThreadId,
+      threadBinding: binding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const lanes = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(lanes.response.status, 200);
+  const pending = lanes.body.coordination.ownerDecisionRequest;
+  assert.equal(pending.identifier, task.identifier);
+  assert.equal(pending.route.rootThreadId, rootThreadId);
+  assert.equal(pending.coordinatorEpoch, "lease:owner-decision-lease");
+  assert.equal(lanes.body.todos.filter((todo) => todo.readyWork.approvalRequest).length, 1);
+
+  const decisionBody = {
+    requestId: pending.requestId,
+    expectedResumeToken: pending.expectedResumeToken,
+    outcome: "authorized",
+    ownerTurnId: "owner-turn-1",
+    rootDecisionTurnId: "root-decision-turn-1",
+    rootThreadId,
+    evidence: "Owner approved in the confirmed Root window",
+    receipt: "owner-turn:decision-1",
+    decidedAt: new Date().toISOString(),
+  };
+  const forged = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      ...decisionBody,
+      deliveryId: "forged-delivery",
+    },
+  });
+  assert.equal(forged.response.status, 403);
+  assert.equal(forged.body.error.code, "INJECTOR_PROOF_REQUIRED");
+
+  const injectorHeaders = (nonce) => ({
+    "x-codex-taskboard-injector-nonce": nonce,
+    "x-codex-taskboard-injector-proof": createHmac("sha256", instanceSecret).update(nonce).digest("hex"),
+  });
+  const unsignedDelivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
+    method: "POST",
+    body: pending,
+  });
+  assert.equal(unsignedDelivery.response.status, 403);
+  const delivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
+    method: "POST",
+    headers: injectorHeaders("c".repeat(32)),
+    body: pending,
+  });
+  assert.equal(delivery.response.status, 201, JSON.stringify(delivery.body));
+  assert.equal(delivery.body.claimed, true);
+  assert.equal("attestationToken" in delivery.body.receipt, false);
+  const fixtureDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  const protectedConfig = JSON.parse(fixtureDatabase.prepare(`
+    SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'
+  `).get().config_json);
+  assert.ok(Date.parse(protectedConfig.coordinatorLease.expiresAt)
+    > Date.parse(delivery.body.receipt.reservationExpiresAt));
+  fixtureDatabase.prepare(`
+    UPDATE owner_decision_deliveries SET reservation_expires_at = ? WHERE id = ?
+  `).run("2000-01-01T00:00:00.000Z", delivery.body.receipt.id);
+  fixtureDatabase.close();
+  const retriedDelivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
+    method: "POST",
+    headers: injectorHeaders("d".repeat(32)),
+    body: pending,
+  });
+  assert.equal(retriedDelivery.response.status, 201);
+  assert.equal(retriedDelivery.body.receipt.id, delivery.body.receipt.id);
+  assert.equal("attestationToken" in retriedDelivery.body.receipt, false);
+  const routeMutationDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.throws(() => routeMutationDatabase.upsertAgentLaneProject("local", {
+    rootTaskId: "replacement",
+    tasks: [{
+      id: "replacement", label: "Replacement Root", owner: "Codex Root", source: "codex",
+      threadId: "replacement-thread", taskType: "root_task",
+    }],
+    adapters: [],
+  }), (error) => error?.code === "OWNER_DECISION_DELIVERY_ACTIVE");
+  routeMutationDatabase.close();
+  const confirmed = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/confirm", {
+    method: "POST",
+    headers: injectorHeaders("e".repeat(32)),
+    body: {
+      deliveryId: retriedDelivery.body.receipt.id,
+      deliveryTurnId: "root-delivery-turn-1",
+    },
+  });
+  assert.equal(confirmed.response.status, 200);
+  assert.equal(confirmed.body.confirmed, true);
+
+  const renewedDuringDecision = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "root",
+      holderThreadId: rootThreadId,
+      expectedLeaseId: "owner-decision-lease",
+      leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(renewedDuringDecision.response.status, 200);
+
+  const delayedDecisionDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  const delayedDelivery = delayedDecisionDatabase.prepare(`
+    SELECT decision_expires_at FROM owner_decision_deliveries WHERE id = ?
+  `).get(retriedDelivery.body.receipt.id);
+  const delayedConfig = JSON.parse(delayedDecisionDatabase.prepare(`
+    SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'
+  `).get().config_json);
+  assert.ok(Date.parse(delayedDelivery.decision_expires_at) > Date.now() + 23 * 60 * 60 * 1_000);
+  assert.ok(Date.parse(delayedConfig.coordinatorLease.expiresAt)
+    > Date.parse(delayedDelivery.decision_expires_at));
+  assert.equal(
+    renewedDuringDecision.body.lease.expiresAt,
+    delayedConfig.coordinatorLease.expiresAt,
+  );
+  delayedDecisionDatabase.prepare(`
+    UPDATE owner_decision_deliveries SET delivered_at = ? WHERE id = ?
+  `).run(new Date(Date.now() - 2 * 60 * 1_000).toISOString(), retriedDelivery.body.receipt.id);
+  delayedDecisionDatabase.close();
+  const delayedRouteMutationDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.throws(() => delayedRouteMutationDatabase.upsertAgentLaneProject("local", {
+    rootTaskId: "replacement",
+    tasks: [{
+      id: "replacement", label: "Replacement Root", owner: "Codex Root", source: "codex",
+      threadId: "replacement-thread", taskType: "root_task",
+    }],
+    adapters: [],
+  }), (error) => error?.code === "OWNER_DECISION_DELIVERY_ACTIVE");
+  delayedRouteMutationDatabase.close();
+
+  const firstServer = runningApps.pop();
+  await firstServer.app.close();
+  const restartedApp = createTaskboardServer({ dataDirectory: firstServer.directory, instanceSecret });
+  const restartedAddress = await restartedApp.listen({ port: 0 });
+  runningApps.push({ app: restartedApp, directory: firstServer.directory });
+  baseUrl = `http://127.0.0.1:${restartedAddress.port}`;
+  const durableReplay = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
+    method: "POST",
+    headers: injectorHeaders("f".repeat(32)),
+    body: pending,
+  });
+  assert.equal(durableReplay.response.status, 200);
+  assert.deepEqual(durableReplay.body, {
+    claimed: false,
+    reason: "already-delivered",
+    receipt: { id: retriedDelivery.body.receipt.id, deliveryTurnId: "root-delivery-turn-1" },
+  });
+
+  const recorded = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("1".repeat(32)),
+    body: {
+      ...decisionBody,
+      deliveryId: retriedDelivery.body.receipt.id,
+    },
+  });
+  assert.equal(recorded.response.status, 201);
+  assert.equal(recorded.body.applied, true);
+  assert.equal(recorded.body.receipt.recordedBy.type, "agent");
+  assert.deepEqual(recorded.body.capsule.readyWork.safeActions.map((action) => action.id), ["push"]);
+  assert.equal(recorded.body.capsule.readyWork.ownerDecisionRequest, null);
+
+  const releasedRouteDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.doesNotThrow(() => releasedRouteDatabase.upsertAgentLaneProject("local", {
+    rootTaskId: "replacement",
+    tasks: [{
+      id: "replacement", label: "Replacement Root", owner: "Codex Root", source: "codex",
+      threadId: "replacement-thread", taskType: "root_task",
+    }],
+    adapters: [],
+  }));
+  releasedRouteDatabase.close();
+
+  const replay = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("2".repeat(32)),
+    body: {
+      ...decisionBody,
+      deliveryId: retriedDelivery.body.receipt.id,
+    },
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.applied, false);
+
+  const conflict = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("3".repeat(32)),
+    body: {
+      ...decisionBody,
+      deliveryId: retriedDelivery.body.receipt.id,
+      outcome: "denied",
+    },
+  });
+  assert.equal(conflict.response.status, 409);
+  const after = await request(baseUrl, `/api/tasks/${task.identifier}/capsule`);
+  assert.deepEqual(after.body.capsule.readyWork.safeActions.map((action) => action.id), ["push"]);
 });
 
 test("project coordinator leases acquire and renew atomically without granting execution ownership", async () => {

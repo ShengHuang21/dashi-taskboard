@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { createInterface } from "node:readline";
 
-export const AGENT_LANE_SNAPSHOT_VERSION = 3;
+export const AGENT_LANE_SNAPSHOT_VERSION = 4;
 const MAX_TAIL_BYTES = 512 * 1024;
 const MAX_VISIBLE_SUBAGENTS = 12;
 const CONNECTED_SOURCES = new Set(["codex"]);
@@ -293,10 +293,15 @@ function readyWorkForTodo(capsule) {
       : [],
     approvalRequest: request?.actionId && request?.message && request?.expectedResumeToken
       ? {
+        requestId: text(request.requestId),
         actionId: text(request.actionId),
+        gateId: text(request.gateId),
+        gateKind: text(request.gateKind),
         approver: text(request.approver),
         message: compact(request.message, 240),
         scope: compact(request.scope, 160),
+        target: compact(request.target, 160),
+        requestedAt: text(request.requestedAt),
         expectedResumeToken: text(request.expectedResumeToken),
       }
       : null,
@@ -365,6 +370,7 @@ async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComm
     ...todoProjection({
     id: task.identifier,
     title: task.title,
+    priority: task.priority,
     state: taskTodoState(task, readyWork, claim, run),
     claimedBy: claim?.agentPath ?? null,
     claimedThreadId: claim?.agentThreadId ?? null,
@@ -774,12 +780,46 @@ export function createAgentLaneSnapshotProvider({
       const todos = todoEntries
         .filter(({ task, capsule }) => (
           capsule?.readyWork?.eligible === true
+          || capsule?.readyWork?.ownerDecisionRequest !== null && capsule?.readyWork?.ownerDecisionRequest !== undefined
           || capsule?.activeRun !== null && capsule?.activeRun !== undefined
           || capsule?.latestRun !== null && capsule?.latestRun !== undefined
           || task.labels.includes("agent-todo")
         ))
         .map(({ todo }) => todo);
       const currentCoordinator = taskLanes.find((lane) => lane.id === coordinatorTaskId) ?? null;
+      const coordinatorEpoch = lease
+        ? lease.status === "active" ? `lease:${lease.id}` : null
+        : `configured:${coordinatorTaskId}`;
+      const decisionPriority = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
+      const ownerDecisionRequest = coordinatorEpoch && currentCoordinator?.threadId
+        ? todos
+          .filter((todo) => (
+            todo.readyWork?.approvalRequest?.requestId
+            && todo.readyWork.safeActions.length === 0
+            && todo.readyWork.reasonCodes.length === 1
+            && todo.readyWork.reasonCodes[0] === "AUTHORIZATION_REQUIRED"
+            && todo.dispatchTarget?.rootThreadId === currentCoordinator.threadId
+          ))
+          .sort((left, right) => (
+            (decisionPriority[left.priority] ?? 9) - (decisionPriority[right.priority] ?? 9)
+            || (left.readyWork.approvalRequest.requestedAt ?? "").localeCompare(right.readyWork.approvalRequest.requestedAt ?? "")
+            || left.id.localeCompare(right.id)
+            || left.readyWork.approvalRequest.actionId.localeCompare(right.readyWork.approvalRequest.actionId)
+          ))
+          .map((todo) => ({
+            ...todo.readyWork.approvalRequest,
+            taskId: todo.taskId,
+            identifier: todo.id,
+            priority: todo.priority,
+            coordinatorEpoch,
+            route: {
+              rootTaskId: coordinatorTaskId,
+              rootThreadId: currentCoordinator.threadId,
+              codexHostId: todo.dispatchTarget.codexHostId,
+              rootWorkspacePath: todo.dispatchTarget.rootWorkspacePath,
+            },
+          }))[0] ?? null
+        : null;
       return {
         version: AGENT_LANE_SNAPSHOT_VERSION,
         projectId,
@@ -801,6 +841,7 @@ export function createAgentLaneSnapshotProvider({
           stateAuthority: "self_learning_checkpoint",
           workAuthority: "todo_claim_lease",
           runtimeOwnership: "single_writer",
+          ownerDecisionRequest,
         },
         todos,
         attentionQueue: todos

@@ -136,6 +136,17 @@ test("standing authority CLI rejects unknown and duplicate actions before networ
   assert.equal(called, false);
 });
 
+test("Owner decisions cannot be forged through taskctl", async () => {
+  let called = false;
+  const result = await run(["decision", "record", "CAP-10"], async () => {
+    called = true;
+    return response({});
+  });
+  assert.equal(result.exitCode, 2);
+  assert.equal(result.stderr.error.code, "USAGE_ERROR");
+  assert.equal(called, false);
+});
+
 test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
   let requestedUrl;
   const result = await run(

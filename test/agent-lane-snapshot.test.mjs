@@ -84,7 +84,7 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
   assert.equal(snapshot.projectId, "capstone-dev");
   assert.equal(snapshot.readOnly, true);
   assert.equal(snapshot.automaticRecoveryEnabled, false);
-  assert.equal(snapshot.version, 3);
+  assert.equal(snapshot.version, 4);
   assert.deepEqual(snapshot.coordination, {
     model: "peer_windows_with_configured_coordinator",
     coordinatorTaskId: "root",
@@ -97,6 +97,7 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
     stateAuthority: "self_learning_checkpoint",
     workAuthority: "todo_claim_lease",
     runtimeOwnership: "single_writer",
+    ownerDecisionRequest: null,
   });
   assert.deepEqual(snapshot.taskLanes.map((lane) => lane.id), ["root", "visual", "taskboard"]);
   assert.deepEqual(snapshot.adapters.map((lane) => lane.id), ["claude", "pi"]);
@@ -267,6 +268,7 @@ test("assigns project coordination through an active replaceable lease", async (
     stateAuthority: "self_learning_checkpoint",
     workAuthority: "todo_claim_lease",
     runtimeOwnership: "single_writer",
+    ownerDecisionRequest: null,
   });
   assert.deepEqual(snapshot.rootSubagents, []);
 });

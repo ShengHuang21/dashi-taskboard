@@ -64,6 +64,8 @@ taskctl issue bootstrap ISSUE_ID [--json]
 
 Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
 
+If the Capsule returns `readyWork.ownerDecisionRequest`, do not send the Owner to Taskboard and do not let a Sub-Agent ask them. The authenticated host Injector reserves the exact current request and Root route atomically, delivers the question once, and reads the delivery id back from the exact Root thread after uncertain transport. Once delivery is confirmed, Taskboard keeps that exact Root coordinator route protected for a bounded human-response window until the decision is recorded. After the Owner replies, Root bootstraps again and follows the injected instruction to emit one `TASKBOARD_OWNER_DECISION_V1` marker only when the request remains current. The Injector accepts that marker only after a real Owner input in the exact Root thread and records the immutable receipt through its host-authenticated route. `taskctl` has no Owner-decision mutation command. This is Root-attested Owner provenance, not Agent self-approval.
+
 ## Create issues
 
 ```bash

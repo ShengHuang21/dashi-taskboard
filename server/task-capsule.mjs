@@ -242,6 +242,46 @@ function authorizationFor(task, comments) {
   };
 }
 
+function applyOwnerDecisionReceipts(authorization, receipts) {
+  if (authorization.state !== "valid" || !Array.isArray(receipts) || receipts.length === 0) {
+    return { authorization, applied: [] };
+  }
+  const matching = receipts
+    .filter((receipt) => (
+      receipt.authorizationCommentId === authorization.source.commentId
+      && receipt.authorizationCommentVersion === authorization.source.commentVersion
+      && ["authorized", "denied"].includes(receipt.outcome)
+    ))
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  if (matching.length === 0) return { authorization, applied: [] };
+  const byGate = new Map(matching.map((receipt) => [receipt.gateId, receipt]));
+  const applied = [];
+  const gates = authorization.envelope.gates.map((gate) => {
+    const receipt = byGate.get(gate.id);
+    if (!receipt || gate.state !== "approval_required") return gate;
+    const action = authorization.envelope.actions.find((candidate) => (
+      candidate.id === receipt.actionId && candidate.gate === gate.id && candidate.status === "pending"
+    ));
+    if (!action) return gate;
+    applied.push(receipt);
+    return {
+      ...gate,
+      state: receipt.outcome,
+      approver: "Owner via confirmed Root",
+      evidence: receipt.evidence,
+      receipt: receipt.receipt,
+    };
+  });
+  if (applied.length === 0) return { authorization, applied: [] };
+  return {
+    authorization: {
+      ...authorization,
+      envelope: { ...authorization.envelope, gates },
+    },
+    applied,
+  };
+}
+
 function standingAuthorityFor(task, authorization, authorities, timestamp) {
   const repository = authorization.state === "valid"
     ? normalizeRepository(authorization.envelope.repository)
@@ -710,6 +750,7 @@ function readyWorkFor(
     safeActions: [],
     deferredActions: [],
     approvalRequest: null,
+    ownerDecisionRequest: null,
   };
 
   const structuralReasonCode = reasonCodes.find((reasonCode) => (
@@ -781,17 +822,21 @@ function readyWorkFor(
   ));
   if (approvalAction) {
     const gate = gates.get(approvalAction.gate);
+    const authorizationComment = comments.find((comment) => comment.id === authorization.source?.commentId);
     readyWork.state = "not_ready";
     readyWork.eligible = false;
     readyWork.reasonCodes.push("AUTHORIZATION_REQUIRED");
     readyWork.approvalRequest = {
       actionId: approvalAction.id,
       gateId: gate.id,
+      gateKind: gate.kind,
       approver: gate.approver,
       message: gate.approvalRequest,
       scope: gate.scope,
       target: approvalAction.target,
+      requestedAt: authorizationComment?.updatedAt ?? task.updatedAt ?? null,
       expectedResumeToken: null,
+      requestId: null,
     };
   } else if (readyWork.deferredActions.length > 0) {
     readyWork.state = "not_ready";
@@ -813,6 +858,7 @@ export function createTaskCapsule({
   currentRun = null,
   latestRun = null,
   standingAuthorities = [],
+  ownerDecisionReceipts = [],
   now = new Date(),
 }) {
   const orderedComments = [...comments].sort((left, right) => (
@@ -826,7 +872,9 @@ export function createTaskCapsule({
   });
   const execution = executionFor(task);
   const authorization = authorizationFor(task, orderedComments);
-  const standingAuthority = standingAuthorityFor(task, authorization, standingAuthorities, now);
+  const ownerDecisionResolution = applyOwnerDecisionReceipts(authorization, ownerDecisionReceipts);
+  const effectiveAuthorization = ownerDecisionResolution.authorization;
+  const standingAuthority = standingAuthorityFor(task, effectiveAuthorization, standingAuthorities, now);
   const handoffs = handoffsFor(coordinationEvents);
   const legacyRun = latestRun ? null : activeRunFor(task, currentClaim, now);
   const activeRun = currentRun ? durableRunFor(currentRun) : legacyRun;
@@ -840,7 +888,7 @@ export function createTaskCapsule({
     coordinationEvents,
     activeRun,
     projectedLatestRun,
-    authorization,
+    effectiveAuthorization,
     standingAuthority,
     requirementsRevision,
   );
@@ -855,9 +903,9 @@ export function createTaskCapsule({
           coordinationEvents,
           activeRun,
           projectedLatestRun,
-          authorization,
-          authorization.state === "valid"
-            ? authorization.envelope.actions
+          effectiveAuthorization,
+          effectiveAuthorization.state === "valid"
+            ? effectiveAuthorization.envelope.actions
               .filter((action) => action.status === "pending")
               .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
             : [],
@@ -880,6 +928,15 @@ export function createTaskCapsule({
       workingLog: task.workingLog,
       workflow,
       authorization,
+      ownerDecisionReceipts: ownerDecisionResolution.applied.map((receipt) => ({
+        id: receipt.id,
+        requestId: receipt.requestId,
+        actionId: receipt.actionId,
+        gateId: receipt.gateId,
+        outcome: receipt.outcome,
+        receipt: receipt.receipt,
+        createdAt: receipt.createdAt,
+      })),
       standingAuthority: {
         state: standingAuthority.state,
         repository: standingAuthority.repository,
@@ -895,6 +952,14 @@ export function createTaskCapsule({
   });
   if (readyWork.approvalRequest) {
     readyWork.approvalRequest.expectedResumeToken = resumeToken;
+    readyWork.approvalRequest.requestId = hash([
+      "OwnerDecisionRequestV1",
+      task.id,
+      readyWork.approvalRequest.actionId,
+      readyWork.approvalRequest.gateId,
+      resumeToken,
+    ]);
+    readyWork.ownerDecisionRequest = { ...readyWork.approvalRequest };
   }
   return {
     capsuleVersion: CAPSULE_VERSION,
@@ -924,6 +989,22 @@ export function createTaskCapsule({
     workingLog: task.workingLog,
     workflow,
     authorization,
+    ownerDecisions: {
+      appliedReceipts: ownerDecisionResolution.applied.map((receipt) => ({
+        id: receipt.id,
+        requestId: receipt.requestId,
+        actionId: receipt.actionId,
+        gateId: receipt.gateId,
+        outcome: receipt.outcome,
+        rootThreadId: receipt.rootThreadId,
+        ownerTurnId: receipt.ownerTurnId,
+        evidence: receipt.evidence,
+        receipt: receipt.receipt,
+        decidedAt: receipt.decidedAt,
+        recordedBy: receipt.recordedBy,
+        createdAt: receipt.createdAt,
+      })),
+    },
     standingAuthority,
     activeRun,
     latestRun: projectedLatestRun,
