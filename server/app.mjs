@@ -2867,6 +2867,38 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { projectIds: database.listAgentLaneProjectIds() });
       }
 
+      if (pathname === "/api/local/activation-readiness") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/activation-readiness");
+        return sendJson(response, 200, database.getActivationReadiness());
+      }
+
+      const activationWorkflowProfileRoute = pathname.match(
+        /^\/api\/local\/activation-readiness\/workflow-profiles\/([^/]+)$/,
+      );
+      if (activationWorkflowProfileRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/activation-readiness/workflow-profiles/:id");
+        if (request.headers["x-taskboard-client"] !== "taskctl") {
+          throw new ApiError(
+            403,
+            "TASKCTL_REQUIRED",
+            "Activation workflow profile migration is available only through protected taskctl",
+          );
+        }
+        const taskId = decodeRouteSegment(activationWorkflowProfileRoute[1], "Task id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["version"]));
+        const result = database.applyActivationWorkflowProfile(
+          taskId,
+          parseVersion(body.version),
+          actorFromRequest(request),
+        );
+        if (result.applied) events.emit("task.updated", { task: result.task });
+        return sendJson(response, 200, result);
+      }
+
       const coordinatorLeaseRoute = pathname.match(
         /^\/api\/local\/projects\/([^/]+)\/coordinator-lease$/,
       );

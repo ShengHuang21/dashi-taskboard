@@ -1558,8 +1558,13 @@ test("existing task and comment thread attribution remains content-specific", as
       );
       INSERT INTO projects VALUES ('local', 'Local', NULL, 2, '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z');
       INSERT INTO tasks VALUES (
-        'legacy-task', 'LOCAL-1', 'local', 'Legacy task', '', 'todo', 'none', '[]', 1000,
+        'legacy-task', 'LOCAL-1', 'local', 'Legacy task', '', 'todo', 'none', '["vibe-coding","no-working-log"]', 1000,
         'legacy-thread', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1,
+        '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z'
+      );
+      INSERT INTO tasks VALUES (
+        'legacy-formal-task', 'LOCAL-2', 'local', 'Legacy formal task', '', 'todo', 'none', '["vibe-coding"]', 2000,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1,
         '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z'
       );
       INSERT INTO comments VALUES (
@@ -1608,6 +1613,63 @@ test("existing task and comment thread attribution remains content-specific", as
     SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'task_threads'
   `).get();
   assert.equal(taskThreads, undefined);
+  const readiness = await request(baseUrl, "/api/local/activation-readiness");
+  assert.equal(readiness.response.status, 200);
+  assert.deepEqual(readiness.body.workflowProfileCandidates.map((candidate) => ({
+    taskId: candidate.taskId,
+    identifier: candidate.identifier,
+    taskVersion: candidate.taskVersion,
+    suggestedProfile: candidate.suggestedProfile,
+    status: candidate.status,
+  })), [{
+    taskId: "legacy-task",
+    identifier: "LOCAL-1",
+    taskVersion: 1,
+    suggestedProfile: "vibe",
+    status: "pending",
+  }]);
+  assert.deepEqual(readiness.body.legacyRootBindings.map((binding) => binding.identifier), ["LOCAL-1"]);
+  const preservedFormal = await request(baseUrl, "/api/tasks/legacy-formal-task");
+  assert.equal(preservedFormal.body.task.workflowProfile, "formal");
+  const rejectedBrowserMutation = await request(
+    baseUrl,
+    "/api/local/activation-readiness/workflow-profiles/LOCAL-1",
+    { method: "POST", body: { version: 1 } },
+  );
+  assert.equal(rejectedBrowserMutation.response.status, 403);
+  assert.equal(rejectedBrowserMutation.body.error.code, "TASKCTL_REQUIRED");
+  const rejectedFormalMigration = await request(
+    baseUrl,
+    "/api/local/activation-readiness/workflow-profiles/LOCAL-2",
+    { method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: { version: 1 } },
+  );
+  assert.equal(rejectedFormalMigration.response.status, 409);
+  assert.equal(rejectedFormalMigration.body.error.code, "ACTIVATION_CANDIDATE_MISSING");
+
+  const appliedProfile = await request(
+    baseUrl,
+    "/api/local/activation-readiness/workflow-profiles/LOCAL-1",
+    { method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: { version: 1 } },
+  );
+  assert.equal(appliedProfile.response.status, 200);
+  assert.equal(appliedProfile.body.applied, true);
+  assert.equal(appliedProfile.body.task.workflowProfile, "vibe");
+  assert.equal(appliedProfile.body.task.version, 2);
+  assert.equal(appliedProfile.body.receipt.taskVersionBefore, 1);
+  assert.equal(appliedProfile.body.receipt.taskVersionAfter, 2);
+
+  const replayedProfile = await request(
+    baseUrl,
+    "/api/local/activation-readiness/workflow-profiles/LOCAL-1",
+    { method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: { version: 1 } },
+  );
+  assert.equal(replayedProfile.response.status, 200);
+  assert.equal(replayedProfile.body.applied, false);
+  assert.deepEqual(replayedProfile.body.receipt, appliedProfile.body.receipt);
+
+  const afterReadiness = await request(baseUrl, "/api/local/activation-readiness");
+  assert.equal(afterReadiness.body.workflowProfileCandidates[0].status, "applied");
+  assert.equal(runningApps.at(-1).app.database.database.prepare("PRAGMA quick_check").get().quick_check, "ok");
   const comments = await request(baseUrl, "/api/tasks/legacy-task/comments");
   assert.equal(comments.body.comments[0].threadId, "legacy-comment-thread");
   assert.equal(comments.body.comments[0].threadBinding, null);
@@ -1619,7 +1681,7 @@ test("existing task and comment thread attribution remains content-specific", as
   const attachments = await request(baseUrl, "/api/tasks/legacy-task/attachments");
   assert.equal(attachments.body.attachments[0].commentId, null);
 
-  let version = result.body.task.version;
+  let version = appliedProfile.body.task.version;
   for (const status of ["in_review", "blocked", "canceled"]) {
     const moveResult = await request(baseUrl, "/api/tasks/legacy-task/move", {
       method: "POST",

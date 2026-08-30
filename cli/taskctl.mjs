@@ -52,6 +52,8 @@ const COMMAND_OPTIONS = new Map([
     "holder-task", "holder-thread-id", "expected-lease-id", "if-version", "json",
   ])],
   ["coordinator receipts", new Set(["json"])],
+  ["activation audit", new Set(["json"])],
+  ["activation apply-workflow-profile", new Set(["if-version", "json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
   ["cloud status", new Set(["json"])],
   ["cloud logout", new Set(["json"])],
@@ -185,6 +187,8 @@ Commands:
   coordinator repair-binding PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
     --expected-lease-id ID --if-version N
   coordinator receipts PROJECT_ID
+  activation audit
+  activation apply-workflow-profile ISSUE_ID --if-version N
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|bootstrap|create|update|move|archive|restore|relation
@@ -210,7 +214,7 @@ Examples:
   taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
-Run taskctl issue --help, taskctl coordinator --help, or taskctl run --help for command arguments.`],
+Run taskctl issue --help, taskctl coordinator --help, taskctl activation --help, or taskctl run --help for command arguments.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
 
 Actions:
@@ -298,6 +302,15 @@ Actions:
 The holder task and thread must already be one exact configured Agent Lane binding.
 Binding repair derives host identity from the protected current Codex runtime; callers never supply it.
 Coordinator ownership does not grant task execution ownership.`],
+  ["activation", `Usage: taskctl activation ACTION [arguments] [options]
+
+Actions:
+  audit [--json]
+  apply-workflow-profile ISSUE_ID --if-version N [--json]
+
+Audit is read-only. Apply accepts only one recorded legacy candidate and is
+optimistic and idempotent. Legacy Root bindings remain a separate coordinator
+repair-binding action.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
@@ -433,7 +446,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/repair-binding/receipts, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/repair-binding/receipts, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -444,7 +457,8 @@ async function execute(parsed, overrides) {
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
   const usesCompanionControl = command.startsWith("cloud ")
     || command === "project map"
-    || command.startsWith("coordinator ");
+    || command.startsWith("coordinator ")
+    || command.startsWith("activation ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
       ? await resolveCompanionUrl(env, overrides)
@@ -549,6 +563,16 @@ async function execute(parsed, overrides) {
     case "coordinator receipts":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${coordinatorLeasePath(parsed.operands[0])}/receipts`);
+    case "activation audit":
+      expectOperandCount(parsed, 0);
+      return api.request("GET", "/api/local/activation-readiness");
+    case "activation apply-workflow-profile":
+      expectOperandCount(parsed, 1);
+      return api.request(
+        "POST",
+        `/api/local/activation-readiness/workflow-profiles/${encodeURIComponent(parsed.operands[0])}`,
+        { version: explicitVersion(parsed.options["if-version"]) },
+      );
     case "cloud login":
       expectOperandCount(parsed, 0);
       return cloudLogin(

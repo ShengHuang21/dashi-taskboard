@@ -663,6 +663,20 @@ function projectPrefix(project) {
   return namePrefix || idPrefix.slice(0, 3);
 }
 
+function activationWorkflowProfileCandidate(row) {
+  return {
+    taskId: row.task_id,
+    identifier: row.identifier,
+    projectId: row.project_id,
+    taskVersion: row.task_version,
+    suggestedProfile: row.suggested_profile,
+    observedLabels: JSON.parse(row.observed_labels),
+    status: row.status,
+    detectedAt: row.detected_at,
+    appliedAt: row.applied_at,
+  };
+}
+
 export class TaskboardDatabase {
   constructor(filename) {
     mkdirSync(path.dirname(filename), { recursive: true });
@@ -731,6 +745,20 @@ export class TaskboardDatabase {
         version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS task_activation_workflow_profile_candidates (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        task_version INTEGER NOT NULL CHECK (task_version > 0),
+        suggested_profile TEXT NOT NULL CHECK (suggested_profile = 'vibe'),
+        observed_labels TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied')),
+        detected_at TEXT NOT NULL,
+        applied_at TEXT,
+        applied_by_type TEXT,
+        applied_by_id TEXT,
+        applied_by_name TEXT,
+        task_version_after INTEGER
       );
 
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
@@ -1174,6 +1202,28 @@ export class TaskboardDatabase {
     }
     if (!taskColumns.some((column) => column.name === "recurrence_unit")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN recurrence_unit TEXT");
+    }
+    const legacyWorkflowProfileSchema = !taskColumns.some((column) => column.name === "workflow_profile");
+    if (legacyWorkflowProfileSchema) {
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        const detectedAt = now();
+        const insertCandidate = this.database.prepare(`
+          INSERT OR IGNORE INTO task_activation_workflow_profile_candidates (
+            task_id, task_version, suggested_profile, observed_labels, detected_at
+          ) VALUES (?, ?, 'vibe', ?, ?)
+        `);
+        for (const task of this.database.prepare("SELECT id, version, labels FROM tasks").all()) {
+          const labels = JSON.parse(task.labels);
+          if (labels.includes("vibe-coding") && labels.includes("no-working-log")) {
+            insertCandidate.run(task.id, task.version, JSON.stringify(labels), detectedAt);
+          }
+        }
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      }
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
@@ -2286,6 +2336,126 @@ export class TaskboardDatabase {
       }
       this.database.exec("COMMIT");
       return Number(result.changes);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getActivationReadiness() {
+    const workflowProfileCandidates = this.database.prepare(`
+      SELECT
+        candidate.*,
+        tasks.identifier,
+        tasks.project_id
+      FROM task_activation_workflow_profile_candidates AS candidate
+      JOIN tasks ON tasks.id = candidate.task_id
+      ORDER BY candidate.detected_at, tasks.identifier
+    `).all().map(activationWorkflowProfileCandidate);
+    const legacyRootBindings = this.database.prepare(`
+      SELECT id, identifier, project_id, version, thread_id
+      FROM tasks
+      WHERE thread_id IS NOT NULL
+        AND (
+          thread_codex_project_id IS NULL
+          OR thread_codex_project_kind IS NULL
+          OR thread_codex_host_id IS NULL
+          OR thread_workspace_path IS NULL
+        )
+      ORDER BY project_id, identifier
+    `).all().map((row) => ({
+      taskId: row.id,
+      identifier: row.identifier,
+      projectId: row.project_id,
+      taskVersion: row.version,
+      legacyLocalThreadId: row.thread_id,
+      repairAction: "coordinator repair-binding",
+    }));
+    return { workflowProfileCandidates, legacyRootBindings };
+  }
+
+  applyActivationWorkflowProfile(id, version, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const candidate = this.database.prepare(`
+        SELECT * FROM task_activation_workflow_profile_candidates WHERE task_id = ?
+      `).get(task.id);
+      if (!candidate) {
+        throw new ApiError(
+          409,
+          "ACTIVATION_CANDIDATE_MISSING",
+          "Workflow profile activation requires a recorded legacy migration candidate",
+        );
+      }
+      if (candidate.status === "applied") {
+        if (candidate.task_version !== version) {
+          throw new ApiError(409, "VERSION_CONFLICT", "Activation replay must use the original candidate version");
+        }
+        this.database.exec("COMMIT");
+        return {
+          applied: false,
+          task: this.getTask(task.id),
+          receipt: {
+            ...activationWorkflowProfileCandidate({
+              ...candidate,
+              identifier: task.identifier,
+              project_id: task.projectId,
+            }),
+            taskVersionBefore: candidate.task_version,
+            taskVersionAfter: candidate.task_version_after,
+            appliedBy: {
+              type: candidate.applied_by_type,
+              id: candidate.applied_by_id,
+              name: candidate.applied_by_name,
+            },
+          },
+        };
+      }
+      this.#requireVersion(task, version);
+      if (candidate.task_version !== version || task.workflowProfile !== "formal") {
+        throw new ApiError(409, "ACTIVATION_CANDIDATE_STALE", "Legacy workflow profile candidate is stale");
+      }
+      const labels = task.labels;
+      if (!labels.includes("vibe-coding") || !labels.includes("no-working-log")) {
+        throw new ApiError(409, "ACTIVATION_CANDIDATE_STALE", "Legacy workflow profile labels changed");
+      }
+      const timestamp = now();
+      const nextVersion = version + 1;
+      this.database.prepare(`
+        UPDATE tasks
+        SET workflow_profile = 'vibe', version = ?, updated_at = ?
+        WHERE id = ? AND version = ? AND workflow_profile = 'formal'
+      `).run(nextVersion, timestamp, task.id, version);
+      this.database.prepare(`
+        UPDATE task_activation_workflow_profile_candidates
+        SET status = 'applied', applied_at = ?, applied_by_type = ?, applied_by_id = ?,
+          applied_by_name = ?, task_version_after = ?
+        WHERE task_id = ? AND status = 'pending'
+      `).run(timestamp, actor.type, actor.id, actor.name, nextVersion, task.id);
+      this.#recordTaskActivity(task.id, actor, [{
+        field: "workflowProfile",
+        before: "formal",
+        after: "vibe",
+      }], timestamp);
+      const appliedCandidate = this.database.prepare(`
+        SELECT * FROM task_activation_workflow_profile_candidates WHERE task_id = ?
+      `).get(task.id);
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        task: this.getTask(task.id),
+        receipt: {
+          ...activationWorkflowProfileCandidate({
+            ...appliedCandidate,
+            identifier: task.identifier,
+            project_id: task.projectId,
+          }),
+          taskVersionBefore: appliedCandidate.task_version,
+          taskVersionAfter: appliedCandidate.task_version_after,
+          appliedBy: { type: actor.type, id: actor.id, name: actor.name },
+        },
+      };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;

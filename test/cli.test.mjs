@@ -473,6 +473,68 @@ test("issue create and update accept an explicit workflow profile", async () => 
   assert.deepEqual(bodies[1], { workflowProfile: "formal", version: 1 });
 });
 
+test("activation CLI audits and explicitly applies one legacy workflow profile candidate", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    if (init.method === "GET") {
+      return response({
+        workflowProfileCandidates: [{ taskId: "task-1", identifier: "CAP-13", taskVersion: 7 }],
+        legacyRootBindings: [],
+      });
+    }
+    return response({
+      applied: true,
+      receipt: { taskId: "task-1", taskVersionBefore: 7, taskVersionAfter: 8 },
+    });
+  };
+
+  const audit = await run(["activation", "audit"], fetchImpl);
+  const applied = await run([
+    "activation", "apply-workflow-profile", "CAP-13", "--if-version", "7",
+  ], fetchImpl);
+
+  assert.equal(audit.exitCode, 0);
+  assert.equal(applied.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/local/activation-readiness");
+  assert.equal(calls[1].url.pathname, "/api/local/activation-readiness/workflow-profiles/CAP-13");
+  assert.deepEqual(JSON.parse(calls[1].init.body), { version: 7 });
+});
+
+test("activation commands use only the loopback companion and fail closed on a remote-only origin", async () => {
+  const calls = [];
+  const env = {
+    CODEX_TASKBOARD_URL: "https://tasks.example.test",
+    CODEX_TASKBOARD_COMPANION_URL: "http://127.0.0.1:51550/activation-token-1",
+  };
+  const fetchImpl = async (url) => {
+    calls.push(url.toString());
+    return response({ workflowProfileCandidates: [], legacyRootBindings: [] });
+  };
+
+  const audit = await run(["activation", "audit"], fetchImpl, { env });
+  const applied = await run([
+    "activation", "apply-workflow-profile", "CAP-13", "--if-version", "7",
+  ], fetchImpl, { env });
+
+  assert.equal(audit.exitCode, 0);
+  assert.equal(applied.exitCode, 0);
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:51550/activation-token-1/api/local/activation-readiness",
+    "http://127.0.0.1:51550/activation-token-1/api/local/activation-readiness/workflow-profiles/CAP-13",
+  ]);
+
+  let remoteFetches = 0;
+  const rejected = await run(["activation", "audit"], async () => {
+    remoteFetches += 1;
+    return response({});
+  }, { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } });
+  assert.equal(rejected.exitCode, 2);
+  assert.equal(rejected.stderr.error.code, "USAGE_ERROR");
+  assert.match(rejected.stderr.error.message, /loopback/);
+  assert.equal(remoteFetches, 0);
+});
+
 test("issue update binds one worktree context", async () => {
   let requestBody;
   const repositoryPath = path.resolve("/work/repo");
