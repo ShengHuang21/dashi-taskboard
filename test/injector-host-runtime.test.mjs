@@ -445,6 +445,14 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /setInterval\(\(\) => void tick\(\), backgroundContinuationIntervalMs\)/);
 });
 
+test("the authenticated network proxy signs host-runtime publications", async () => {
+  const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
+  assert.match(
+    source,
+    /method === "PUT" && requestUrl === `\$\{taskboardBaseUrl\}\/api\/local\/host-runtime`[\s\S]{0,500}requestedHeaders\.push\(\.\.\.Object\.entries\(injectorProofHeaders\(\)\)\)/,
+  );
+});
+
 test("Agent Todo coordination steers an active Root turn", async () => {
   const calls = [];
   const request = {

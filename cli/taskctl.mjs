@@ -48,6 +48,9 @@ const COMMAND_OPTIONS = new Map([
   ["coordinator release", new Set([
     "holder-task", "holder-thread-id", "expected-lease-id", "json",
   ])],
+  ["coordinator repair-binding", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "if-version", "json",
+  ])],
   ["coordinator receipts", new Set(["json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
   ["cloud status", new Set(["json"])],
@@ -179,6 +182,8 @@ Commands:
     --expected-lease-id ID --lease-seconds N
   coordinator release PROJECT_ID --holder-task TASK --holder-thread-id THREAD
     --expected-lease-id ID
+  coordinator repair-binding PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --if-version N
   coordinator receipts PROJECT_ID
   cloud login --url URL --actor-name NAME
   cloud status|logout
@@ -286,9 +291,12 @@ Actions:
     --expected-lease-id ID --lease-seconds 30..3600 [--json]
   release PROJECT_ID --holder-task TASK --holder-thread-id THREAD
     --expected-lease-id ID [--json]
+  repair-binding PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --if-version N [--json]
   receipts PROJECT_ID [--json]
 
 The holder task and thread must already be one exact configured Agent Lane binding.
+Binding repair derives host identity from the protected current Codex runtime; callers never supply it.
 Coordinator ownership does not grant task execution ownership.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
@@ -425,7 +433,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/receipts, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/repair-binding/receipts, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -530,6 +538,14 @@ async function execute(parsed, overrides) {
     case "coordinator release":
       expectOperandCount(parsed, 1);
       return releaseCoordinatorLease(api, parsed.operands[0], parsed.options);
+    case "coordinator repair-binding":
+      expectOperandCount(parsed, 2);
+      return repairLegacyRootBinding(
+        api,
+        parsed.operands[0],
+        parsed.operands[1],
+        parsed.options,
+      );
     case "coordinator receipts":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${coordinatorLeasePath(parsed.operands[0])}/receipts`);
@@ -1250,6 +1266,15 @@ function releaseCoordinatorLease(api, projectId, options) {
   return api.request("POST", `${coordinatorLeasePath(projectId)}/release`, {
     ...coordinatorHolder(options),
     expectedLeaseId,
+  });
+}
+
+function repairLegacyRootBinding(api, projectId, taskId, options) {
+  return api.request("POST", `${coordinatorLeasePath(projectId)}/repair-binding`, {
+    taskId,
+    taskVersion: explicitVersion(options["if-version"]),
+    ...coordinatorHolder(options),
+    expectedLeaseId: expectedCoordinatorLeaseId(options),
   });
 }
 
