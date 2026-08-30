@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
 import { createTaskCapsule } from "./task-capsule.mjs";
+import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 
@@ -103,7 +104,11 @@ function sameThreadBinding(left, right) {
 function sameDevelopmentContext(left, right) {
   if (left === right) return true;
   if (!left || !right) return false;
-  return left.type === right.type && left.path === right.path && left.branch === right.branch;
+  return left.type === right.type
+    && left.path === right.path
+    && left.branch === right.branch
+    && left.repository === right.repository
+    && left.repositoryVerifiedAt === right.repositoryVerifiedAt;
 }
 
 function commentConversationTitle(body) {
@@ -300,7 +305,15 @@ function parseAiChatTodoProgress(row) {
 
 function taskFromRow(row) {
   const developmentContext = row.worktree_path
-    ? { type: "worktree", path: row.worktree_path, branch: row.worktree_branch }
+    ? {
+      type: "worktree",
+      path: row.worktree_path,
+      branch: row.worktree_branch,
+      ...(row.worktree_repository ? { repository: row.worktree_repository } : {}),
+      ...(row.worktree_repository_verified_at
+        ? { repositoryVerifiedAt: row.worktree_repository_verified_at }
+        : {}),
+    }
     : row.git_branch
       ? { type: "branch", branch: row.git_branch }
       : null;
@@ -346,6 +359,31 @@ function taskFromRow(row) {
     externalKey: row.external_key ?? null,
     externalUrl: row.external_url ?? null,
     archivedAt: row.archived_at,
+    version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function standingAuthorityFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    repository: row.repository,
+    actions: JSON.parse(row.actions_json),
+    sourceTaskId: row.source_task_id,
+    sourceThreadId: row.source_thread_id,
+    evidence: row.evidence,
+    receipt: row.receipt,
+    recordedBy: { type: row.recorded_by_type, id: row.recorded_by_id, name: row.recorded_by_name },
+    grantedAt: row.granted_at,
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    revocationEvidence: row.revocation_evidence,
+    revocationReceipt: row.revocation_receipt,
+    revokedBy: row.revoked_by_type ? {
+      type: row.revoked_by_type, id: row.revoked_by_id, name: row.revoked_by_name,
+    } : null,
     version: row.version,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -643,6 +681,8 @@ export class TaskboardDatabase {
         git_branch TEXT,
         worktree_path TEXT,
         worktree_branch TEXT,
+        worktree_repository TEXT,
+        worktree_repository_verified_at TEXT,
         working_log_path TEXT,
         working_log_status TEXT CHECK (working_log_status IN ('planned', 'active', 'blocked', 'complete')),
         working_log_updated_at TEXT,
@@ -663,6 +703,34 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS tasks_project_status_sort
         ON tasks(project_id, archived_at, status, sort_order, created_at);
+
+      CREATE TABLE IF NOT EXISTS project_standing_authorities (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository TEXT NOT NULL,
+        actions_json TEXT NOT NULL,
+        source_task_id TEXT NOT NULL REFERENCES tasks(id),
+        source_thread_id TEXT NOT NULL,
+        evidence TEXT NOT NULL,
+        receipt TEXT NOT NULL UNIQUE,
+        recorded_by_type TEXT NOT NULL CHECK (recorded_by_type IN ('user', 'agent')),
+        recorded_by_id TEXT NOT NULL,
+        recorded_by_name TEXT NOT NULL,
+        granted_at TEXT NOT NULL,
+        expires_at TEXT,
+        revoked_at TEXT,
+        revocation_evidence TEXT,
+        revocation_receipt TEXT UNIQUE,
+        revoked_by_type TEXT CHECK (revoked_by_type IS NULL OR revoked_by_type IN ('user', 'agent')),
+        revoked_by_id TEXT,
+        revoked_by_name TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS standing_authorities_project_repository
+        ON project_standing_authorities(project_id, repository, revoked_at, expires_at);
 
       CREATE TABLE IF NOT EXISTS comments (
         id TEXT PRIMARY KEY,
@@ -1016,6 +1084,12 @@ export class TaskboardDatabase {
     }
     this.#migrateTaskStatuses();
     const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    if (!migratedTaskColumns.some((column) => column.name === "worktree_repository")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN worktree_repository TEXT");
+    }
+    if (!migratedTaskColumns.some((column) => column.name === "worktree_repository_verified_at")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN worktree_repository_verified_at TEXT");
+    }
     if (!migratedTaskColumns.some((column) => column.name === "working_log_path")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_path TEXT");
     }
@@ -2706,6 +2780,116 @@ export class TaskboardDatabase {
     return attachTaskActivity(task, comments, activities, previewImage);
   }
 
+  recordTaskWorktreeRepository(taskId, { worktreePath, repository, verifiedAt }) {
+    const task = this.#requireTask(taskId);
+    if (task.developmentContext?.type !== "worktree" || task.developmentContext.path !== worktreePath) {
+      throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree changed during repository verification");
+    }
+    this.database.prepare(`
+      UPDATE tasks
+      SET worktree_repository = ?, worktree_repository_verified_at = ?
+      WHERE id = ? AND worktree_path = ?
+    `).run(repository, verifiedAt, task.id, worktreePath);
+    return this.getTask(task.id);
+  }
+
+  listProjectStandingAuthorities(projectId) {
+    if (!this.getProject(projectId)) {
+      throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
+    }
+    return this.database.prepare(`
+      SELECT * FROM project_standing_authorities
+      WHERE project_id = ?
+      ORDER BY created_at, id
+    `).all(projectId).map(standingAuthorityFromRow);
+  }
+
+  grantProjectStandingAuthority(projectId, input, actor) {
+    const repository = normalizeRepository(input.repository);
+    const actions = normalizeStandingActions(input.actions);
+    if (!repository || !actions) {
+      throw new ApiError(400, "INVALID_STANDING_AUTHORITY", "Standing authority scope is invalid");
+    }
+    const grantedAt = Date.parse(input.grantedAt);
+    const expiresAt = input.expiresAt === null ? null : Date.parse(input.expiresAt);
+    if (Number.isNaN(grantedAt)
+      || grantedAt > Date.now() + 5 * 60 * 1_000
+      || (expiresAt !== null && (Number.isNaN(expiresAt) || expiresAt <= grantedAt))) {
+      throw new ApiError(400, "INVALID_STANDING_AUTHORITY", "Standing authority time bounds are invalid");
+    }
+    const sourceTask = this.getTask(input.sourceTaskId);
+    if (!sourceTask || sourceTask.projectId !== projectId) {
+      throw new ApiError(409, "STANDING_AUTHORITY_SOURCE_MISMATCH", "Source task must belong to the authority project");
+    }
+    if (!sourceTask.threadBinding || sourceTask.threadBinding.threadId !== input.sourceThreadId) {
+      throw new ApiError(409, "STANDING_AUTHORITY_ROOT_MISMATCH", "Source thread must be the task's confirmed Root");
+    }
+    const existing = this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE receipt = ?
+    `).get(input.receipt);
+    if (existing) {
+      const authority = standingAuthorityFromRow(existing);
+      if (authority.projectId === projectId
+        && authority.repository === repository
+        && JSON.stringify(authority.actions) === JSON.stringify(actions)
+        && authority.sourceTaskId === sourceTask.id
+        && authority.sourceThreadId === input.sourceThreadId
+        && authority.evidence === input.evidence
+        && authority.grantedAt === input.grantedAt
+        && authority.expiresAt === input.expiresAt) {
+        return { created: false, authority };
+      }
+      throw new ApiError(409, "STANDING_AUTHORITY_RECEIPT_CONFLICT", "Receipt is already bound to a different grant");
+    }
+    const id = randomUUID();
+    const timestamp = now();
+    this.database.prepare(`
+      INSERT INTO project_standing_authorities (
+        id, project_id, repository, actions_json, source_task_id, source_thread_id,
+        evidence, receipt, recorded_by_type, recorded_by_id, recorded_by_name,
+        granted_at, expires_at, version, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    `).run(
+      id, projectId, repository, JSON.stringify(actions), sourceTask.id, input.sourceThreadId,
+      input.evidence, input.receipt, actor.type, actor.id, actor.name,
+      input.grantedAt, input.expiresAt, timestamp, timestamp,
+    );
+    return { created: true, authority: standingAuthorityFromRow(this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE id = ?
+    `).get(id)) };
+  }
+
+  revokeProjectStandingAuthority(projectId, authorityId, input, actor) {
+    const row = this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE id = ? AND project_id = ?
+    `).get(authorityId, projectId);
+    if (!row) throw new ApiError(404, "STANDING_AUTHORITY_NOT_FOUND", "Standing authority does not exist");
+    const receiptOwner = this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE revocation_receipt = ?
+    `).get(input.receipt);
+    if (receiptOwner) {
+      const authority = standingAuthorityFromRow(receiptOwner);
+      if (authority.id === authorityId && authority.revocationEvidence === input.evidence) {
+        return { changed: false, authority };
+      }
+      throw new ApiError(409, "STANDING_AUTHORITY_RECEIPT_CONFLICT", "Receipt is already bound to a different revocation");
+    }
+    if (row.revoked_at !== null) {
+      throw new ApiError(409, "STANDING_AUTHORITY_ALREADY_REVOKED", "Standing authority is already revoked");
+    }
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE project_standing_authorities SET
+        revoked_at = ?, revocation_evidence = ?, revocation_receipt = ?,
+        revoked_by_type = ?, revoked_by_id = ?, revoked_by_name = ?,
+        version = version + 1, updated_at = ?
+      WHERE id = ? AND revoked_at IS NULL
+    `).run(timestamp, input.evidence, input.receipt, actor.type, actor.id, actor.name, timestamp, authorityId);
+    return { changed: true, authority: standingAuthorityFromRow(this.database.prepare(`
+      SELECT * FROM project_standing_authorities WHERE id = ?
+    `).get(authorityId)) };
+  }
+
   getTaskCapsule(id) {
     const task = this.getTask(id);
     if (!task) return null;
@@ -2718,6 +2902,7 @@ export class TaskboardDatabase {
       currentClaim: this.getAgentTaskClaim(task.id),
       currentRun: this.getActiveTaskAgentRun(task.id),
       latestRun: this.getLatestTaskAgentRun(task.id),
+      standingAuthorities: this.listProjectStandingAuthorities(task.projectId),
     });
   }
 
@@ -2776,6 +2961,28 @@ export class TaskboardDatabase {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  confirmTaskSafeActionDelivery(id, { rootThreadId, expectedResumeToken, safeActionId }) {
+    const task = this.#requireTask(id);
+    const capsule = this.getTaskCapsule(task.id);
+    if (capsule.execution.threadBinding?.threadId !== rootThreadId) {
+      throw new ApiError(409, "ROOT_THREAD_MISMATCH", "Bootstrap delivery must match the exact configured Root thread");
+    }
+    if (capsule.resumeToken !== expectedResumeToken) {
+      throw new ApiError(409, "RESUME_TOKEN_MISMATCH", "Task Capsule changed before bootstrap delivery");
+    }
+    if (capsule.readyWork.eligible !== true || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
+      throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap delivery must match the current first safe action");
+    }
+    const row = this.database.prepare(`
+      SELECT * FROM task_safe_action_receipts
+      WHERE task_id = ? AND resume_token = ? AND safe_action_id = ? AND root_thread_id = ?
+    `).get(task.id, expectedResumeToken, safeActionId, rootThreadId);
+    if (!row) {
+      throw new ApiError(409, "SAFE_ACTION_RECEIPT_MISSING", "Bootstrap delivery requires an existing reservation receipt");
+    }
+    return { confirmed: true, receipt: this.#taskSafeActionReceipt(row) };
   }
 
   #taskSafeActionReceipt(row) {
@@ -2849,11 +3056,11 @@ export class TaskboardDatabase {
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
           assignee_type, assignee_id, assignee_name, assignee_avatar_url,
-          git_branch, worktree_path, worktree_branch,
+          git_branch, worktree_path, worktree_branch, worktree_repository, worktree_repository_verified_at,
           working_log_path, working_log_status, working_log_updated_at,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -2877,6 +3084,8 @@ export class TaskboardDatabase {
         input.developmentContext?.type === "branch" ? input.developmentContext.branch : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.path : null,
         input.developmentContext?.type === "worktree" ? input.developmentContext.branch : null,
+        input.developmentContext?.type === "worktree" ? input.developmentContext.repository ?? null : null,
+        input.developmentContext?.type === "worktree" ? input.developmentContext.repositoryVerifiedAt ?? null : null,
         workingLog?.path ?? null,
         workingLog?.status ?? null,
         workingLog ? timestamp : null,
@@ -2960,11 +3169,19 @@ export class TaskboardDatabase {
     const timestamp = now();
     for (const [key, value] of Object.entries(changes)) {
       if (key === "developmentContext") {
-        assignments.push("git_branch = ?", "worktree_path = ?", "worktree_branch = ?");
+        assignments.push(
+          "git_branch = ?",
+          "worktree_path = ?",
+          "worktree_branch = ?",
+          "worktree_repository = ?",
+          "worktree_repository_verified_at = ?",
+        );
         values.push(
           value?.type === "branch" ? value.branch : null,
           value?.type === "worktree" ? value.path : null,
           value?.type === "worktree" ? value.branch : null,
+          value?.type === "worktree" ? value.repository ?? null : null,
+          value?.type === "worktree" ? value.repositoryVerifiedAt ?? null : null,
         );
         continue;
       }

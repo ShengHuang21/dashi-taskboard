@@ -1,6 +1,6 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { isIP } from "node:net";
 import os from "node:os";
@@ -33,6 +33,10 @@ import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
+import {
+  normalizeRepository,
+  normalizeStandingActions,
+} from "./standing-authority.mjs";
 import { createTaskboardPanelPresence } from "./taskboard-panel-presence.mjs";
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -44,6 +48,8 @@ const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_ATTACHMENT_LIMIT = 10;
 const AI_CHAT_SKILL_MARKER = "\uFFFC";
 const HOST_RUNTIME_TTL_MS = 3_000;
+const WORKTREE_REPOSITORY_TTL_MS = 2_000;
+const STANDING_AUTHORITY_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 const CODEX_PLAN_TAIL_BYTES = 16 * 1024 * 1024;
 const INLINE_ATTACHMENT_TYPES = new Set([
   "application/pdf",
@@ -528,6 +534,66 @@ function parseProjectLabel(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["label"]));
   return stringField(body.label, "label", { required: true, maxLength: 64 });
+}
+
+function parseIsoTimestamp(value, name, { nullable = false } = {}) {
+  const timestamp = stringField(value, name, { required: !nullable, nullable, maxLength: 64 });
+  if (timestamp === null) return null;
+  if (Number.isNaN(Date.parse(timestamp))) {
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' must be an ISO timestamp`);
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function parseStandingAuthorityGrant(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "repository",
+    "actions",
+    "sourceTaskId",
+    "sourceThreadId",
+    "evidence",
+    "receipt",
+    "grantedAt",
+    "expiresAt",
+  ]));
+  const repository = normalizeRepository(body.repository);
+  if (!repository) {
+    throw new ApiError(400, "INVALID_FIELD", "'repository' must be a normalized GitHub or GitLab owner/repository URL");
+  }
+  const actions = normalizeStandingActions(body.actions);
+  if (!actions) {
+    throw new ApiError(400, "INVALID_FIELD", "'actions' must be a unique non-empty supported action list");
+  }
+  const grantedAt = parseIsoTimestamp(body.grantedAt, "grantedAt");
+  const expiresAt = body.expiresAt === undefined
+    ? null
+    : parseIsoTimestamp(body.expiresAt, "expiresAt", { nullable: true });
+  if (expiresAt !== null && Date.parse(expiresAt) <= Date.parse(grantedAt)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expiresAt' must be later than 'grantedAt'");
+  }
+  if (Date.parse(grantedAt) > Date.now() + STANDING_AUTHORITY_CLOCK_SKEW_MS) {
+    throw new ApiError(400, "INVALID_FIELD", "'grantedAt' cannot be more than five minutes in the future");
+  }
+  return {
+    repository,
+    actions,
+    sourceTaskId: stringField(body.sourceTaskId, "sourceTaskId", { required: true, maxLength: 256 }),
+    sourceThreadId: stringField(body.sourceThreadId, "sourceThreadId", { required: true, maxLength: 256 }),
+    evidence: stringField(body.evidence, "evidence", { required: true, maxLength: 4096 }),
+    receipt: stringField(body.receipt, "receipt", { required: true, maxLength: 256 }),
+    grantedAt,
+    expiresAt,
+  };
+}
+
+function parseStandingAuthorityRevocation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["evidence", "receipt"]));
+  return {
+    evidence: stringField(body.evidence, "evidence", { required: true, maxLength: 4096 }),
+    receipt: stringField(body.receipt, "receipt", { required: true, maxLength: 256 }),
+  };
 }
 
 function parseProjectReadmeSave(body) {
@@ -1903,9 +1969,147 @@ export function createTaskboardServer(options = {}) {
   });
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath);
+  const worktreeRepositoryCache = new Map();
   const events = new EventHub();
   const panelPresence = options.panelPresence ?? createTaskboardPanelPresence();
   let clientStorageWrite = Promise.resolve();
+
+  async function refreshTaskWorktreeRepository(taskId, { force = false } = {}) {
+    const task = database.getTask(taskId);
+    if (!task || task.developmentContext?.type !== "worktree") return task;
+    const worktreePath = task.developmentContext.path;
+    const cacheKey = `${task.id}:${worktreePath}`;
+    const cachedAt = worktreeRepositoryCache.get(cacheKey) ?? 0;
+    if (!force && Date.now() - cachedAt < WORKTREE_REPOSITORY_TTL_MS) return task;
+
+    let repository = null;
+    try {
+      const [resolvedPath, topLevelResult, remoteResult, branchResult] = await Promise.all([
+        realpath(worktreePath),
+        execFileAsync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
+          env: codexProcessEnvironment,
+          timeout: 5_000,
+          windowsHide: true,
+        }),
+        execFileAsync("git", ["-C", worktreePath, "remote", "get-url", "origin"], {
+          env: codexProcessEnvironment,
+          timeout: 5_000,
+          windowsHide: true,
+        }),
+        execFileAsync("git", ["-C", worktreePath, "branch", "--show-current"], {
+          env: codexProcessEnvironment,
+          timeout: 5_000,
+          windowsHide: true,
+        }),
+      ]);
+      const resolvedTopLevel = await realpath(topLevelResult.stdout.trim());
+      const actualBranch = branchResult.stdout.trim();
+      if (resolvedTopLevel === resolvedPath
+        && actualBranch
+        && actualBranch === task.developmentContext.branch) {
+        repository = normalizeRepository(remoteResult.stdout.trim());
+      }
+    } catch {
+      repository = null;
+    }
+    const verifiedAt = new Date().toISOString();
+    const updated = database.recordTaskWorktreeRepository(task.id, {
+      worktreePath,
+      repository,
+      verifiedAt,
+    });
+    worktreeRepositoryCache.set(cacheKey, Date.now());
+    return updated;
+  }
+
+  async function verifiedTaskCapsule(taskId, options) {
+    await refreshTaskWorktreeRepository(taskId, options);
+    let capsule = database.getTaskCapsule(taskId);
+    if (!options?.force && capsule?.standingAuthority.state === "matched") {
+      await refreshTaskWorktreeRepository(taskId, { force: true });
+      capsule = database.getTaskCapsule(taskId);
+    }
+    return capsule;
+  }
+
+  function assertInsideWorktree(worktreePath, targetPath, message) {
+    const relative = path.relative(worktreePath, targetPath);
+    if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new ApiError(409, "STANDING_SCOPE_MISMATCH", message);
+    }
+  }
+
+  async function nearestExistingParent(targetPath, worktreePath) {
+    let candidate = path.dirname(targetPath);
+    while (true) {
+      try {
+        const candidateStat = await lstat(candidate);
+        if (candidateStat.isSymbolicLink() || !candidateStat.isDirectory()) {
+          throw new ApiError(409, "STANDING_SCOPE_MISMATCH", "New edit targets require one real directory parent");
+        }
+        const resolvedParent = await realpath(candidate);
+        if (resolvedParent === worktreePath) return resolvedParent;
+        assertInsideWorktree(worktreePath, resolvedParent, "New edit target parent must stay inside the exact worktree");
+        return resolvedParent;
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        if (error.code !== "ENOENT") throw error;
+      }
+      const parent = path.dirname(candidate);
+      if (parent === candidate) {
+        throw new ApiError(409, "STANDING_SCOPE_MISMATCH", "New edit target has no existing worktree parent");
+      }
+      candidate = parent;
+    }
+  }
+
+  async function assertStandingActionExecutionScope(taskId, safeActionId) {
+    const task = database.getTask(taskId);
+    const capsule = database.getTaskCapsule(taskId);
+    const action = capsule?.readyWork.safeActions.find((candidate) => candidate.id === safeActionId);
+    if (!action?.standingAuthority) return;
+    const worktreePath = await realpath(task.developmentContext.path);
+    if (action.standingScope.kind === "edit") {
+      for (const relativePath of action.standingScope.paths) {
+        const targetPath = path.resolve(worktreePath, relativePath);
+        assertInsideWorktree(worktreePath, targetPath, "Edit target must stay inside the exact worktree");
+        try {
+          const targetStat = await lstat(targetPath);
+          if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+            throw new ApiError(409, "STANDING_SCOPE_MISMATCH", "Existing edit target must be one real worktree file");
+          }
+          const resolvedTarget = await realpath(targetPath);
+          assertInsideWorktree(worktreePath, resolvedTarget, "Edit target must resolve inside the exact worktree");
+        } catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (error.code !== "ENOENT") throw error;
+          await nearestExistingParent(targetPath, worktreePath);
+        }
+      }
+      return;
+    }
+    if (action.standingScope.kind !== "scoped_delete") return;
+    for (const relativePath of action.standingScope.paths) {
+      let resolvedTarget;
+      let targetStat;
+      try {
+        const targetPath = path.resolve(worktreePath, relativePath);
+        const linkStat = await lstat(targetPath);
+        if (linkStat.isSymbolicLink()) {
+          throw new ApiError(409, "STANDING_SCOPE_MISMATCH", "Scoped delete target cannot be a symbolic link");
+        }
+        resolvedTarget = await realpath(targetPath);
+        targetStat = await stat(resolvedTarget);
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        throw new ApiError(409, "STANDING_SCOPE_MISMATCH", "Scoped delete target must be one existing worktree file");
+      }
+      assertInsideWorktree(worktreePath, resolvedTarget, "Scoped delete target must resolve to a file inside the exact worktree");
+      if (!targetStat.isFile()) {
+        throw new ApiError(409, "STANDING_SCOPE_MISMATCH", "Scoped delete target must resolve to a file inside the exact worktree");
+      }
+    }
+  }
 
   async function readClientStorage() {
     try {
@@ -2103,7 +2307,7 @@ export function createTaskboardServer(options = {}) {
     getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
-    getTaskCapsule: (taskId) => database.getTaskCapsule(taskId),
+    getTaskCapsule: (taskId) => verifiedTaskCapsule(taskId),
     getTask: (identifier) => database.getTask(identifier),
     listComments: (taskId) => database.listComments(taskId),
     recordProgress: async (progress) => {
@@ -2913,6 +3117,53 @@ export function createTaskboardServer(options = {}) {
       }
 
       const projectLabelsRoute = pathname.match(/^\/api\/projects\/([^/]+)\/labels$/);
+      const projectStandingAuthoritiesRoute = pathname.match(
+        /^\/api\/projects\/([^/]+)\/standing-authorities$/,
+      );
+      if (projectStandingAuthoritiesRoute) {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Standing authority routes do not accept query parameters");
+        }
+        const projectId = decodeRouteSegment(projectStandingAuthoritiesRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (request.method === "GET") {
+          return sendJson(response, 200, {
+            authorities: database.listProjectStandingAuthorities(projectId),
+          });
+        }
+        if (request.method === "POST") {
+          const result = database.grantProjectStandingAuthority(
+            projectId,
+            parseStandingAuthorityGrant(await readJson(request)),
+            actorFromRequest(request),
+          );
+          events.emit("project.standing-authority.updated", { projectId, authority: result.authority });
+          return sendJson(response, result.created ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const projectStandingAuthorityRevokeRoute = pathname.match(
+        /^\/api\/projects\/([^/]+)\/standing-authorities\/([^/]+)\/revoke$/,
+      );
+      if (projectStandingAuthorityRevokeRoute) {
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Standing authority routes do not accept query parameters");
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const projectId = decodeRouteSegment(projectStandingAuthorityRevokeRoute[1], "Project id");
+        const authorityId = decodeRouteSegment(projectStandingAuthorityRevokeRoute[2], "Standing authority id");
+        validateProjectId(projectId);
+        const result = database.revokeProjectStandingAuthority(
+          projectId,
+          authorityId,
+          parseStandingAuthorityRevocation(await readJson(request)),
+          actorFromRequest(request),
+        );
+        events.emit("project.standing-authority.updated", { projectId, authority: result.authority });
+        return sendJson(response, 200, result);
+      }
+
       if (projectLabelsRoute) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "Project label routes do not accept query parameters");
@@ -3522,10 +3773,35 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-claim");
+        const claim = parseSafeActionBootstrapClaim(await readJson(request));
+        await refreshTaskWorktreeRepository(id, { force: true });
+        await assertStandingActionExecutionScope(id, claim.safeActionId);
         return sendJson(response, 200, database.claimTaskSafeAction(
           id,
-          parseSafeActionBootstrapClaim(await readJson(request)),
+          claim,
         ));
+      }
+
+      const safeActionBootstrapDeliveryRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/bootstrap-delivery$/);
+      if (safeActionBootstrapDeliveryRoute) {
+        const id = decodeRouteSegment(safeActionBootstrapDeliveryRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-delivery");
+        const delivery = parseSafeActionBootstrapClaim(await readJson(request));
+        const task = await refreshTaskWorktreeRepository(id, { force: true });
+        await assertStandingActionExecutionScope(id, delivery.safeActionId);
+        const result = database.confirmTaskSafeActionDelivery(id, delivery);
+        const safeAction = database.getTaskCapsule(id).readyWork.safeActions[0];
+        return sendJson(response, 200, {
+          ...result,
+          executionIdentity: {
+            worktreePath: task.developmentContext.path,
+            branch: task.developmentContext.branch,
+            repository: task.developmentContext.repository,
+            verifiedAt: task.developmentContext.repositoryVerifiedAt,
+            standingScope: safeAction.standingAuthority ? safeAction.standingScope : null,
+          },
+        });
       }
 
       const taskCapsuleRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/capsule$/);
@@ -3543,7 +3819,7 @@ export function createTaskboardServer(options = {}) {
         if ([...url.searchParams.keys()].length > 0) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/tasks/:id/capsule does not accept query parameters");
         }
-        const capsule = database.getTaskCapsule(id);
+        const capsule = await verifiedTaskCapsule(id);
         if (!capsule) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${id}' does not exist`);
         return sendJson(response, 200, { capsule });
       }

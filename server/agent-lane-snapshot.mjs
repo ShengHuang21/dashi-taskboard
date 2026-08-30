@@ -275,6 +275,7 @@ function readyWorkForTodo(capsule) {
   const action = (item) => ({
     id: text(item?.id),
     text: compact(item?.text, 120),
+    standingAuthority: item?.standingAuthority === true,
   });
   const request = readyWork?.approvalRequest;
   return {

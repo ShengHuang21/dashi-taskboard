@@ -169,11 +169,13 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   policy,
   readSnapshot,
   claimReceipt,
+  confirmDelivery,
   deliver,
 }) {
   if (
     typeof readSnapshot !== "function"
     || typeof claimReceipt !== "function"
+    || typeof confirmDelivery !== "function"
     || typeof deliver !== "function"
   ) return { delivered: false, reason: "invalid-monitor" };
 
@@ -207,14 +209,28 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   if (!todo) return { delivered: false, reason: "no-eligible-work" };
 
   const safeAction = todo.readyWork.safeActions[0];
-  if (!await claimReceipt({
+  const authorization = {
     todoId: todo.id,
     taskId: todo.taskId,
     rootThreadId: todo.dispatchTarget.rootThreadId,
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
-  })) {
+  };
+  if (!await claimReceipt(authorization)) {
     return { delivered: false, reason: "reservation-unavailable" };
+  }
+  const executionIdentity = await confirmDelivery(authorization);
+  const standingAuthority = safeAction.standingAuthority === true;
+  if (!executionIdentity
+    || typeof executionIdentity.worktreePath !== "string"
+    || path.resolve(executionIdentity.worktreePath) !== path.resolve(todo.dispatchTarget.worktreePath)
+    || typeof executionIdentity.branch !== "string"
+    || !executionIdentity.branch
+    || (standingAuthority && (
+      typeof executionIdentity.repository !== "string"
+      || !/^(?:github\.com|gitlab\.com)\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(executionIdentity.repository)
+    ))) {
+    return { delivered: false, reason: "delivery-unavailable" };
   }
   await deliver({
     projectId: policy.projectId,
@@ -225,6 +241,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     targetRoot: path.resolve(todo.dispatchTarget.worktreePath),
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
+    executionIdentity: { ...executionIdentity, standingAuthority },
   });
   return { delivered: true, todoId: todo.id, actionId: safeAction.id };
 }
@@ -243,7 +260,7 @@ async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionT
   if (!rootCwd || rootWorkspacePath !== rootCwd) {
     throw new Error("Configured Root cwd must exactly match the coordination workspace");
   }
-  await validateExecutionTarget(targetRoot);
+  await validateExecutionTarget(targetRoot, request.executionIdentity);
   const instruction = [
     `taskctl issue bootstrap ${request.todoId} --json`,
     `Project: ${request.projectId}`,
@@ -251,6 +268,10 @@ async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionT
     `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
     `Authorized safe action id: ${request.safeActionId}`,
     `Exact execution worktree: ${targetRoot}`,
+    ...(request.executionIdentity ? [
+      `Verified execution repository: ${request.executionIdentity.repository ?? "not-required"}`,
+      `Verified execution branch: ${request.executionIdentity.branch}`,
+    ] : []),
     "Before editing or testing, verify the exact execution worktree is a Git worktree and use it for all repository commands. The Root coordination cwd may be different and must not be treated as the execution worktree.",
     "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
     "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent if needed, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",

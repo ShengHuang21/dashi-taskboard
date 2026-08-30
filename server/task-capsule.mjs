@@ -1,5 +1,12 @@
 import { createHash } from "node:crypto";
 
+import {
+  STANDING_AUTHORITY_ACTIONS,
+  canonicalStandingAction,
+  normalizeRepository,
+  validateStandingAction,
+} from "./standing-authority.mjs";
+
 const CAPSULE_VERSION = "TaskCapsuleV1";
 const AUTHORIZATION_MARKER = "Task Authorization Envelope V1";
 const AUTHORIZATION_GATE_KINDS = new Set([
@@ -17,6 +24,9 @@ const AUTHORIZATION_GATE_KINDS = new Set([
   "destructive",
   "financial",
   "shared_runtime",
+  "scoped_delete",
+  "ordinary_push",
+  "draft_pr",
 ]);
 const AUTHORIZATION_GATE_STATES = new Set(["authorized", "approval_required", "denied", "forbidden"]);
 const AUTHORIZATION_ACTION_STATES = new Set(["pending", "completed"]);
@@ -140,6 +150,15 @@ function authorizationFor(task, comments) {
   if (!envelope || !Array.isArray(envelope.gates) || !Array.isArray(envelope.actions)) {
     return { state: "invalid", envelope: null, source: null };
   }
+  if (envelope.useStandingAuthority !== undefined && typeof envelope.useStandingAuthority !== "boolean") {
+    return { state: "invalid", envelope: null, source: null };
+  }
+  if (envelope.repository !== undefined && normalizeRepository(envelope.repository) === null) {
+    return { state: "invalid", envelope: null, source: null };
+  }
+  if (envelope.useStandingAuthority === true && normalizeRepository(envelope.repository) === null) {
+    return { state: "invalid", envelope: null, source: null };
+  }
   const priorSourceIds = sources.slice(0, -1).map((comment) => comment.id);
   const supersedesCommentIds = envelope.supersedesCommentIds;
   if (priorSourceIds.length === 0) {
@@ -220,6 +239,62 @@ function authorizationFor(task, comments) {
     state: "valid",
     envelope,
     source: { commentId: source.id, commentVersion: source.version },
+  };
+}
+
+function standingAuthorityFor(task, authorization, authorities, timestamp) {
+  const repository = authorization.state === "valid"
+    ? normalizeRepository(authorization.envelope.repository)
+    : null;
+  const projection = {
+    state: "absent",
+    repository,
+    matchedPolicyIds: [],
+    authorizedGateIds: [],
+    authorizedActionIds: [],
+    evaluatedAt: timestamp.toISOString(),
+  };
+  if (!Array.isArray(authorities) || authorities.length === 0) return projection;
+  if (authorization.state !== "valid" || authorization.envelope.useStandingAuthority !== true || !repository) {
+    return { ...projection, state: "unmatched" };
+  }
+  const executionRepository = task.developmentContext?.type === "worktree"
+    ? normalizeRepository(task.developmentContext.repository)
+    : null;
+  if (!executionRepository
+    || !task.developmentContext.repositoryVerifiedAt
+    || executionRepository !== repository) {
+    return { ...projection, state: "unmatched" };
+  }
+  const active = authorities.filter((authority) => (
+    authority.projectId === task.projectId
+    && authority.repository === repository
+    && authority.revokedAt === null
+    && !Number.isNaN(Date.parse(authority.grantedAt))
+    && new Date(authority.grantedAt) <= timestamp
+    && (authority.expiresAt === null || new Date(authority.expiresAt) > timestamp)
+  ));
+  if (active.length === 0) return { ...projection, state: "unmatched" };
+  const allowed = new Set(active.flatMap((authority) => authority.actions));
+  const standingKinds = new Set(STANDING_AUTHORITY_ACTIONS);
+  const authorizedGateIds = authorization.envelope.gates
+    .filter((gate) => gate.state === "approval_required" && standingKinds.has(gate.kind) && allowed.has(gate.kind))
+    .filter((gate) => authorization.envelope.actions
+      .filter((action) => action.gate === gate.id && action.status === "pending")
+      .every((action) => validateStandingAction(action, gate.kind, {
+        branch: task.developmentContext.branch,
+      })))
+    .map((gate) => gate.id);
+  const gateIds = new Set(authorizedGateIds);
+  const authorizedActionIds = authorization.envelope.actions
+    .filter((action) => action.status === "pending" && gateIds.has(action.gate))
+    .map((action) => action.id);
+  return {
+    ...projection,
+    state: authorizedActionIds.length > 0 ? "matched" : "unmatched",
+    matchedPolicyIds: active.map((authority) => authority.id).sort(),
+    authorizedGateIds,
+    authorizedActionIds,
   };
 }
 
@@ -583,6 +658,7 @@ function readyWorkFor(
   activeRun,
   latestRun,
   authorization,
+  standingAuthority,
   requirementsRevision,
 ) {
   const reasonCodes = [];
@@ -660,14 +736,23 @@ function readyWorkFor(
     const expired = gate.state === "authorized"
       && gate.expiresAt
       && new Date(gate.expiresAt) <= timestamp;
-    if (!expired) return [gate.id, gate];
+    if (!expired) {
+      return [gate.id, standingAuthority.authorizedGateIds.includes(gate.id)
+        ? { ...gate, state: "authorized", standingAuthority: true }
+        : gate];
+    }
     return [gate.id, {
       ...gate,
       state: gate.renewable ? "approval_required" : "forbidden",
       expired: true,
     }];
   }));
-  readyWork.safeActions = pendingActions.filter((action) => gates.get(action.gate).state === "authorized");
+  readyWork.safeActions = pendingActions
+    .filter((action) => gates.get(action.gate).state === "authorized")
+    .map((action) => {
+      const gate = gates.get(action.gate);
+      return gate.standingAuthority ? canonicalStandingAction(action, gate.kind) : action;
+    });
   readyWork.deferredActions = pendingActions.filter((action) => gates.get(action.gate).state !== "authorized");
 
   if (reasonCodes.length > 0) return readyWork;
@@ -727,6 +812,7 @@ export function createTaskCapsule({
   currentClaim,
   currentRun = null,
   latestRun = null,
+  standingAuthorities = [],
   now = new Date(),
 }) {
   const orderedComments = [...comments].sort((left, right) => (
@@ -740,6 +826,7 @@ export function createTaskCapsule({
   });
   const execution = executionFor(task);
   const authorization = authorizationFor(task, orderedComments);
+  const standingAuthority = standingAuthorityFor(task, authorization, standingAuthorities, now);
   const handoffs = handoffsFor(coordinationEvents);
   const legacyRun = latestRun ? null : activeRunFor(task, currentClaim, now);
   const activeRun = currentRun ? durableRunFor(currentRun) : legacyRun;
@@ -754,6 +841,7 @@ export function createTaskCapsule({
     activeRun,
     projectedLatestRun,
     authorization,
+    standingAuthority,
     requirementsRevision,
   );
   const workflow = workflowFor(task);
@@ -783,10 +871,22 @@ export function createTaskCapsule({
       eligible: readyWork.eligible,
       reasonCodes: readyWork.reasonCodes,
       nextAction: readyWork.nextAction,
-      worktree: task.developmentContext,
+      worktree: task.developmentContext?.type === "worktree" ? {
+        type: "worktree",
+        path: task.developmentContext.path,
+        branch: task.developmentContext.branch,
+        repository: task.developmentContext.repository,
+      } : task.developmentContext,
       workingLog: task.workingLog,
       workflow,
       authorization,
+      standingAuthority: {
+        state: standingAuthority.state,
+        repository: standingAuthority.repository,
+        matchedPolicyIds: standingAuthority.matchedPolicyIds,
+        authorizedGateIds: standingAuthority.authorizedGateIds,
+        authorizedActionIds: standingAuthority.authorizedActionIds,
+      },
     },
     run: projectedLatestRun,
     handoffs,
@@ -824,6 +924,7 @@ export function createTaskCapsule({
     workingLog: task.workingLog,
     workflow,
     authorization,
+    standingAuthority,
     activeRun,
     latestRun: projectedLatestRun,
     readyWork,

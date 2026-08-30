@@ -1,17 +1,23 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
+import { promisify } from "node:util";
 
 import { createTaskboardServer, resolveHost } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
-import { runTaskboardContinuationMonitorOnce } from "../scripts/codex-injector-runtime.mjs";
+import {
+  deliverTaskboardCoordination,
+  runTaskboardContinuationMonitorOnce,
+} from "../scripts/codex-injector-runtime.mjs";
 
 const runningApps = [];
+const execFileAsync = promisify(execFile);
 
 afterEach(async () => {
   while (runningApps.length > 0) {
@@ -591,6 +597,22 @@ test("Agent Lane snapshot reserves its internal task id and delivers one backgro
       assert.equal(reservation.response.status, 200);
       assert.equal(reservation.body.receipt.taskId, claim.taskId);
       return reservation.body.reused === false;
+    },
+    confirmDelivery: async (delivery) => {
+      const confirmation = await request(
+        baseUrl,
+        `/api/tasks/${encodeURIComponent(delivery.todoId)}/bootstrap-delivery`,
+        {
+          method: "POST",
+          body: {
+            rootThreadId: delivery.rootThreadId,
+            expectedResumeToken: delivery.expectedResumeToken,
+            safeActionId: delivery.safeActionId,
+          },
+        },
+      );
+      assert.equal(confirmation.response.status, 200);
+      return confirmation.body.executionIdentity;
     },
     deliver: async (delivery) => {
       deliveries.push(delivery);
@@ -1948,6 +1970,349 @@ test("taskctl issue creation and comments use the Codex Agent identity", async (
   assert.equal(comment.authorName, "Codex Agent");
   assert.equal(comment.authorAvatarUrl, null);
   assert.equal(comment.threadId, "thread-agent-comment");
+});
+
+test("project standing authority is provenance-bound, idempotent, revocable, and projected into Capsules", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let worktreePath;
+  let escapedLinkPath;
+  let outsideFile;
+  const baseUrl = await startServer(async (directory) => {
+    worktreePath = path.join(directory, "standing-authority-worktree");
+    await mkdir(worktreePath, { recursive: true });
+    await execFileAsync("git", ["init", worktreePath]);
+    await execFileAsync("git", ["-C", worktreePath, "checkout", "-b", "codex/standing-authority-test"]);
+    await execFileAsync("git", ["-C", worktreePath, "remote", "add", "origin", "git@github.com:Owner/Repo.git"]);
+    outsideFile = path.join(directory, "outside.txt");
+    escapedLinkPath = path.join(worktreePath, "escaped-link");
+    await writeFile(outsideFile, "outside", "utf8");
+    await symlink(outsideFile, escapedLinkPath);
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{
+        id: "root", label: "Standing Authority Root", owner: "Codex Root", source: "codex",
+        threadId: rootThreadId, taskType: "root_task",
+      }],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+  const rootBinding = {
+    threadId: rootThreadId,
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: worktreePath,
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      projectId: "local",
+      title: "Standing authority source",
+      status: "todo",
+      workflowProfile: "vibe",
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/standing-authority-test",
+      },
+    },
+  });
+  assert.equal(created.response.status, 201);
+  const task = created.body.task;
+  const grantBody = {
+    repository: "https://github.com/Owner/Repo.git",
+    actions: ["edit", "test", "scoped_delete", "ordinary_push", "draft_pr"],
+    sourceTaskId: task.identifier,
+    sourceThreadId: rootBinding.threadId,
+    evidence: "Owner granted standing authority in the confirmed Root window",
+    receipt: "owner-turn:standing-authority:1",
+    grantedAt: "2026-08-30T00:00:00.000Z",
+    expiresAt: null,
+  };
+  const granted = await request(baseUrl, "/api/projects/local/standing-authorities", {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: grantBody,
+  });
+  assert.equal(granted.response.status, 201);
+  assert.equal(granted.body.created, true);
+  assert.equal(granted.body.authority.repository, "github.com/owner/repo");
+  assert.equal(granted.body.authority.sourceTaskId, task.id);
+  assert.deepEqual(granted.body.authority.recordedBy, {
+    type: "agent", id: "codex-agent", name: "Codex Agent",
+  });
+
+  const replay = await request(baseUrl, "/api/projects/local/standing-authorities", {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: grantBody,
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.created, false);
+  const conflict = await request(baseUrl, "/api/projects/local/standing-authorities", {
+    method: "POST",
+    body: { ...grantBody, actions: ["commit"] },
+  });
+  assert.equal(conflict.response.status, 409);
+  assert.equal(conflict.body.error.code, "STANDING_AUTHORITY_RECEIPT_CONFLICT");
+  const wrongRoot = await request(baseUrl, "/api/projects/local/standing-authorities", {
+    method: "POST",
+    body: {
+      ...grantBody,
+      receipt: "owner-turn:standing-authority:wrong-root",
+      sourceThreadId: "not-the-confirmed-root",
+    },
+  });
+  assert.equal(wrongRoot.response.status, 409);
+  assert.equal(wrongRoot.body.error.code, "STANDING_AUTHORITY_ROOT_MISMATCH");
+  const futureGrant = await request(baseUrl, "/api/projects/local/standing-authorities", {
+    method: "POST",
+    body: {
+      ...grantBody,
+      receipt: "owner-turn:standing-authority:future",
+      grantedAt: "2099-01-01T00:00:00.000Z",
+    },
+  });
+  assert.equal(futureGrant.response.status, 400);
+
+  const envelope = {
+    repository: "github.com/owner/repo",
+    useStandingAuthority: true,
+    gates: [
+      {
+        id: "push", kind: "ordinary_push", state: "approval_required", scope: "origin branch",
+        approver: "Owner", approvalRequest: "Approve ordinary push",
+      },
+      {
+        id: "delete", kind: "scoped_delete", state: "approval_required", scope: "one declared file",
+        approver: "Owner", approvalRequest: "Approve scoped delete",
+      },
+      {
+        id: "edit", kind: "edit", state: "approval_required", scope: "one declared file",
+        approver: "Owner", approvalRequest: "Approve edit",
+      },
+    ],
+    actions: [
+      {
+        id: "push-branch", order: 1, text: "Push branch", gate: "push", target: "origin", status: "pending",
+        standingScope: {
+          kind: "ordinary_push", remote: "origin", branch: "codex/standing-authority-test", force: false,
+        },
+      },
+      {
+        id: "delete-link", order: 2, text: "Delete escaped link", gate: "delete", target: "escaped-link", status: "pending",
+        standingScope: { kind: "scoped_delete", paths: ["escaped-link"], recursive: false },
+      },
+      {
+        id: "edit-link", order: 3, text: "Edit escaped link", gate: "edit", target: "escaped-link", status: "pending",
+        standingScope: { kind: "edit", paths: ["escaped-link"] },
+      },
+    ],
+  };
+  await request(baseUrl, `/api/tasks/${task.id}/comments`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify(envelope)}\n\`\`\``,
+      threadId: rootBinding.threadId,
+    },
+  });
+  const capsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
+  assert.equal(capsule.response.status, 200);
+  assert.deepEqual(
+    capsule.body.capsule.readyWork.safeActions.map((action) => action.id),
+    ["push-branch", "delete-link", "edit-link"],
+    JSON.stringify(capsule.body.capsule, null, 2),
+  );
+  assert.deepEqual(
+    capsule.body.capsule.standingAuthority.authorizedActionIds,
+    ["push-branch", "delete-link", "edit-link"],
+  );
+
+  const escapedDeleteClaim = await request(baseUrl, `/api/tasks/${task.id}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: rootBinding.threadId,
+      expectedResumeToken: capsule.body.capsule.resumeToken,
+      safeActionId: "delete-link",
+    },
+  });
+  assert.equal(escapedDeleteClaim.response.status, 409);
+  assert.equal(escapedDeleteClaim.body.error.code, "STANDING_SCOPE_MISMATCH");
+  await access(escapedLinkPath);
+
+  const escapedEditClaim = await request(baseUrl, `/api/tasks/${task.id}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: rootBinding.threadId,
+      expectedResumeToken: capsule.body.capsule.resumeToken,
+      safeActionId: "edit-link",
+    },
+  });
+  assert.equal(escapedEditClaim.response.status, 409);
+  assert.equal(escapedEditClaim.body.error.code, "STANDING_SCOPE_MISMATCH");
+
+  const laneSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(laneSnapshot.response.status, 200);
+  const standingTodo = laneSnapshot.body.todos.find((todo) => todo.taskId === task.id);
+  assert.equal(standingTodo?.readyWork.safeActions[0]?.standingAuthority, true);
+  let validatedIdentity = null;
+  const monitorResult = await runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "local" },
+    readSnapshot: async () => laneSnapshot.body,
+    claimReceipt: async (claim) => {
+      const result = await request(baseUrl, `/api/tasks/${claim.todoId}/bootstrap-claim`, {
+        method: "POST",
+        body: {
+          rootThreadId: claim.rootThreadId,
+          expectedResumeToken: claim.expectedResumeToken,
+          safeActionId: claim.safeActionId,
+        },
+      });
+      assert.equal(result.response.status, 200);
+      return result.body.reused === false;
+    },
+    confirmDelivery: async (delivery) => {
+      const result = await request(baseUrl, `/api/tasks/${delivery.todoId}/bootstrap-delivery`, {
+        method: "POST",
+        body: {
+          rootThreadId: delivery.rootThreadId,
+          expectedResumeToken: delivery.expectedResumeToken,
+          safeActionId: delivery.safeActionId,
+        },
+      });
+      assert.equal(result.response.status, 200);
+      return result.body.executionIdentity;
+    },
+    deliver: (delivery) => deliverTaskboardCoordination(
+      delivery,
+      async (method) => {
+        if (method === "thread/read") {
+          return { thread: { id: rootBinding.threadId, cwd: rootBinding.workspacePath, turns: [{ id: "active-turn", status: "inProgress" }] } };
+        }
+        if (method === "turn/steer") return {};
+        throw new Error(`Unexpected RPC method: ${method}`);
+      },
+      async (targetRoot, executionIdentity) => {
+        assert.equal(targetRoot, worktreePath);
+        validatedIdentity = executionIdentity;
+      },
+    ),
+  });
+  assert.deepEqual(monitorResult, {
+    delivered: true,
+    todoId: task.identifier,
+    actionId: "push-branch",
+  });
+  assert.equal(validatedIdentity?.standingAuthority, true);
+  assert.equal(validatedIdentity?.repository, "github.com/owner/repo");
+  assert.equal(validatedIdentity?.branch, "codex/standing-authority-test");
+  assert.deepEqual(validatedIdentity?.standingScope, {
+    kind: "ordinary_push", remote: "origin", branch: "codex/standing-authority-test", force: false,
+  });
+
+  const editablePath = path.join(worktreePath, "editable.txt");
+  await writeFile(editablePath, "inside", "utf8");
+  const editTaskResult = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      projectId: "local",
+      title: "Edit path swap task",
+      status: "todo",
+      workflowProfile: "vibe",
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree", path: worktreePath, branch: "codex/standing-authority-test",
+      },
+    },
+  });
+  const editTask = editTaskResult.body.task;
+  await request(baseUrl, `/api/tasks/${editTask.id}/comments`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        repository: "github.com/owner/repo",
+        useStandingAuthority: true,
+        gates: [{
+          id: "edit", kind: "edit", state: "approval_required", scope: "one file",
+          approver: "Owner", approvalRequest: "Approve edit",
+        }],
+        actions: [{
+          id: "edit-file", order: 1, text: "Edit file", gate: "edit", target: "editable.txt", status: "pending",
+          standingScope: { kind: "edit", paths: ["editable.txt"] },
+        }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+    },
+  });
+  const editCapsule = (await request(baseUrl, `/api/tasks/${editTask.id}/capsule`)).body.capsule;
+  const editClaim = await request(baseUrl, `/api/tasks/${editTask.id}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: rootBinding.threadId,
+      expectedResumeToken: editCapsule.resumeToken,
+      safeActionId: "edit-file",
+    },
+  });
+  assert.equal(editClaim.response.status, 200);
+  await unlink(editablePath);
+  await symlink(outsideFile, editablePath);
+  const swappedEditDelivery = await request(baseUrl, `/api/tasks/${editTask.id}/bootstrap-delivery`, {
+    method: "POST",
+    body: {
+      rootThreadId: rootBinding.threadId,
+      expectedResumeToken: editCapsule.resumeToken,
+      safeActionId: "edit-file",
+    },
+  });
+  assert.equal(swappedEditDelivery.response.status, 409);
+  assert.equal(swappedEditDelivery.body.error.code, "STANDING_SCOPE_MISMATCH");
+
+  await execFileAsync("git", ["-C", worktreePath, "remote", "set-url", "origin", "git@github.com:Company/Other.git"]);
+  const changedRemoteDelivery = await request(baseUrl, `/api/tasks/${task.id}/bootstrap-delivery`, {
+    method: "POST",
+    body: {
+      rootThreadId: rootBinding.threadId,
+      expectedResumeToken: capsule.body.capsule.resumeToken,
+      safeActionId: "push-branch",
+    },
+  });
+  assert.equal(changedRemoteDelivery.response.status, 409);
+  assert.equal(changedRemoteDelivery.body.error.code, "RESUME_TOKEN_MISMATCH");
+
+  const authorityId = granted.body.authority.id;
+  const revokeBody = { evidence: "Owner revoked standing authority", receipt: "owner-turn:standing-authority:2" };
+  const revoked = await request(baseUrl, `/api/projects/local/standing-authorities/${authorityId}/revoke`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: revokeBody,
+  });
+  assert.equal(revoked.response.status, 200);
+  assert.equal(revoked.body.changed, true);
+  const revokeReplay = await request(baseUrl, `/api/projects/local/standing-authorities/${authorityId}/revoke`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: revokeBody,
+  });
+  assert.equal(revokeReplay.response.status, 200);
+  assert.equal(revokeReplay.body.changed, false);
+  const revokeConflict = await request(baseUrl, `/api/projects/local/standing-authorities/${authorityId}/revoke`, {
+    method: "POST",
+    body: { ...revokeBody, evidence: "Different revocation" },
+  });
+  assert.equal(revokeConflict.response.status, 409);
+  assert.equal(revokeConflict.body.error.code, "STANDING_AUTHORITY_RECEIPT_CONFLICT");
+  const revokedCapsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
+  assert.deepEqual(revokedCapsule.body.capsule.readyWork.safeActions, []);
 });
 
 test("Codex-hosted user mutations persist the current account identity and avatar", async () => {

@@ -78,6 +78,64 @@ test("project list uses the default local service and adds schemaVersion", async
   assert.equal(calls[0].init.headers["x-taskboard-client"], "taskctl");
 });
 
+test("standing authority CLI normalizes a narrow grant and supports list and revoke", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url: url.toString(), init, body: init.body ? JSON.parse(init.body) : null });
+    return response({ ok: true });
+  };
+
+  const grant = await run([
+    "authority", "grant", "personal",
+    "--repository", "HTTPS://GitHub.com/Owner/Repo.git",
+    "--actions", "edit,test,ordinary_push,draft_pr",
+    "--source-task", "CAP-8",
+    "--source-thread-id", "root-thread",
+    "--evidence", "Owner standing instruction",
+    "--receipt", "owner-turn:1",
+    "--granted-at", "2026-08-30T00:00:00.000Z",
+  ], fetchImplementation);
+  assert.equal(grant.exitCode, 0);
+  assert.equal(calls[0].url, "http://127.0.0.1:47823/api/projects/personal/standing-authorities");
+  assert.deepEqual(calls[0].body, {
+    repository: "github.com/owner/repo",
+    actions: ["draft_pr", "edit", "ordinary_push", "test"],
+    sourceTaskId: "CAP-8",
+    sourceThreadId: "root-thread",
+    evidence: "Owner standing instruction",
+    receipt: "owner-turn:1",
+    grantedAt: "2026-08-30T00:00:00.000Z",
+  });
+
+  assert.equal((await run(["authority", "list", "personal"], fetchImplementation)).exitCode, 0);
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal((await run([
+    "authority", "revoke", "personal", "authority-1",
+    "--evidence", "Owner revoked it",
+    "--receipt", "owner-turn:2",
+  ], fetchImplementation)).exitCode, 0);
+  assert.equal(calls[2].url, "http://127.0.0.1:47823/api/projects/personal/standing-authorities/authority-1/revoke");
+});
+
+test("standing authority CLI rejects unknown and duplicate actions before network access", async () => {
+  let called = false;
+  for (const actions of ["edit,deploy", "edit,edit"]) {
+    const result = await run([
+      "authority", "grant", "personal",
+      "--repository", "github.com/owner/repo",
+      "--actions", actions,
+      "--source-task", "CAP-8",
+      "--source-thread-id", "root-thread",
+      "--evidence", "Owner standing instruction",
+      "--receipt", "owner-turn:1",
+      "--granted-at", "2026-08-30T00:00:00.000Z",
+    ], async () => { called = true; return response({}); });
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.stderr.error.code, "USAGE_ERROR");
+  }
+  assert.equal(called, false);
+});
+
 test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
   let requestedUrl;
   const result = await run(
