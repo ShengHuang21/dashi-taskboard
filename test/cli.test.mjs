@@ -197,6 +197,35 @@ test("coordinator CLI rejects unsafe duration and incomplete lease identity befo
   assert.equal(called, false);
 });
 
+test("coordinator CLI repairs a legacy Root binding without caller-supplied host identity", async () => {
+  let call;
+  const result = await run([
+    "coordinator", "repair-binding", "personal", "CAP-12",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "lease-1", "--if-version", "3",
+  ], async (url, init) => {
+    call = {
+      pathname: url.pathname,
+      method: init.method,
+      body: JSON.parse(init.body),
+    };
+    return response({ task: { identifier: "CAP-12", version: 4 }, receipt: { id: "activity-1" } });
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(call, {
+    pathname: "/api/local/projects/personal/coordinator-lease/repair-binding",
+    method: "POST",
+    body: {
+      taskId: "CAP-12",
+      taskVersion: 3,
+      holderTaskId: "root",
+      holderThreadId: "thread-root",
+      expectedLeaseId: "lease-1",
+    },
+  });
+});
+
 test("standing authority CLI rejects unknown and duplicate actions before network access", async () => {
   let called = false;
   for (const actions of ["edit,deploy", "edit,edit"]) {

@@ -376,6 +376,23 @@ function parseCoordinatorLeaseRelease(value) {
   };
 }
 
+function parseCoordinatorBindingRepair(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "taskId", "taskVersion", "holderTaskId", "holderThreadId", "expectedLeaseId",
+  ]));
+  if (!Number.isInteger(value.taskVersion) || value.taskVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "'taskVersion' must be a positive integer");
+  }
+  return {
+    taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
+    taskVersion: value.taskVersion,
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    expectedLeaseId: stringField(value.expectedLeaseId, "expectedLeaseId", { required: true, maxLength: 256 }),
+  };
+}
+
 function pathField(value, name) {
   const normalized = stringField(value, name, { nullable: true, maxLength: 4096 });
   if (normalized === "") {
@@ -2293,6 +2310,24 @@ export function createTaskboardServer(options = {}) {
       workspacePath: hostRuntime.workspacePath,
     };
   }
+  function currentHostThreadIdentity(threadId) {
+    if (
+      !hostRuntime
+      || Date.now() - hostRuntime.updatedAt > HOST_RUNTIME_TTL_MS
+      || hostRuntime.threadId !== threadId
+      || !hostRuntime.codexProjectId
+      || !hostRuntime.codexProjectKind
+      || !hostRuntime.codexHostId
+      || !hostRuntime.workspacePath
+    ) return null;
+    return {
+      threadId,
+      codexProjectId: hostRuntime.codexProjectId,
+      codexProjectKind: hostRuntime.codexProjectKind,
+      codexHostId: hostRuntime.codexHostId,
+      workspacePath: hostRuntime.workspacePath,
+    };
+  }
   function resolveInputThreadBinding(input) {
     if (input.threadBinding !== undefined) return input;
     const threadBinding = currentHostThreadBinding(input.threadId);
@@ -2774,6 +2809,7 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, 200, { runtime });
         }
         if (request.method === "PUT") {
+          assertInjectorProof(request, resolved.instanceSecret);
           const body = await readJson(request);
           assertPlainObject(body);
           assertAllowedKeys(body, new Set([
@@ -2858,6 +2894,33 @@ export function createTaskboardServer(options = {}) {
           projectId,
           parseCoordinatorLeaseRelease(await readJson(request)),
         ));
+      }
+
+      const coordinatorBindingRepairRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-lease\/repair-binding$/,
+      );
+      if (coordinatorBindingRepairRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-lease/repair-binding");
+        const projectId = decodeRouteSegment(coordinatorBindingRepairRoute[1], "Project id");
+        validateProjectId(projectId);
+        const input = parseCoordinatorBindingRepair(await readJson(request));
+        const threadBinding = currentHostThreadIdentity(input.holderThreadId);
+        if (!threadBinding) {
+          throw new ApiError(
+            409,
+            "HOST_IDENTITY_UNAVAILABLE",
+            "The coordinator thread must be the fresh protected Codex host identity",
+          );
+        }
+        const result = database.repairLegacyTaskRootBinding(
+          projectId,
+          input,
+          threadBinding,
+          actorFromRequest(request),
+        );
+        events.emit("task.updated", { task: result.task });
+        return sendJson(response, 200, result);
       }
 
       const coordinatorLeaseReceiptsRoute = pathname.match(

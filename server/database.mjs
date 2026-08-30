@@ -2508,6 +2508,115 @@ export class TaskboardDatabase {
     }
   }
 
+  repairLegacyTaskRootBinding(projectId, input, threadBinding, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const laneRow = this.database.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!laneRow) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const config = JSON.parse(laneRow.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId)
+        : null;
+      if (!holder || holder.threadId !== input.holderThreadId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_BINDING_MISMATCH",
+          "Binding repair holder must match one configured peer window",
+        );
+      }
+      const lease = config.coordinatorLease ?? null;
+      if ((lease?.id ?? null) !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_CONFLICT",
+          "Coordinator lease changed since it was read",
+          { actualLeaseId: lease?.id ?? null },
+        );
+      }
+      const timestamp = now();
+      if (!lease || Date.parse(lease.expiresAt) <= Date.parse(timestamp)) {
+        throw new ApiError(409, "COORDINATOR_LEASE_NOT_ACTIVE", "Coordinator lease is not active");
+      }
+      if (lease.holderTaskId !== input.holderTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_ACTIVE",
+          "Another peer window holds the active coordinator lease",
+        );
+      }
+      if (threadBinding.threadId !== input.holderThreadId) {
+        throw new ApiError(409, "COORDINATOR_BINDING_MISMATCH", "Host identity does not match the coordinator thread");
+      }
+
+      const task = this.#requireTask(input.taskId);
+      if (task.projectId !== projectId) {
+        throw new ApiError(409, "TASK_PROJECT_MISMATCH", "Binding repair target belongs to another project");
+      }
+      this.#requireVersion(task, input.taskVersion);
+      if (task.threadBinding) {
+        throw new ApiError(409, "ROOT_BINDING_ALREADY_DURABLE", "Task already has a durable Root binding");
+      }
+      this.#assertNoOpenTaskAgentRunRebinding(task, {}, threadBinding);
+
+      const activityId = randomUUID();
+      const previousThreadId = task.legacyLocalThreadId;
+      const storedBinding = storedThreadBinding(threadBinding, threadBinding.threadId);
+      const updated = this.database.prepare(`
+        UPDATE tasks SET
+          thread_id = ?,
+          thread_codex_project_id = ?,
+          thread_codex_project_kind = ?,
+          thread_codex_host_id = ?,
+          thread_workspace_path = ?,
+          version = version + 1,
+          updated_at = ?
+        WHERE id = ? AND version = ?
+      `).run(...storedBinding, timestamp, task.id, input.taskVersion);
+      if (updated.changes !== 1) this.#throwMissingOrConflict(task.id, input.taskVersion);
+      const changes = [
+        { field: "threadBinding", before: null, after: threadBinding },
+        { field: "legacyLocalThreadId", before: previousThreadId, after: null },
+        { field: "coordinatorLeaseId", before: null, after: lease.id },
+      ];
+      this.database.prepare(`
+        INSERT INTO task_activities (
+          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        activityId,
+        task.id,
+        actor.type,
+        actor.id,
+        actor.name,
+        actor.avatarUrl,
+        JSON.stringify(changes),
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        task: this.getTask(task.id),
+        receipt: {
+          id: activityId,
+          taskId: task.id,
+          projectId,
+          leaseId: lease.id,
+          holderTaskId: input.holderTaskId,
+          holderThreadId: input.holderThreadId,
+          previousThreadId,
+          threadBinding,
+          createdAt: timestamp,
+        },
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   listAgentLaneCoordinatorReceipts(projectId, limit = 50) {
     if (!this.getAgentLaneProject(projectId)) {
       throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);

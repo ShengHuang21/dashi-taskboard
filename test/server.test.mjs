@@ -71,6 +71,13 @@ async function requestWithHost(baseUrl, host) {
   });
 }
 
+function signedInjectorHeaders(instanceSecret, nonce) {
+  return {
+    "x-codex-taskboard-injector-nonce": nonce,
+    "x-codex-taskboard-injector-proof": createHmac("sha256", instanceSecret).update(nonce).digest("hex"),
+  };
+}
+
 test("health and the default local project are available", async () => {
   let skillPath;
   const baseUrl = await startServer(async (directory) => {
@@ -1109,6 +1116,160 @@ test("project coordinator leases acquire and renew atomically without granting e
   );
 });
 
+test("active coordinator repairs one legacy Root binding from protected host identity", async () => {
+  let legacyTask;
+  const instanceSecret = "b".repeat(64);
+  const repairActor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+      ],
+      adapters: [],
+    });
+    legacyTask = database.createTask({
+      projectId: "local", title: "Legacy recovery target", description: "preserve me", status: "todo",
+      priority: "high", labels: ["agent-todo"], threadId: "legacy-thread", actor: repairActor,
+      assignee: repairActor, workflowId: null, developmentContext: null, startDate: null,
+      dueDate: null, recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const lease = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "root", holderThreadId: "root-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(lease.response.status, 200);
+
+  const forgedHost = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    body: {
+      threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/replacement-root",
+    },
+  });
+  assert.equal(forgedHost.response.status, 403);
+  assert.equal(forgedHost.body.error.code, "INJECTOR_PROOF_REQUIRED");
+  const afterForgedHost = await request(baseUrl, `/api/tasks/${legacyTask.identifier}`);
+  const activitiesAfterForgedHost = await request(baseUrl, `/api/tasks/${legacyTask.identifier}/activities`);
+  assert.equal(afterForgedHost.body.task.threadBinding, null);
+  assert.equal(afterForgedHost.body.task.version, legacyTask.version);
+  assert.deepEqual(activitiesAfterForgedHost.body.activities, []);
+
+  const host = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "1".repeat(32)),
+    body: {
+      threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/replacement-root",
+    },
+  });
+  assert.equal(host.response.status, 200);
+
+  const wrongHostThread = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "2".repeat(32)),
+    body: {
+      threadId: "other-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/replacement-root",
+    },
+  });
+  assert.equal(wrongHostThread.response.status, 200);
+  const wrongHostRepair = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
+    method: "POST",
+    body: {
+      taskId: legacyTask.identifier, taskVersion: legacyTask.version,
+      holderTaskId: "root", holderThreadId: "root-thread",
+      expectedLeaseId: lease.body.lease.id,
+    },
+  });
+  assert.equal(wrongHostRepair.response.status, 409);
+  assert.equal(wrongHostRepair.body.error.code, "HOST_IDENTITY_UNAVAILABLE");
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "3".repeat(32)),
+    body: {
+      threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/replacement-root",
+    },
+  });
+
+  const staleLease = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
+    method: "POST",
+    body: {
+      taskId: legacyTask.identifier, taskVersion: legacyTask.version,
+      holderTaskId: "root", holderThreadId: "root-thread",
+      expectedLeaseId: "stale-lease",
+    },
+  });
+  assert.equal(staleLease.response.status, 409);
+  assert.equal(staleLease.body.error.code, "COORDINATOR_LEASE_CONFLICT");
+  const afterStaleLease = await request(baseUrl, `/api/tasks/${legacyTask.identifier}`);
+  assert.equal(afterStaleLease.body.task.threadBinding, null);
+  assert.equal(afterStaleLease.body.task.version, legacyTask.version);
+
+  const repaired = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
+    method: "POST",
+    body: {
+      taskId: legacyTask.identifier, taskVersion: legacyTask.version,
+      holderTaskId: "root", holderThreadId: "root-thread",
+      expectedLeaseId: lease.body.lease.id,
+    },
+  });
+  assert.equal(repaired.response.status, 200);
+  assert.equal(repaired.body.task.description, "preserve me");
+  assert.equal(repaired.body.task.legacyLocalThreadId, null);
+  assert.deepEqual(repaired.body.task.threadBinding, {
+    threadId: "root-thread",
+    codexProjectId: "codex-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/replacement-root",
+  });
+  assert.equal(repaired.body.receipt.taskId, legacyTask.id);
+  assert.equal(repaired.body.receipt.leaseId, lease.body.lease.id);
+  const activities = await request(baseUrl, `/api/tasks/${legacyTask.identifier}/activities`);
+  const repairActivity = activities.body.activities.find(
+    (activity) => activity.id === repaired.body.receipt.id,
+  );
+  assert.ok(repairActivity);
+  assert.deepEqual(
+    repairActivity.changes.find((change) => change.field === "coordinatorLeaseId"),
+    { field: "coordinatorLeaseId", before: null, after: lease.body.lease.id },
+  );
+
+  const capsule = await request(baseUrl, `/api/tasks/${legacyTask.identifier}/capsule`);
+  assert.equal(capsule.response.status, 200);
+  assert.doesNotMatch(capsule.body.capsule.readyWork.reasonCodes.join(","), /LEGACY_THREAD_BINDING_ONLY/);
+
+  const repeated = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
+    method: "POST",
+    body: {
+      taskId: legacyTask.identifier, taskVersion: repaired.body.task.version,
+      holderTaskId: "root", holderThreadId: "root-thread",
+      expectedLeaseId: lease.body.lease.id,
+    },
+  });
+  assert.equal(repeated.response.status, 409);
+  assert.equal(repeated.body.error.code, "ROOT_BINDING_ALREADY_DURABLE");
+
+  const unchanged = await request(baseUrl, `/api/tasks/${legacyTask.identifier}`);
+  assert.deepEqual(unchanged.body.task.threadBinding, repaired.body.task.threadBinding);
+  assert.equal(unchanged.body.task.version, repaired.body.task.version);
+});
+
 test("Talking Window inbox delivery is durable and idempotent without interrupting active execution", async () => {
   const baseUrl = await startServer(async (directory) => {
     const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
@@ -1848,9 +2009,11 @@ test("remote task bindings keep their own identity and can be cleared independen
 });
 
 test("the active local Codex conversation supplies its exact task binding identity", async () => {
-  const baseUrl = await startServer();
+  const instanceSecret = "c".repeat(64);
+  const baseUrl = await startServer(() => ({ instanceSecret }));
   const runtime = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
     body: {
       threadId: "local-thread",
       threadRunning: true,

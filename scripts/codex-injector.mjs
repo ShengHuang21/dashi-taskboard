@@ -2031,7 +2031,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
       try {
         const browserOrigin = request.headers?.Origin || request.headers?.origin;
         const corsOrigin = browserOrigin === "app://-" ? "app://-" : "null";
-        const requestedHeaders = Object.entries(request.headers || {}).filter(([name]) => !(
+        let requestedHeaders = Object.entries(request.headers || {}).filter(([name]) => !(
           /^(?:host|connection|content-length|accept-encoding|origin|referer)$/i.test(name)
           || /^sec-fetch-/i.test(name)
         ));
@@ -2054,6 +2054,12 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
           return;
         }
         const method = request.method || "GET";
+        if (method === "PUT" && requestUrl === `${taskboardBaseUrl}/api/local/host-runtime`) {
+          requestedHeaders = requestedHeaders.filter(([name]) => !(
+            /^x-codex-taskboard-injector-(?:nonce|proof)$/i.test(name)
+          ));
+          requestedHeaders.push(...Object.entries(injectorProofHeaders()));
+        }
         const response = await proxyTaskboardRequest(requestUrl, request, requestedHeaders);
         const responseHeaders = Array.from(response.headers.entries())
           .filter(([name]) => !/^(?:content-length|content-encoding|transfer-encoding|connection)$/i.test(name))
