@@ -48,6 +48,14 @@ npm run taskctl -- issue create \
   --labels product,mvp
 ```
 
+For a fresh or memoryless Codex window, recover an existing task with one read before deciding whether work may start:
+
+```bash
+taskctl issue bootstrap ISSUE_ID --json
+```
+
+The returned Task Capsule includes the task and relations, comments, attachments, inbox, handoffs, active/latest execution state, authorization frontier, safe actions, and `resumeToken`. This read is the durable recovery source; another window's chat summary is not a substitute and the command does not grant execution or Git authority.
+
 Use `npm link` if you want `taskctl` on your shell path. Set `CODEX_TASKBOARD_URL` to point the CLI at another local or LAN service. Cloud deployments are configured through the **loopback companion** (device-local loopback service for auth and path mapping—not a chat persona) with `taskctl cloud login`.
 
 ## Install the Codex Skill
@@ -69,10 +77,12 @@ stored in SQLite; local Codex session evidence supplies runtime activity. The
 endpoint does not send prompts, claim work, restart agents, or perform recovery.
 
 The version 2 configuration maps independent Codex tasks/windows and explicitly
-disabled external adapters. Root-internal Sub-Agents are not configured by hand:
-Snapshot v3 discovers their stable path, agent thread, lifecycle, and latest
-result from the Root task's local collaboration events. Prompts are never
-returned. The snapshot keeps `readOnly: true` and
+disabled external adapters. Window-internal Sub-Agents are not configured by
+hand: Snapshot v3 discovers their stable path, agent thread, lifecycle, and
+latest result independently for every configured Codex window. The
+`windowSubagentTrees` projection keeps each window's ownership boundary explicit;
+the existing `rootSubagents` field remains the coordinator-window compatibility
+view. Prompts are never returned. The snapshot keeps `readOnly: true` and
 `automaticRecoveryEnabled: false`.
 
 To migrate a version 2 JSON configuration, run
@@ -84,6 +94,45 @@ Any project with a durable Agent Lanes configuration exposes the Agent Lanes tab
 and opens that view by default. The board title, task lanes, runtime Sub-Agents,
 and optional adapters all come from the selected project's configuration; no
 project ID or adapter name is hard-coded in the UI.
+
+### Talking Windows and conversation scope
+
+A Codex window may be a discussion and coordination context without being an
+execution owner. Task Capsules project this explicitly as `conversation.scope`
+plus a deduplicated `conversation.talkingWindows` list derived from the issue and
+comment thread bindings. An ordinary issue has `work_item` scope. One durable,
+non-dispatchable issue labeled `project-inbox` may act as the project-level
+conversation inbox and has `project` scope. A Talking Window never receives Git
+or Ready Work authority from that association; execution still requires the
+existing worktree, Working Log, authorization, and claim gates.
+
+Project coordination may be assigned by a time-bounded `coordinatorLease` to
+any configured peer window. An active lease selects only the coordination
+window; it does not grant Git execution authority. An expired lease fails
+closed with no coordinator instead of silently restoring the legacy fixed
+`rootTaskId`. Projects without a lease retain the legacy configured coordinator
+contract until they are migrated.
+
+Task Capsules project a `planning` contract only for issues explicitly labeled
+`feature` or `workstream`. It carries milestone dates, the exact parent Feature,
+sorted child Workstream identifiers, and a status rollup. Unlabeled children are
+counted separately instead of being silently classified as Workstreams;
+ordinary issues return `planning: null`.
+
+Before a coordinator dispatches work, it may reserve the current safe frontier
+with `POST /api/tasks/:id/bootstrap-claim`. The server compares the exact
+Task Capsule `resumeToken`, first `safeActionId`, and configured Root thread in
+one SQLite transaction and returns an idempotent durable receipt. This receipt
+only prevents stale or duplicate coordination; it does not claim the execution
+Ticket, grant Git authority, or replace the Sub-Agent claim lease.
+
+External providers use a provider-neutral adapter projection. Until a separately
+authorized callable adapter exists, every configured adapter must remain
+`not_connected` and exposes a versioned disabled contract with no transport and
+all inspect, dispatch, wait, and checkpoint-receipt capabilities set to false.
+Declaring an unimplemented external adapter connected invalidates the Agent Lanes
+mapping instead of creating apparent authority. Provider names do not change
+this fail-closed behavior.
 
 ## Embed in Codex
 

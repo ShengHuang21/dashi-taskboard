@@ -111,6 +111,10 @@ function parseHostRequest(payload, parseAutomationRequest) {
     && /^[a-z0-9._-]{1,128}$/i.test(request.safeActionId)
     && typeof request.expectedResumeToken === "string"
     && /^[a-f0-9]{64}$/.test(request.expectedResumeToken)
+    && typeof request.rootWorkspacePath === "string"
+    && request.rootWorkspacePath.length > 0
+    && request.rootWorkspacePath.length <= 4_096
+    && path.isAbsolute(request.rootWorkspacePath)
     && typeof request.targetRoot === "string"
     && request.targetRoot.length > 0
     && request.targetRoot.length <= 4_096
@@ -119,16 +123,20 @@ function parseHostRequest(payload, parseAutomationRequest) {
   return { id, request: null, error: HOST_REQUEST_ERROR };
 }
 
-export async function deliverTaskboardCoordination(request, rpc) {
+export async function deliverTaskboardCoordination(request, rpc, validateExecutionTarget) {
+  if (typeof validateExecutionTarget !== "function") {
+    throw new Error("Execution worktree validator is required");
+  }
   const observedAt = Date.now();
   for (const [key, entry] of coordinationDeliveries) {
     if (entry.expiresAt <= observedAt) coordinationDeliveries.delete(key);
   }
+  const rootWorkspacePath = path.resolve(request.rootWorkspacePath);
   const targetRoot = path.resolve(request.targetRoot);
-  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.safeActionId}:${request.expectedResumeToken}:${request.rootThreadId}:${targetRoot}`;
+  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.safeActionId}:${request.expectedResumeToken}:${request.rootThreadId}:${rootWorkspacePath}:${targetRoot}`;
   const existing = coordinationDeliveries.get(deliveryKey);
   if (existing) return existing.promise;
-  const delivery = deliverTaskboardCoordinationOnce(request, rpc);
+  const delivery = deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget);
   const entry = { promise: delivery, expiresAt: observedAt + COORDINATION_DEDUPLICATION_MS };
   coordinationDeliveries.set(deliveryKey, entry);
   delivery.catch(() => {
@@ -179,6 +187,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     const safeAction = readyWork?.safeActions?.[0];
     return (
       COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+      && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
       && candidate?.run == null
       && readyWork?.eligible === true
       && Array.isArray(readyWork.safeActions)
@@ -189,6 +198,8 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && target.codexHostId.length > 0
       && target.codexHostId.length <= 240
       && !/[\u0000-\u001f\u007f]/.test(target.codexHostId)
+      && typeof target?.rootWorkspacePath === "string"
+      && path.isAbsolute(target.rootWorkspacePath)
       && typeof target?.worktreePath === "string"
       && path.isAbsolute(target.worktreePath)
     );
@@ -196,22 +207,21 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   if (!todo) return { delivered: false, reason: "no-eligible-work" };
 
   const safeAction = todo.readyWork.safeActions[0];
-  const receiptKey = [
-    policy.projectId,
-    todo.id,
-    safeAction.id,
-    todo.readyWork.resumeToken,
-    todo.dispatchTarget.rootThreadId,
-    path.resolve(todo.dispatchTarget.worktreePath),
-  ].join(":");
-  if (!await claimReceipt(receiptKey)) {
-    return { delivered: false, reason: "already-delivered" };
+  if (!await claimReceipt({
+    todoId: todo.id,
+    taskId: todo.taskId,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    safeActionId: safeAction.id,
+    expectedResumeToken: todo.readyWork.resumeToken,
+  })) {
+    return { delivered: false, reason: "reservation-unavailable" };
   }
   await deliver({
     projectId: policy.projectId,
     todoId: todo.id,
     rootThreadId: todo.dispatchTarget.rootThreadId,
     codexHostId: todo.dispatchTarget.codexHostId,
+    rootWorkspacePath: path.resolve(todo.dispatchTarget.rootWorkspacePath),
     targetRoot: path.resolve(todo.dispatchTarget.worktreePath),
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
@@ -219,7 +229,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   return { delivered: true, todoId: todo.id, actionId: safeAction.id };
 }
 
-async function deliverTaskboardCoordinationOnce(request, rpc) {
+async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget) {
   const threadResult = await rpc("thread/read", {
     threadId: request.rootThreadId,
     includeTurns: true,
@@ -228,16 +238,20 @@ async function deliverTaskboardCoordinationOnce(request, rpc) {
     throw new Error("Codex did not confirm the configured Root task");
   }
   const rootCwd = typeof threadResult.thread.cwd === "string" ? path.resolve(threadResult.thread.cwd) : null;
+  const rootWorkspacePath = path.resolve(request.rootWorkspacePath);
   const targetRoot = path.resolve(request.targetRoot);
-  if (!rootCwd || targetRoot !== rootCwd) {
-    throw new Error("Configured Root cwd must exactly match the Todo worktree");
+  if (!rootCwd || rootWorkspacePath !== rootCwd) {
+    throw new Error("Configured Root cwd must exactly match the coordination workspace");
   }
+  await validateExecutionTarget(targetRoot);
   const instruction = [
     `taskctl issue bootstrap ${request.todoId} --json`,
     `Project: ${request.projectId}`,
     `Todo: ${request.todoId}`,
     `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
     `Authorized safe action id: ${request.safeActionId}`,
+    `Exact execution worktree: ${targetRoot}`,
+    "Before editing or testing, verify the exact execution worktree is a Git worktree and use it for all repository commands. The Root coordination cwd may be different and must not be treated as the execution worktree.",
     "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
     "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent if needed, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
     "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",

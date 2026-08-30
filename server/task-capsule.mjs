@@ -120,9 +120,11 @@ function authorizationFor(task, comments) {
     [...comment.body.matchAll(markerLinePattern)].map(() => comment)
   ));
   if (sources.length === 0) return { state: "absent", envelope: null, source: null };
-  if (sources.length !== 1) return { state: "invalid", envelope: null, source: null };
+  if (new Set(sources.map((comment) => comment.id)).size !== sources.length) {
+    return { state: "invalid", envelope: null, source: null };
+  }
 
-  const source = sources[0];
+  const source = sources.at(-1);
   const matches = [...source.body.matchAll(envelopePattern)];
   if (matches.length !== 1 || hasDuplicateJsonKeys(matches[0][1])) {
     return { state: "invalid", envelope: null, source: null };
@@ -138,6 +140,22 @@ function authorizationFor(task, comments) {
   if (!envelope || !Array.isArray(envelope.gates) || !Array.isArray(envelope.actions)) {
     return { state: "invalid", envelope: null, source: null };
   }
+  const priorSourceIds = sources.slice(0, -1).map((comment) => comment.id);
+  const supersedesCommentIds = envelope.supersedesCommentIds;
+  if (priorSourceIds.length === 0) {
+    if (supersedesCommentIds !== undefined
+      && (!Array.isArray(supersedesCommentIds) || supersedesCommentIds.length !== 0)) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+  } else if (
+    !Array.isArray(supersedesCommentIds)
+    || supersedesCommentIds.length !== priorSourceIds.length
+    || new Set(supersedesCommentIds).size !== supersedesCommentIds.length
+    || supersedesCommentIds.some((id) => !nonEmptyString(id))
+    || priorSourceIds.some((id) => !supersedesCommentIds.includes(id))
+  ) {
+    return { state: "invalid", envelope: null, source: null };
+  }
 
   const gateIds = new Set();
   for (const gate of envelope.gates) {
@@ -147,19 +165,26 @@ function authorizationFor(task, comments) {
       || !nonEmptyString(gate.scope)) {
       return { state: "invalid", envelope: null, source: null };
     }
-    if (gate.state === "authorized" && (!nonEmptyString(gate.evidence) || !nonEmptyString(gate.receipt))) {
-      return { state: "invalid", envelope: null, source: null };
-    }
     if (gate.state === "approval_required"
       && (!nonEmptyString(gate.approver) || !nonEmptyString(gate.approvalRequest))) {
       return { state: "invalid", envelope: null, source: null };
     }
-    if (gate.state === "denied"
-      && (!nonEmptyString(gate.approver) || !nonEmptyString(gate.evidence) || !nonEmptyString(gate.receipt))) {
+    if (["authorized", "denied", "forbidden"].includes(gate.state)
+      && (
+        !nonEmptyString(gate.approver)
+        || !nonEmptyString(gate.approvalRequest)
+        || !nonEmptyString(gate.evidence)
+        || !nonEmptyString(gate.receipt)
+      )) {
       return { state: "invalid", envelope: null, source: null };
     }
     if (gate.expiresAt !== undefined
       && (!nonEmptyString(gate.expiresAt) || Number.isNaN(new Date(gate.expiresAt).getTime()))) {
+      return { state: "invalid", envelope: null, source: null };
+    }
+    if (gate.state === "authorized"
+      && gate.expiresAt !== undefined
+      && typeof gate.renewable !== "boolean") {
       return { state: "invalid", envelope: null, source: null };
     }
     gateIds.add(gate.id);
@@ -179,8 +204,8 @@ function authorizationFor(task, comments) {
     actionIds.add(action.id);
   }
 
-  const recordsDecision = envelope.gates.some((gate) => (
-    gate.state === "authorized" || gate.state === "denied"
+  const recordsDecision = priorSourceIds.length > 0 || envelope.gates.some((gate) => (
+    gate.state === "authorized" || gate.state === "denied" || gate.state === "forbidden"
   ));
   if (recordsDecision && (
     source.authorType !== "user"
@@ -205,6 +230,77 @@ function allAttachments(comments, attachments) {
   ].sort((left, right) => (
     left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
   ));
+}
+
+function inboxFor(receipts) {
+  const ordered = [...receipts].sort((left, right) => (
+    right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id)
+  ));
+  return {
+    pendingCount: ordered.filter((receipt) => receipt.status === "queued").length,
+    latestReceipt: ordered[0] ?? null,
+  };
+}
+
+function handoffsFor(events) {
+  const ordered = [...events].sort((left, right) => (
+    right.envelope.timestamp.localeCompare(left.envelope.timestamp)
+      || right.createdAt.localeCompare(left.createdAt)
+      || right.eventId.localeCompare(left.eventId)
+  ));
+  return {
+    pendingAcknowledgementCount: ordered.filter((event) => (
+      event.envelope.requiresAck === true && event.acknowledgements.length === 0
+    )).length,
+    latestEvent: ordered[0] ?? null,
+  };
+}
+
+function conversationFor(task) {
+  const scope = task.labels?.includes("project-inbox")
+    ? { type: "project", projectId: task.projectId }
+    : {
+        type: "work_item",
+        projectId: task.projectId,
+        taskId: task.id,
+        identifier: task.identifier,
+      };
+  const windows = new Map();
+  for (const reference of task.conversationRefs ?? []) {
+    if (!nonEmptyString(reference.threadId)) continue;
+    const confirmed = !reference.legacyLocal
+      && [
+        reference.codexProjectId,
+        reference.codexProjectKind,
+        reference.codexHostId,
+        reference.workspacePath,
+      ].every(nonEmptyString);
+    const candidate = {
+      threadId: reference.threadId,
+      bindingState: reference.legacyLocal
+        ? "legacy_local"
+        : confirmed ? "confirmed" : "incomplete",
+      codexProjectId: reference.codexProjectId ?? null,
+      codexProjectKind: reference.codexProjectKind ?? null,
+      codexHostId: reference.codexHostId ?? null,
+      workspacePath: reference.workspacePath ?? null,
+      latestSource: { type: reference.source, id: reference.sourceId },
+      updatedAt: reference.updatedAt,
+    };
+    const current = windows.get(reference.threadId);
+    const bindingRank = { legacy_local: 0, incomplete: 1, confirmed: 2 };
+    if (current
+      && (bindingRank[current.bindingState] > bindingRank[candidate.bindingState]
+        || (bindingRank[current.bindingState] === bindingRank[candidate.bindingState]
+          && current.updatedAt > candidate.updatedAt))) continue;
+    windows.set(reference.threadId, candidate);
+  }
+  return {
+    scope,
+    talkingWindows: [...windows.values()].sort((left, right) => (
+      right.updatedAt.localeCompare(left.updatedAt) || left.threadId.localeCompare(right.threadId)
+    )),
+  };
 }
 
 function hasFullThreadBinding(task) {
@@ -240,6 +336,9 @@ function relationEvidence(task) {
     title: item.title,
     status: item.status,
     priority: item.priority,
+    labels: item.labels ?? [],
+    startDate: item.startDate ?? null,
+    dueDate: item.dueDate ?? null,
     assignee: {
       type: item.assignee.type,
       id: item.assignee.id,
@@ -259,6 +358,53 @@ function relationEvidence(task) {
     blockedBy: relations(task.relations.blockedBy),
     blocks: relations(task.relations.blocks),
     related: relations(task.relations.related),
+  };
+}
+
+function planningFor(task) {
+  const labels = task.labels ?? [];
+  const role = labels.includes("feature")
+    ? "feature"
+    : labels.includes("workstream") ? "workstream" : null;
+  if (!role) return null;
+
+  const parent = task.relations.parent;
+  const children = task.relations.subIssues ?? [];
+  const childWorkstreams = children.filter((child) => (
+    (child.labels ?? []).includes("workstream")
+  ));
+  const completed = children.filter((child) => child.status === "done").length;
+  const active = children.filter((child) => (
+    child.status === "in_progress" || child.status === "in_review"
+  )).length;
+  const blocked = children.filter((child) => child.status === "blocked").length;
+  const totalChildren = children.length;
+  const state = totalChildren === 0
+    ? "empty"
+    : completed === totalChildren ? "complete"
+      : blocked > 0 ? "blocked"
+        : active > 0 ? "active" : "planned";
+
+  return {
+    role,
+    milestone: {
+      startDate: task.startDate ?? null,
+      dueDate: task.dueDate ?? null,
+    },
+    parentFeature: parent && (parent.labels ?? []).includes("feature")
+      ? parent.identifier
+      : null,
+    childWorkstreams: childWorkstreams.map((child) => child.identifier).sort(),
+    rollup: role === "feature" ? {
+      totalChildren,
+      workstreams: childWorkstreams.length,
+      unclassifiedChildren: totalChildren - childWorkstreams.length,
+      completed,
+      active,
+      blocked,
+      remaining: totalChildren - completed,
+      state,
+    } : null,
   };
 }
 
@@ -359,8 +505,35 @@ function nextActionFor(task, comments, latestRun) {
   };
 }
 
+const STRUCTURAL_NEXT_ACTIONS = new Map([
+  [
+    "PROJECT_INBOX_NON_DISPATCHABLE",
+    "项目 Inbox 仅用于接收和协调，不可派发执行；请选择一个明确的 Feature 或 Task 继续。",
+  ],
+  [
+    "LEGACY_THREAD_BINDING_ONLY",
+    "将 legacy Root thread 迁移为带 host、project 和 workspace 的确认绑定，然后重新生成 Capsule。",
+  ],
+  [
+    "AUTHORIZATION_ENVELOPE_INVALID",
+    "修复无效的 Task Authorization Envelope V1；在验证通过前不要派发工作或请求 Owner 授权。",
+  ],
+]);
+
+function structuralNextActionFor(reasonCode) {
+  const text = STRUCTURAL_NEXT_ACTIONS.get(reasonCode);
+  if (!text) return null;
+  return {
+    text,
+    source: { type: "structural_blocker", reasonCode },
+  };
+}
+
 function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, authorization, requirementsRevision) {
   const reasonCodes = [];
+  if (task.labels.includes("project-inbox")) {
+    reasonCodes.push("PROJECT_INBOX_NON_DISPATCHABLE");
+  }
   if (task.archivedAt !== null) reasonCodes.push("TASK_ARCHIVED");
   if (task.status === "backlog") reasonCodes.push("BACKLOG_NOT_ELIGIBLE");
   else if (task.status !== "todo") reasonCodes.push("TASK_STATUS_NOT_TODO");
@@ -380,9 +553,6 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, au
   else if (!["planned", "active"].includes(task.workingLog.status)) {
     reasonCodes.push("WORKING_LOG_STATUS_NOT_READY");
   }
-  if (task.threadBinding?.workspacePath !== task.developmentContext?.path) {
-    reasonCodes.push("ROOT_WORKTREE_MISMATCH");
-  }
   const state = claimState(claim, timestamp);
   if (state === "active") reasonCodes.push("ACTIVE_CLAIM");
   if (state === "expired_unresolved") reasonCodes.push("EXPIRED_UNRESOLVED_CLAIM");
@@ -396,11 +566,23 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, au
     approvalRequest: null,
   };
 
+  const structuralReasonCode = reasonCodes.find((reasonCode) => (
+    STRUCTURAL_NEXT_ACTIONS.has(reasonCode)
+  ));
+  if (structuralReasonCode) {
+    readyWork.nextAction = structuralNextActionFor(structuralReasonCode);
+  }
+
+  if (reasonCodes.includes("PROJECT_INBOX_NON_DISPATCHABLE")) return readyWork;
+
   if (authorization.state === "absent") return readyWork;
   if (authorization.state === "invalid") {
     readyWork.state = "not_ready";
     readyWork.eligible = false;
     readyWork.reasonCodes.push("AUTHORIZATION_ENVELOPE_INVALID");
+    if (readyWork.nextAction.source.type !== "structural_blocker") {
+      readyWork.nextAction = structuralNextActionFor("AUTHORIZATION_ENVELOPE_INVALID");
+    }
     return readyWork;
   }
 
@@ -411,9 +593,7 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, au
     if (!expired) return [gate.id, gate];
     return [gate.id, {
       ...gate,
-      state: nonEmptyString(gate.approver) && nonEmptyString(gate.approvalRequest)
-        ? "approval_required"
-        : "forbidden",
+      state: gate.renewable ? "approval_required" : "forbidden",
       expired: true,
     }];
   }));
@@ -469,6 +649,8 @@ export function createTaskCapsule({
   task,
   comments,
   attachments,
+  inboxReceipts = [],
+  coordinationEvents = [],
   currentClaim,
   currentRun = null,
   latestRun = null,
@@ -485,6 +667,7 @@ export function createTaskCapsule({
   });
   const execution = executionFor(task);
   const authorization = authorizationFor(task, orderedComments);
+  const handoffs = handoffsFor(coordinationEvents);
   const legacyRun = latestRun ? null : activeRunFor(task, currentClaim, now);
   const activeRun = currentRun ? durableRunFor(currentRun) : legacyRun;
   const projectedLatestRun = latestRun ? durableRunFor(latestRun) : legacyRun;
@@ -511,6 +694,7 @@ export function createTaskCapsule({
       authorization,
     },
     run: projectedLatestRun,
+    handoffs,
     legacyClaim: latestRun ? null : claimEvidence(currentClaim),
     threadBinding: execution.threadBinding,
   });
@@ -526,6 +710,7 @@ export function createTaskCapsule({
       projectId: task.projectId,
       title: task.title,
       description: task.description,
+      labels: task.labels ?? [],
       status: task.status,
       version: task.version,
       archivedAt: task.archivedAt,
@@ -533,7 +718,12 @@ export function createTaskCapsule({
     relations: task.relations,
     comments: orderedComments,
     attachments: orderedAttachments,
+    inbox: inboxFor(inboxReceipts),
+    handoffs,
+    conversation: conversationFor(task),
+    planning: planningFor(task),
     execution,
+    executionTarget: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     worktree: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     workingLog: task.workingLog,
     authorization,

@@ -75,7 +75,23 @@ function validateConfigTask(value) {
 
 function validateConfigAdapter(value) {
   const lane = validateConfigTask({ ...value, taskType: "peer_task" });
-  return lane ? { ...lane, taskType: null } : null;
+  return lane?.connection === "not_connected" ? { ...lane, taskType: null } : null;
+}
+
+function disabledAdapterContract(providerId) {
+  return {
+    version: 1,
+    providerId,
+    state: "disabled",
+    reasonCode: "ADAPTER_NOT_CONFIGURED",
+    transport: null,
+    capabilities: {
+      inspect: false,
+      dispatch: false,
+      wait: false,
+      checkpointReceipt: false,
+    },
+  };
 }
 
 function validateTodo(value, taskIds) {
@@ -122,20 +138,46 @@ async function readConfig(configPath, projectId, getLaneConfig) {
   const adapters = Array.isArray(project?.adapters) ? project.adapters.map(validateConfigAdapter) : [];
   const taskIds = tasks.flatMap((lane) => lane ? [lane.id] : []);
   const adapterIds = adapters.flatMap((lane) => lane ? [lane.id] : []);
+  const coordinatorLease = project?.coordinatorLease;
+  const coordinatorLeaseConfigured = coordinatorLease !== null && coordinatorLease !== undefined;
+  const hasCoordinatorLease = Boolean(
+    coordinatorLease
+    && text(coordinatorLease.id)
+    && text(coordinatorLease.holderTaskId)
+    && taskIds.includes(coordinatorLease.holderTaskId)
+    && text(coordinatorLease.acquiredAt)
+    && text(coordinatorLease.expiresAt)
+    && !Number.isNaN(Date.parse(coordinatorLease.acquiredAt))
+    && !Number.isNaN(Date.parse(coordinatorLease.expiresAt))
+    && Date.parse(coordinatorLease.acquiredAt) < Date.parse(coordinatorLease.expiresAt),
+  );
+  const hasLegacyCoordinator = Boolean(
+    text(project?.rootTaskId)
+    && tasks.some((task) => task.id === project.rootTaskId && task.taskType === "root_task"),
+  );
   if (
     tasks.length === 0
     || tasks.some((lane) => lane === null)
     || adapters.some((lane) => lane === null)
     || new Set([...taskIds, ...adapterIds]).size !== taskIds.length + adapterIds.length
-    || !text(project?.rootTaskId)
-    || !tasks.some((task) => task.id === project.rootTaskId && task.taskType === "root_task")
+    || (coordinatorLeaseConfigured ? !hasCoordinatorLease : !hasLegacyCoordinator)
   ) {
     throw new AgentLaneSnapshotError(
       "AGENT_LANES_NOT_CONFIGURED",
       `Project '${projectId}' has no valid Agent Lane mapping`,
     );
   }
-  return { rootTaskId: project.rootTaskId, tasks, adapters };
+  return {
+    rootTaskId: !coordinatorLeaseConfigured && hasLegacyCoordinator ? project.rootTaskId : null,
+    coordinatorLease: hasCoordinatorLease ? {
+      id: coordinatorLease.id,
+      holderTaskId: coordinatorLease.holderTaskId,
+      acquiredAt: coordinatorLease.acquiredAt,
+      expiresAt: coordinatorLease.expiresAt,
+    } : null,
+    tasks,
+    adapters,
+  };
 }
 
 function actionFingerprint(value) {
@@ -263,17 +305,18 @@ function readyWorkForTodo(capsule) {
 
 function dispatchTargetFor(capsule) {
   const binding = capsule?.execution?.threadBinding;
-  const worktree = capsule?.worktree;
+  const worktree = capsule?.executionTarget ?? capsule?.worktree;
   if (
     !binding?.threadId
     || !binding?.codexHostId
+    || !binding?.workspacePath
     || worktree?.type !== "worktree"
     || !worktree.path
-    || binding.workspacePath !== worktree.path
   ) return null;
   return {
     rootThreadId: binding.threadId,
     codexHostId: binding.codexHostId,
+    rootWorkspacePath: binding.workspacePath,
     worktreePath: worktree.path,
   };
 }
@@ -331,10 +374,13 @@ async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComm
     nextAction: readyWork.nextAction ?? nextActionFrom(latest?.body) ?? compact(task.title, 80),
     evidenceRef: latest ? `comment:${latest.id}` : `task:${task.identifier}`,
     }, projectId, taskLanes, generatedAt),
+    taskId: task.id,
     dispatchTarget: dispatchTargetFor(capsule),
     workingLog: workingLogFor(capsule),
     run,
     readyWork,
+    inbox: capsule?.inbox ?? { pendingCount: 0, latestReceipt: null },
+    handoffs: capsule?.handoffs ?? { pendingAcknowledgementCount: 0, latestEvent: null },
   };
 }
 
@@ -594,7 +640,7 @@ export function createAgentLaneSnapshotProvider({
 }) {
   const sessionFilePromises = new Map();
   const subagentStates = new Map();
-  const allRootSubagentsByProject = new Map();
+  const allSubagentsByProject = new Map();
   const resolveSessionFile = (threadId) => {
     let pending = sessionFilePromises.get(threadId);
     if (!pending) {
@@ -657,30 +703,59 @@ export function createAgentLaneSnapshotProvider({
         actionId: null,
         duplicateOfLaneId: null,
         continuity: { state: "adapter_off", reason: "Adapter is intentionally disabled." },
+        adapterContract: disabledAdapterContract(adapter.source),
         workItem: null,
         nextAction: null,
         provenance: { kind: "not-connected", threadId: null },
       }));
-      const rootTask = configured.tasks.find((task) => task.id === configured.rootTaskId);
-      const rootSessionFile = await resolveSessionFile(rootTask.threadId);
-      let rootSubagents = [];
-      let observedSubagentCount = 0;
-      if (rootSessionFile) {
-        const state = await scanSubagents(rootSessionFile, subagentStates.get(rootSessionFile));
-        subagentStates.set(rootSessionFile, state);
-        const allSubagents = [...state.agents.values()].map((agent) => ({
-          ...agent,
-          label: agent.agentPath.split("/").at(-1),
-          parentTaskId: configured.rootTaskId,
-          stableIdentity: `${projectId}:subagent:${agent.agentThreadId ?? agent.agentPath}`,
-          provenance: { kind: "codex-collaboration-event", threadId: rootTask.threadId },
-        })).sort((left, right) => (right.lastActivityAt ?? "").localeCompare(left.lastActivityAt ?? ""));
-        observedSubagentCount = allSubagents.length;
-        allRootSubagentsByProject.set(projectId, allSubagents);
-        rootSubagents = allSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
-      } else {
-        allRootSubagentsByProject.set(projectId, []);
+      const lease = configured.coordinatorLease ? {
+        id: configured.coordinatorLease.id,
+        status: generatedAt.getTime() < Date.parse(configured.coordinatorLease.expiresAt)
+          ? "active"
+          : "expired",
+        acquiredAt: configured.coordinatorLease.acquiredAt,
+        expiresAt: configured.coordinatorLease.expiresAt,
+      } : null;
+      const coordinatorTaskId = lease
+        ? lease.status === "active" ? configured.coordinatorLease.holderTaskId : null
+        : configured.rootTaskId;
+      const allSubagentsByWindow = new Map();
+      const windowSubagentTrees = [];
+      for (const windowTask of configured.tasks.filter((task) => task.source === "codex")) {
+        const sessionFile = await resolveSessionFile(windowTask.threadId);
+        let allSubagents = [];
+        if (sessionFile) {
+          const state = await scanSubagents(sessionFile, subagentStates.get(sessionFile));
+          subagentStates.set(sessionFile, state);
+          allSubagents = [...state.agents.values()].map((agent) => ({
+            ...agent,
+            label: agent.agentPath.split("/").at(-1),
+            parentTaskId: windowTask.id,
+            stableIdentity: `${projectId}:subagent:${agent.agentThreadId ?? agent.agentPath}`,
+            provenance: { kind: "codex-collaboration-event", threadId: windowTask.threadId },
+          })).sort((left, right) => (
+            (right.lastActivityAt ?? "").localeCompare(left.lastActivityAt ?? "")
+          ));
+        }
+        allSubagentsByWindow.set(windowTask.id, allSubagents);
+        const subagents = allSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
+        windowSubagentTrees.push({
+          windowTaskId: windowTask.id,
+          rootThreadId: windowTask.threadId,
+          stableIdentity: `${projectId}:window:${windowTask.id}`,
+          observed: Boolean(sessionFile),
+          subagents,
+          summary: {
+            observed: allSubagents.length,
+            active: allSubagents.filter((agent) => agent.lifecycleStatus === "running").length,
+            shown: subagents.length,
+          },
+        });
       }
+      const allRootSubagents = allSubagentsByWindow.get(coordinatorTaskId) ?? [];
+      allSubagentsByProject.set(projectId, [...allSubagentsByWindow.values()].flat());
+      const rootSubagents = allRootSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
+      const observedSubagentCount = allRootSubagents.length;
       const projectTasks = listTasks ? await listTasks(projectId) : [];
       const todoEntries = await Promise.all(projectTasks
         .filter((task) => task.archivedAt === null)
@@ -702,7 +777,7 @@ export function createAgentLaneSnapshotProvider({
           || task.labels.includes("agent-todo")
         ))
         .map(({ todo }) => todo);
-      const currentCoordinator = taskLanes.find((lane) => lane.id === configured.rootTaskId) ?? null;
+      const currentCoordinator = taskLanes.find((lane) => lane.id === coordinatorTaskId) ?? null;
       return {
         version: AGENT_LANE_SNAPSHOT_VERSION,
         projectId,
@@ -710,10 +785,17 @@ export function createAgentLaneSnapshotProvider({
         readOnly: true,
         automaticRecoveryEnabled: false,
         coordination: {
-          model: "peer_todos_with_replaceable_coordinator",
-          coordinatorTaskId: configured.rootTaskId,
+          model: lease
+            ? "peer_windows_with_coordinator_lease"
+            : "peer_windows_with_configured_coordinator",
+          coordinatorTaskId,
           coordinatorStableIdentity: currentCoordinator?.stableIdentity ?? null,
-          replaceable: true,
+          assignment: lease ? lease.status === "active" ? "lease" : "unassigned" : "configured",
+          replaceable: Boolean(lease),
+          scope: "project",
+          ...(lease ? { lease } : {}),
+          crossWindowProtocol: "task_capsule_claim_checkpoint_receipt",
+          subagentAuthority: "window_root",
           stateAuthority: "self_learning_checkpoint",
           workAuthority: "todo_claim_lease",
           runtimeOwnership: "single_writer",
@@ -727,6 +809,7 @@ export function createAgentLaneSnapshotProvider({
           })
           .map((todo) => todo.id),
         taskLanes,
+        windowSubagentTrees,
         rootSubagents,
         adapters,
         subagentSummary: {
@@ -740,11 +823,12 @@ export function createAgentLaneSnapshotProvider({
       if (!recordProgress && !recordCompletion) return { applied: 0 };
       const snapshot = await this.getProjectSnapshot(projectId);
       let applied = 0;
-      const rootSubagents = allRootSubagentsByProject.get(projectId) ?? snapshot.rootSubagents;
-      for (const agent of rootSubagents) {
+      const projectSubagents = allSubagentsByProject.get(projectId) ?? snapshot.rootSubagents;
+      for (const agent of projectSubagents) {
         if (!agent.lastActualAction) continue;
         const claimedTodo = snapshot.todos.find((todo) => (
           todo.claimedBy === agent.agentPath
+          && todo.claimedThreadId === agent.agentThreadId
           && todo.claim?.leaseState === "active"
         ));
         const claimedAtMs = Date.parse(claimedTodo?.claimedAt ?? "");

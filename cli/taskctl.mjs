@@ -109,6 +109,13 @@ const COMMAND_OPTIONS = new Map([
   ["run get", new Set(["json"])],
   ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["handoff list", new Set(["json"])],
+  ["handoff add", new Set([
+    "event-id", "idempotency-key", "parent-task", "agent-path", "thread-id", "sequence",
+    "timestamp", "summary", "evidence-ref", "blocker", "next-action", "requires-ack",
+    "causation-id", "correlation-id", "json",
+  ])],
+  ["handoff ack", new Set(["acknowledgement-id", "agent-path", "thread-id", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
     "body",
@@ -143,6 +150,10 @@ Commands:
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|bootstrap|create|update|move|archive|restore|relation
+  handoff list ISSUE_ID
+  handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
+    --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
+  handoff ack EVENT_ID --acknowledgement-id ID --agent-path /root
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -157,7 +168,7 @@ Global options:
   --help               Show help for a supported command level
 
 Examples:
-  taskctl issue get LOCAL-275 --json
+  taskctl issue bootstrap LOCAL-275 --json
   taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
@@ -207,7 +218,7 @@ Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
 
 Example:
-  taskctl issue get LOCAL-275 --json`],
+  taskctl issue bootstrap LOCAL-275 --json`],
   ["run", `Usage: taskctl run ACTION [arguments] [options]
 
 Actions:
@@ -220,6 +231,19 @@ Actions:
 Examples:
   taskctl run get RUN_ID --json
   taskctl run checkpoint RUN_ID --summary "Focused checks passed" --next-action "Open the capsule" --if-version 2 --json`],
+  ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
+
+Actions:
+  list ISSUE_ID [--json]
+  add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
+    --sequence N [--timestamp ISO] --summary TEXT [--evidence-ref REF[,REF]]
+    [--blocker TEXT] --next-action TEXT --requires-ack true|false
+    [--parent-task ISSUE_ID] [--causation-id ID] [--correlation-id ID]
+    [--thread-id ID] [--json]
+  ack EVENT_ID --acknowledgement-id ID --agent-path /root [--thread-id ID] [--json]
+
+Handoff add uses CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
+when the durable task has no parent relation.`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -312,7 +336,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl issue, taskctl run, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -342,7 +366,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -446,6 +470,15 @@ async function execute(parsed, overrides) {
     case "run finish":
       expectOperandCount(parsed, 1);
       return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);
+    case "handoff add":
+      expectOperandCount(parsed, 1);
+      return addTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff ack":
+      expectOperandCount(parsed, 1);
+      return acknowledgeTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
     case "comment list": {
       expectOperandCount(parsed, 1);
       const search = new URLSearchParams();
@@ -1072,6 +1105,75 @@ async function finishAgentRun(api, runId, options, overrides) {
     status,
     version: explicitVersion(options["if-version"]),
   });
+}
+
+function parsePositiveIntegerOption(options, name) {
+  const value = Number(requiredOption(options, name));
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw usageError(`--${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseBooleanOption(options, name) {
+  const raw = requiredOption(options, name);
+  if (raw !== "true" && raw !== "false") {
+    throw usageError(`--${name} must be true or false`);
+  }
+  return raw === "true";
+}
+
+function parseEvidenceRefs(raw) {
+  if (raw === undefined || raw === "") return [];
+  const references = raw.split(",").map((value) => value.trim()).filter(Boolean);
+  if (references.length > 32 || new Set(references).size !== references.length) {
+    throw usageError("--evidence-ref must contain at most 32 unique comma-separated references");
+  }
+  return references;
+}
+
+async function addTaskHandoff(api, taskId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (!agentPath.startsWith("/root/")) {
+    throw usageError("--agent-path must identify a Root Sub-Agent and start with /root/");
+  }
+  const timestamp = options.timestamp ?? new Date().toISOString();
+  if (Number.isNaN(Date.parse(timestamp))) {
+    throw usageError("--timestamp must be an ISO timestamp");
+  }
+  return api.request("POST", `${taskPath(taskId)}/coordination-events`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    parentTaskId: options["parent-task"] ?? null,
+    senderThreadId: resolveThreadId(options, overrides),
+    senderAgentPath: agentPath,
+    eventType: "handoff",
+    sequence: parsePositiveIntegerOption(options, "sequence"),
+    timestamp,
+    summary: requiredOption(options, "summary"),
+    evidenceRefs: parseEvidenceRefs(options["evidence-ref"]),
+    blocker: options.blocker ?? null,
+    nextAction: requiredOption(options, "next-action"),
+    requiresAck: parseBooleanOption(options, "requires-ack"),
+    causationId: options["causation-id"] ?? null,
+    correlationId: options["correlation-id"] ?? null,
+  });
+}
+
+async function acknowledgeTaskHandoff(api, eventId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (agentPath !== "/root") {
+    throw usageError("handoff ack --agent-path must be /root");
+  }
+  return api.request(
+    "POST",
+    `/api/coordination-events/${encodeURIComponent(eventId)}/acknowledgements`,
+    {
+      acknowledgementId: requiredOption(options, "acknowledgement-id"),
+      senderThreadId: resolveThreadId(options, overrides),
+      senderAgentPath: agentPath,
+    },
+  );
 }
 
 async function archiveIssue(api, taskId, options, overrides, action) {

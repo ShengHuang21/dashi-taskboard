@@ -59,7 +59,10 @@ Except for built-in help, every successful command writes one JSON object with `
 ```bash
 taskctl issue list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
 taskctl issue get ID [--json]
+taskctl issue bootstrap ISSUE_ID [--json]
 ```
+
+Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
 
 ## Create issues
 
@@ -167,6 +170,41 @@ taskctl comment delete COMMENT_ID --if-version N [--thread-id ID] [--json]
 Without `--after`, `comment list` returns the full list. Its response includes `nextCursor`; keep that value and pass it to the next read of the same issue to return only comments created or modified after that cursor. `--body-file` reads the UTF-8 file and passes its contents directly to the existing comment write path.
 
 Each comment JSON object independently records the most recent conversation that created or changed that comment as `threadId`. Comment operations never change the parent issue's `threadId`.
+
+## Structured handoffs
+
+Append a compact, durable Sub-Agent-to-Root handoff only from the Sub-Agent that holds the task's active exact claim. Read events to replay/recover them, then acknowledge a `requiresAck` event from the parent Root identity:
+
+```bash
+taskctl handoff add ISSUE_ID \
+  --event-id EVENT_ID \
+  --idempotency-key KEY \
+  --agent-path /root/NAME \
+  --sequence N \
+  [--timestamp ISO] \
+  --summary TEXT \
+  [--evidence-ref REF[,REF]] \
+  [--blocker TEXT] \
+  --next-action TEXT \
+  --requires-ack true|false \
+  [--parent-task TASK_ID] \
+  [--causation-id ID] \
+  [--correlation-id ID] \
+  [--thread-id ID] \
+  [--json]
+
+taskctl handoff list ISSUE_ID [--json]
+
+taskctl handoff ack EVENT_ID \
+  --acknowledgement-id ID \
+  --agent-path /root \
+  [--thread-id ID] \
+  [--json]
+```
+
+`handoff add` reads the sender conversation from `CODEX_THREAD_ID` unless `--thread-id` is explicit. `--parent-task` is the exact durable parent task id and must be omitted when the task has no parent. `--evidence-ref` accepts at most 32 unique comma-separated references; store only compact pointers, never credentials, complete prompts, or sensitive payloads.
+
+The service persists the structured event and its compact Task Comment atomically. Repeating an idempotency key with the identical envelope returns the same receipt; changing the envelope conflicts. Handoffs and acknowledgements are append-only and do not change the task version/status, active run, claim, coordinator lease, Ready Work, or authorization boundary. `handoff ack` accepts only the `/root` agent path and the exact parent Root conversation for an event that requires acknowledgement.
 
 ## Attachments
 

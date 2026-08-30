@@ -41,6 +41,7 @@ test("a ready Agent Todo can be delivered to the configured Root coordinator", (
   );
   assert.match(coordinateSource, /rootThreadId: target\.rootThreadId/);
   assert.match(coordinateSource, /codexHostId: target\.codexHostId/);
+  assert.match(coordinateSource, /rootWorkspacePath: target\.rootWorkspacePath/);
   assert.match(coordinateSource, /targetRoot: target\.worktreePath/);
   assert.match(coordinateSource, /safeActionId/);
   assert.match(coordinateSource, /expectedResumeToken: resumeToken/);
@@ -73,7 +74,7 @@ test("a legacy Agent Todo backlog is not made dispatchable by its Root binding",
 });
 
 test("Todo cards expose Capsule-backed eligibility, Working Log, and durable Run state", () => {
-  for (const label of ["认领", "租约", "写入范围", "工作日志", "执行", "关注", "下一步"]) {
+  for (const label of ["认领", "租约", "写入范围", "工作日志", "执行", "关注", "消息排队", "交接待确认", "下一步"]) {
     assert.match(boardSource, new RegExp(label));
   }
   assert.match(boardSource, /todo\.claim\?\.ownerLabel/);
@@ -85,6 +86,9 @@ test("Todo cards expose Capsule-backed eligibility, Working Log, and durable Run
   assert.match(boardSource, /执行中/);
   assert.match(boardSource, /交付回执/);
   assert.match(boardSource, /todo\.continuation\.attention/);
+  assert.match(boardSource, /todo\.inbox\.pendingCount/);
+  assert.match(boardSource, /todo\.handoffs\.pendingAcknowledgementCount/);
+  assert.match(boardSource, /当前工作继续/);
   assert.match(boardSource, /snapshot\.attentionQueue/);
   assert.match(boardSource, /setDeliveryState\("idle"\)/);
   assert.doesNotMatch(boardSource, /todo\.evidenceRef|latestWorkingLog/);

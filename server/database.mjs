@@ -361,6 +361,9 @@ function taskRelationSummaryFromRow(row) {
     title: row.title,
     status: row.status,
     priority: row.priority,
+    labels: JSON.parse(row.labels),
+    startDate: row.start_date,
+    dueDate: row.due_date,
     assignee: {
       type: row.assignee_type,
       id: row.assignee_id,
@@ -414,6 +417,60 @@ function commentFromRow(row) {
   };
   Object.defineProperty(comment, "changeRevision", { value: row.change_revision });
   return comment;
+}
+
+function taskInboxDeliveryReceiptFromRow(row) {
+  return {
+    id: row.id,
+    deliveryId: row.delivery_id,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    commentId: row.comment_id,
+    sourceThreadId: row.source_thread_id,
+    status: "queued",
+    executionDisposition: "current_execution_continues",
+    createdAt: row.created_at,
+  };
+}
+
+function coordinationAcknowledgementFromRow(row) {
+  return {
+    id: row.id,
+    acknowledgementId: row.acknowledgement_id,
+    eventId: row.event_id,
+    senderThreadId: row.sender_thread_id,
+    senderAgentPath: row.sender_agent_path,
+    createdAt: row.created_at,
+  };
+}
+
+function coordinationEventFromRow(row, acknowledgements = []) {
+  return {
+    eventId: row.event_id,
+    idempotencyKey: row.idempotency_key,
+    taskId: row.task_id,
+    projectId: row.project_id,
+    commentId: row.comment_id,
+    envelope: JSON.parse(row.envelope_json),
+    acknowledgements,
+    createdAt: row.created_at,
+  };
+}
+
+function coordinationCommentBody(envelope) {
+  const evidence = envelope.evidenceRefs.length > 0
+    ? envelope.evidenceRefs.map((reference) => `- ${reference}`).join("\n")
+    : "- none";
+  return [
+    "Agent Handoff",
+    "",
+    `Summary: ${envelope.summary}`,
+    `Blocker: ${envelope.blocker ?? "none"}`,
+    `Next action: ${envelope.nextAction}`,
+    "Evidence:",
+    evidence,
+    `Event: ${envelope.eventId}`,
+  ].join("\n");
 }
 
 function attachmentFromRow(row) {
@@ -647,6 +704,44 @@ export class TaskboardDatabase {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS agent_coordinator_lease_receipts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        lease_id TEXT NOT NULL,
+        holder_task_id TEXT NOT NULL,
+        holder_thread_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('acquired', 'renewed', 'released')),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_coordinator_lease_receipts_project_created
+        ON agent_coordinator_lease_receipts(project_id, created_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS task_inbox_delivery_receipts (
+        id TEXT PRIMARY KEY,
+        delivery_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        comment_id TEXT NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+        source_thread_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(task_id, delivery_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS task_inbox_delivery_receipts_task_created
+        ON task_inbox_delivery_receipts(task_id, created_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS task_safe_action_receipts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        resume_token TEXT NOT NULL,
+        safe_action_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        UNIQUE(task_id, resume_token)
+      );
+
       CREATE TABLE IF NOT EXISTS agent_task_claims (
         task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -693,7 +788,19 @@ export class TaskboardDatabase {
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         comment_id TEXT REFERENCES comments(id) ON DELETE SET NULL,
+        idempotency_key TEXT,
+        envelope_json TEXT,
         created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_event_acknowledgements (
+        id TEXT PRIMARY KEY,
+        acknowledgement_id TEXT NOT NULL,
+        event_id TEXT NOT NULL REFERENCES agent_event_receipts(event_id) ON DELETE CASCADE,
+        sender_thread_id TEXT NOT NULL,
+        sender_agent_path TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(event_id, acknowledgement_id)
       );
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
@@ -809,6 +916,19 @@ export class TaskboardDatabase {
     if (!agentClaimColumns.some((column) => column.name === "write_scope_json")) {
       this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN write_scope_json TEXT NOT NULL DEFAULT '[]'");
     }
+
+    const agentEventReceiptColumns = this.database.prepare("PRAGMA table_info(agent_event_receipts)").all();
+    if (!agentEventReceiptColumns.some((column) => column.name === "idempotency_key")) {
+      this.database.exec("ALTER TABLE agent_event_receipts ADD COLUMN idempotency_key TEXT");
+    }
+    if (!agentEventReceiptColumns.some((column) => column.name === "envelope_json")) {
+      this.database.exec("ALTER TABLE agent_event_receipts ADD COLUMN envelope_json TEXT");
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS agent_event_receipts_task_idempotency
+      ON agent_event_receipts(task_id, idempotency_key)
+      WHERE idempotency_key IS NOT NULL
+    `);
 
     const taskAgentRunColumns = this.database.prepare("PRAGMA table_info(task_agent_runs)").all();
     if (!taskAgentRunColumns.some((column) => column.name === "project_id")) {
@@ -2070,6 +2190,177 @@ export class TaskboardDatabase {
     return this.getAgentLaneProject(projectId);
   }
 
+  claimAgentLaneCoordinator(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const config = JSON.parse(row.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId)
+        : null;
+      if (!holder || holder.threadId !== input.holderThreadId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_BINDING_MISMATCH",
+          "Coordinator lease holder must match one configured peer window",
+        );
+      }
+
+      const existing = config.coordinatorLease ?? null;
+      if ((existing?.id ?? null) !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_CONFLICT",
+          "Coordinator lease changed since it was read",
+          { actualLeaseId: existing?.id ?? null },
+        );
+      }
+      const timestamp = now();
+      const active = existing && Date.parse(existing.expiresAt) > Date.parse(timestamp);
+      if (active && existing.holderTaskId !== input.holderTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_ACTIVE",
+          "Another peer window holds the active coordinator lease",
+        );
+      }
+
+      const lease = {
+        id: active ? existing.id : randomUUID(),
+        holderTaskId: input.holderTaskId,
+        acquiredAt: active ? existing.acquiredAt : timestamp,
+        expiresAt: new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString(),
+      };
+      this.database.prepare(`
+        UPDATE agent_lane_projects
+        SET config_json = ?, updated_at = ?
+        WHERE project_id = ?
+      `).run(JSON.stringify({ ...config, coordinatorLease: lease }), timestamp, projectId);
+      const receipt = this.#insertCoordinatorLeaseReceipt({
+        projectId,
+        leaseId: lease.id,
+        holderTaskId: input.holderTaskId,
+        holderThreadId: input.holderThreadId,
+        action: active ? "renewed" : "acquired",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { lease: { ...lease, status: "active" }, receipt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseAgentLaneCoordinator(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const config = JSON.parse(row.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId)
+        : null;
+      if (!holder || holder.threadId !== input.holderThreadId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_BINDING_MISMATCH",
+          "Coordinator lease holder must match one configured peer window",
+        );
+      }
+
+      const existing = config.coordinatorLease ?? null;
+      if ((existing?.id ?? null) !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_CONFLICT",
+          "Coordinator lease changed since it was read",
+          { actualLeaseId: existing?.id ?? null },
+        );
+      }
+      const timestamp = now();
+      const active = existing && Date.parse(existing.expiresAt) > Date.parse(timestamp);
+      if (!active) {
+        throw new ApiError(409, "COORDINATOR_LEASE_NOT_ACTIVE", "Coordinator lease is not active");
+      }
+      if (existing.holderTaskId !== input.holderTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_LEASE_ACTIVE",
+          "Another peer window holds the active coordinator lease",
+        );
+      }
+
+      const lease = { ...existing, expiresAt: timestamp };
+      this.database.prepare(`
+        UPDATE agent_lane_projects
+        SET config_json = ?, updated_at = ?
+        WHERE project_id = ?
+      `).run(JSON.stringify({ ...config, coordinatorLease: lease }), timestamp, projectId);
+      const receipt = this.#insertCoordinatorLeaseReceipt({
+        projectId,
+        leaseId: lease.id,
+        holderTaskId: input.holderTaskId,
+        holderThreadId: input.holderThreadId,
+        action: "released",
+        createdAt: timestamp,
+      });
+      this.database.exec("COMMIT");
+      return { lease: { ...lease, status: "expired" }, receipt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listAgentLaneCoordinatorReceipts(projectId, limit = 50) {
+    if (!this.getAgentLaneProject(projectId)) {
+      throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+    }
+    return this.database.prepare(`
+      SELECT id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
+      FROM agent_coordinator_lease_receipts
+      WHERE project_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(projectId, limit).map((row) => ({
+      id: row.id,
+      projectId: row.project_id,
+      leaseId: row.lease_id,
+      holderTaskId: row.holder_task_id,
+      holderThreadId: row.holder_thread_id,
+      action: row.action,
+      createdAt: row.created_at,
+    }));
+  }
+
+  #insertCoordinatorLeaseReceipt(input) {
+    const receipt = { id: randomUUID(), ...input };
+    this.database.prepare(`
+      INSERT INTO agent_coordinator_lease_receipts (
+        id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      receipt.id,
+      receipt.projectId,
+      receipt.leaseId,
+      receipt.holderTaskId,
+      receipt.holderThreadId,
+      receipt.action,
+      receipt.createdAt,
+    );
+    return receipt;
+  }
+
   getAgentTaskClaim(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
@@ -2416,10 +2707,81 @@ export class TaskboardDatabase {
       task,
       comments: this.listComments(task.id),
       attachments: this.listAttachments(task.id),
+      inboxReceipts: this.listTaskInboxDeliveryReceipts(task.id),
+      coordinationEvents: this.listTaskCoordinationEvents(task.id),
       currentClaim: this.getAgentTaskClaim(task.id),
       currentRun: this.getActiveTaskAgentRun(task.id),
       latestRun: this.getLatestTaskAgentRun(task.id),
     });
+  }
+
+  claimTaskSafeAction(id, { rootThreadId, expectedResumeToken, safeActionId }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const capsule = this.getTaskCapsule(task.id);
+      if (capsule.execution.threadBinding?.threadId !== rootThreadId) {
+        throw new ApiError(409, "ROOT_THREAD_MISMATCH", "Bootstrap claim must match the exact configured Root thread");
+      }
+      if (capsule.resumeToken !== expectedResumeToken) {
+        throw new ApiError(409, "RESUME_TOKEN_MISMATCH", "Task Capsule changed before bootstrap claim");
+      }
+      if (capsule.readyWork.eligible !== true || capsule.readyWork.safeActions.length === 0) {
+        throw new ApiError(409, "SAFE_ACTION_NOT_READY", "Task Capsule has no eligible safe action");
+      }
+      if (capsule.readyWork.safeActions[0].id !== safeActionId) {
+        throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap claim must match the first authorized safe action");
+      }
+
+      const existing = this.database.prepare(`
+        SELECT * FROM task_safe_action_receipts
+        WHERE task_id = ? AND resume_token = ?
+      `).get(task.id, expectedResumeToken);
+      if (existing) {
+        this.database.exec("COMMIT");
+        return { receipt: this.#taskSafeActionReceipt(existing), reused: true };
+      }
+
+      const receipt = {
+        id: randomUUID(),
+        taskId: task.id,
+        projectId: task.projectId,
+        resumeToken: expectedResumeToken,
+        safeActionId,
+        rootThreadId,
+        claimedAt: now(),
+      };
+      this.database.prepare(`
+        INSERT INTO task_safe_action_receipts (
+          id, task_id, project_id, resume_token, safe_action_id, root_thread_id, claimed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        receipt.id,
+        receipt.taskId,
+        receipt.projectId,
+        receipt.resumeToken,
+        receipt.safeActionId,
+        receipt.rootThreadId,
+        receipt.claimedAt,
+      );
+      this.database.exec("COMMIT");
+      return { receipt, reused: false };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #taskSafeActionReceipt(row) {
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      projectId: row.project_id,
+      resumeToken: row.resume_token,
+      safeActionId: row.safe_action_id,
+      rootThreadId: row.root_thread_id,
+      claimedAt: row.claimed_at,
+    };
   }
 
   createTask(input) {
@@ -3073,6 +3435,321 @@ export class TaskboardDatabase {
     return this.getComment(id);
   }
 
+  deliverTaskInboxMessage(taskId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const existing = this.database.prepare(`
+        SELECT * FROM task_inbox_delivery_receipts
+        WHERE task_id = ? AND delivery_id = ?
+      `).get(task.id, input.deliveryId);
+      if (existing) {
+        const receipt = taskInboxDeliveryReceiptFromRow(existing);
+        const comment = this.getComment(receipt.commentId);
+        const incomingBinding = storedThreadBinding(input.threadBinding, input.threadId);
+        const existingBinding = [
+          comment.threadBinding?.threadId ?? comment.threadId ?? comment.legacyLocalThreadId ?? null,
+          comment.threadBinding?.codexProjectId ?? null,
+          comment.threadBinding?.codexProjectKind ?? null,
+          comment.threadBinding?.codexHostId ?? null,
+          comment.threadBinding?.workspacePath ?? null,
+        ];
+        const actorMatches = (
+          comment.authorType === input.actor.type
+          && comment.authorId === input.actor.id
+          && comment.authorName === input.actor.name
+          && comment.authorAvatarUrl === input.actor.avatarUrl
+        );
+        if (
+          comment.body !== input.body
+          || receipt.sourceThreadId !== input.threadId
+          || JSON.stringify(existingBinding) !== JSON.stringify(incomingBinding)
+          || !actorMatches
+        ) {
+          throw new ApiError(
+            409,
+            "IDEMPOTENCY_CONFLICT",
+            "Inbox delivery id is already bound to a different message",
+          );
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, receipt, comment };
+      }
+
+      const timestamp = now();
+      const commentId = randomUUID();
+      const receiptId = randomUUID();
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
+          thread_codex_host_id, thread_workspace_path,
+          author_type, author_id, author_name, author_avatar_url,
+          version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId,
+        task.id,
+        input.body,
+        ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
+        input.actor.type,
+        input.actor.id,
+        input.actor.name,
+        input.actor.avatarUrl,
+        timestamp,
+        timestamp,
+        changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO task_inbox_delivery_receipts (
+          id, delivery_id, task_id, project_id, comment_id, source_thread_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        receiptId,
+        input.deliveryId,
+        task.id,
+        task.projectId,
+        commentId,
+        input.threadId,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        receipt: this.getTaskInboxDeliveryReceipt(receiptId),
+        comment: this.getComment(commentId),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskInboxDeliveryReceipt(id) {
+    const row = this.database.prepare(
+      "SELECT * FROM task_inbox_delivery_receipts WHERE id = ?",
+    ).get(id);
+    return row ? taskInboxDeliveryReceiptFromRow(row) : null;
+  }
+
+  listTaskInboxDeliveryReceipts(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM task_inbox_delivery_receipts
+      WHERE task_id = ?
+      ORDER BY created_at DESC, rowid DESC
+    `).all(task.id).map(taskInboxDeliveryReceiptFromRow);
+  }
+
+  appendTaskCoordinationEvent(taskId, envelope, actor) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      const serializedEnvelope = JSON.stringify(envelope);
+      const existing = this.database.prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+        LIMIT 1
+      `).get(envelope.eventId, task.id, envelope.idempotencyKey);
+      if (existing) {
+        if (existing.task_id !== task.id || existing.envelope_json !== serializedEnvelope) {
+          throw new ApiError(
+            409,
+            "COORDINATION_EVENT_CONFLICT",
+            "The event or idempotency key is already bound to different handoff content",
+          );
+        }
+        const event = this.getTaskCoordinationEvent(existing.event_id);
+        this.database.exec("COMMIT");
+        return { applied: false, event, comment: this.getComment(existing.comment_id) };
+      }
+
+      const parentTaskId = task.relations.parent?.id ?? null;
+      if (envelope.parentTaskId !== parentTaskId) {
+        throw new ApiError(
+          409,
+          "COORDINATION_PARENT_MISMATCH",
+          "The envelope parent must match the task's durable parent relation",
+          { actualParentTaskId: parentTaskId },
+        );
+      }
+      const claim = this.getAgentTaskClaim(task.id);
+      if (
+        task.status !== "in_progress"
+        || claim?.status !== "active"
+        || !claim.leaseExpiresAt
+        || Date.parse(claim.leaseExpiresAt) <= Date.now()
+      ) {
+        throw new ApiError(409, "COORDINATION_CLAIM_NOT_ACTIVE", "A handoff requires an active execution claim");
+      }
+      if (
+        claim.agentThreadId !== envelope.senderThreadId
+        || claim.agentPath !== envelope.senderAgentPath
+      ) {
+        throw new ApiError(
+          409,
+          "COORDINATION_SENDER_MISMATCH",
+          "The handoff sender must match the active execution claim",
+        );
+      }
+      const previous = this.database.prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND envelope_json IS NOT NULL
+        ORDER BY created_at DESC, rowid DESC
+      `).all(task.id)
+        .map((row) => JSON.parse(row.envelope_json))
+        .find((candidate) => candidate.senderAgentPath === envelope.senderAgentPath);
+      if (previous && envelope.sequence <= previous.sequence) {
+        throw new ApiError(
+          409,
+          "COORDINATION_SEQUENCE_CONFLICT",
+          "The handoff sequence must advance for this sender",
+          { previousSequence: previous.sequence },
+        );
+      }
+
+      const timestamp = now();
+      const commentId = randomUUID();
+      const changeRevision = this.#nextCommentAttachmentRevision();
+      this.database.prepare(`
+        INSERT INTO comments (
+          id, task_id, body, thread_id, author_type, author_id, author_name,
+          author_avatar_url, version, created_at, updated_at, change_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+      `).run(
+        commentId,
+        task.id,
+        coordinationCommentBody(envelope),
+        envelope.senderThreadId,
+        actor.type,
+        actor.id,
+        actor.name,
+        actor.avatarUrl,
+        timestamp,
+        timestamp,
+        changeRevision,
+      );
+      this.database.prepare(`
+        INSERT INTO agent_event_receipts (
+          event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        envelope.eventId,
+        task.projectId,
+        task.id,
+        commentId,
+        envelope.idempotencyKey,
+        serializedEnvelope,
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        event: this.getTaskCoordinationEvent(envelope.eventId),
+        comment: this.getComment(commentId),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskCoordinationEvent(eventId) {
+    const row = this.database.prepare(`
+      SELECT * FROM agent_event_receipts
+      WHERE event_id = ? AND envelope_json IS NOT NULL
+    `).get(eventId);
+    if (!row) return null;
+    const acknowledgements = this.database.prepare(`
+      SELECT * FROM agent_event_acknowledgements
+      WHERE event_id = ?
+      ORDER BY created_at, rowid
+    `).all(eventId).map(coordinationAcknowledgementFromRow);
+    return coordinationEventFromRow(row, acknowledgements);
+  }
+
+  listTaskCoordinationEvents(taskId) {
+    const task = this.#requireTask(taskId);
+    return this.database.prepare(`
+      SELECT * FROM agent_event_receipts
+      WHERE task_id = ? AND envelope_json IS NOT NULL
+      ORDER BY created_at, rowid
+    `).all(task.id).map((row) => this.getTaskCoordinationEvent(row.event_id));
+  }
+
+  acknowledgeTaskCoordinationEvent(eventId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.database.prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? AND envelope_json IS NOT NULL
+      `).get(eventId);
+      if (!row) {
+        throw new ApiError(404, "COORDINATION_EVENT_NOT_FOUND", `Coordination event '${eventId}' does not exist`);
+      }
+      const envelope = JSON.parse(row.envelope_json);
+      if (!envelope.requiresAck) {
+        throw new ApiError(409, "COORDINATION_ACK_NOT_REQUIRED", "This handoff does not require acknowledgement");
+      }
+      const task = this.#requireTask(row.task_id);
+      if (
+        input.senderAgentPath !== "/root"
+        || !task.threadBinding
+        || task.threadBinding.threadId !== input.senderThreadId
+      ) {
+        throw new ApiError(
+          409,
+          "COORDINATION_ACK_SENDER_MISMATCH",
+          "Acknowledgement must come from the task's exactly bound Root",
+        );
+      }
+      const existing = this.database.prepare(`
+        SELECT * FROM agent_event_acknowledgements WHERE event_id = ?
+      `).get(eventId);
+      if (existing) {
+        if (
+          existing.acknowledgement_id !== input.acknowledgementId
+          || existing.sender_thread_id !== input.senderThreadId
+          || existing.sender_agent_path !== input.senderAgentPath
+        ) {
+          throw new ApiError(
+            409,
+            "COORDINATION_ACK_CONFLICT",
+            "This handoff already has a different acknowledgement",
+          );
+        }
+        const acknowledgement = coordinationAcknowledgementFromRow(existing);
+        this.database.exec("COMMIT");
+        return { applied: false, acknowledgement };
+      }
+      const acknowledgement = {
+        id: randomUUID(),
+        acknowledgementId: input.acknowledgementId,
+        eventId,
+        senderThreadId: input.senderThreadId,
+        senderAgentPath: input.senderAgentPath,
+        createdAt: now(),
+      };
+      this.database.prepare(`
+        INSERT INTO agent_event_acknowledgements (
+          id, acknowledgement_id, event_id, sender_thread_id, sender_agent_path, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        acknowledgement.id,
+        acknowledgement.acknowledgementId,
+        acknowledgement.eventId,
+        acknowledgement.senderThreadId,
+        acknowledgement.senderAgentPath,
+        acknowledgement.createdAt,
+      );
+      this.database.exec("COMMIT");
+      return { applied: true, acknowledgement };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getComment(id) {
     const row = this.database.prepare("SELECT * FROM comments WHERE id = ?").get(id);
     return row ? this.#commentWithAttachments(row) : null;
@@ -3488,12 +4165,10 @@ export class TaskboardDatabase {
     if (worktree?.type !== "worktree" || !worktree.path || !worktree.branch) {
       throw new ApiError(409, "ROOT_WORKTREE_REQUIRED", "A durable Agent Run requires a task worktree and branch");
     }
-    if (binding.workspacePath !== worktree.path) {
-      throw new ApiError(409, "ROOT_WORKTREE_MISMATCH", "Task Root binding and worktree must match before claiming");
-    }
     return {
       projectId: task.projectId,
       rootThreadId: binding.threadId,
+      rootWorkspacePath: binding.workspacePath,
       worktreePath: worktree.path,
       worktreeBranch: worktree.branch,
     };

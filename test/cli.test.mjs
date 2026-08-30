@@ -9,6 +9,7 @@ function capture() {
   return {
     stream: { write(chunk) { value += chunk; } },
     json() { return JSON.parse(value); },
+    text() { return value; },
   };
 }
 
@@ -43,6 +44,21 @@ test("parseArgs supports equals syntax and boolean --json", () => {
     operands: [],
     options: { project: "local", json: true },
   });
+});
+
+test("built-in help leads fresh windows through complete Capsule bootstrap", async () => {
+  for (const argv of [["--help"], ["issue", "--help"]]) {
+    const stdout = capture();
+    const exitCode = await main(argv, {
+      stdout: stdout.stream,
+      stderr: capture().stream,
+      fetch: async () => assert.fail("help must not call the service"),
+    });
+
+    assert.equal(exitCode, 0);
+    assert.match(stdout.text(), /taskctl issue bootstrap LOCAL-275 --json/);
+    assert.doesNotMatch(stdout.text(), /taskctl issue get LOCAL-275 --json/);
+  }
 });
 
 test("project list uses the default local service and adds schemaVersion", async () => {
@@ -127,6 +143,27 @@ test("issue list serializes project and status filters", async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(requestedUrl.searchParams.get("projectId"), "local");
   assert.equal(requestedUrl.searchParams.get("status"), "todo");
+});
+
+test("issue bootstrap recovers the complete Task Capsule through one direct request", async () => {
+  const capsule = {
+    task: { identifier: "TASK/1", version: 7 },
+    comments: [{ id: "comment-1" }],
+    attachments: [{ id: "attachment-1" }],
+    inbox: { pendingCount: 1, latestReceipt: { id: "delivery-1" } },
+    handoffs: { pendingAcknowledgementCount: 1, latestEvent: { eventId: "handoff-1" } },
+    resumeToken: "a".repeat(64),
+  };
+  let request;
+  const result = await run(["issue", "bootstrap", "TASK/1"], async (url, init) => {
+    request = { url, init };
+    return response({ capsule });
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(request.url.pathname, "/api/tasks/TASK%2F1/capsule");
+  assert.equal(request.init.method, "GET");
+  assert.deepEqual(result.stdout.capsule, capsule);
 });
 
 test("issue commands accept in-review, blocked, and canceled statuses", async () => {
@@ -417,6 +454,93 @@ test("run commands use durable lifecycle endpoints and agent thread attribution"
   assert.equal(calls[2].init.method, "GET");
 });
 
+test("handoff commands append, replay, and acknowledge structured coordination events", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url, init });
+    if (init.method === "GET") return response({ events: [] });
+    if (url.pathname.endsWith("/acknowledgements")) {
+      return response({ applied: true, acknowledgement: { id: "ack-receipt-1" } }, 201);
+    }
+    return response({ applied: true, event: { eventId: "handoff-1" } }, 201);
+  };
+
+  const add = await run([
+    "handoff", "add", "TASK/1",
+    "--event-id", "handoff-1",
+    "--idempotency-key", "handoff-key-1",
+    "--agent-path", "/root/backend",
+    "--sequence", "3",
+    "--timestamp", "2026-08-29T05:00:00.000Z",
+    "--summary", "Backend complete",
+    "--evidence-ref", "test/server.test.mjs#handoff,artifact://focused-result",
+    "--next-action", "Root reviews evidence",
+    "--requires-ack", "true",
+    "--causation-id", "claim-1",
+    "--correlation-id", "feature-1",
+  ], fetchImplementation);
+  const list = await run(["handoff", "list", "TASK/1"], fetchImplementation);
+  const ack = await run([
+    "handoff", "ack", "handoff-1",
+    "--acknowledgement-id", "root-ack-1",
+    "--agent-path", "/root",
+  ], fetchImplementation);
+
+  assert.equal(add.exitCode, 0);
+  assert.equal(list.exitCode, 0);
+  assert.equal(ack.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/tasks/TASK%2F1/coordination-events");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    eventId: "handoff-1",
+    idempotencyKey: "handoff-key-1",
+    parentTaskId: null,
+    senderThreadId: "thread-current",
+    senderAgentPath: "/root/backend",
+    eventType: "handoff",
+    sequence: 3,
+    timestamp: "2026-08-29T05:00:00.000Z",
+    summary: "Backend complete",
+    evidenceRefs: ["test/server.test.mjs#handoff", "artifact://focused-result"],
+    blocker: null,
+    nextAction: "Root reviews evidence",
+    requiresAck: true,
+    causationId: "claim-1",
+    correlationId: "feature-1",
+  });
+  assert.equal(calls[1].url.pathname, "/api/tasks/TASK%2F1/coordination-events");
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal(calls[2].url.pathname, "/api/coordination-events/handoff-1/acknowledgements");
+  assert.deepEqual(JSON.parse(calls[2].init.body), {
+    acknowledgementId: "root-ack-1",
+    senderThreadId: "thread-current",
+    senderAgentPath: "/root",
+  });
+});
+
+test("handoff commands reject unsafe acknowledgement and boolean shapes before fetch", async () => {
+  const neverFetch = async () => assert.fail("fetch should not be called");
+  const invalidAck = await run([
+    "handoff", "ack", "handoff-1",
+    "--acknowledgement-id", "root-ack-1",
+    "--agent-path", "/root/backend",
+  ], neverFetch);
+  const invalidBoolean = await run([
+    "handoff", "add", "TASK-1",
+    "--event-id", "handoff-1",
+    "--idempotency-key", "handoff-key-1",
+    "--agent-path", "/root/backend",
+    "--sequence", "1",
+    "--summary", "Backend complete",
+    "--next-action", "Root reviews evidence",
+    "--requires-ack", "yes",
+  ], neverFetch);
+
+  assert.equal(invalidAck.exitCode, 2);
+  assert.match(invalidAck.stderr.error.message, /must be \/root/);
+  assert.equal(invalidBoolean.exitCode, 2);
+  assert.match(invalidBoolean.stderr.error.message, /must be true or false/);
+});
+
 test("issue update rebinds only with explicit binding identity", async () => {
   let requestBody;
   const result = await run(
@@ -651,7 +775,7 @@ test("manual linked-thread options and commands are no longer accepted", async (
     async () => assert.fail("fetch should not be called"),
   );
   assert.equal(commandResult.exitCode, 2);
-  assert.match(commandResult.stderr.error.message, /Expected one of/);
+  assert.match(commandResult.stderr.error.message, /Expected one of:[\s\S]*issue list\/get\/bootstrap\/create/);
 });
 
 test("API conflicts produce stable JSON on stderr and exit code 5", async () => {

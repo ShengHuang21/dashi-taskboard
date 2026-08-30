@@ -14,17 +14,23 @@ import {
 const coordinationAuthorization = {
   safeActionId: "safe-action",
   expectedResumeToken: "a".repeat(64),
+  rootWorkspacePath: "/tmp/taskboard/project",
 };
+const deliverCoordination = (request, rpc, validateExecutionTarget = async () => {}) => (
+  deliverTaskboardCoordination(request, rpc, validateExecutionTarget)
+);
 
 test("background continuation delivers one eligible first safe action without a mounted view", async () => {
   const deliveries = [];
   const receipts = new Set();
   const todo = {
     id: "TASKBOARD-BACKGROUND",
+    taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
     run: null,
     dispatchTarget: {
       rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
       codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/project",
       worktreePath: "/tmp/taskboard/project",
     },
     readyWork: {
@@ -37,7 +43,15 @@ test("background continuation delivers one eligible first safe action without a 
   const options = {
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo] }),
-    claimReceipt: async (key) => {
+    claimReceipt: async (claim) => {
+      assert.deepEqual(claim, {
+        todoId: todo.id,
+        taskId: todo.taskId,
+        rootThreadId: todo.dispatchTarget.rootThreadId,
+        safeActionId: "safe-first",
+        expectedResumeToken: "b".repeat(64),
+      });
+      const key = `${claim.todoId}:${claim.expectedResumeToken}`;
       if (receipts.has(key)) return false;
       receipts.add(key);
       return true;
@@ -52,13 +66,14 @@ test("background continuation delivers one eligible first safe action without a 
   const duplicate = await runTaskboardContinuationMonitorOnce(options);
 
   assert.deepEqual(first, { delivered: true, todoId: todo.id, actionId: "safe-first" });
-  assert.deepEqual(duplicate, { delivered: false, reason: "already-delivered" });
+  assert.deepEqual(duplicate, { delivered: false, reason: "reservation-unavailable" });
   assert.equal(deliveries.length, 1);
   assert.deepEqual(deliveries[0], {
     projectId: "taskboard-core",
     todoId: todo.id,
     rootThreadId: todo.dispatchTarget.rootThreadId,
     codexHostId: "local",
+    rootWorkspacePath: "/tmp/taskboard/project",
     targetRoot: "/tmp/taskboard/project",
     safeActionId: "safe-first",
     expectedResumeToken: "b".repeat(64),
@@ -114,10 +129,12 @@ test("background continuation reserves the durable receipt before an uncertain d
       projectId: "taskboard-core",
       todos: [{
         id: "UNCERTAIN",
+        taskId: "36e47e0e-77f3-41ca-b569-0125788288c4",
         run: null,
         dispatchTarget: {
           rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
           codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard/project",
           worktreePath: "/tmp/taskboard/project",
         },
         readyWork: {
@@ -137,8 +154,39 @@ test("background continuation reserves the durable receipt before an uncertain d
   await assert.rejects(runTaskboardContinuationMonitorOnce(options), /receipt unknown/);
   assert.deepEqual(
     await runTaskboardContinuationMonitorOnce(options),
-    { delivered: false, reason: "already-delivered" },
+    { delivered: false, reason: "reservation-unavailable" },
   );
+});
+
+test("background continuation fails closed when the authoritative reservation is rejected", async () => {
+  let delivered = false;
+  const result = await runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "STALE",
+        taskId: "f727e1f4-e4da-44d3-9c55-4f4d8b487955",
+        run: null,
+        dispatchTarget: {
+          rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard/project",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        readyWork: {
+          eligible: true,
+          safeActions: [{ id: "safe-first" }],
+          resumeToken: "f".repeat(64),
+        },
+      }],
+    }),
+    claimReceipt: async () => false,
+    deliver: async () => { delivered = true; },
+  });
+
+  assert.deepEqual(result, { delivered: false, reason: "reservation-unavailable" });
+  assert.equal(delivered, false);
 });
 
 test("the resident authenticated host polls durable opt-in policies without the Agent Lanes view", async () => {
@@ -146,9 +194,10 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /taskboard:background-continuation:policy:/);
   assert.match(source, /api\/client-storage/);
   assert.match(source, /api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);
+  assert.match(source, /api\/tasks\/\$\{encodeURIComponent\(claim\.todoId\)\}\/bootstrap-claim/);
   assert.match(source, /runTaskboardContinuationMonitorOnce/);
   assert.match(source, /deliverTaskboardCoordination/);
-  assert.match(source, /open\(receiptPath, "wx", 0o600\)/);
+  assert.doesNotMatch(source, /background-continuation-receipts/);
   assert.match(source, /setInterval\(\(\) => void tick\(\), backgroundContinuationIntervalMs\)/);
 });
 
@@ -162,13 +211,13 @@ test("Agent Todo coordination steers an active Root turn", async () => {
     targetRoot: "/tmp/taskboard/project",
     ...coordinationAuthorization,
   };
-  const result = await deliverTaskboardCoordination(request, async (method, params) => {
+  const result = await deliverCoordination(request, async (method, params) => {
     calls.push([method, params]);
     if (method === "thread/read") {
       return {
         thread: {
           id: request.rootThreadId,
-          cwd: request.targetRoot,
+          cwd: request.rootWorkspacePath,
           turns: [{ id: "turn-active", status: "inProgress" }],
         },
       };
@@ -197,10 +246,10 @@ test("Agent Todo coordination starts an idle Root turn", async () => {
     targetRoot: "/tmp/taskboard/project",
     ...coordinationAuthorization,
   };
-  const result = await deliverTaskboardCoordination(request, async (method, params) => {
+  const result = await deliverCoordination(request, async (method, params) => {
     calls.push([method, params]);
     if (method === "thread/read") {
-      return { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } };
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
     }
     if (method === "turn/start") return { turn: { id: "turn-new" } };
     return {};
@@ -241,7 +290,7 @@ test("the authenticated host binding accepts one bounded Agent Todo request", as
   ]);
 });
 
-test("Agent Todo coordination rejects a Root cwd that is not exactly the Todo worktree", async () => {
+test("Agent Todo coordination rejects a Root cwd that is not exactly the coordination workspace", async () => {
   const calls = [];
   const request = {
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
@@ -249,13 +298,52 @@ test("Agent Todo coordination rejects a Root cwd that is not exactly the Todo wo
     ...coordinationAuthorization,
   };
   await assert.rejects(
-    deliverTaskboardCoordination(request, async (method) => {
+    deliverCoordination(request, async (method) => {
       calls.push(method);
       return { thread: { id: request.rootThreadId, cwd: "/tmp/taskboard", turns: [] } };
     }),
     /exactly match/i,
   );
   assert.deepEqual(calls, ["thread/read"]);
+});
+
+test("Agent Todo coordination can target a Git worktree outside the Root coordination workspace", async () => {
+  const calls = [];
+  const validatedTargets = [];
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
+    projectId: "taskboard-core", todoId: "TASKBOARD-SEPARATE",
+    rootWorkspacePath: "/Users/owner/capstone-coordination",
+    targetRoot: "/tmp/capstone-execution-worktree",
+    safeActionId: "safe-action-separate",
+    expectedResumeToken: "f".repeat(64),
+  };
+  const result = await deliverCoordination(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") {
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
+    }
+    if (method === "turn/start") return { turn: { id: "turn-separate" } };
+    return {};
+  }, async (targetRoot) => validatedTargets.push(targetRoot));
+  assert.deepEqual(result, { delivery: "started", turnId: "turn-separate" });
+  assert.deepEqual(validatedTargets, [request.targetRoot]);
+  const instruction = calls.find(([method]) => method === "turn/start")?.[1]?.input?.[0]?.text ?? "";
+  assert.match(instruction, /Exact execution worktree: \/tmp\/capstone-execution-worktree/);
+  assert.match(instruction, /coordination cwd may be different/);
+});
+
+test("Agent Todo coordination fails closed without an execution worktree validator", async () => {
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
+    projectId: "taskboard-core", todoId: "TASKBOARD-NO-VALIDATOR",
+    targetRoot: "/tmp/taskboard/project",
+    ...coordinationAuthorization,
+  };
+  await assert.rejects(
+    deliverTaskboardCoordination(request, async () => assert.fail("RPC must not run")),
+    /validator is required/i,
+  );
 });
 
 test("Agent Todo delivery dedupe is scoped to the normalized Todo worktree", async () => {
@@ -271,24 +359,24 @@ test("Agent Todo delivery dedupe is scoped to the normalized Todo worktree", asy
   const rpc = async (method) => {
     calls.push(method);
     if (method === "thread/read") {
-      return { thread: { id: request.rootThreadId, cwd: "/tmp/right", turns: [] } };
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
     }
     if (method === "turn/start") return { turn: { id: "turn-right" } };
     return {};
   };
 
-  const first = await deliverTaskboardCoordination(request, rpc);
-  const duplicate = await deliverTaskboardCoordination({ ...request }, rpc);
+  const first = await deliverCoordination(request, rpc);
+  const duplicate = await deliverCoordination({ ...request }, rpc);
   assert.deepEqual(first, { delivery: "started", turnId: "turn-right" });
   assert.deepEqual(duplicate, first);
   assert.equal(calls.filter((method) => method === "thread/read").length, 1);
 
-  await assert.rejects(
-    deliverTaskboardCoordination({ ...request, targetRoot: "/tmp/wrong" }, rpc),
-    /exactly match/i,
+  assert.deepEqual(
+    await deliverCoordination({ ...request, targetRoot: "/tmp/wrong" }, rpc),
+    { delivery: "started", turnId: "turn-right" },
   );
   assert.equal(calls.filter((method) => method === "thread/read").length, 2);
-  assert.equal(calls.filter((method) => method === "turn/start").length, 1);
+  assert.equal(calls.filter((method) => method === "turn/start").length, 2);
 });
 
 test("Agent Todo coordination is idempotent and requires a turn receipt", async () => {
@@ -300,30 +388,30 @@ test("Agent Todo coordination is idempotent and requires a turn receipt", async 
   };
   const rpc = async (method) => {
     calls.push(method);
-    if (method === "thread/read") return { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } };
+    if (method === "thread/read") return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
     if (method === "turn/start") return { turn: { id: "turn-once" } };
     return {};
   };
   const [left, right] = await Promise.all([
-    deliverTaskboardCoordination(request, rpc), deliverTaskboardCoordination(request, rpc),
+    deliverCoordination(request, rpc), deliverCoordination(request, rpc),
   ]);
   assert.deepEqual(left, { delivery: "started", turnId: "turn-once" });
   assert.deepEqual(right, left);
   assert.equal(calls.filter((method) => method === "turn/start").length, 1);
 
   await assert.rejects(
-    deliverTaskboardCoordination({ ...request, todoId: "TASKBOARD-NO-RECEIPT" }, async (method) => (
+    deliverCoordination({ ...request, todoId: "TASKBOARD-NO-RECEIPT" }, async (method) => (
       method === "thread/read"
-        ? { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } }
+        ? { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } }
         : {}
     )),
     /turn receipt/i,
   );
 
-  const retry = await deliverTaskboardCoordination(
+  const retry = await deliverCoordination(
     { ...request, todoId: "TASKBOARD-NO-RECEIPT" },
     async (method) => method === "thread/read"
-      ? { thread: { id: request.rootThreadId, cwd: request.targetRoot, turns: [] } }
+      ? { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } }
       : { turn: { id: "turn-after-retry" } },
   );
   assert.deepEqual(retry, { delivery: "started", turnId: "turn-after-retry" });

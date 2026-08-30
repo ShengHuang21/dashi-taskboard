@@ -169,6 +169,7 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
   assert.deepEqual(readyTodo?.dispatchTarget, {
     rootThreadId: fixture.rootBinding.threadId,
     codexHostId: fixture.rootBinding.codexHostId,
+    rootWorkspacePath: fixture.rootBinding.workspacePath,
     worktreePath: fixture.developmentContext.path,
   });
   assert.equal(readyTodo?.workingLog?.path, `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`);
@@ -195,6 +196,48 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
   fixture.database.close();
 });
 
+test("keeps a non-Git Root workspace separate from the Git execution target", async () => {
+  const fixture = await setup();
+  const coordinationBinding = {
+    ...fixture.rootBinding,
+    workspacePath: "/Users/owner/capstone-coordination",
+  };
+  const executionTarget = {
+    type: "worktree",
+    path: "/tmp/capstone-execution-worktree",
+    branch: "codex/capstone-e2e",
+  };
+  const task = fixture.database.createTask({
+    projectId: "capstone-dev", title: "Separated Root and execution target", description: "", status: "todo",
+    priority: "high", labels: ["agent-todo"], threadId: coordinationBinding.threadId,
+    threadBinding: coordinationBinding, actor, assignee: actor, developmentContext: executionTarget,
+    workingLog: {
+      path: `${executionTarget.path}/CAPSTONE-WORKING-LOG.md`,
+      status: "planned",
+    },
+    startDate: null, dueDate: null, recurrence: null,
+  });
+
+  const snapshot = await fixture.makeProvider(fixture.database).getProjectSnapshot("capstone-dev");
+  const todo = snapshot.todos.find((candidate) => candidate.id === task.identifier);
+  assert.equal(todo?.readyWork.eligible, true);
+  assert.doesNotMatch(todo?.readyWork.reasonCodes.join(",") ?? "", /ROOT_WORKTREE_MISMATCH/);
+  assert.deepEqual(todo?.dispatchTarget, {
+    rootThreadId: coordinationBinding.threadId,
+    codexHostId: coordinationBinding.codexHostId,
+    rootWorkspacePath: coordinationBinding.workspacePath,
+    worktreePath: executionTarget.path,
+  });
+
+  const claimed = fixture.database.claimAgentTask(task.id, task.version, {
+    agentPath: "/root/capstone_e2e", agentThreadId: "capstone-e2e-thread",
+    leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["test/e2e"],
+  });
+  assert.equal(claimed.run.worktree.path, executionTarget.path);
+  assert.equal(claimed.run.rootThreadId, coordinationBinding.threadId);
+  fixture.database.close();
+});
+
 test("projects safe continuation and one exact authorization gate into Agent Todos", async () => {
   const fixture = await setup();
   const gatedTask = fixture.database.createTask({
@@ -210,7 +253,11 @@ test("projects safe continuation and one exact authorization gate into Agent Tod
   fixture.database.createComment(gatedTask.id, {
     body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
       gates: [
-        { id: "local", kind: "test", state: "authorized", scope: "local tests", evidence: "Owner resumed", receipt: "turn:resume" },
+        {
+          id: "local", kind: "test", state: "authorized", scope: "local tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:resume",
+        },
         { id: "push", kind: "push", state: "approval_required", scope: "exact commit", approver: "Owner", approvalRequest: "同意推送 exact commit" },
       ],
       actions: [

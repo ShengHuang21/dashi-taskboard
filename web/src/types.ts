@@ -550,6 +550,20 @@ export type CoordinationTodoState = "ready" | "claimed" | "waiting_user" | "bloc
 export type CoordinationAttention = "needs_user" | "needs_coordinator" | "ready" | "blocked" | "watch" | "done";
 export type CoordinationRoute = "ready_for_agent" | "replan_required" | "user_action_required" | "blocked" | "wait" | "validated_completion";
 
+export interface AgentAdapterContract {
+  version: 1;
+  providerId: string;
+  state: "disabled";
+  reasonCode: "ADAPTER_NOT_CONFIGURED";
+  transport: null;
+  capabilities: {
+    inspect: false;
+    dispatch: false;
+    wait: false;
+    checkpointReceipt: false;
+  };
+}
+
 export interface AgentTaskLaneSnapshot {
   id: string;
   label: string;
@@ -572,6 +586,7 @@ export interface AgentTaskLaneSnapshot {
   actionId: string | null;
   duplicateOfLaneId: string | null;
   continuity: { state: AgentLaneContinuity; reason: string | null };
+  adapterContract?: AgentAdapterContract;
   workItem: {
     identifier: string;
     title: string;
@@ -606,8 +621,22 @@ export interface RootSubagentSnapshot {
   };
 }
 
+export interface WindowSubagentTreeSnapshot {
+  windowTaskId: string;
+  rootThreadId: string;
+  stableIdentity: string;
+  observed: boolean;
+  subagents: RootSubagentSnapshot[];
+  summary: {
+    observed: number;
+    active: number;
+    shown: number;
+  };
+}
+
 export interface CoordinationTodoSnapshot {
   id: string;
+  taskId: string;
   title: string;
   state: CoordinationTodoState;
   claimedBy: string | null;
@@ -639,11 +668,20 @@ export interface CoordinationTodoSnapshot {
   workingLog: CoordinationWorkingLogSnapshot | null;
   run: CoordinationRunSnapshot | null;
   readyWork: CoordinationReadyWorkSnapshot;
+  inbox: {
+    pendingCount: number;
+    latestReceipt: unknown | null;
+  };
+  handoffs: {
+    pendingAcknowledgementCount: number;
+    latestEvent: unknown | null;
+  };
 }
 
 export interface CoordinationDispatchTarget {
   rootThreadId: string;
   codexHostId: string;
+  rootWorkspacePath: string;
   worktreePath: string;
 }
 
@@ -697,10 +735,20 @@ export interface AgentLaneSnapshot {
   readOnly: true;
   automaticRecoveryEnabled: false;
   coordination: {
-    model: "peer_todos_with_replaceable_coordinator";
-    coordinatorTaskId: string;
+    model: "peer_windows_with_configured_coordinator" | "peer_windows_with_coordinator_lease";
+    coordinatorTaskId: string | null;
     coordinatorStableIdentity: string | null;
-    replaceable: true;
+    assignment: "configured" | "lease" | "unassigned";
+    replaceable: boolean;
+    scope: "project";
+    lease?: {
+      id: string;
+      status: "active" | "expired";
+      acquiredAt: string;
+      expiresAt: string;
+    };
+    crossWindowProtocol: "task_capsule_claim_checkpoint_receipt";
+    subagentAuthority: "window_root";
     stateAuthority: "self_learning_checkpoint";
     workAuthority: "todo_claim_lease";
     runtimeOwnership: "single_writer";
@@ -708,6 +756,7 @@ export interface AgentLaneSnapshot {
   todos: CoordinationTodoSnapshot[];
   attentionQueue: string[];
   taskLanes: AgentTaskLaneSnapshot[];
+  windowSubagentTrees: WindowSubagentTreeSnapshot[];
   rootSubagents: RootSubagentSnapshot[];
   adapters: AgentTaskLaneSnapshot[];
   subagentSummary: {

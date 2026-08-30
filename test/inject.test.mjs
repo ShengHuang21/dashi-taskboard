@@ -22,14 +22,14 @@ test("injection is an idempotent IIFE guarded by its current source hash", () =>
   assert.match(source, /window\[SENTINEL_KEY\] = api/);
 });
 
-test("embedded page uses the launcher URL inside an opaque sandbox", () => {
+test("embedded page navigates to the authenticated launcher origin inside a cross-origin sandbox", () => {
   assert.match(source, /http:\/\/127\.0\.0\.1:47823\/\?host=codex/);
   assert.match(source, /window\.__CODEX_TASKBOARD_URL__/);
   assert.match(source, /nextFrame\.name = frameName/);
   assert.match(source, /nextFrame\.src = "about:blank"/);
   assert.match(source, /requestHost\("load-frame", \{ frameName, frameCapability: capability \}\)/);
   assert.match(source, /frameCapability = crypto\.randomUUID\(\)/);
-  assert.match(source, /nextFrame\.setAttribute\("sandbox", "allow-scripts/);
+  assert.match(source, /nextFrame\.setAttribute\(\s*"sandbox",\s*"allow-scripts allow-forms/);
   assert.match(source, /taskboardOrigin = taskboardUrl\.origin/);
   assert.match(source, /frameOrigin = "null"/);
   assert.doesNotMatch(source, /allow-same-origin/);
@@ -61,6 +61,14 @@ test("opening Taskboard suppresses native selection and contextual header until 
   assert.match(source, /restoreNativeSelection\(\)/);
   assert.match(source, /function onDocumentClick[\s\S]*closeTaskboard\(false\);/);
   assert.doesNotMatch(source, /setTimeout\(\(\) => closeTaskboard\(false\), 0\)/);
+});
+
+test("opening waits for the native browser panel to close before loading the embedded app", () => {
+  assert.match(source, /if \(suspendedNativeBrowserPanel\)/);
+  assert.match(source, /data-browser-sidebar-webview/);
+  assert.match(source, /Date\.now\(\) \+ 2_000/);
+  assert.match(source, /if \(active && !suspendedNativeBrowserPanel\) closeTaskboard\(false\)/);
+  assert.match(source, /await prepareTaskboard\(generation\)/);
 });
 
 test("the embedded header fills the native titlebar without clipping or a full-page no-drag region", () => {
@@ -120,6 +128,8 @@ test("the embedded header exposes Codex's native sidebar expansion when collapse
 
 test("opening asks the resident launcher to ensure the service and rebuilds failed frames", () => {
   assert.match(source, /const HOST_REQUEST_MESSAGE = "__codexTaskboardHostRequestV1"/);
+  assert.match(source, /HOST_REQUEST_QUEUE_NAME/);
+  assert.match(source, /requestQueue\.push/);
   assert.match(source, /return requestHost\("ensure"\)/);
   assert.match(source, /result\.restarted/);
   assert.match(source, /loadTaskboardFrame\(\)/);
@@ -153,7 +163,7 @@ test("reopening reuses a ready cache-busted iframe without showing the startup p
   assert.doesNotMatch(prepareSource, /async function prepareTaskboard\(generation\) \{\s*showLoading\(\);/);
 });
 
-test("opaque iframe messages require the current document capability", () => {
+test("cross-origin iframe messages require the current document capability", () => {
   assert.match(
     source,
     /event\.source !== frame\.contentWindow \|\| event\.origin !== frameOrigin/,

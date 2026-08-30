@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,7 @@ import {
   restartResidentInjector,
   runTaskboardContinuationMonitorOnce,
 } from "./codex-injector-runtime.mjs";
+import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
 import { readCodexQuotaStatus } from "./codex-rate-limits.mjs";
 import { createTaskboardSupervisor } from "./taskboard-supervisor.mjs";
 import {
@@ -83,6 +84,8 @@ const hostResponseMessage = "__codexTaskboardHostResponseV1";
 const hostHeartbeatMessage = "__codexTaskboardHostHeartbeatV1";
 const hostStartupTokenName = "__codexTaskboardHostStartupTokenV1";
 const hostCapability = randomUUID();
+const hostRequestQueueGlobalName = "__CODEX_TASKBOARD_HOST_REQUEST_QUEUE_V1__";
+const hostRequestQueueName = `${hostBindingName}_queue_${randomBytes(16).toString("hex")}`;
 const injectionSourceHashName = "__CODEX_TASKBOARD_SOURCE_HASH__";
 const injectionScriptIdentifierName = "__CODEX_TASKBOARD_SCRIPT_IDENTIFIER__";
 const codexAutomationMethods = new Set([
@@ -96,10 +99,6 @@ const taskConversationOperations = new Map();
 const taskConversationFailureTtlMs = 120_000;
 const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
 const backgroundContinuationIntervalMs = 15_000;
-const backgroundContinuationReceiptDirectory = path.join(
-  taskboardDataDirectory,
-  "background-continuation-receipts",
-);
 const quotaPolicyTimers = new Map();
 const quotaPolicyRecords = new Map();
 const quotaPolicyQueues = new Map();
@@ -1136,6 +1135,14 @@ async function requestCodexAppServerViaCdp(
   return response.result;
 }
 
+function initializeHostRequestQueueExpression(queueName) {
+  return `(() => {
+    const queueName = ${JSON.stringify(queueName)};
+    if (!Array.isArray(window[queueName])) window[queueName] = [];
+    return window[queueName].length;
+  })()`;
+}
+
 async function applyTaskboardAutomationPolicy(
   request,
   rpc,
@@ -1670,23 +1677,50 @@ async function readTaskboardAgentLaneSnapshot(projectId) {
   return response.json();
 }
 
-async function claimBackgroundContinuationReceipt(deliveryKey) {
-  await mkdir(backgroundContinuationReceiptDirectory, { recursive: true, mode: 0o700 });
-  const digest = createHash("sha256").update(deliveryKey).digest("hex");
-  const receiptPath = path.join(backgroundContinuationReceiptDirectory, `${digest}.json`);
-  let descriptor;
-  try {
-    descriptor = await open(receiptPath, "wx", 0o600);
-  } catch (error) {
-    if (error.code === "EEXIST") return false;
-    throw error;
+async function claimBackgroundContinuationReceipt(claim) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootThreadId: claim.rootThreadId,
+        expectedResumeToken: claim.expectedResumeToken,
+        safeActionId: claim.safeActionId,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return false;
+  if (!response.ok) {
+    throw new Error(`Taskboard bootstrap reservation returned HTTP ${response.status}`);
   }
-  try {
-    await descriptor.writeFile(`${JSON.stringify({ claimedAt: new Date().toISOString() })}\n`);
-  } finally {
-    await descriptor.close();
+  const result = await response.json();
+  if (
+    result?.receipt?.taskId !== claim.taskId
+    || result.receipt.rootThreadId !== claim.rootThreadId
+    || result.receipt.resumeToken !== claim.expectedResumeToken
+    || result.receipt.safeActionId !== claim.safeActionId
+    || typeof result.reused !== "boolean"
+  ) {
+    throw new Error("Taskboard returned an invalid bootstrap reservation receipt");
   }
-  return true;
+  return result.reused === false;
+}
+
+function validateGitExecutionTarget(targetRoot) {
+  const result = spawnSync(
+    "git",
+    ["-C", targetRoot, "rev-parse", "--show-toplevel"],
+    { encoding: "utf8", timeout: 3_000 },
+  );
+  const resolvedTopLevel = result.status === 0 && typeof result.stdout === "string"
+    ? path.resolve(result.stdout.trim())
+    : null;
+  if (resolvedTopLevel !== path.resolve(targetRoot)) {
+    throw new Error("Execution target must be the exact root of an available Git worktree");
+  }
 }
 
 async function runBackgroundContinuationMonitor(cdp) {
@@ -1711,6 +1745,7 @@ async function runBackgroundContinuationMonitor(cdp) {
           params,
           10_000,
         ),
+        validateGitExecutionTarget,
       ),
     });
   }
@@ -1718,8 +1753,24 @@ async function runBackgroundContinuationMonitor(cdp) {
 
 function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   let activeContextId = null;
+  let activeMainContextId = null;
   let installInFlight = null;
   let backgroundContinuationTimer = null;
+  let hostRequestQueueTimer = null;
+  let hostRequestQueueInFlight = false;
+  let taskboardNetworkProxyInstalled = false;
+  const mainContextsByFrame = new Map();
+
+  cdp.on("Runtime.executionContextCreated", ({ context }) => {
+    if (context.auxData?.isDefault === true && typeof context.auxData.frameId === "string") {
+      mainContextsByFrame.set(context.auxData.frameId, context.id);
+    }
+  });
+  cdp.on("Runtime.executionContextDestroyed", ({ executionContextId }) => {
+    for (const [frameId, contextId] of mainContextsByFrame) {
+      if (contextId === executionContextId) mainContextsByFrame.delete(frameId);
+    }
+  });
 
   const scheduleBackgroundContinuation = () => {
     if (backgroundContinuationTimer || cdp.closed) return;
@@ -1736,11 +1787,78 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
     backgroundContinuationTimer.unref?.();
   };
 
-  cdp.on("Runtime.bindingCalled", async (params) => {
-    if (params.name !== hostBindingName) return;
-    if (params.executionContextId !== activeContextId) return;
-    await handleHostBindingPayload(params, {
-      isAuthorizedContext: (executionContextId) => executionContextId === activeContextId,
+  const installTaskboardNetworkProxy = async () => {
+    if (taskboardNetworkProxyInstalled) return;
+    taskboardNetworkProxyInstalled = true;
+    cdp.on("Fetch.requestPaused", async ({ requestId, request }) => {
+      const requestUrl = typeof request?.url === "string" ? request.url : "";
+      if (!(requestUrl === taskboardBaseUrl || requestUrl.startsWith(`${taskboardBaseUrl}/`))) {
+        await cdp.send("Fetch.continueRequest", { requestId });
+        return;
+      }
+      try {
+        const browserOrigin = request.headers?.Origin || request.headers?.origin;
+        const corsOrigin = browserOrigin === "app://-" ? "app://-" : "null";
+        const requestedHeaders = Object.entries(request.headers || {}).filter(([name]) => !(
+          /^(?:host|connection|content-length|accept-encoding|origin|referer)$/i.test(name)
+          || /^sec-fetch-/i.test(name)
+        ));
+        if (request.method === "OPTIONS") {
+          await cdp.send("Fetch.fulfillRequest", {
+            requestId,
+            responseCode: 204,
+            responseHeaders: [
+              { name: "access-control-allow-origin", value: corsOrigin },
+              { name: "access-control-allow-private-network", value: "true" },
+              { name: "access-control-allow-methods", value: "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS" },
+              {
+                name: "access-control-allow-headers",
+                value: request.headers?.["Access-Control-Request-Headers"]
+                  || request.headers?.["access-control-request-headers"]
+                  || "content-type",
+              },
+            ],
+          });
+          return;
+        }
+        const method = request.method || "GET";
+        const response = await proxyTaskboardRequest(requestUrl, request, requestedHeaders);
+        const responseHeaders = Array.from(response.headers.entries())
+          .filter(([name]) => !/^(?:content-length|content-encoding|transfer-encoding|connection)$/i.test(name))
+          .map(([name, value]) => ({ name, value }));
+        responseHeaders.push(
+          { name: "access-control-allow-origin", value: corsOrigin },
+          { name: "access-control-allow-private-network", value: "true" },
+        );
+        const body = method === "HEAD"
+          ? ""
+          : Buffer.from(await response.arrayBuffer()).toString("base64");
+        await cdp.send("Fetch.fulfillRequest", {
+          requestId,
+          responseCode: response.status,
+          responsePhrase: response.statusText,
+          responseHeaders,
+          body,
+        });
+      } catch (_) {
+        if (!cdp.closed) {
+          try {
+            await cdp.send("Fetch.failRequest", {
+              requestId,
+              errorReason: "Failed",
+            });
+          } catch {}
+        }
+      }
+    });
+    await cdp.send("Fetch.enable", {
+      patterns: [{ urlPattern: `${taskboardOrigin}/*`, requestStage: "Request" }],
+    });
+  };
+
+  const handleAuthorizedHostPayload = (payload, executionContextId = activeContextId) => (
+    handleHostBindingPayload({ executionContextId, payload }, {
+      isAuthorizedContext: (candidateContextId) => candidateContextId === activeContextId,
       parseAutomationRequest: parseTaskboardAutomationHostRequest,
       ensure: () => supervisor.ensure({ force: true }),
       loadFrame: (request) => loadTaskboardFrameViaCdp(
@@ -1783,17 +1901,64 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
           params,
           10_000,
         ),
+        validateGitExecutionTarget,
       ),
-      sendResponse: (executionContextId, response) => (
-        sendHostResponse(cdp, executionContextId, response)
+      sendResponse: (candidateContextId, response) => (
+        sendHostResponse(cdp, candidateContextId, response)
       ),
-    });
+    })
+  );
+
+  const pollHostRequestQueue = async () => {
+    if (hostRequestQueueInFlight || cdp.closed || !activeMainContextId || !activeContextId) return;
+    hostRequestQueueInFlight = true;
+    try {
+      const drained = await cdp.send("Runtime.evaluate", {
+        contextId: activeMainContextId,
+        expression: `(() => {
+          const queue = window[${JSON.stringify(hostRequestQueueName)}];
+          return Array.isArray(queue) ? queue.splice(0, queue.length) : [];
+        })()`,
+        returnByValue: true,
+      });
+      const envelopes = Array.isArray(drained.result.value) ? drained.result.value : [];
+      for (const envelope of envelopes) {
+        if (
+          !envelope
+          || envelope.capability !== hostCapability
+          || !envelope.payload
+          || typeof envelope.payload !== "object"
+        ) continue;
+        await handleAuthorizedHostPayload(JSON.stringify(envelope.payload));
+      }
+    } catch (error) {
+      if (!cdp.closed) console.error(`Taskboard host request queue failed: ${error.message}`);
+    } finally {
+      hostRequestQueueInFlight = false;
+      if (cdp.closed && hostRequestQueueTimer) {
+        clearInterval(hostRequestQueueTimer);
+        hostRequestQueueTimer = null;
+      }
+    }
+  };
+
+  cdp.on("Runtime.bindingCalled", async (params) => {
+    if (params.name !== hostBindingName || params.executionContextId !== activeContextId) return;
+    await handleAuthorizedHostPayload(params.payload, params.executionContextId);
   });
 
   async function install() {
     if (installInFlight) return installInFlight;
     installInFlight = (async () => {
       const { frameTree } = await cdp.send("Page.getFrameTree");
+      const mainContextDeadline = Date.now() + 3_000;
+      while (!mainContextsByFrame.has(frameTree.frame.id) && Date.now() < mainContextDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      activeMainContextId = mainContextsByFrame.get(frameTree.frame.id) ?? null;
+      if (!activeMainContextId) {
+        throw new Error("Codex main execution context is unavailable");
+      }
       const isolatedWorld = await cdp.send("Page.createIsolatedWorld", {
         frameId: frameTree.frame.id,
         worldName: "codex-taskboard-host",
@@ -1803,6 +1968,16 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         name: hostBindingName,
         executionContextId: activeContextId,
       });
+      await cdp.send("Runtime.evaluate", {
+        contextId: activeMainContextId,
+        expression: initializeHostRequestQueueExpression(hostRequestQueueName),
+        returnByValue: true,
+      });
+      await installTaskboardNetworkProxy();
+      if (!hostRequestQueueTimer) {
+        hostRequestQueueTimer = setInterval(() => void pollHostRequestQueue(), 50);
+        hostRequestQueueTimer.unref?.();
+      }
       await cdp.send("Runtime.evaluate", {
         contextId: activeContextId,
         expression: `(() => {
@@ -1884,6 +2059,19 @@ async function readInjectionStatus(cdp) {
   return status.result.value;
 }
 
+async function waitForHostHeartbeat(cdp, startupToken, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const heartbeat = await cdp.send("Runtime.evaluate", {
+      expression: `window[${JSON.stringify(hostStartupTokenName)}] === ${JSON.stringify(startupToken)}`,
+      returnByValue: true,
+    });
+    if (heartbeat.result.value === true) return;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("Timed out waiting for the Taskboard host heartbeat");
+}
+
 async function waitForInjectionStatus(cdp, shouldOpen, expectedSourceHash, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let status = await readInjectionStatus(cdp);
@@ -1928,6 +2116,31 @@ async function registerInjectionSource(cdp, source) {
   return registration.identifier;
 }
 
+function taskboardRequestBody(request, method) {
+  if (method === "GET" || method === "HEAD") return undefined;
+  if (Array.isArray(request.postDataEntries)) {
+    return Buffer.concat(request.postDataEntries.map((entry) => {
+      if (typeof entry?.bytes !== "string") {
+        throw new Error("Taskboard proxy received an unreadable request body entry");
+      }
+      return Buffer.from(entry.bytes, "base64");
+    }));
+  }
+  return typeof request.postData === "string"
+    ? Buffer.from(request.postData, "utf8")
+    : undefined;
+}
+
+async function proxyTaskboardRequest(requestUrl, request, requestedHeaders) {
+  const method = request.method || "GET";
+  return fetch(requestUrl, {
+    method,
+    headers: Object.fromEntries(requestedHeaders),
+    body: taskboardRequestBody(request, method),
+    redirect: "follow",
+  });
+}
+
 async function injectTarget(
   runtime,
   target,
@@ -1964,10 +2177,14 @@ async function injectTarget(
         registerCurrentSource: (currentSource) => registerInjectionSource(cdp, currentSource),
         evaluateCurrentSource: (currentSource) => evaluateInjectionSource(cdp, currentSource),
         publishRegistration: (identifier) => publishInjectionScriptIdentifier(cdp, identifier),
-        reopen: () => cdp.send("Runtime.evaluate", {
-          expression: "window.__codexTaskboardInjection__?.open()",
-          returnByValue: true,
-        }),
+        reopen: async () => {
+          await hostBridge.publishHeartbeat();
+          await waitForHostHeartbeat(cdp, startupToken);
+          return cdp.send("Runtime.evaluate", {
+            expression: "window.__codexTaskboardInjection__?.open()",
+            returnByValue: true,
+          });
+        },
       });
       cdp.on("Page.loadEventFired", async () => {
         await hostBridge.install();
@@ -1975,6 +2192,7 @@ async function injectTarget(
         await hostBridge.publishHeartbeat();
       });
       await hostBridge.publishHeartbeat();
+      await waitForHostHeartbeat(cdp, startupToken);
       if (shouldOpen && !reconciled.shouldRemainOpen) {
         await cdp.send("Runtime.evaluate", {
           expression: "window.__codexTaskboardInjection__?.open()",
@@ -1982,15 +2200,27 @@ async function injectTarget(
         });
       }
       const shouldRemainOpen = shouldOpen || reconciled.shouldRemainOpen;
-      const status = await waitForInjectionStatus(
+      let status = await waitForInjectionStatus(
         cdp,
         shouldRemainOpen,
         sourceHash,
         15_000,
       );
-      const frameLoaded = status.frameUrl
+      let frameLoaded = status.frameUrl
         ? await waitForFrame(cdp, status.frameUrl, 15_000)
         : false;
+      if (shouldRemainOpen && (!status.frameReady || !frameLoaded)) {
+        await hostBridge.publishHeartbeat();
+        await waitForHostHeartbeat(cdp, startupToken);
+        await cdp.send("Runtime.evaluate", {
+          expression: "window.__codexTaskboardInjection__?.open()",
+          returnByValue: true,
+        });
+        status = await waitForInjectionStatus(cdp, true, sourceHash, 15_000);
+        frameLoaded = status.frameUrl
+          ? await waitForFrame(cdp, status.frameUrl, 15_000)
+          : false;
+      }
       if (shouldRemainOpen && (!status.frameReady || !frameLoaded)) {
         throw new Error("Taskboard frame did not report ready in the Codex renderer");
       }
@@ -2008,7 +2238,10 @@ async function injectTarget(
     });
     await evaluateInjectionSource(cdp, source);
     await publishInjectionScriptIdentifier(cdp, scriptIdentifier);
-    if (keepAlive) await hostBridge.publishHeartbeat();
+    if (keepAlive) {
+      await hostBridge.publishHeartbeat();
+      await waitForHostHeartbeat(cdp, startupToken);
+    }
     if (shouldOpen) {
       await waitForInjectionStatus(cdp, false, sourceHash, 60_000);
       await cdp.send("Runtime.evaluate", {
@@ -2020,10 +2253,22 @@ async function injectTarget(
       });
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    const status = await waitForInjectionStatus(cdp, shouldOpen, sourceHash, 15_000);
-    const frameLoaded = status.frameUrl
+    let status = await waitForInjectionStatus(cdp, shouldOpen, sourceHash, 15_000);
+    let frameLoaded = status.frameUrl
       ? await waitForFrame(cdp, status.frameUrl, 15_000)
       : false;
+    if (shouldOpen && (!status.frameReady || !frameLoaded)) {
+      await hostBridge.publishHeartbeat();
+      await waitForHostHeartbeat(cdp, startupToken);
+      await cdp.send("Runtime.evaluate", {
+        expression: "window.__codexTaskboardInjection__?.open()",
+        returnByValue: true,
+      });
+      status = await waitForInjectionStatus(cdp, true, sourceHash, 15_000);
+      frameLoaded = status.frameUrl
+        ? await waitForFrame(cdp, status.frameUrl, 15_000)
+        : false;
+    }
     if (shouldOpen && (!status.frameReady || !frameLoaded)) {
       throw new Error("Taskboard frame did not report ready in the Codex renderer");
     }
@@ -2098,8 +2343,9 @@ async function injectAll(
 
 async function currentInjectionSource() {
   const userScript = await readFile(injectionPath, "utf8");
-  const runtimeSource = `window.__CODEX_TASKBOARD_MANAGED_ORIGIN__ = ${JSON.stringify(taskboardOrigin)};
+const runtimeSource = `window.__CODEX_TASKBOARD_MANAGED_ORIGIN__ = ${JSON.stringify(taskboardOrigin)};
 window.__CODEX_TASKBOARD_HOST_CAPABILITY__ = ${JSON.stringify(hostCapability)};
+window[${JSON.stringify(hostRequestQueueGlobalName)}] = ${JSON.stringify(hostRequestQueueName)};
 window.__CODEX_TASKBOARD_URL__ = ${JSON.stringify(taskboardPageUrl)};
 ${userScript}`;
   const sourceHash = createHash("sha256").update(runtimeSource).digest("hex");
@@ -2167,6 +2413,32 @@ async function main() {
   let idleAfterNormalExit = false;
   let openRequestGeneration = options.open ? 1 : 0;
   let openedRequestGeneration = 0;
+  const nativeTaskboardPanelOpener = createNativeTaskboardPanelOpener({
+    hasLivePanel: async () => {
+      const response = await fetch(`${taskboardBaseUrl}/api/local/taskboard-panel-presence`, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (!response.ok) throw new Error(`Taskboard panel presence returned ${response.status}`);
+      return (await response.json()).live === true;
+    },
+    openPanel: async () => {
+      const deepLink = new URL("codex://threads/new");
+      deepLink.searchParams.set("browserUrl", taskboardPageUrl);
+      await new Promise((resolve, reject) => {
+        const child = spawn("/usr/bin/open", [deepLink.toString()], {
+          env: withoutTaskboardLauncherEnvironment(process.env),
+          stdio: "ignore",
+        });
+        child.once("error", reject);
+        child.once("close", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`LaunchServices could not open Taskboard (${code})`));
+        });
+      });
+    },
+    focusApp: () => activateCodexApp(codexAppPid),
+  });
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
   const queueTaskboardOpen = () => {
     openRequestGeneration += 1;
@@ -2180,21 +2452,15 @@ async function main() {
     if (!nativeCodexBrowser && !connection) return false;
     try {
       if (nativeCodexBrowser) {
-        const deepLink = new URL("codex://threads/new");
-        deepLink.searchParams.set("browserUrl", taskboardPageUrl);
-        await new Promise((resolve, reject) => {
-          const child = spawn("/usr/bin/open", [deepLink.toString()], {
-            env: withoutTaskboardLauncherEnvironment(process.env),
-            stdio: "ignore",
-          });
-          child.once("error", reject);
-          child.once("close", (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(`LaunchServices could not open Taskboard (${code})`));
-          });
-        });
+        const result = await nativeTaskboardPanelOpener.openOrFocus();
         openedRequestGeneration = Math.max(openedRequestGeneration, generation);
-        console.log(JSON.stringify({ openedTaskboardInExistingCodex: true }));
+        console.log(JSON.stringify(
+          result.action === "opened"
+            ? { openedTaskboardInExistingCodex: true }
+            : result.action === "opening"
+              ? { openingTaskboardInExistingCodex: true }
+              : { reusedTaskboardInExistingCodex: true },
+        ));
         return true;
       }
       const evaluation = await connection.send("Runtime.evaluate", {

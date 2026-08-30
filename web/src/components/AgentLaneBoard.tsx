@@ -205,6 +205,8 @@ function TodoCard({
         <div><dt>工作日志</dt><dd>{todo.workingLog ? `${todo.workingLog.status}: ${todo.workingLog.path}` : "未记录"}</dd></div>
         <div><dt>执行</dt><dd>{todo.run ? RUN_STATE_LABELS[todo.run.state] : "未启动"}</dd></div>
         <div><dt>关注</dt><dd>{ATTENTION_LABELS[todo.continuation.attention]}</dd></div>
+        <div><dt>消息排队</dt><dd>{todo.inbox.pendingCount > 0 ? `${todo.inbox.pendingCount} 条（当前工作继续）` : "0 条"}</dd></div>
+        <div><dt>交接待确认</dt><dd>{todo.handoffs.pendingAcknowledgementCount} 条</dd></div>
       </dl>
       {(todo.readyWork.safeActions.length > 0 || todo.readyWork.deferredActions.length > 0) && (
         <div className="agent-todo-authorization-summary" aria-label="任务授权状态">
@@ -396,7 +398,11 @@ export function AgentLaneBoard({
         <div>
           <span className="agent-lanes-eyebrow">开发状态</span>
           <h2 id="agent-lanes-title">{projectName}</h2>
-          <p>由 Root 分工，Sub-Agent 执行，结果自动回到待办。</p>
+          <p>{snapshot.coordination.assignment === "lease"
+            ? "窗口平级领取 Capsule；当前协调租约只负责项目分工，每个窗口管理自己的 Sub-Agent。"
+            : snapshot.coordination.assignment === "unassigned"
+              ? "窗口平级领取 Capsule；当前没有有效协调租约，执行认领保持关闭。"
+              : "窗口平级领取 Capsule；当前配置的协调窗口只负责项目分工，每个窗口管理自己的 Sub-Agent。"}</p>
         </div>
         <div className="agent-lanes-policy" aria-label="安全状态">
           <span>自动同步</span>

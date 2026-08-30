@@ -90,6 +90,7 @@ import {
   setEmbeddedFrameChallenge,
 } from "./embeddedHost.mjs";
 import { buildIssueUrl, readIssueIdentifier } from "./issueRoute";
+import { installTaskboardPanelPresence } from "./panelPresence";
 import {
   getTaskboardI18n,
   resolveTaskboardLanguage,
@@ -709,6 +710,7 @@ export function App() {
   const query = useMemo(() => new URL(document.baseURI).searchParams, []);
   const host = query.get("host");
   const embedded = host === "codex" || host === "workbuddy" || host === "deepseek-harness";
+  useEffect(() => installTaskboardPanelPresence(), []);
   const undoShortcut = navigator.userAgent.includes("Macintosh") ? "⌘Z" : "Ctrl+Z";
   const [theme, setTheme] = useState<Theme>(getInitialTheme);
   const [hostContext, setHostContext] = useState<HostContext | null>(null);
@@ -2880,7 +2882,7 @@ export function App() {
       ));
       return false;
     }
-    if (!target.rootThreadId || !target.codexHostId || !target.worktreePath || !safeActionId || !resumeToken) {
+    if (!target.rootThreadId || !target.codexHostId || !target.rootWorkspacePath || !target.worktreePath || !safeActionId || !resumeToken) {
       setActionError(text("待办没有可用的 Root / worktree 交付目标。", "This Todo has no dispatchable Root/worktree target."));
       return false;
     }
@@ -2904,6 +2906,7 @@ export function App() {
         todoId,
         rootThreadId: target.rootThreadId,
         codexHostId: target.codexHostId,
+        rootWorkspacePath: target.rootWorkspacePath,
         targetRoot: target.worktreePath,
         safeActionId,
         expectedResumeToken: resumeToken,

@@ -17,7 +17,7 @@ afterEach(async () => {
   )));
 });
 
-async function fixture() {
+async function fixture(projectConfig = null) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "agent-lanes-"));
   directories.push(directory);
   const sessionsDirectory = path.join(directory, "sessions", "2026", "08", "23");
@@ -40,7 +40,7 @@ async function fixture() {
   await writeFile(configPath, JSON.stringify({
     version: 2,
     projects: {
-      "capstone-dev": {
+      "capstone-dev": projectConfig ?? {
         rootTaskId: "root",
         tasks: [
           { id: "root", label: "Capstone Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1" },
@@ -85,6 +85,19 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
   assert.equal(snapshot.readOnly, true);
   assert.equal(snapshot.automaticRecoveryEnabled, false);
   assert.equal(snapshot.version, 3);
+  assert.deepEqual(snapshot.coordination, {
+    model: "peer_windows_with_configured_coordinator",
+    coordinatorTaskId: "root",
+    coordinatorStableIdentity: "capstone-dev:task:root",
+    assignment: "configured",
+    replaceable: false,
+    scope: "project",
+    crossWindowProtocol: "task_capsule_claim_checkpoint_receipt",
+    subagentAuthority: "window_root",
+    stateAuthority: "self_learning_checkpoint",
+    workAuthority: "todo_claim_lease",
+    runtimeOwnership: "single_writer",
+  });
   assert.deepEqual(snapshot.taskLanes.map((lane) => lane.id), ["root", "visual", "taskboard"]);
   assert.deepEqual(snapshot.adapters.map((lane) => lane.id), ["claude", "pi"]);
   assert.deepEqual(snapshot.rootSubagents.map((agent) => agent.agentPath), ["/root/ui_review", "/root/retrieval_review"]);
@@ -118,6 +131,194 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
 
   assert.equal(snapshot.adapters[0].connection, "not_connected");
   assert.equal(snapshot.adapters[0].continuity.state, "adapter_off");
+  assert.deepEqual(snapshot.adapters[0].adapterContract, {
+    version: 1,
+    providerId: "claude",
+    state: "disabled",
+    reasonCode: "ADAPTER_NOT_CONFIGURED",
+    transport: null,
+    capabilities: {
+      inspect: false,
+      dispatch: false,
+      wait: false,
+      checkpointReceipt: false,
+    },
+  });
+});
+
+test("projects a provider-neutral disabled adapter contract and rejects unimplemented connected adapters", async () => {
+  const base = {
+    rootTaskId: "root",
+    tasks: [{
+      id: "root",
+      label: "Project coordinator",
+      owner: "Codex",
+      source: "codex",
+      threadId: "root-thread",
+      taskType: "root_task",
+    }],
+  };
+  const paths = await fixture({
+    ...base,
+    adapters: [{
+      id: "future",
+      label: "Future provider",
+      owner: "External",
+      source: "future-provider",
+      connection: "not_connected",
+    }],
+  });
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.adapters[0].source, "future-provider");
+  assert.equal(snapshot.adapters[0].connection, "not_connected");
+  assert.deepEqual(snapshot.adapters[0].adapterContract, {
+    version: 1,
+    providerId: "future-provider",
+    state: "disabled",
+    reasonCode: "ADAPTER_NOT_CONFIGURED",
+    transport: null,
+    capabilities: {
+      inspect: false,
+      dispatch: false,
+      wait: false,
+      checkpointReceipt: false,
+    },
+  });
+
+  const unsafePaths = await fixture({
+    ...base,
+    adapters: [{
+      id: "future",
+      label: "Future provider",
+      owner: "External",
+      source: "future-provider",
+      connection: "connected",
+    }],
+  });
+  await assert.rejects(
+    createAgentLaneSnapshotProvider(unsafePaths).getProjectSnapshot("capstone-dev"),
+    (error) => error?.code === "AGENT_LANES_NOT_CONFIGURED",
+  );
+});
+
+test("projects one isolated Sub-Agent tree per configured Codex window", async () => {
+  const paths = await fixture();
+  await appendFile(paths.visualPath, `\n${JSON.stringify({
+    timestamp: "2026-08-23T08:03:30.000Z",
+    type: "event_msg",
+    payload: {
+      type: "sub_agent_activity",
+      agent_thread_id: "visual-review-thread",
+      agent_path: "/root/visual_review",
+      kind: "started",
+    },
+  })}`);
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.deepEqual(snapshot.windowSubagentTrees.map((tree) => ({
+    windowTaskId: tree.windowTaskId,
+    observed: tree.observed,
+    agents: tree.subagents.map((agent) => agent.agentPath),
+  })), [
+    { windowTaskId: "root", observed: true, agents: ["/root/ui_review", "/root/retrieval_review"] },
+    { windowTaskId: "visual", observed: true, agents: ["/root/visual_review"] },
+    { windowTaskId: "taskboard", observed: false, agents: [] },
+  ]);
+  assert.equal(snapshot.windowSubagentTrees[0].stableIdentity, "capstone-dev:window:root");
+  assert.equal(snapshot.windowSubagentTrees[1].subagents[0].parentTaskId, "visual");
+  assert.deepEqual(snapshot.rootSubagents.map((agent) => agent.agentPath), [
+    "/root/ui_review",
+    "/root/retrieval_review",
+  ]);
+});
+
+test("assigns project coordination through an active replaceable lease", async () => {
+  const paths = await fixture({
+    coordinatorLease: {
+      id: "lease-1",
+      holderTaskId: "visual",
+      acquiredAt: "2026-08-23T08:00:00.000Z",
+      expiresAt: "2026-08-23T08:10:00.000Z",
+    },
+    tasks: [
+      { id: "root", label: "Capstone Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1" },
+      { id: "visual", label: "Capstone Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1" },
+    ],
+    adapters: [],
+  });
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.deepEqual(snapshot.coordination, {
+    model: "peer_windows_with_coordinator_lease",
+    coordinatorTaskId: "visual",
+    coordinatorStableIdentity: "capstone-dev:task:visual",
+    assignment: "lease",
+    replaceable: true,
+    scope: "project",
+    lease: {
+      id: "lease-1",
+      status: "active",
+      acquiredAt: "2026-08-23T08:00:00.000Z",
+      expiresAt: "2026-08-23T08:10:00.000Z",
+    },
+    crossWindowProtocol: "task_capsule_claim_checkpoint_receipt",
+    subagentAuthority: "window_root",
+    stateAuthority: "self_learning_checkpoint",
+    workAuthority: "todo_claim_lease",
+    runtimeOwnership: "single_writer",
+  });
+  assert.deepEqual(snapshot.rootSubagents, []);
+});
+
+test("an expired coordinator lease fails closed without restoring fixed authority", async () => {
+  const paths = await fixture({
+    coordinatorLease: {
+      id: "lease-expired",
+      holderTaskId: "root",
+      acquiredAt: "2026-08-23T07:00:00.000Z",
+      expiresAt: "2026-08-23T08:04:59.000Z",
+    },
+    tasks: [
+      { id: "root", label: "Capstone Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1" },
+    ],
+    adapters: [],
+  });
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.equal(snapshot.coordination.coordinatorTaskId, null);
+  assert.equal(snapshot.coordination.coordinatorStableIdentity, null);
+  assert.equal(snapshot.coordination.assignment, "unassigned");
+  assert.equal(snapshot.coordination.replaceable, true);
+  assert.deepEqual(snapshot.coordination.lease, {
+    id: "lease-expired",
+    status: "expired",
+    acquiredAt: "2026-08-23T07:00:00.000Z",
+    expiresAt: "2026-08-23T08:04:59.000Z",
+  });
+  assert.deepEqual(snapshot.rootSubagents, []);
+});
+
+test("rejects a malformed coordinator lease instead of restoring legacy Root authority", async () => {
+  const paths = await fixture({
+    rootTaskId: "root",
+    coordinatorLease: {
+      id: "lease-invalid",
+      holderTaskId: "missing-window",
+      acquiredAt: "2026-08-23T08:00:00.000Z",
+      expiresAt: "2026-08-23T08:10:00.000Z",
+    },
+    tasks: [
+      { id: "root", label: "Capstone Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1" },
+    ],
+    adapters: [],
+  });
+
+  await assert.rejects(
+    createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev"),
+    (error) => error.code === "AGENT_LANES_NOT_CONFIGURED",
+  );
 });
 
 test("reconciliation processes completed Sub-Agents beyond the display limit", async () => {
@@ -164,6 +365,51 @@ test("reconciliation processes completed Sub-Agents beyond the display limit", a
   assert.equal(snapshot.rootSubagents.length, 12);
   await provider.reconcileProject("capstone-dev");
   assert.equal(completed.length, 13);
+});
+
+test("reconciliation processes completed Sub-Agents from peer Talking Windows", async () => {
+  const paths = await fixture();
+  await appendFile(paths.rootPath, `\n${[
+    JSON.stringify({ timestamp: "2026-08-23T08:05:40.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "root-review-thread", agent_path: "/root/review", kind: "started" } }),
+    JSON.stringify({ timestamp: "2026-08-23T08:05:50.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/review", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nRoot review complete" }] } }),
+  ].join("\n")}`);
+  await appendFile(paths.visualPath, `\n${[
+    JSON.stringify({ timestamp: "2026-08-23T08:06:00.000Z", type: "event_msg", payload: { type: "sub_agent_activity", agent_thread_id: "peer-review-thread", agent_path: "/root/review", kind: "started" } }),
+    JSON.stringify({ timestamp: "2026-08-23T08:06:30.000Z", type: "response_item", payload: { type: "agent_message", author: "/root/review", recipient: "/root", content: [{ type: "input_text", text: "Message Type: FINAL_ANSWER\nPeer review complete" }] } }),
+  ].join("\n")}`);
+  const completed = [];
+  const provider = createAgentLaneSnapshotProvider({
+    ...paths,
+    listTasks: async () => ["root", "peer"].map((kind) => ({
+      id: `${kind}-task`,
+      identifier: `${kind.toUpperCase()}-1`,
+      title: `${kind} review`,
+      status: "in_progress",
+      labels: ["agent-todo"],
+      archivedAt: null,
+      threadId: `${kind}-review-thread`,
+    })),
+    getClaim: async (taskId) => ({
+      agentPath: "/root/review",
+      agentThreadId: `${taskId.replace("-task", "")}-review-thread`,
+      status: "active",
+      claimedAt: "2026-08-23T08:05:30.000Z",
+      leaseExpiresAt: "2026-08-23T09:00:00.000Z",
+      writeScope: ["test/peer-review.test.mjs"],
+    }),
+    listComments: async () => [],
+    recordCompletion: async (event) => {
+      completed.push(event.agentThreadId);
+      return { applied: true };
+    },
+  });
+
+  const snapshot = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.rootSubagents.some((agent) => agent.agentThreadId === "peer-review-thread"), false);
+  assert.equal(snapshot.windowSubagentTrees.find((tree) => tree.windowTaskId === "visual")
+    .subagents.some((agent) => agent.agentThreadId === "peer-review-thread"), true);
+  await provider.reconcileProject("capstone-dev");
+  assert.deepEqual(completed, ["root-review-thread", "peer-review-thread"]);
 });
 
 test("marks a configured Codex lane disconnected when its session evidence disappears", async () => {
