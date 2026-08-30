@@ -5,9 +5,75 @@ const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 const coordinationDeliveries = new Map();
 const COORDINATION_DEDUPLICATION_MS = 60_000;
 const continuationMonitorRuns = new Map();
+const ownerDecisionMonitorRuns = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
 const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
+const OWNER_DECISION_MARKER = "TASKBOARD_OWNER_DECISION_V1";
+
+function collectStringValues(value, output = []) {
+  if (typeof value === "string") output.push(value);
+  else if (Array.isArray(value)) value.forEach((entry) => collectStringValues(entry, output));
+  else if (value && typeof value === "object") {
+    Object.values(value).forEach((entry) => collectStringValues(entry, output));
+  }
+  return output;
+}
+
+function normalizedMessageRole(value) {
+  const role = typeof value?.role === "string" ? value.role.toLowerCase() : "";
+  const type = typeof value?.type === "string"
+    ? value.type.toLowerCase().replaceAll(/[^a-z]/g, "")
+    : "";
+  if (role === "user" || type.includes("usermessage")) return "user";
+  if (role === "assistant" || role === "agent"
+    || type.includes("assistantmessage") || type.includes("agentmessage")) return "assistant";
+  return null;
+}
+
+function turnTextsForRole(turn, role) {
+  const output = [];
+  if (role === "user" && turn?.input !== undefined) collectStringValues(turn.input, output);
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (normalizedMessageRole(value) === role) {
+      collectStringValues(value.content ?? value.text ?? value.message ?? value.input, output);
+      return;
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(turn?.items ?? turn?.messages ?? turn?.output);
+  return output;
+}
+
+function deliveryMarker(deliveryId) {
+  return `Taskboard Owner decision delivery id: ${deliveryId}`;
+}
+
+function findDeliveryTurn(turns, deliveryId) {
+  const marker = deliveryMarker(deliveryId);
+  return turns.find((turn) => collectStringValues(turn).some((text) => text.includes(marker))) ?? null;
+}
+
+function parseOwnerDecisionMarker(text, requestId) {
+  const markerIndex = text.indexOf(OWNER_DECISION_MARKER);
+  if (markerIndex < 0) return null;
+  const payloadText = text.slice(markerIndex + OWNER_DECISION_MARKER.length).trim().split(/\r?\n/, 1)[0];
+  let payload;
+  try {
+    payload = JSON.parse(payloadText);
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || Object.keys(payload).some((key) => !["requestId", "outcome", "evidence"].includes(key))
+    || payload.requestId !== requestId
+    || !["authorized", "denied"].includes(payload.outcome)
+    || typeof payload.evidence !== "string"
+    || !payload.evidence.trim()
+    || payload.evidence.length > 4_096) return null;
+  return { outcome: payload.outcome, evidence: payload.evidence.trim() };
+}
 
 function parseHostRequest(payload, parseAutomationRequest) {
   if (typeof payload !== "string" || payload.length > 4_194_304) {
@@ -143,6 +209,193 @@ export async function deliverTaskboardCoordination(request, rpc, validateExecuti
     if (coordinationDeliveries.get(deliveryKey) === entry) coordinationDeliveries.delete(deliveryKey);
   });
   return delivery;
+}
+
+export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = false } = {}) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.route.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.route.rootThreadId
+    || path.resolve(threadResult.thread.cwd ?? "") !== path.resolve(request.route.rootWorkspacePath)) {
+    throw new Error("Owner decision delivery must match the exact confirmed Root thread and workspace");
+  }
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const observedDelivery = findDeliveryTurn(turns, request.deliveryReceipt.id);
+  if (observedDelivery?.id) {
+    return { delivery: "observed", turnId: observedDelivery.id };
+  }
+  if (readOnly) return null;
+  const instruction = [
+    `taskctl issue bootstrap ${request.identifier} --json`,
+    `Owner decision request id: ${request.requestId}`,
+    `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
+    `Coordinator epoch: ${request.coordinatorEpoch}`,
+    deliveryMarker(request.deliveryReceipt.id),
+    `Ask the Owner exactly this one question in this Root window: ${request.message}`,
+    "Do not approve it yourself and do not send the Owner to Taskboard comments. Child agents must only checkpoint or hand off to Root.",
+    `After the Owner answers, bootstrap the issue again. If the request id and token are still exact, answer the Owner normally and include exactly one machine-readable line: ${OWNER_DECISION_MARKER} {"requestId":"${request.requestId}","outcome":"authorized","evidence":"brief actual Owner answer"}. Use outcome "denied" when the Owner denies it. Do not emit this marker before an actual Owner reply.`,
+  ].join("\n");
+  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
+  if (activeTurn?.id) {
+    await rpc("turn/steer", {
+      threadId: request.route.rootThreadId,
+      expectedTurnId: activeTurn.id,
+      input: [{ type: "text", text: instruction }],
+    });
+    return { delivery: "steered", turnId: activeTurn.id };
+  }
+  await rpc("thread/resume", { threadId: request.route.rootThreadId });
+  const started = await rpc("turn/start", {
+    threadId: request.route.rootThreadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a valid Root turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
+}
+
+export async function observeTaskboardOwnerDecision(request, receipt, rpc) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.route.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.route.rootThreadId
+    || path.resolve(threadResult.thread.cwd ?? "") !== path.resolve(request.route.rootWorkspacePath)) {
+    throw new Error("Owner decision observation must match the exact confirmed Root thread and workspace");
+  }
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const deliveryIndex = turns.findIndex((turn) => (
+    turn?.id === receipt.deliveryTurnId
+    || collectStringValues(turn).some((text) => text.includes(deliveryMarker(receipt.id)))
+  ));
+  if (deliveryIndex < 0) return null;
+  let ownerTurn = null;
+  for (let index = deliveryIndex + 1; index < turns.length; index += 1) {
+    const turn = turns[index];
+    const userTexts = turnTextsForRole(turn, "user").filter((text) => (
+      !text.includes(deliveryMarker(receipt.id)) && !text.includes(OWNER_DECISION_MARKER)
+    ));
+    if (userTexts.some((text) => text.trim())) ownerTurn = turn;
+    const marker = turnTextsForRole(turn, "assistant")
+      .map((text) => parseOwnerDecisionMarker(text, request.requestId))
+      .find(Boolean);
+    if (marker && ownerTurn?.id && turn?.id) {
+      return {
+        ...marker,
+        ownerTurnId: ownerTurn.id,
+        rootDecisionTurnId: turn.id,
+        rootThreadId: request.route.rootThreadId,
+      };
+    }
+  }
+  return null;
+}
+
+export async function runOwnerDecisionMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
+    || typeof options?.readSnapshot !== "function"
+    || typeof options?.claimDelivery !== "function"
+    || typeof options?.confirmDelivery !== "function"
+    || typeof options?.deliver !== "function"
+    || typeof options?.observeDecision !== "function"
+    || typeof options?.recordDecision !== "function") {
+    return { delivered: false, reason: "invalid-monitor" };
+  }
+  const existing = ownerDecisionMonitorRuns.get(policy.projectId);
+  if (existing) return existing;
+  const run = runOwnerDecisionMonitorOnceUnlocked(options);
+  ownerDecisionMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (ownerDecisionMonitorRuns.get(policy.projectId) === run) {
+      ownerDecisionMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runOwnerDecisionMonitorOnceUnlocked({
+  policy,
+  readSnapshot,
+  claimDelivery,
+  confirmDelivery,
+  deliver,
+  observeDecision,
+  recordDecision,
+}) {
+  const snapshot = await readSnapshot(policy.projectId);
+  const request = snapshot?.coordination?.ownerDecisionRequest;
+  if (snapshot?.projectId !== policy.projectId
+    || !request
+    || !RESUME_TOKEN_PATTERN.test(request.requestId ?? "")
+    || !RESUME_TOKEN_PATTERN.test(request.expectedResumeToken ?? "")
+    || !COORDINATION_ID_PATTERN.test(request.identifier ?? "")
+    || !COORDINATION_ID_PATTERN.test(request.actionId ?? "")
+    || typeof request.message !== "string"
+    || !request.message.trim()
+    || typeof request.coordinatorEpoch !== "string"
+    || !request.coordinatorEpoch
+    || !THREAD_ID_PATTERN.test(request.route?.rootThreadId ?? "")
+    || typeof request.route?.rootWorkspacePath !== "string"
+    || !path.isAbsolute(request.route.rootWorkspacePath)) {
+    return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  const claim = await claimDelivery(request);
+  if (!claim?.receipt || typeof claim.receipt.id !== "string") {
+    if (claim?.claimed !== true && !["reserved", "already-delivered"].includes(claim?.reason)) {
+      return { delivered: false, reason: claim?.reason ?? "reservation-rejected" };
+    }
+    return { delivered: false, reason: "invalid-reservation" };
+  }
+  let deliveryResult = null;
+  let deliveryReceipt = claim.receipt;
+  if (claim.claimed === true) {
+    deliveryResult = await deliver({ ...request, deliveryReceipt });
+  } else if (claim.reason === "reserved") {
+    deliveryResult = await deliver({ ...request, deliveryReceipt }, { readOnly: true });
+    if (!deliveryResult?.turnId) return { delivered: false, reason: "reserved" };
+  } else if (claim.reason !== "already-delivered") {
+    return { delivered: false, reason: claim.reason ?? "reservation-rejected" };
+  }
+  if (deliveryResult) {
+    const confirmation = await confirmDelivery({
+      deliveryId: deliveryReceipt.id,
+      deliveryTurnId: deliveryResult.turnId,
+    });
+    if (confirmation?.confirmed !== true) {
+      return { delivered: false, reason: "delivery-not-confirmed" };
+    }
+    deliveryReceipt = { ...deliveryReceipt, deliveryTurnId: deliveryResult.turnId };
+  }
+  const decision = await observeDecision(request, deliveryReceipt);
+  if (decision) {
+    const recorded = await recordDecision({
+      taskId: request.identifier,
+      requestId: request.requestId,
+      expectedResumeToken: request.expectedResumeToken,
+      deliveryId: deliveryReceipt.id,
+      ...decision,
+    });
+    if (recorded?.applied !== true && recorded?.applied !== false) {
+      return { delivered: false, reason: "decision-not-recorded" };
+    }
+    return {
+      delivered: claim.claimed === true,
+      requestId: request.requestId,
+      delivery: deliveryResult?.delivery ?? null,
+      decisionRecorded: true,
+    };
+  }
+  return {
+    delivered: claim.claimed === true,
+    requestId: request.requestId,
+    delivery: deliveryResult?.delivery ?? null,
+    awaitingOwner: true,
+  };
 }
 
 export async function runTaskboardContinuationMonitorOnce(options) {

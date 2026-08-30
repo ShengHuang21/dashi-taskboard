@@ -467,6 +467,69 @@ test("one deterministic approval request is emitted after safe work is exhausted
   assert.equal(result.readyWork.approvalRequest.message, "同意推送 exact commit");
   assert.match(result.readyWork.approvalRequest.expectedResumeToken, /^[a-f0-9]{64}$/);
   assert.equal(result.readyWork.approvalRequest.expectedResumeToken, result.resumeToken);
+  assert.deepEqual(result.readyWork.ownerDecisionRequest, result.readyWork.approvalRequest);
+  assert.match(result.readyWork.ownerDecisionRequest.requestId, /^[a-f0-9]{64}$/);
+  assert.equal(result.readyWork.ownerDecisionRequest.gateId, "push");
+  assert.equal(result.readyWork.ownerDecisionRequest.gateKind, "push");
+  assert.equal(result.readyWork.ownerDecisionRequest.requestedAt, "2026-08-26T00:01:00.000Z");
+});
+
+test("a matching Root-attested Owner decision receipt resolves the exact current request", () => {
+  const source = envelopeComment(envelope({
+    gates: [gate("push", "push", "approval_required", {
+      approver: "Owner", approvalRequest: "同意推送 exact commit",
+    })],
+    actions: [action("push", 10, "push", "Push the reviewed commit")],
+  }));
+  const pending = capsule([source]);
+  const request = pending.readyWork.ownerDecisionRequest;
+  const receipt = {
+    id: "decision-1",
+    requestId: request.requestId,
+    taskId: "task-1",
+    projectId: "capstone-dev",
+    actionId: request.actionId,
+    gateId: request.gateId,
+    expectedResumeToken: request.expectedResumeToken,
+    outcome: "authorized",
+    rootTaskId: "root",
+    rootThreadId: "root-thread",
+    coordinatorEpoch: "configured:root",
+    ownerTurnId: "owner-turn-1",
+    evidence: "Owner approved in the confirmed Root window",
+    receipt: "owner-turn:1",
+    decidedAt: "2026-08-26T00:30:00.000Z",
+    authorizationCommentId: source.id,
+    authorizationCommentVersion: source.version,
+    recordedBy: { type: "agent", id: "codex-agent", name: "Codex Agent" },
+    createdAt: "2026-08-26T00:30:01.000Z",
+  };
+  const resolved = capsule([source], {}, { ownerDecisionReceipts: [receipt] });
+
+  assert.deepEqual(resolved.readyWork.safeActions.map((action) => action.id), ["push"]);
+  assert.equal(resolved.readyWork.ownerDecisionRequest, null);
+  assert.equal(resolved.ownerDecisions.appliedReceipts.length, 1);
+  assert.deepEqual(resolved.ownerDecisions.appliedReceipts[0], {
+    id: receipt.id,
+    requestId: receipt.requestId,
+    actionId: receipt.actionId,
+    gateId: receipt.gateId,
+    outcome: receipt.outcome,
+    rootThreadId: receipt.rootThreadId,
+    ownerTurnId: receipt.ownerTurnId,
+    evidence: receipt.evidence,
+    receipt: receipt.receipt,
+    decidedAt: receipt.decidedAt,
+    recordedBy: receipt.recordedBy,
+    createdAt: receipt.createdAt,
+  });
+  assert.notEqual(resolved.resumeToken, pending.resumeToken);
+
+  const stale = capsule([source], {}, {
+    ownerDecisionReceipts: [{ ...receipt, authorizationCommentVersion: source.version + 1 }],
+  });
+  assert.equal(stale.readyWork.ownerDecisionRequest.requestId, request.requestId);
+  assert.deepEqual(stale.ownerDecisions.appliedReceipts, []);
 });
 
 test("structural blockers suppress approval requests", () => {

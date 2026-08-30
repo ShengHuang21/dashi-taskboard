@@ -20,10 +20,13 @@ import {
 } from "../shared/taskboard-automation.mjs";
 import {
   deliverTaskboardCoordination,
+  deliverTaskboardOwnerDecision,
   findResidentInjectorPids,
   handleHostBindingPayload,
   reconcileInjectionRuntime,
   restartResidentInjector,
+  observeTaskboardOwnerDecision,
+  runOwnerDecisionMonitorOnce,
   runTaskboardContinuationMonitorOnce,
 } from "./codex-injector-runtime.mjs";
 import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
@@ -1679,6 +1682,89 @@ async function readTaskboardAgentLaneSnapshot(projectId) {
   return response.json();
 }
 
+function injectorProofHeaders() {
+  const nonce = randomBytes(32).toString("hex");
+  return {
+    "content-type": "application/json",
+    "x-codex-taskboard-injector-nonce": nonce,
+    "x-codex-taskboard-injector-proof": createHmac("sha256", taskboardInstanceSecret)
+      .update(nonce)
+      .digest("hex"),
+  };
+}
+
+async function claimOwnerDecisionDelivery(request, projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/claim`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify(request),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { claimed: false, reason: "stale-route" };
+  if (!response.ok) throw new Error(`Taskboard Owner decision reservation returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.claimed === false && typeof result.reason === "string") return result;
+  if (result?.claimed !== true
+    || typeof result?.receipt?.id !== "string") {
+    throw new Error("Taskboard returned an invalid Owner decision reservation receipt");
+  }
+  return result;
+}
+
+async function confirmOwnerDecisionDelivery(request, projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/confirm`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify(request),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { confirmed: false };
+  if (!response.ok) throw new Error(`Taskboard Owner decision confirmation returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.confirmed !== true || result.deliveryId !== request.deliveryId) {
+    throw new Error("Taskboard returned an invalid Owner decision confirmation receipt");
+  }
+  return result;
+}
+
+async function recordOwnerDecision(request) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(request.taskId)}/owner-decisions`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify({
+        requestId: request.requestId,
+        expectedResumeToken: request.expectedResumeToken,
+        outcome: request.outcome,
+        ownerTurnId: request.ownerTurnId,
+        rootDecisionTurnId: request.rootDecisionTurnId,
+        rootThreadId: request.rootThreadId,
+        evidence: request.evidence,
+        deliveryId: request.deliveryId,
+        receipt: `owner-decision:${request.deliveryId}:${request.rootDecisionTurnId}`,
+        decidedAt: new Date().toISOString(),
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (!response.ok) throw new Error(`Taskboard Owner decision receipt returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.applied !== "boolean") {
+    throw new Error("Taskboard returned an invalid Owner decision receipt");
+  }
+  return result;
+}
+
 async function claimBackgroundContinuationReceipt(claim) {
   const response = await fetch(
     `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`,
@@ -1862,6 +1948,37 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         validateGitExecutionTarget,
       ),
+    });
+    await runOwnerDecisionMonitorOnce({
+      policy: { enabled: true, projectId },
+      readSnapshot: readTaskboardAgentLaneSnapshot,
+      claimDelivery: (request) => claimOwnerDecisionDelivery(request, projectId),
+      confirmDelivery: (request) => confirmOwnerDecisionDelivery(request, projectId),
+      deliver: (request, options) => deliverTaskboardOwnerDecision(
+        request,
+        (method, params) => requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          request.route.codexHostId,
+          method,
+          params,
+          10_000,
+        ),
+        options,
+      ),
+      observeDecision: (request, receipt) => observeTaskboardOwnerDecision(
+        request,
+        receipt,
+        (method, params) => requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          request.route.codexHostId,
+          method,
+          params,
+          10_000,
+        ),
+      ),
+      recordDecision: recordOwnerDecision,
     });
   }
 }

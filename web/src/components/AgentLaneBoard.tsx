@@ -444,6 +444,13 @@ export function AgentLaneBoard({
         <div className="agent-lane-section-heading">
           <h3 id="root-status-title">当前工作</h3>
         </div>
+        {snapshot.coordination.ownerDecisionRequest && (
+          <div className="agent-lane-empty" role="status" aria-label="Root decision request">
+            <strong>Root 需要向你确认一件事</strong>
+            <p>{snapshot.coordination.ownerDecisionRequest.identifier}：{snapshot.coordination.ownerDecisionRequest.message}</p>
+            <small>只在当前 Root 窗口询问；Sub-Agent 继续写 checkpoint 或 handoff。</small>
+          </div>
+        )}
         {rootLane && (
           <div className="agent-lane-grid" role="list">
             <TaskLaneCard lane={rootLane} root onOpenCodexThread={onOpenCodexThread} />

@@ -596,6 +596,118 @@ function parseStandingAuthorityRevocation(body) {
   };
 }
 
+function parseOwnerDecision(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "requestId",
+    "expectedResumeToken",
+    "outcome",
+    "ownerTurnId",
+    "rootDecisionTurnId",
+    "rootThreadId",
+    "evidence",
+    "deliveryId",
+    "receipt",
+    "decidedAt",
+  ]));
+  const outcome = stringField(body.outcome, "outcome", { required: true, maxLength: 32 });
+  if (!["authorized", "denied"].includes(outcome)) {
+    throw new ApiError(400, "INVALID_FIELD", "'outcome' must be authorized or denied");
+  }
+  const requestId = stringField(body.requestId, "requestId", { required: true, maxLength: 64 });
+  const expectedResumeToken = stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 64 });
+  if (!/^[a-f0-9]{64}$/.test(requestId) || !/^[a-f0-9]{64}$/.test(expectedResumeToken)) {
+    throw new ApiError(400, "INVALID_FIELD", "Decision request and resume token must be SHA-256 values");
+  }
+  return {
+    requestId,
+    expectedResumeToken,
+    outcome,
+    ownerTurnId: stringField(body.ownerTurnId, "ownerTurnId", { required: true, maxLength: 256 }),
+    rootDecisionTurnId: stringField(body.rootDecisionTurnId, "rootDecisionTurnId", { required: true, maxLength: 256 }),
+    rootThreadId: stringField(body.rootThreadId, "rootThreadId", { required: true, maxLength: 256 }),
+    evidence: stringField(body.evidence, "evidence", { required: true, maxLength: 4096 }),
+    deliveryId: stringField(body.deliveryId, "deliveryId", { required: true, maxLength: 256 }),
+    receipt: stringField(body.receipt, "receipt", { required: true, maxLength: 256 }),
+    decidedAt: parseIsoTimestamp(body.decidedAt, "decidedAt"),
+  };
+}
+
+function parseOwnerDecisionDeliveryClaim(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "requestId", "expectedResumeToken", "gateId", "gateKind", "actionId", "approver", "message",
+    "scope", "target", "requestedAt", "taskId", "identifier", "priority",
+    "coordinatorEpoch", "route",
+  ]));
+  assertPlainObject(body.route);
+  assertAllowedKeys(body.route, new Set([
+    "rootTaskId", "rootThreadId", "codexHostId", "rootWorkspacePath",
+  ]));
+  const requestId = stringField(body.requestId, "requestId", { required: true, maxLength: 64 });
+  const expectedResumeToken = stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 64 });
+  if (!/^[a-f0-9]{64}$/.test(requestId) || !/^[a-f0-9]{64}$/.test(expectedResumeToken)) {
+    throw new ApiError(400, "INVALID_FIELD", "Delivery request and resume token must be SHA-256 values");
+  }
+  const rootWorkspacePath = stringField(body.route.rootWorkspacePath, "route.rootWorkspacePath", { required: true, maxLength: 4096 });
+  if (!path.isAbsolute(rootWorkspacePath)) {
+    throw new ApiError(400, "INVALID_FIELD", "Owner decision Root workspace must be absolute");
+  }
+  return {
+    requestId,
+    expectedResumeToken,
+    gateId: stringField(body.gateId, "gateId", { required: true, maxLength: 256 }),
+    gateKind: stringField(body.gateKind, "gateKind", { required: true, maxLength: 256 }),
+    actionId: stringField(body.actionId, "actionId", { required: true, maxLength: 256 }),
+    approver: stringField(body.approver, "approver", { required: true, maxLength: 256 }),
+    message: stringField(body.message, "message", { required: true, maxLength: 4096 }),
+    scope: body.scope ?? null,
+    target: body.target ?? null,
+    requestedAt: stringField(body.requestedAt, "requestedAt", { required: true, maxLength: 64 }),
+    taskId: stringField(body.taskId, "taskId", { required: true, maxLength: 256 }),
+    identifier: stringField(body.identifier, "identifier", { required: true, maxLength: 256 }),
+    priority: stringField(body.priority, "priority", { required: true, maxLength: 32 }),
+    coordinatorEpoch: stringField(body.coordinatorEpoch, "coordinatorEpoch", { required: true, maxLength: 512 }),
+    route: {
+      rootTaskId: stringField(body.route.rootTaskId, "route.rootTaskId", { required: true, maxLength: 256 }),
+      rootThreadId: stringField(body.route.rootThreadId, "route.rootThreadId", { required: true, maxLength: 256 }),
+      codexHostId: stringField(body.route.codexHostId, "route.codexHostId", { required: true, maxLength: 256 }),
+      rootWorkspacePath,
+    },
+  };
+}
+
+function parseOwnerDecisionDeliveryConfirmation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["deliveryId", "deliveryTurnId"]));
+  return {
+    deliveryId: stringField(body.deliveryId, "deliveryId", { required: true, maxLength: 256 }),
+    deliveryTurnId: stringField(body.deliveryTurnId, "deliveryTurnId", { required: true, maxLength: 256 }),
+  };
+}
+
+function sameOwnerDecisionDeliveryRequest(left, right) {
+  return Boolean(left && right
+    && left.requestId === right.requestId
+    && left.expectedResumeToken === right.expectedResumeToken
+    && left.gateId === right.gateId
+    && left.gateKind === right.gateKind
+    && left.actionId === right.actionId
+    && left.approver === right.approver
+    && left.message === right.message
+    && JSON.stringify(left.scope ?? null) === JSON.stringify(right.scope ?? null)
+    && JSON.stringify(left.target ?? null) === JSON.stringify(right.target ?? null)
+    && left.requestedAt === right.requestedAt
+    && left.taskId === right.taskId
+    && left.identifier === right.identifier
+    && left.priority === right.priority
+    && left.coordinatorEpoch === right.coordinatorEpoch
+    && left.route?.rootTaskId === right.route?.rootTaskId
+    && left.route?.rootThreadId === right.route?.rootThreadId
+    && left.route?.codexHostId === right.route?.codexHostId
+    && path.resolve(left.route?.rootWorkspacePath ?? "") === path.resolve(right.route?.rootWorkspacePath ?? ""));
+}
+
 function parseProjectReadmeSave(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["content", "version"]));
@@ -671,6 +783,19 @@ function parseThreadBinding(value) {
 function requestHeader(request, name) {
   const value = request.headers[name];
   return Array.isArray(value) ? value[0] : value;
+}
+
+function assertInjectorProof(request, instanceSecret) {
+  const nonce = requestHeader(request, "x-codex-taskboard-injector-nonce");
+  const proof = requestHeader(request, "x-codex-taskboard-injector-proof");
+  if (!instanceSecret
+    || typeof nonce !== "string"
+    || !/^[a-f0-9]{32,128}$/i.test(nonce)
+    || typeof proof !== "string"
+    || !/^[a-f0-9]{64}$/i.test(proof)
+    || createHmac("sha256", instanceSecret).update(nonce).digest("hex") !== proof.toLowerCase()) {
+    throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", "Owner decision delivery reservations require the authenticated host Injector");
+  }
 }
 
 function actorFromRequest(request) {
@@ -2748,6 +2873,41 @@ export function createTaskboardServer(options = {}) {
         });
       }
 
+      const ownerDecisionDeliveryRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/owner-decision-delivery\/(claim|confirm)$/,
+      );
+      if (ownerDecisionDeliveryRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/owner-decision-delivery/:action");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const projectId = decodeRouteSegment(ownerDecisionDeliveryRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (ownerDecisionDeliveryRoute[2] === "confirm") {
+          return sendJson(response, 200, database.confirmOwnerDecisionDelivery(
+            projectId,
+            parseOwnerDecisionDeliveryConfirmation(await readJson(request)),
+          ));
+        }
+        const deliveryRequest = parseOwnerDecisionDeliveryClaim(await readJson(request));
+        let snapshot;
+        try {
+          snapshot = await agentLanes.getProjectSnapshot(projectId);
+        } catch (error) {
+          if (["AGENT_LANES_NOT_CONFIGURED", "AGENT_LANES_CONFIG_UNAVAILABLE"].includes(error?.code)) {
+            throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator is not currently available");
+          }
+          throw error;
+        }
+        if (!sameOwnerDecisionDeliveryRequest(
+          snapshot?.coordination?.ownerDecisionRequest,
+          deliveryRequest,
+        )) {
+          throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision request or exact Root route changed before delivery");
+        }
+        const result = database.claimOwnerDecisionDelivery(projectId, deliveryRequest);
+        return sendJson(response, result.claimed ? 201 : 200, result);
+      }
+
       const agentLaneRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/agent-lanes$/);
       if (agentLaneRoute) {
         if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
@@ -3802,6 +3962,21 @@ export function createTaskboardServer(options = {}) {
             standingScope: safeAction.standingAuthority ? safeAction.standingScope : null,
           },
         });
+      }
+
+      const ownerDecisionRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/owner-decisions$/);
+      if (ownerDecisionRoute) {
+        const id = decodeRouteSegment(ownerDecisionRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/owner-decisions");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const result = database.recordTaskOwnerDecision(
+          id,
+          parseOwnerDecision(await readJson(request)),
+          CODEX_AGENT_ACTOR,
+        );
+        if (result.applied) events.emit("task.updated", { task: database.getTask(id) });
+        return sendJson(response, result.applied ? 201 : 200, result);
       }
 
       const taskCapsuleRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/capsule$/);
