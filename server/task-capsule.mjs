@@ -244,8 +244,7 @@ function inboxFor(receipts) {
 
 function handoffsFor(events) {
   const ordered = [...events].sort((left, right) => (
-    right.envelope.timestamp.localeCompare(left.envelope.timestamp)
-      || right.createdAt.localeCompare(left.createdAt)
+    right.createdAt.localeCompare(left.createdAt)
       || right.eventId.localeCompare(left.eventId)
   ));
   return {
@@ -480,29 +479,74 @@ function isSuperseded(comment) {
     || /^(?:#{1,6}\s*)?Superseded\s*:\s*(?:true|yes)\b/im.test(comment.body);
 }
 
-function nextActionFor(task, comments, latestRun) {
-  if (latestRun?.nextAction) {
-    return {
-      text: latestRun.nextAction,
-      source: { type: "agent_run", runId: latestRun.id, runVersion: latestRun.version },
-    };
-  }
-  const checkpoint = [...comments].reverse().find((comment) => (
-    isCheckpointOrHandoff(comment) && !isSuperseded(comment)
-  ));
-  const match = checkpoint?.body.match(
-    /^(?:Next executable action|Next action)\s*:\s*(.+)$/im,
-  );
-  if (match) {
-    return {
-      text: match[1].trim(),
-      source: { type: "checkpoint", commentId: checkpoint.id, commentVersion: checkpoint.version },
-    };
-  }
-  return {
-    text: task.title,
-    source: { type: "task_title_fallback", explicit: true },
+function workflowFor(task) {
+  const profile = task.workflowProfile === "vibe" ? "vibe" : "formal";
+  return { profile, workingLogRequired: profile === "formal" };
+}
+
+function frontierFor(task, comments, coordinationEvents, activeRun, latestRun, authorization, pendingActions) {
+  const candidates = [];
+  const add = (candidate) => {
+    if (!candidate.text || !candidate.observedAt || Number.isNaN(Date.parse(candidate.observedAt))) return;
+    candidates.push(candidate);
   };
+  const seenRunIds = new Set();
+  for (const run of [activeRun, latestRun]) {
+    if (!run?.id || seenRunIds.has(run.id) || !run.nextAction) continue;
+    seenRunIds.add(run.id);
+    add({
+      text: run.nextAction,
+      source: { type: "agent_run", runId: run.id, runVersion: run.version },
+      observedAt: run.updatedAt,
+      tieRank: ["active", "blocked"].includes(run.status) ? 30 : 20,
+    });
+  }
+  const handoffCommentIds = new Set(coordinationEvents.map((event) => event.commentId).filter(Boolean));
+  for (const comment of comments) {
+    if (handoffCommentIds.has(comment.id) || !isCheckpointOrHandoff(comment) || isSuperseded(comment)) continue;
+    const match = comment.body.match(/^(?:Next executable action|Next action)\s*:\s*(.+)$/im);
+    if (!match) continue;
+    add({
+      text: match[1].trim(),
+      source: { type: "checkpoint", commentId: comment.id, commentVersion: comment.version },
+      observedAt: comment.updatedAt,
+      tieRank: 40,
+    });
+  }
+  for (const event of coordinationEvents) {
+    add({
+      text: event.envelope?.nextAction,
+      source: { type: "structured_handoff", eventId: event.eventId },
+      observedAt: event.createdAt,
+      tieRank: 50,
+    });
+  }
+  const authorizationComment = authorization.source
+    ? comments.find((comment) => comment.id === authorization.source.commentId)
+    : null;
+  const authorizationAction = pendingActions[0];
+  if (authorizationAction && authorizationComment) {
+    add({
+      text: authorizationAction.text,
+      source: { type: "authorization_action", actionId: authorizationAction.id },
+      observedAt: authorizationComment.updatedAt,
+      tieRank: 60,
+    });
+  }
+  if (candidates.length === 0) {
+    return {
+      text: task.title,
+      source: { type: "task_title_fallback", explicit: true },
+      observedAt: task.updatedAt ?? null,
+    };
+  }
+  candidates.sort((left, right) => (
+    Date.parse(right.observedAt) - Date.parse(left.observedAt)
+      || right.tieRank - left.tieRank
+      || JSON.stringify(left.source).localeCompare(JSON.stringify(right.source))
+  ));
+  const { tieRank: _tieRank, ...frontier } = candidates[0];
+  return frontier;
 }
 
 const STRUCTURAL_NEXT_ACTIONS = new Map([
@@ -529,8 +573,20 @@ function structuralNextActionFor(reasonCode) {
   };
 }
 
-function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, authorization, requirementsRevision) {
+function readyWorkFor(
+  task,
+  claim,
+  timestamp,
+  execution,
+  comments,
+  coordinationEvents,
+  activeRun,
+  latestRun,
+  authorization,
+  requirementsRevision,
+) {
   const reasonCodes = [];
+  const workflow = workflowFor(task);
   if (task.labels.includes("project-inbox")) {
     reasonCodes.push("PROJECT_INBOX_NON_DISPATCHABLE");
   }
@@ -549,18 +605,32 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, au
   if (task.developmentContext?.type !== "worktree" || !task.developmentContext.branch) {
     reasonCodes.push("WORKTREE_BRANCH_MISSING");
   }
-  if (!task.workingLog) reasonCodes.push("WORKING_LOG_MISSING");
-  else if (!["planned", "active"].includes(task.workingLog.status)) {
+  if (workflow.workingLogRequired && !task.workingLog) reasonCodes.push("WORKING_LOG_MISSING");
+  else if (workflow.workingLogRequired && !["planned", "active"].includes(task.workingLog.status)) {
     reasonCodes.push("WORKING_LOG_STATUS_NOT_READY");
   }
   const state = claimState(claim, timestamp);
   if (state === "active") reasonCodes.push("ACTIVE_CLAIM");
   if (state === "expired_unresolved") reasonCodes.push("EXPIRED_UNRESOLVED_CLAIM");
+  const pendingActions = authorization.state === "valid"
+    ? authorization.envelope.actions
+      .filter((action) => action.status === "pending")
+      .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
+    : [];
+  const currentFrontier = frontierFor(
+    task,
+    comments,
+    coordinationEvents,
+    activeRun,
+    latestRun,
+    authorization,
+    pendingActions,
+  );
   const readyWork = {
     state: reasonCodes.length === 0 ? "ready" : "not_ready",
     eligible: reasonCodes.length === 0,
     reasonCodes,
-    nextAction: nextActionFor(task, comments, latestRun),
+    nextAction: { text: currentFrontier.text, source: currentFrontier.source },
     safeActions: [],
     deferredActions: [],
     approvalRequest: null,
@@ -597,9 +667,6 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, au
       expired: true,
     }];
   }));
-  const pendingActions = authorization.envelope.actions
-    .filter((action) => action.status === "pending")
-    .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
   readyWork.safeActions = pendingActions.filter((action) => gates.get(action.gate).state === "authorized");
   readyWork.deferredActions = pendingActions.filter((action) => gates.get(action.gate).state !== "authorized");
 
@@ -610,11 +677,17 @@ function readyWorkFor(task, claim, timestamp, execution, comments, latestRun, au
     readyWork.reasonCodes.push("AUTHORIZATION_ACTIONS_EXHAUSTED");
     return readyWork;
   }
+  const frontierActionId = currentFrontier.source.type === "authorization_action"
+    ? currentFrontier.source.actionId
+    : null;
+  if (frontierActionId !== pendingActions[0].id) {
+    readyWork.safeActions = [];
+    readyWork.state = "not_ready";
+    readyWork.eligible = false;
+    readyWork.reasonCodes.push("AUTHORIZATION_ACTION_SUPERSEDED");
+    return readyWork;
+  }
   if (readyWork.safeActions.length > 0) {
-    readyWork.nextAction = {
-      text: readyWork.safeActions[0].text,
-      source: { type: "authorization_action", actionId: readyWork.safeActions[0].id },
-    };
     return readyWork;
   }
 
@@ -677,10 +750,31 @@ export function createTaskCapsule({
     now,
     execution,
     orderedComments,
+    coordinationEvents,
+    activeRun,
     projectedLatestRun,
     authorization,
     requirementsRevision,
   );
+  const workflow = workflowFor(task);
+  const currentFrontier = {
+    ...readyWork.nextAction,
+    observedAt: readyWork.nextAction.source.type === "structural_blocker"
+      ? (task.updatedAt ?? now.toISOString())
+      : frontierFor(
+          task,
+          orderedComments,
+          coordinationEvents,
+          activeRun,
+          projectedLatestRun,
+          authorization,
+          authorization.state === "valid"
+            ? authorization.envelope.actions
+              .filter((action) => action.status === "pending")
+              .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
+            : [],
+        ).observedAt,
+  };
   const resumeToken = hash({
     requirementsRevision,
     relations: relationEvidence(task),
@@ -691,6 +785,7 @@ export function createTaskCapsule({
       nextAction: readyWork.nextAction,
       worktree: task.developmentContext,
       workingLog: task.workingLog,
+      workflow,
       authorization,
     },
     run: projectedLatestRun,
@@ -711,6 +806,7 @@ export function createTaskCapsule({
       title: task.title,
       description: task.description,
       labels: task.labels ?? [],
+      workflowProfile: workflow.profile,
       status: task.status,
       version: task.version,
       archivedAt: task.archivedAt,
@@ -726,10 +822,12 @@ export function createTaskCapsule({
     executionTarget: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     worktree: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     workingLog: task.workingLog,
+    workflow,
     authorization,
     activeRun,
     latestRun: projectedLatestRun,
     readyWork,
+    currentFrontier,
     resumeToken,
   };
 }

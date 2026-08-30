@@ -376,6 +376,7 @@ async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComm
     }, projectId, taskLanes, generatedAt),
     taskId: task.id,
     dispatchTarget: dispatchTargetFor(capsule),
+    workflow: capsule?.workflow ?? { profile: "formal", workingLogRequired: true },
     workingLog: workingLogFor(capsule),
     run,
     readyWork,

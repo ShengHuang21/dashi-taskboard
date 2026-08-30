@@ -202,7 +202,9 @@ function TodoCard({
         <div><dt>认领</dt><dd>{todo.claim?.ownerLabel ?? "未认领"}</dd></div>
         <div><dt>租约</dt><dd>{todo.claim ? LEASE_LABELS[todo.claim.leaseState] : "未开始"}</dd></div>
         <div><dt>写入范围</dt><dd>{todo.writeScope.length ? todo.writeScope.join("、") : "无"}</dd></div>
-        <div><dt>工作日志</dt><dd>{todo.workingLog ? `${todo.workingLog.status}: ${todo.workingLog.path}` : "未记录"}</dd></div>
+        <div><dt>工作日志</dt><dd>{todo.workingLog
+          ? `${todo.workingLog.status}: ${todo.workingLog.path}`
+          : todo.workflow.workingLogRequired ? "缺失" : "个人任务不要求"}</dd></div>
         <div><dt>执行</dt><dd>{todo.run ? RUN_STATE_LABELS[todo.run.state] : "未启动"}</dd></div>
         <div><dt>关注</dt><dd>{ATTENTION_LABELS[todo.continuation.attention]}</dd></div>
         <div><dt>消息排队</dt><dd>{todo.inbox.pendingCount > 0 ? `${todo.inbox.pendingCount} 条（当前工作继续）` : "0 条"}</dd></div>

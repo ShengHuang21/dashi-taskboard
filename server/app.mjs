@@ -659,6 +659,14 @@ function parseAssigneeTarget(value) {
   return value;
 }
 
+function parseWorkflowProfile(value, fallback) {
+  const profile = value ?? fallback;
+  if (profile !== "formal" && profile !== "vibe") {
+    throw new ApiError(400, "INVALID_FIELD", "'workflowProfile' must be formal or vibe");
+  }
+  return profile;
+}
+
 function resolveAssignee(target, actor) {
   if (target === undefined) return actor;
   if (target === "codex-agent") return CODEX_AGENT_ACTOR;
@@ -672,7 +680,7 @@ function parseTaskCreate(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "projectId", "title", "description", "status", "priority", "labels", "sortOrder", "threadId", "threadBinding",
-    "assigneeTarget", "developmentContext", "workingLog", "startDate", "dueDate", "recurrence",
+    "assigneeTarget", "developmentContext", "workingLog", "workflowProfile", "startDate", "dueDate", "recurrence",
   ]));
   const projectId = validateProjectId(body.projectId ?? DEFAULT_PROJECT_ID);
   const task = {
@@ -688,6 +696,7 @@ function parseTaskCreate(body) {
     assigneeTarget: parseAssigneeTarget(body.assigneeTarget),
     developmentContext: parseDevelopmentContext(body.developmentContext ?? null),
     workingLog: parseWorkingLog(body.workingLog ?? null),
+    workflowProfile: parseWorkflowProfile(body.workflowProfile, "formal"),
     startDate: parseDueDate(body.startDate ?? null, "startDate"),
     dueDate: parseDueDate(body.dueDate ?? null),
     recurrence: parseRecurrence(body.recurrence ?? null),
@@ -702,7 +711,7 @@ function parseTaskPatch(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "version", "projectId", "title", "description", "status", "priority", "labels", "threadId", "threadBinding",
-    "assigneeTarget", "developmentContext", "workingLog", "startDate", "dueDate", "recurrence",
+    "assigneeTarget", "developmentContext", "workingLog", "workflowProfile", "startDate", "dueDate", "recurrence",
   ]));
   const version = parseVersion(body.version);
   const threadId = parseThreadId(body.threadId);
@@ -720,6 +729,7 @@ function parseTaskPatch(body) {
   if (body.labels !== undefined) changes.labels = parseLabels(body.labels);
   if (body.developmentContext !== undefined) changes.developmentContext = parseDevelopmentContext(body.developmentContext);
   if (body.workingLog !== undefined) changes.workingLog = parseWorkingLog(body.workingLog);
+  if (body.workflowProfile !== undefined) changes.workflowProfile = parseWorkflowProfile(body.workflowProfile);
   if (body.startDate !== undefined) changes.startDate = parseDueDate(body.startDate, "startDate");
   if (body.dueDate !== undefined) changes.dueDate = parseDueDate(body.dueDate);
   if (body.recurrence !== undefined) changes.recurrence = parseRecurrence(body.recurrence);
