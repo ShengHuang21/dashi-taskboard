@@ -38,6 +38,17 @@ const COMMAND_OPTIONS = new Map([
     "granted-at", "expires-at", "json",
   ])],
   ["authority revoke", new Set(["evidence", "receipt", "json"])],
+  ["coordinator status", new Set(["json"])],
+  ["coordinator acquire", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
+  ])],
+  ["coordinator renew", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
+  ])],
+  ["coordinator release", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "json",
+  ])],
+  ["coordinator receipts", new Set(["json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
   ["cloud status", new Set(["json"])],
   ["cloud logout", new Set(["json"])],
@@ -161,6 +172,14 @@ Commands:
     --source-task ISSUE_ID --source-thread-id ID --evidence TEXT --receipt ID
     --granted-at ISO [--expires-at ISO]
   authority revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID
+  coordinator status PROJECT_ID
+  coordinator acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id none|ID --lease-seconds N
+  coordinator renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --lease-seconds N
+  coordinator release PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID
+  coordinator receipts PROJECT_ID
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|bootstrap|create|update|move|archive|restore|relation
@@ -186,7 +205,7 @@ Examples:
   taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
-Run taskctl issue --help or taskctl run --help for command arguments.`],
+Run taskctl issue --help, taskctl coordinator --help, or taskctl run --help for command arguments.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
 
 Actions:
@@ -257,6 +276,20 @@ Actions:
   revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID [--json]
 
 Actions: edit, test, scoped_delete, commit, ordinary_push, draft_pr`],
+  ["coordinator", `Usage: taskctl coordinator ACTION PROJECT_ID [options]
+
+Actions:
+  status PROJECT_ID [--json]
+  acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id none|ID --lease-seconds 30..3600 [--json]
+  renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --lease-seconds 30..3600 [--json]
+  release PROJECT_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID [--json]
+  receipts PROJECT_ID [--json]
+
+The holder task and thread must already be one exact configured Agent Lane binding.
+Coordinator ownership does not grant task execution ownership.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
@@ -362,7 +395,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl authority, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -392,7 +425,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/receipts, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -401,7 +434,9 @@ async function execute(parsed, overrides) {
   const env = parsed.options["runtime-file"] === undefined
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
-  const usesCompanionControl = command.startsWith("cloud ") || command === "project map";
+  const usesCompanionControl = command.startsWith("cloud ")
+    || command === "project map"
+    || command.startsWith("coordinator ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
       ? await resolveCompanionUrl(env, overrides)
@@ -470,6 +505,34 @@ async function execute(parsed, overrides) {
           receipt: requiredOption(parsed.options, "receipt"),
         },
       );
+    case "coordinator status": {
+      expectOperandCount(parsed, 1);
+      const projectId = parsed.operands[0];
+      const snapshot = await api.request("GET", agentLaneProjectPath(projectId));
+      return { projectId, coordination: snapshot.coordination ?? null };
+    }
+    case "coordinator acquire":
+      expectOperandCount(parsed, 1);
+      return mutateCoordinatorLease(
+        api,
+        parsed.operands[0],
+        parsed.options,
+        expectedCoordinatorLeaseId(parsed.options, { allowNone: true }),
+      );
+    case "coordinator renew":
+      expectOperandCount(parsed, 1);
+      return mutateCoordinatorLease(
+        api,
+        parsed.operands[0],
+        parsed.options,
+        expectedCoordinatorLeaseId(parsed.options),
+      );
+    case "coordinator release":
+      expectOperandCount(parsed, 1);
+      return releaseCoordinatorLease(api, parsed.operands[0], parsed.options);
+    case "coordinator receipts":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${coordinatorLeasePath(parsed.operands[0])}/receipts`);
     case "cloud login":
       expectOperandCount(parsed, 0);
       return cloudLogin(
@@ -1134,6 +1197,59 @@ async function claimIssue(api, taskId, options, overrides) {
     leaseExpiresAt: new Date(Date.now() + leaseMinutes * 60_000).toISOString(),
     writeScope,
     version: await resolveVersion(api, taskId, options["if-version"]),
+  });
+}
+
+function agentLaneProjectPath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`;
+}
+
+function coordinatorLeasePath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/coordinator-lease`;
+}
+
+function coordinatorHolder(options) {
+  const holderTaskId = requiredOption(options, "holder-task").trim();
+  const holderThreadId = requiredOption(options, "holder-thread-id").trim();
+  if (!holderTaskId || holderTaskId.length > 256) {
+    throw usageError("--holder-task must contain 1 to 256 characters");
+  }
+  if (!holderThreadId || holderThreadId.length > 256) {
+    throw usageError("--holder-thread-id must contain 1 to 256 characters");
+  }
+  return { holderTaskId, holderThreadId };
+}
+
+function expectedCoordinatorLeaseId(options, { allowNone = false } = {}) {
+  const value = requiredOption(options, "expected-lease-id").trim();
+  if (allowNone && value === "none") return null;
+  if (!value || value === "none" || value.length > 256) {
+    throw usageError(`--expected-lease-id must contain ${allowNone ? "none or " : ""}1 to 256 characters`);
+  }
+  return value;
+}
+
+function mutateCoordinatorLease(api, projectId, options, expectedLeaseId) {
+  const leaseDurationSeconds = Number(requiredOption(options, "lease-seconds"));
+  if (!Number.isInteger(leaseDurationSeconds)
+    || leaseDurationSeconds < 30
+    || leaseDurationSeconds > 3600) {
+    throw usageError("--lease-seconds must be an integer from 30 to 3600");
+  }
+  return api.request("POST", coordinatorLeasePath(projectId), {
+    ...coordinatorHolder(options),
+    expectedLeaseId,
+    leaseDurationSeconds,
+  });
+}
+
+function releaseCoordinatorLease(api, projectId, options) {
+  const expectedLeaseId = expectedCoordinatorLeaseId(options);
+  return api.request("POST", `${coordinatorLeasePath(projectId)}/release`, {
+    ...coordinatorHolder(options),
+    expectedLeaseId,
   });
 }
 

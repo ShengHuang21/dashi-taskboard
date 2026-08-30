@@ -62,6 +62,18 @@ taskctl issue get ID [--json]
 taskctl issue bootstrap ISSUE_ID [--json]
 ```
 
+For a replaceable project coordinator, inspect and mutate only the exact configured Agent Lane task/thread binding:
+
+```bash
+taskctl coordinator status PROJECT_ID [--json]
+taskctl coordinator acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id none|LEASE_ID --lease-seconds 300 [--json]
+taskctl coordinator renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id LEASE_ID --lease-seconds 300 [--json]
+taskctl coordinator release PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id LEASE_ID [--json]
+taskctl coordinator receipts PROJECT_ID [--json]
+```
+
+Acquire requires an explicit expected identity: use `none` only when status has no stored lease, or pass the expired lease id when replacing an expired coordinator. Renew/release require the exact active lease id. Conflicts fail closed. Persist a checkpoint or handoff before release, and remember that coordinator ownership never grants execution ownership.
+
 Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
 
 If the Capsule returns `readyWork.ownerDecisionRequest`, do not send the Owner to Taskboard and do not let a Sub-Agent ask them. The authenticated host Injector reserves the exact current request and Root route atomically, delivers the question once, and reads the delivery id back from the exact Root thread after uncertain transport. Once delivery is confirmed, Taskboard keeps that exact Root coordinator route protected for a bounded human-response window until the decision is recorded. After the Owner replies, Root bootstraps again and follows the injected instruction to emit one `TASKBOARD_OWNER_DECISION_V1` marker only when the request remains current. The Injector accepts that marker only after a real Owner input in the exact Root thread and records the immutable receipt through its host-authenticated route. `taskctl` has no Owner-decision mutation command. This is Root-attested Owner provenance, not Agent self-approval.
