@@ -11,6 +11,7 @@ import {
   TASK_STATUSES,
   isTaskPriority,
   isTaskStatus,
+  isWorkingLogStatus,
 } from "../shared/domain.mjs";
 
 export const SCHEMA_VERSION = 2;
@@ -22,7 +23,7 @@ const sourceRuntimeFile = path.resolve(
   ".data",
   "launcher-runtime.json",
 );
-const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "help"]);
+const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "clear-working-log", "help"]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
@@ -35,6 +36,7 @@ const COMMAND_OPTIONS = new Map([
   ["cloud logout", new Set(["json"])],
   ["issue list", new Set(["project", "status", "archived", "json"])],
   ["issue get", new Set(["json"])],
+  ["issue bootstrap", new Set(["json"])],
   [
     "issue create",
     new Set([
@@ -49,6 +51,8 @@ const COMMAND_OPTIONS = new Map([
       "git-branch",
       "worktree-path",
       "worktree-branch",
+      "working-log-path",
+      "working-log-status",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -66,10 +70,18 @@ const COMMAND_OPTIONS = new Map([
       "status",
       "priority",
       "labels",
-      "thread-id",
       "git-branch",
       "worktree-path",
       "worktree-branch",
+      "working-log-path",
+      "working-log-status",
+      "clear-working-log",
+      "binding-thread-id",
+      "binding-codex-project-id",
+      "binding-codex-project-kind",
+      "binding-codex-host-id",
+      "binding-workspace-path",
+      "clear-binding-thread",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -90,9 +102,20 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
+  ["issue claim", new Set(["agent-path", "thread-id", "if-version", "lease-minutes", "write-scope", "json"])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
+  ["run get", new Set(["json"])],
+  ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["handoff list", new Set(["json"])],
+  ["handoff add", new Set([
+    "event-id", "idempotency-key", "parent-task", "agent-path", "thread-id", "sequence",
+    "timestamp", "summary", "evidence-ref", "blocker", "next-action", "requires-ack",
+    "causation-id", "correlation-id", "json",
+  ])],
+  ["handoff ack", new Set(["acknowledgement-id", "agent-path", "thread-id", "json"])],
   ["comment list", new Set(["after", "json"])],
   ["comment add", new Set([
     "body",
@@ -126,7 +149,11 @@ Commands:
   project readme set [PROJECT_ID] (--content TEXT | --file FILE) [--if-version N]
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|create|update|move|archive|restore|relation
+  issue list|get|bootstrap|create|update|move|archive|restore|relation
+  handoff list ISSUE_ID
+  handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
+    --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
+  handoff ack EVENT_ID --acknowledgement-id ID --agent-path /root
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -141,28 +168,36 @@ Global options:
   --help               Show help for a supported command level
 
 Examples:
-  taskctl issue get LOCAL-275 --json
+  taskctl issue bootstrap LOCAL-275 --json
+  taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
-Run taskctl issue --help for all issue arguments.`],
+Run taskctl issue --help or taskctl run --help for command arguments.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
 
 Actions:
   list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
   get ISSUE_ID [--json]
+  bootstrap ISSUE_ID [--json]
   create --project PROJECT_ID --title TITLE
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
     [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
+    [--working-log-path PATH --working-log-status planned|active|blocked|complete]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year] [--json]
   update ISSUE_ID
     [--project PROJECT_ID] [--title TITLE]
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
-    [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
+    [--working-log-path PATH --working-log-status planned|active|blocked|complete
+     | --clear-working-log]
+    [--binding-thread-id ID
+      [--binding-codex-project-id ID --binding-codex-project-kind local|remote
+       --binding-codex-host-id ID --binding-workspace-path PATH]
+     | --clear-binding-thread]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year]
     [--if-version N] [--json]
@@ -173,6 +208,8 @@ Actions:
      | --clear-binding-thread]
     [--if-version N] [--json]
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
+  claim ISSUE_ID --agent-path /root/NAME --thread-id ID
+    --lease-minutes N --write-scope path[,path] [--if-version N] [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   relation add|remove ISSUE_ID --type parent|blocks|blocked_by|related
     --issue RELATED_ISSUE_ID [--thread-id ID] [--if-version N] [--json]
@@ -181,7 +218,32 @@ Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
 
 Example:
-  taskctl issue get LOCAL-275 --json`],
+  taskctl issue bootstrap LOCAL-275 --json`],
+  ["run", `Usage: taskctl run ACTION [arguments] [options]
+
+Actions:
+  get RUN_ID [--json]
+  checkpoint RUN_ID --summary TEXT --next-action TEXT
+    [--status active|blocked] --thread-id ID --if-version N [--json]
+  finish RUN_ID --status completed|failed|interrupted --summary TEXT --next-action TEXT
+    --thread-id ID --if-version N [--json]
+
+Examples:
+  taskctl run get RUN_ID --json
+  taskctl run checkpoint RUN_ID --summary "Focused checks passed" --next-action "Open the capsule" --if-version 2 --json`],
+  ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
+
+Actions:
+  list ISSUE_ID [--json]
+  add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
+    --sequence N [--timestamp ISO] --summary TEXT [--evidence-ref REF[,REF]]
+    [--blocker TEXT] --next-action TEXT --requires-ack true|false
+    [--parent-task ISSUE_ID] [--causation-id ID] [--correlation-id ID]
+    [--thread-id ID] [--json]
+  ack EVENT_ID --acknowledgement-id ID --agent-path /root [--thread-id ID] [--json]
+
+Handoff add uses CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
+when the durable task has no parent relation.`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -274,7 +336,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl issue, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -304,7 +366,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/create/update/move/archive/restore/relation, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -369,6 +431,9 @@ async function execute(parsed, overrides) {
     case "issue get":
       expectOperandCount(parsed, 1);
       return api.request("GET", taskPath(parsed.operands[0]));
+    case "issue bootstrap":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
     case "issue create":
       expectOperandCount(parsed, 0);
       return createIssue(api, parsed.options, overrides);
@@ -378,6 +443,9 @@ async function execute(parsed, overrides) {
     case "issue move":
       expectOperandCount(parsed, 1);
       return moveIssue(api, parsed.operands[0], parsed.options, overrides);
+    case "issue claim":
+      expectOperandCount(parsed, 1);
+      return claimIssue(api, parsed.operands[0], parsed.options, overrides);
     case "issue archive":
       expectOperandCount(parsed, 1);
       return archiveIssue(api, parsed.operands[0], parsed.options, overrides, "archive");
@@ -393,6 +461,24 @@ async function execute(parsed, overrides) {
         parsed.options,
         overrides,
       );
+    case "run get":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", agentRunPath(parsed.operands[0]));
+    case "run checkpoint":
+      expectOperandCount(parsed, 1);
+      return checkpointAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "run finish":
+      expectOperandCount(parsed, 1);
+      return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);
+    case "handoff add":
+      expectOperandCount(parsed, 1);
+      return addTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff ack":
+      expectOperandCount(parsed, 1);
+      return acknowledgeTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
     case "comment list": {
       expectOperandCount(parsed, 1);
       const search = new URLSearchParams();
@@ -855,6 +941,7 @@ async function createIssue(api, options, overrides) {
   assertPriority(priority);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
+  const workingLog = workingLogFromOptions(options, overrides);
   const recurrence = recurrenceFromOptions(options);
   const threadId = resolveThreadId(options, overrides);
   return api.request("POST", "/api/tasks", {
@@ -866,6 +953,7 @@ async function createIssue(api, options, overrides) {
     labels: parseLabels(options.labels),
     threadId,
     ...optionalField("developmentContext", developmentContext),
+    ...optionalField("workingLog", workingLog),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
     ...optionalField("recurrence", recurrence),
@@ -877,8 +965,9 @@ async function updateIssue(api, taskId, options, overrides) {
   if (options.priority !== undefined) assertPriority(options.priority);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
+  const workingLog = workingLogFromOptions(options, overrides);
   const recurrence = recurrenceFromOptions(options);
-  const threadId = resolveThreadId(options, overrides);
+  const threadBinding = threadBindingFromOptions(options);
   const patch = {
     ...optionalField("projectId", options.project),
     ...optionalField("title", options.title),
@@ -886,6 +975,8 @@ async function updateIssue(api, taskId, options, overrides) {
     ...optionalField("priority", options.priority),
     ...optionalField("labels", options.labels === undefined ? undefined : parseLabels(options.labels)),
     ...optionalField("developmentContext", developmentContext),
+    ...optionalField("workingLog", workingLog),
+    ...optionalField("threadBinding", threadBinding),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
     ...optionalField("recurrence", recurrence),
@@ -897,7 +988,6 @@ async function updateIssue(api, taskId, options, overrides) {
   if (Object.keys(patch).length === 0) {
     throw usageError("issue update requires at least one field to update");
   }
-  patch.threadId = threadId;
   patch.version = await resolveVersion(api, taskId, options["if-version"]);
   return api.request("PATCH", taskPath(taskId), patch);
 }
@@ -961,6 +1051,129 @@ function threadBindingFromOptions(options) {
     throw usageError("--binding-workspace-path must be absolute");
   }
   return { threadId, codexProjectId, codexProjectKind, codexHostId, workspacePath };
+}
+
+async function claimIssue(api, taskId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (!agentPath.startsWith("/root/")) throw usageError("--agent-path must start with /root/");
+  const leaseMinutes = Number(requiredOption(options, "lease-minutes"));
+  if (!Number.isInteger(leaseMinutes) || leaseMinutes < 1 || leaseMinutes > 1440) {
+    throw usageError("--lease-minutes must be an integer from 1 to 1440");
+  }
+  const writeScope = requiredOption(options, "write-scope")
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  if (writeScope.length === 0 || writeScope.length > 32 || writeScope.some((value) => value.length > 240)) {
+    throw usageError("--write-scope must contain 1 to 32 comma-separated paths");
+  }
+  return api.request("POST", `${taskPath(taskId)}/claim`, {
+    agentPath,
+    agentThreadId: resolveThreadId(options, overrides),
+    leaseExpiresAt: new Date(Date.now() + leaseMinutes * 60_000).toISOString(),
+    writeScope,
+    version: await resolveVersion(api, taskId, options["if-version"]),
+  });
+}
+
+function agentRunPath(runId) {
+  if (!runId) throw usageError("Missing Agent Run id");
+  return `/api/runs/${encodeURIComponent(runId)}`;
+}
+
+async function checkpointAgentRun(api, runId, options, overrides) {
+  const status = options.status ?? "active";
+  if (status !== "active" && status !== "blocked") {
+    throw usageError("--status must be active or blocked for run checkpoint");
+  }
+  return api.request("POST", `${agentRunPath(runId)}/checkpoint`, {
+    agentThreadId: resolveThreadId(options, overrides),
+    summary: requiredOption(options, "summary"),
+    nextAction: requiredOption(options, "next-action"),
+    status,
+    version: explicitVersion(options["if-version"]),
+  });
+}
+
+async function finishAgentRun(api, runId, options, overrides) {
+  const status = requiredOption(options, "status");
+  if (!["completed", "failed", "interrupted"].includes(status)) {
+    throw usageError("--status must be completed, failed, or interrupted for run finish");
+  }
+  return api.request("POST", `${agentRunPath(runId)}/finish`, {
+    agentThreadId: resolveThreadId(options, overrides),
+    summary: requiredOption(options, "summary"),
+    nextAction: requiredOption(options, "next-action"),
+    status,
+    version: explicitVersion(options["if-version"]),
+  });
+}
+
+function parsePositiveIntegerOption(options, name) {
+  const value = Number(requiredOption(options, name));
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw usageError(`--${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseBooleanOption(options, name) {
+  const raw = requiredOption(options, name);
+  if (raw !== "true" && raw !== "false") {
+    throw usageError(`--${name} must be true or false`);
+  }
+  return raw === "true";
+}
+
+function parseEvidenceRefs(raw) {
+  if (raw === undefined || raw === "") return [];
+  const references = raw.split(",").map((value) => value.trim()).filter(Boolean);
+  if (references.length > 32 || new Set(references).size !== references.length) {
+    throw usageError("--evidence-ref must contain at most 32 unique comma-separated references");
+  }
+  return references;
+}
+
+async function addTaskHandoff(api, taskId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (!agentPath.startsWith("/root/")) {
+    throw usageError("--agent-path must identify a Root Sub-Agent and start with /root/");
+  }
+  const timestamp = options.timestamp ?? new Date().toISOString();
+  if (Number.isNaN(Date.parse(timestamp))) {
+    throw usageError("--timestamp must be an ISO timestamp");
+  }
+  return api.request("POST", `${taskPath(taskId)}/coordination-events`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    parentTaskId: options["parent-task"] ?? null,
+    senderThreadId: resolveThreadId(options, overrides),
+    senderAgentPath: agentPath,
+    eventType: "handoff",
+    sequence: parsePositiveIntegerOption(options, "sequence"),
+    timestamp,
+    summary: requiredOption(options, "summary"),
+    evidenceRefs: parseEvidenceRefs(options["evidence-ref"]),
+    blocker: options.blocker ?? null,
+    nextAction: requiredOption(options, "next-action"),
+    requiresAck: parseBooleanOption(options, "requires-ack"),
+    causationId: options["causation-id"] ?? null,
+    correlationId: options["correlation-id"] ?? null,
+  });
+}
+
+async function acknowledgeTaskHandoff(api, eventId, options, overrides) {
+  const agentPath = requiredOption(options, "agent-path");
+  if (agentPath !== "/root") {
+    throw usageError("handoff ack --agent-path must be /root");
+  }
+  return api.request(
+    "POST",
+    `/api/coordination-events/${encodeURIComponent(eventId)}/acknowledgements`,
+    {
+      acknowledgementId: requiredOption(options, "acknowledgement-id"),
+      senderThreadId: resolveThreadId(options, overrides),
+      senderAgentPath: agentPath,
+    },
+  );
 }
 
 async function archiveIssue(api, taskId, options, overrides, action) {
@@ -1077,6 +1290,28 @@ function developmentContextFromOptions(options, overrides) {
     };
   }
   return undefined;
+}
+
+function workingLogFromOptions(options, overrides) {
+  const workingLogPath = options["working-log-path"];
+  const status = options["working-log-status"];
+  if (options["clear-working-log"]) {
+    if (workingLogPath !== undefined || status !== undefined) {
+      throw usageError("--clear-working-log cannot be combined with working log options");
+    }
+    return null;
+  }
+  if (workingLogPath === undefined && status === undefined) return undefined;
+  if (workingLogPath === undefined || status === undefined) {
+    throw usageError("Use --working-log-path and --working-log-status together");
+  }
+  if (!isWorkingLogStatus(status)) {
+    throw usageError("--working-log-status must be planned, active, blocked, or complete");
+  }
+  if (!path.isAbsolute(workingLogPath)) {
+    throw usageError("--working-log-path must be absolute");
+  }
+  return { path: path.resolve(workingLogPath), status };
 }
 
 function recurrenceFromOptions(options) {

@@ -21,6 +21,7 @@
   const HOST_RESPONSE_MESSAGE = "__codexTaskboardHostResponseV1";
   const HOST_HEARTBEAT_MESSAGE = "__codexTaskboardHostHeartbeatV1";
   const HOST_STARTUP_TOKEN_NAME = "__codexTaskboardHostStartupTokenV1";
+  const HOST_REQUEST_QUEUE_NAME = window.__CODEX_TASKBOARD_HOST_REQUEST_QUEUE_V1__;
   const HOST_CAPABILITY = window.__CODEX_TASKBOARD_HOST_CAPABILITY__;
   const REATTACH_DELAY_MS = 160;
   const FRAME_READY_TIMEOUT_MS = 12_000;
@@ -1188,6 +1189,42 @@
     }
   }
 
+  async function handleAgentTodoCoordination(payload) {
+    const requestId = typeof payload?.requestId === "string" ? payload.requestId : "";
+    if (!requestId) return;
+    try {
+      const response = await requestHost("coordinate-agent-todo", {
+        rootThreadId: payload?.rootThreadId,
+        codexHostId: payload?.codexHostId,
+        projectId: payload?.projectId,
+        todoId: payload?.todoId,
+        safeActionId: payload?.safeActionId,
+        expectedResumeToken: payload?.expectedResumeToken,
+        rootWorkspacePath: payload?.rootWorkspacePath,
+        targetRoot: payload?.targetRoot,
+      }, 35_000);
+      postToFrame({
+        type: "taskboard:coordination-response",
+        payload: {
+          requestId,
+          ok: true,
+          delivery: response.delivery,
+        },
+      });
+    } catch (error) {
+      postToFrame({
+        type: "taskboard:coordination-response",
+        payload: {
+          requestId,
+          ok: false,
+          error: error instanceof Error
+            ? error.message
+            : hostText("Root 没有收到协作任务", "Root did not receive the coordination task"),
+        },
+      });
+    }
+  }
+
   function handleExternalOpen(payload) {
     try {
       const url = new URL(payload?.url);
@@ -1263,6 +1300,10 @@
     }
     if (message.type === "taskboard:automation-request") {
       void handleAutomationRequest(message.payload);
+      return;
+    }
+    if (message.type === "taskboard:coordinate-todo") {
+      void handleAgentTodoCoordination(message.payload);
       return;
     }
     if (message.type === "taskboard:open-external") {
@@ -1444,7 +1485,10 @@
     nextFrame.id = FRAME_ID;
     nextFrame.name = frameName;
     nextFrame.hidden = true;
-    nextFrame.setAttribute("sandbox", "allow-scripts allow-forms allow-modals allow-downloads");
+    nextFrame.setAttribute(
+      "sandbox",
+      "allow-scripts allow-forms allow-modals allow-downloads",
+    );
     nextFrame.src = "about:blank";
     nextFrame.title = hostText("任务面板", "Taskboard");
     nextFrame.referrerPolicy = "no-referrer";
@@ -1512,11 +1556,22 @@
         }, timeoutMs);
       hostRequests.set(id, { resolve, reject, timeout });
       try {
-        window.postMessage({
+        const request = {
           type: HOST_REQUEST_MESSAGE,
           capability: HOST_CAPABILITY,
           payload: { ...payload, id, action },
-        }, window.location.origin);
+        };
+        const requestQueue = typeof HOST_REQUEST_QUEUE_NAME === "string"
+          ? window[HOST_REQUEST_QUEUE_NAME]
+          : null;
+        if (Array.isArray(requestQueue)) {
+          requestQueue.push({
+            capability: HOST_CAPABILITY,
+            payload: request.payload,
+          });
+        } else {
+          window.postMessage(request, window.location.origin);
+        }
       } catch (error) {
         if (timeout !== null) window.clearTimeout(timeout);
         hostRequests.delete(id);
@@ -1715,7 +1770,22 @@
     ensureEntry();
     mountActivePage();
     syncEntryState();
-    void prepareTaskboard(generation);
+    void (async () => {
+      if (suspendedNativeBrowserPanel) {
+        const deadline = Date.now() + 2_000;
+        while (active && generation === openGeneration && Date.now() < deadline) {
+          const browserPanelVisible = Array.from(
+            document.querySelectorAll("[data-browser-sidebar-webview]"),
+          ).some((node) => window.getComputedStyle(node).visibility !== "hidden");
+          if (!browserPanelVisible) break;
+          await new Promise((resolve) => window.setTimeout(resolve, 50));
+        }
+      }
+      if (!active || generation !== openGeneration) return;
+      ensureEntry();
+      mountActivePage();
+      await prepareTaskboard(generation);
+    })();
   }
 
   function isNativePageNavigation(target) {
@@ -1817,7 +1887,7 @@
   }
 
   function onNativeRouteChange() {
-    if (active) closeTaskboard(false);
+    if (active && !suspendedNativeBrowserPanel) closeTaskboard(false);
   }
 
   const api = {

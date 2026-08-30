@@ -1,5 +1,13 @@
+import path from "node:path";
+
 const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
+const coordinationDeliveries = new Map();
+const COORDINATION_DEDUPLICATION_MS = 60_000;
+const continuationMonitorRuns = new Map();
+const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
+const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
 
 function parseHostRequest(payload, parseAutomationRequest) {
   if (typeof payload !== "string" || payload.length > 4_194_304) {
@@ -87,7 +95,186 @@ function parseHostRequest(payload, parseAutomationRequest) {
   ) {
     return { id, request, error: null };
   }
+  if (
+    request.action === "coordinate-agent-todo"
+    && typeof request.rootThreadId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(request.rootThreadId)
+    && typeof request.codexHostId === "string"
+    && request.codexHostId.length > 0
+    && request.codexHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && typeof request.projectId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.projectId)
+    && typeof request.todoId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.todoId)
+    && typeof request.safeActionId === "string"
+    && /^[a-z0-9._-]{1,128}$/i.test(request.safeActionId)
+    && typeof request.expectedResumeToken === "string"
+    && /^[a-f0-9]{64}$/.test(request.expectedResumeToken)
+    && typeof request.rootWorkspacePath === "string"
+    && request.rootWorkspacePath.length > 0
+    && request.rootWorkspacePath.length <= 4_096
+    && path.isAbsolute(request.rootWorkspacePath)
+    && typeof request.targetRoot === "string"
+    && request.targetRoot.length > 0
+    && request.targetRoot.length <= 4_096
+    && path.isAbsolute(request.targetRoot)
+  ) return { id, request, error: null };
   return { id, request: null, error: HOST_REQUEST_ERROR };
+}
+
+export async function deliverTaskboardCoordination(request, rpc, validateExecutionTarget) {
+  if (typeof validateExecutionTarget !== "function") {
+    throw new Error("Execution worktree validator is required");
+  }
+  const observedAt = Date.now();
+  for (const [key, entry] of coordinationDeliveries) {
+    if (entry.expiresAt <= observedAt) coordinationDeliveries.delete(key);
+  }
+  const rootWorkspacePath = path.resolve(request.rootWorkspacePath);
+  const targetRoot = path.resolve(request.targetRoot);
+  const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.safeActionId}:${request.expectedResumeToken}:${request.rootThreadId}:${rootWorkspacePath}:${targetRoot}`;
+  const existing = coordinationDeliveries.get(deliveryKey);
+  if (existing) return existing.promise;
+  const delivery = deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget);
+  const entry = { promise: delivery, expiresAt: observedAt + COORDINATION_DEDUPLICATION_MS };
+  coordinationDeliveries.set(deliveryKey, entry);
+  delivery.catch(() => {
+    if (coordinationDeliveries.get(deliveryKey) === entry) coordinationDeliveries.delete(deliveryKey);
+  });
+  return delivery;
+}
+
+export async function runTaskboardContinuationMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  if (!policy || !COORDINATION_ID_PATTERN.test(policy.projectId ?? "")) {
+    return { delivered: false, reason: "invalid-policy" };
+  }
+  const existing = continuationMonitorRuns.get(policy.projectId);
+  if (existing) return existing;
+
+  const run = runTaskboardContinuationMonitorOnceUnlocked(options);
+  continuationMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (continuationMonitorRuns.get(policy.projectId) === run) {
+      continuationMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runTaskboardContinuationMonitorOnceUnlocked({
+  policy,
+  readSnapshot,
+  claimReceipt,
+  deliver,
+}) {
+  if (
+    typeof readSnapshot !== "function"
+    || typeof claimReceipt !== "function"
+    || typeof deliver !== "function"
+  ) return { delivered: false, reason: "invalid-monitor" };
+
+  const snapshot = await readSnapshot(policy.projectId);
+  if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
+    return { delivered: false, reason: "invalid-snapshot" };
+  }
+  const todo = snapshot.todos.find((candidate) => {
+    const target = candidate?.dispatchTarget;
+    const readyWork = candidate?.readyWork;
+    const safeAction = readyWork?.safeActions?.[0];
+    return (
+      COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+      && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
+      && candidate?.run == null
+      && readyWork?.eligible === true
+      && Array.isArray(readyWork.safeActions)
+      && COORDINATION_ID_PATTERN.test(safeAction?.id ?? "")
+      && RESUME_TOKEN_PATTERN.test(readyWork?.resumeToken ?? "")
+      && THREAD_ID_PATTERN.test(target?.rootThreadId ?? "")
+      && typeof target?.codexHostId === "string"
+      && target.codexHostId.length > 0
+      && target.codexHostId.length <= 240
+      && !/[\u0000-\u001f\u007f]/.test(target.codexHostId)
+      && typeof target?.rootWorkspacePath === "string"
+      && path.isAbsolute(target.rootWorkspacePath)
+      && typeof target?.worktreePath === "string"
+      && path.isAbsolute(target.worktreePath)
+    );
+  });
+  if (!todo) return { delivered: false, reason: "no-eligible-work" };
+
+  const safeAction = todo.readyWork.safeActions[0];
+  if (!await claimReceipt({
+    todoId: todo.id,
+    taskId: todo.taskId,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    safeActionId: safeAction.id,
+    expectedResumeToken: todo.readyWork.resumeToken,
+  })) {
+    return { delivered: false, reason: "reservation-unavailable" };
+  }
+  await deliver({
+    projectId: policy.projectId,
+    todoId: todo.id,
+    rootThreadId: todo.dispatchTarget.rootThreadId,
+    codexHostId: todo.dispatchTarget.codexHostId,
+    rootWorkspacePath: path.resolve(todo.dispatchTarget.rootWorkspacePath),
+    targetRoot: path.resolve(todo.dispatchTarget.worktreePath),
+    safeActionId: safeAction.id,
+    expectedResumeToken: todo.readyWork.resumeToken,
+  });
+  return { delivered: true, todoId: todo.id, actionId: safeAction.id };
+}
+
+async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget) {
+  const threadResult = await rpc("thread/read", {
+    threadId: request.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.rootThreadId) {
+    throw new Error("Codex did not confirm the configured Root task");
+  }
+  const rootCwd = typeof threadResult.thread.cwd === "string" ? path.resolve(threadResult.thread.cwd) : null;
+  const rootWorkspacePath = path.resolve(request.rootWorkspacePath);
+  const targetRoot = path.resolve(request.targetRoot);
+  if (!rootCwd || rootWorkspacePath !== rootCwd) {
+    throw new Error("Configured Root cwd must exactly match the coordination workspace");
+  }
+  await validateExecutionTarget(targetRoot);
+  const instruction = [
+    `taskctl issue bootstrap ${request.todoId} --json`,
+    `Project: ${request.projectId}`,
+    `Todo: ${request.todoId}`,
+    `Expected Capsule resumeToken: ${request.expectedResumeToken}`,
+    `Authorized safe action id: ${request.safeActionId}`,
+    `Exact execution worktree: ${targetRoot}`,
+    "Before editing or testing, verify the exact execution worktree is a Git worktree and use it for all repository commands. The Root coordination cwd may be different and must not be treated as the execution worktree.",
+    "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
+    "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, then spawn the smallest useful Sub-Agent if needed, claim the Todo with that Sub-Agent thread identity, a future lease, and an explicit bounded write scope, and collect its result back into Root.",
+    "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",
+  ].join("\n");
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
+  if (activeTurn?.id) {
+    await rpc("turn/steer", {
+      threadId: request.rootThreadId,
+      expectedTurnId: activeTurn.id,
+      input: [{ type: "text", text: instruction }],
+    });
+    return { delivery: "steered", turnId: activeTurn.id };
+  }
+  await rpc("thread/resume", { threadId: request.rootThreadId });
+  const started = await rpc("turn/start", {
+    threadId: request.rootThreadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a valid Root turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
 }
 
 export async function handleHostBindingPayload(params, handlers) {
@@ -122,6 +309,8 @@ export async function handleHostBindingPayload(params, handlers) {
       result = await handlers.openAttachment(parsed.request);
     } else if (parsed.request.action === "automation") {
       result = await handlers.runAutomation(parsed.request, params.executionContextId);
+    } else if (parsed.request.action === "coordinate-agent-todo") {
+      result = await handlers.coordinateAgentTodo(parsed.request, params.executionContextId);
     } else {
       result = await handlers.startConversation(parsed.request, params.executionContextId);
     }

@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { access, chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, test } from "node:test";
 
-import { createTaskboardServer } from "../server/index.mjs";
+import { createTaskboardServer, resolveHost } from "../server/index.mjs";
+import { TaskboardDatabase } from "../server/database.mjs";
+import { runTaskboardContinuationMonitorOnce } from "../scripts/codex-injector-runtime.mjs";
 
 const runningApps = [];
 
@@ -88,6 +90,943 @@ test("health and the default local project are available", async () => {
   assert.equal(result.body.projects[0].name, "全局");
   assert.equal(result.body.projects[0].workspacePath, null);
   assert.equal(result.body.projects[0].issueCount, 0);
+  const agentLaneProjects = await request(baseUrl, "/api/local/agent-lane-projects");
+  assert.equal(agentLaneProjects.response.status, 200);
+  assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
+});
+
+test("protected panel presence reports live and closed Taskboard pages", async () => {
+  const instanceToken = "taskboard-panel-test-token";
+  const baseUrl = await startServer(async () => ({
+    instanceToken,
+    instanceSecret: "a".repeat(64),
+  }));
+  const route = `/${instanceToken}/api/local/taskboard-panel-presence`;
+  const panelId = "panel-12345678";
+
+  const initial = await request(baseUrl, route);
+  assert.equal(initial.response.status, 200);
+  assert.deepEqual(initial.body, { live: false });
+
+  const touched = await request(baseUrl, route, {
+    method: "PUT",
+    body: { panelId },
+  });
+  assert.equal(touched.response.status, 204);
+  assert.deepEqual((await request(baseUrl, route)).body, { live: true });
+
+  const removed = await request(baseUrl, route, {
+    method: "DELETE",
+    body: { panelId },
+  });
+  assert.equal(removed.response.status, 204);
+  assert.deepEqual((await request(baseUrl, route)).body, { live: false });
+});
+
+test("durable Agent Runs checkpoint, finish, and recover through the API", async () => {
+  const baseUrl = await startServer();
+  const rootBinding = {
+    threadId: "root-thread",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/durable-agent-run-worktree",
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: {
+      projectId: "local",
+      title: "Durable run task",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: [],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/durable-agent-run",
+      },
+      workingLog: { path: "/tmp/durable-agent-run-worktree/CAP-3-WORKING-LOG.md", status: "active" },
+    },
+  });
+  assert.equal(created.response.status, 201);
+  const claimed = await request(baseUrl, `/api/tasks/${created.body.task.id}/claim`, {
+    method: "POST",
+    body: {
+      version: created.body.task.version,
+      agentPath: "/root/server-test",
+      agentThreadId: "server-test-agent",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+      writeScope: ["server/database.mjs"],
+    },
+  });
+  assert.equal(claimed.response.status, 200);
+  assert.equal(claimed.body.run.status, "active");
+  const activeCapsule = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  assert.equal(activeCapsule.body.capsule.activeRun.id, claimed.body.run.id);
+  assert.equal(activeCapsule.body.capsule.latestRun.id, claimed.body.run.id);
+  const wrongThread = await request(baseUrl, `/api/runs/${claimed.body.run.id}/checkpoint`, {
+    method: "POST",
+    body: {
+      version: claimed.body.run.version,
+      agentThreadId: "other-agent",
+      summary: "Wrong thread",
+      nextAction: "Do not persist",
+      status: "active",
+    },
+  });
+  assert.equal(wrongThread.response.status, 409);
+  assert.equal(wrongThread.body.error.code, "RUN_THREAD_MISMATCH");
+  const checkpointed = await request(baseUrl, `/api/runs/${claimed.body.run.id}/checkpoint`, {
+    method: "POST",
+    body: {
+      version: claimed.body.run.version,
+      agentThreadId: "server-test-agent",
+      summary: "Checkpoint persisted",
+      nextAction: "Resume from API",
+      status: "blocked",
+    },
+  });
+  assert.equal(checkpointed.response.status, 200);
+  assert.equal(checkpointed.body.run.version, 2);
+  const capsule = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  assert.equal(capsule.body.capsule.latestRun.nextAction, "Resume from API");
+  const finished = await request(baseUrl, `/api/runs/${claimed.body.run.id}/finish`, {
+    method: "POST",
+    body: {
+      version: checkpointed.body.run.version,
+      agentThreadId: "server-test-agent",
+      summary: "Finished",
+      nextAction: "Review",
+      status: "completed",
+    },
+  });
+  assert.equal(finished.response.status, 200);
+  assert.equal(finished.body.task.status, "in_review");
+  const repeated = await request(baseUrl, `/api/runs/${claimed.body.run.id}/finish`, {
+    method: "POST",
+    body: {
+      version: checkpointed.body.run.version,
+      agentThreadId: "server-test-agent",
+      summary: "Finished",
+      nextAction: "Review",
+      status: "completed",
+    },
+  });
+  assert.equal(repeated.response.status, 200);
+  assert.equal(repeated.body.applied, false);
+});
+
+test("structured handoff envelopes replay and acknowledge without changing execution", async () => {
+  let dataDirectory;
+  let baseUrl = await startServer(async (directory) => {
+    dataDirectory = directory;
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+  const rootBinding = {
+    threadId: "root-thread",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/handoff-envelope-worktree",
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: {
+      projectId: "local",
+      title: "Durable handoff",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/handoff-envelope",
+      },
+    },
+  });
+  const claimed = await request(baseUrl, `/api/tasks/${created.body.task.id}/claim`, {
+    method: "POST",
+    body: {
+      version: created.body.task.version,
+      agentPath: "/root/backend",
+      agentThreadId: "backend-thread",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+      writeScope: ["server/database.mjs"],
+    },
+  });
+  const envelope = {
+    eventId: "handoff-event-1",
+    idempotencyKey: "backend-to-root-1",
+    parentTaskId: null,
+    senderThreadId: "backend-thread",
+    senderAgentPath: "/root/backend",
+    eventType: "handoff",
+    sequence: 1,
+    timestamp: "2098-01-01T01:02:03.000Z",
+    summary: "Backend contract is verified.",
+    evidenceRefs: ["test/server.test.mjs#structured-handoff"],
+    blocker: null,
+    nextAction: "Root reviews the focused evidence.",
+    requiresAck: true,
+    causationId: "claim-backend-1",
+    correlationId: "feature-handoff-1",
+  };
+
+  const first = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: envelope,
+  });
+  assert.equal(first.response.status, 201);
+  assert.equal(first.body.applied, true);
+  assert.deepEqual(first.body.event.envelope, envelope);
+  assert.equal(first.body.event.acknowledgements.length, 0);
+  const pendingCapsule = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  assert.equal(pendingCapsule.body.capsule.handoffs.pendingAcknowledgementCount, 1);
+  assert.deepEqual(pendingCapsule.body.capsule.handoffs.latestEvent, first.body.event);
+  const pendingLanes = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  const pendingTodo = pendingLanes.body.todos.find((todo) => todo.id === created.body.task.identifier);
+  assert.equal(pendingTodo.handoffs.pendingAcknowledgementCount, 1);
+  assert.deepEqual(pendingTodo.handoffs.latestEvent, first.body.event);
+
+  const duplicate = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: envelope,
+  });
+  assert.equal(duplicate.response.status, 200);
+  assert.equal(duplicate.body.applied, false);
+  assert.deepEqual(duplicate.body.event, first.body.event);
+  const conflictingDelivery = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: { ...envelope, eventId: "handoff-event-conflict", summary: "Conflicting content." },
+  });
+  assert.equal(conflictingDelivery.response.status, 409);
+  assert.equal(conflictingDelivery.body.error.code, "COORDINATION_EVENT_CONFLICT");
+  const sensitiveDelivery = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "handoff-event-sensitive",
+      idempotencyKey: "backend-to-root-sensitive",
+      sequence: 2,
+      summary: "token=must-not-persist",
+    },
+  });
+  assert.equal(sensitiveDelivery.response.status, 400);
+  assert.equal(sensitiveDelivery.body.error.code, "SENSITIVE_COORDINATION_CONTENT");
+
+  const replay = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`);
+  assert.equal(replay.response.status, 200);
+  assert.deepEqual(replay.body.events, [first.body.event]);
+
+  const acknowledged = await request(baseUrl, `/api/coordination-events/${envelope.eventId}/acknowledgements`, {
+    method: "POST",
+    body: {
+      acknowledgementId: "root-ack-1",
+      senderThreadId: rootBinding.threadId,
+      senderAgentPath: "/root",
+    },
+  });
+  assert.equal(acknowledged.response.status, 201);
+  assert.equal(acknowledged.body.applied, true);
+  const acknowledgedCapsule = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  assert.equal(acknowledgedCapsule.body.capsule.handoffs.pendingAcknowledgementCount, 0);
+  assert.deepEqual(
+    acknowledgedCapsule.body.capsule.handoffs.latestEvent.acknowledgements,
+    [acknowledged.body.acknowledgement],
+  );
+  const wrongRoot = await request(baseUrl, `/api/coordination-events/${envelope.eventId}/acknowledgements`, {
+    method: "POST",
+    body: {
+      acknowledgementId: "wrong-root-ack",
+      senderThreadId: "other-root-thread",
+      senderAgentPath: "/root",
+    },
+  });
+  assert.equal(wrongRoot.response.status, 409);
+  assert.equal(wrongRoot.body.error.code, "COORDINATION_ACK_SENDER_MISMATCH");
+  const repeatedAck = await request(baseUrl, `/api/coordination-events/${envelope.eventId}/acknowledgements`, {
+    method: "POST",
+    body: {
+      acknowledgementId: "root-ack-1",
+      senderThreadId: rootBinding.threadId,
+      senderAgentPath: "/root",
+    },
+  });
+  assert.equal(repeatedAck.response.status, 200);
+  assert.equal(repeatedAck.body.applied, false);
+  assert.deepEqual(repeatedAck.body.acknowledgement, acknowledged.body.acknowledgement);
+
+  const recovered = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`);
+  assert.deepEqual(recovered.body.events[0].acknowledgements, [acknowledged.body.acknowledgement]);
+  const taskAfter = await request(baseUrl, `/api/tasks/${created.body.task.id}`);
+  assert.equal(taskAfter.body.task.version, claimed.body.task.version);
+  assert.equal(taskAfter.body.task.status, "in_progress");
+  const runAfter = await request(baseUrl, `/api/runs/${claimed.body.run.id}`);
+  assert.deepEqual(runAfter.body.run, claimed.body.run);
+  const comments = await request(baseUrl, `/api/tasks/${created.body.task.id}/comments`);
+  assert.equal(comments.body.comments.length, 1);
+  assert.match(comments.body.comments[0].body, /^Agent Handoff\b/);
+  assert.equal(comments.body.comments[0].authorType, "agent");
+  assert.match(comments.body.comments[0].body, /Backend contract is verified\./);
+  assert.match(comments.body.comments[0].body, /Root reviews the focused evidence\./);
+
+  const running = runningApps.pop();
+  await running.app.close();
+  const restarted = createTaskboardServer({ dataDirectory });
+  const restartedAddress = await restarted.listen({ port: 0 });
+  runningApps.push({ app: restarted, directory: dataDirectory });
+  baseUrl = `http://127.0.0.1:${restartedAddress.port}`;
+  const replayAfterRestart = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`);
+  assert.deepEqual(replayAfterRestart.body.events[0].acknowledgements, [acknowledged.body.acknowledgement]);
+});
+
+test("bootstrap safe-action reservation atomically validates the Capsule frontier", async () => {
+  let taskId;
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const rootBinding = {
+      threadId: "root-thread",
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/bootstrap-safe-action-worktree",
+    };
+    const task = database.createTask({
+      projectId: "local",
+      title: "Reserve exact safe action",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor,
+      assignee: actor,
+      workflowId: null,
+      developmentContext: { type: "worktree", path: rootBinding.workspacePath, branch: "codex/bootstrap-safe-action" },
+      workingLog: { path: `${rootBinding.workspacePath}/WORKING-LOG.md`, status: "active" },
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "local tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:resume",
+        }],
+        actions: [{ id: "test", order: 10, text: "Run local acceptance", gate: "local", target: "candidate", status: "pending" }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    taskId = task.id;
+    database.close();
+    return {};
+  });
+
+  const bootstrap = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
+  const capsule = bootstrap.body.capsule;
+  const reservation = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: capsule.readyWork.safeActions[0].id,
+    },
+  });
+  assert.equal(reservation.response.status, 200);
+  assert.equal(reservation.body.reused, false);
+  assert.equal(reservation.body.receipt.safeActionId, "test");
+  assert.equal(reservation.body.receipt.resumeToken, capsule.resumeToken);
+
+  const repeated = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: "test",
+    },
+  });
+  assert.equal(repeated.response.status, 200);
+  assert.equal(repeated.body.reused, true);
+  assert.equal(repeated.body.receipt.id, reservation.body.receipt.id);
+
+  const wrongRoot = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "other-root-thread",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: "test",
+    },
+  });
+  assert.equal(wrongRoot.response.status, 409);
+  assert.equal(wrongRoot.body.error.code, "ROOT_THREAD_MISMATCH");
+
+  const stale = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      expectedResumeToken: "0".repeat(64),
+      safeActionId: "test",
+    },
+  });
+  assert.equal(stale.response.status, 409);
+  assert.equal(stale.body.error.code, "RESUME_TOKEN_MISMATCH");
+
+  const unchanged = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
+  assert.equal(unchanged.body.capsule.task.status, "todo");
+  assert.equal(unchanged.body.capsule.activeRun, null);
+});
+
+test("the default host is loopback-only", () => {
+  assert.equal(resolveHost(undefined), "127.0.0.1");
+  assert.equal(resolveHost("0.0.0.0"), "0.0.0.0");
+});
+
+test("Agent Lane snapshot reserves its internal task id and delivers one background continuation", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let task;
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{
+        id: "root",
+        label: "Taskboard Root",
+        owner: "Codex Root",
+        source: "codex",
+        threadId: rootThreadId,
+        taskType: "root_task",
+      }],
+      adapters: [],
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const rootBinding = {
+      threadId: rootThreadId,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/background-continuation-worktree",
+    };
+    task = database.createTask({
+      projectId: "local",
+      title: "Deliver exact background continuation",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor,
+      assignee: actor,
+      workflowId: null,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/background-continuation",
+      },
+      workingLog: { path: `${rootBinding.workspacePath}/WORKING-LOG.md`, status: "active" },
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "local continuation",
+          approver: "Owner", approvalRequest: "同意本地自动衔接",
+          evidence: "Owner resumed", receipt: "turn:resume",
+        }],
+        actions: [{
+          id: "continue", order: 10, text: "Continue exact task", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    database.close();
+    return {};
+  });
+
+  const deliveries = [];
+  const options = {
+    policy: { enabled: true, projectId: "local" },
+    readSnapshot: async () => (await request(baseUrl, "/api/local/projects/local/agent-lanes")).body,
+    claimReceipt: async (claim) => {
+      assert.equal(claim.todoId, task.identifier);
+      assert.equal(claim.taskId, task.id);
+      const reservation = await request(
+        baseUrl,
+        `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`,
+        {
+          method: "POST",
+          body: {
+            rootThreadId: claim.rootThreadId,
+            expectedResumeToken: claim.expectedResumeToken,
+            safeActionId: claim.safeActionId,
+          },
+        },
+      );
+      assert.equal(reservation.response.status, 200);
+      assert.equal(reservation.body.receipt.taskId, claim.taskId);
+      return reservation.body.reused === false;
+    },
+    deliver: async (delivery) => {
+      deliveries.push(delivery);
+      return { delivery: "started", turnId: "turn-background" };
+    },
+  };
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true,
+    todoId: task.identifier,
+    actionId: "continue",
+  });
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    reason: "reservation-unavailable",
+  });
+  assert.equal(deliveries.length, 1);
+});
+
+test("project Agent Lanes read durable database configuration through a local route", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const sessionsDirectory = path.join(directory, "sessions", "2026", "08", "23");
+    await mkdir(sessionsDirectory, { recursive: true });
+    await writeFile(
+      path.join(sessionsDirectory, "rollout-root-thread.jsonl"),
+      `${JSON.stringify({
+        timestamp: "2026-08-23T08:02:00.000Z",
+        type: "event_msg",
+        payload: { type: "task_complete", last_agent_message: "Root milestone complete." },
+      })}\n`,
+    );
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "root-thread", taskType: "peer_task" },
+        { id: "taskboard", label: "Taskboard", owner: "Codex Taskboard", source: "codex", threadId: "root-thread", taskType: "infrastructure_task" },
+      ],
+      adapters: [
+        { id: "claude", label: "Claude", owner: "Claude", source: "claude", connection: "not_connected" },
+        { id: "pi", label: "Pi", owner: "Pi", source: "pi", connection: "not_connected" },
+      ],
+    });
+    const rootBinding = {
+      threadId: "root-thread",
+      codexProjectId: "local",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/local-agent-worktree",
+    };
+    database.createTask({
+      projectId: "local",
+      title: "Capsule-dispatchable lane task",
+      description: "",
+      status: "todo",
+      priority: "medium",
+      labels: [],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null },
+      assignee: { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null },
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/local-agent-lane",
+      },
+      workingLog: {
+        path: `${rootBinding.workspacePath}/CAP-LOCAL-WORKING-LOG.md`,
+        status: "planned",
+      },
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.close();
+    return { codexSessionsDirectory: path.join(directory, "sessions") };
+  });
+
+  const result = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.readOnly, true);
+  assert.equal(result.body.automaticRecoveryEnabled, false);
+  assert.equal(result.body.version, 3);
+  assert.equal(result.body.taskLanes.length, 3);
+  assert.equal(result.body.rootSubagents.length, 0);
+  assert.equal(result.body.adapters.length, 2);
+  const capsuleTodo = result.body.todos.find((todo) => todo.title === "Capsule-dispatchable lane task");
+  assert.equal(capsuleTodo.readyWork.eligible, true);
+  assert.deepEqual(capsuleTodo.dispatchTarget, {
+    rootThreadId: "root-thread",
+    codexHostId: "local",
+    rootWorkspacePath: "/tmp/local-agent-worktree",
+    worktreePath: "/tmp/local-agent-worktree",
+  });
+  assert.equal(capsuleTodo.workingLog.status, "planned");
+  assert.equal(capsuleTodo.run, null);
+
+  const projects = await request(baseUrl, "/api/local/agent-lane-projects");
+  assert.equal(projects.response.status, 200);
+  assert.deepEqual(projects.body, { projectIds: ["local"] });
+
+  const mutation = await request(baseUrl, "/api/local/projects/local/agent-lanes", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(mutation.response.status, 405);
+});
+
+test("project coordinator leases acquire and renew atomically without granting execution ownership", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task" },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+
+  const acquired = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "visual-thread",
+      expectedLeaseId: null,
+      leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(acquired.response.status, 200);
+  assert.equal(acquired.body.lease.holderTaskId, "visual");
+  assert.equal(acquired.body.lease.status, "active");
+  assert.match(acquired.body.lease.id, /^[0-9a-f-]{36}$/);
+  assert.equal(acquired.body.receipt.action, "acquired");
+  assert.equal(acquired.body.receipt.leaseId, acquired.body.lease.id);
+  assert.equal(acquired.body.receipt.holderThreadId, "visual-thread");
+
+  const wrongBinding = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "root-thread",
+      expectedLeaseId: acquired.body.lease.id,
+      leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(wrongBinding.response.status, 409);
+  assert.equal(wrongBinding.body.error.code, "COORDINATOR_BINDING_MISMATCH");
+
+  const invalidDuration = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "visual-thread",
+      expectedLeaseId: acquired.body.lease.id,
+      leaseDurationSeconds: 10,
+    },
+  });
+  assert.equal(invalidDuration.response.status, 400);
+  assert.equal(invalidDuration.body.error.code, "INVALID_FIELD");
+
+  const competing = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "root",
+      holderThreadId: "root-thread",
+      expectedLeaseId: acquired.body.lease.id,
+      leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(competing.response.status, 409);
+  assert.equal(competing.body.error.code, "COORDINATOR_LEASE_ACTIVE");
+
+  const renewed = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "visual-thread",
+      expectedLeaseId: acquired.body.lease.id,
+      leaseDurationSeconds: 120,
+    },
+  });
+  assert.equal(renewed.response.status, 200);
+  assert.equal(renewed.body.lease.id, acquired.body.lease.id);
+  assert.equal(renewed.body.lease.acquiredAt, acquired.body.lease.acquiredAt);
+  assert.ok(renewed.body.lease.expiresAt > acquired.body.lease.expiresAt);
+  assert.equal(renewed.body.receipt.action, "renewed");
+
+  const stale = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "visual-thread",
+      expectedLeaseId: "00000000-0000-0000-0000-000000000000",
+      leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(stale.response.status, 409);
+  assert.equal(stale.body.error.code, "COORDINATOR_LEASE_CONFLICT");
+
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200);
+  assert.equal(snapshot.body.coordination.assignment, "lease");
+  assert.equal(snapshot.body.coordination.coordinatorTaskId, "visual");
+  assert.equal(snapshot.body.coordination.workAuthority, "todo_claim_lease");
+
+  const released = await request(baseUrl, "/api/local/projects/local/coordinator-lease/release", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "visual-thread",
+      expectedLeaseId: renewed.body.lease.id,
+    },
+  });
+  assert.equal(released.response.status, 200);
+  assert.equal(released.body.lease.status, "expired");
+  assert.equal(released.body.receipt.action, "released");
+
+  const afterRelease = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(afterRelease.response.status, 200);
+  assert.equal(afterRelease.body.coordination.assignment, "unassigned");
+  assert.equal(afterRelease.body.coordination.coordinatorTaskId, null);
+
+  const staleRelease = await request(baseUrl, "/api/local/projects/local/coordinator-lease/release", {
+    method: "POST",
+    body: {
+      holderTaskId: "visual",
+      holderThreadId: "visual-thread",
+      expectedLeaseId: renewed.body.lease.id,
+    },
+  });
+  assert.equal(staleRelease.response.status, 409);
+  assert.equal(staleRelease.body.error.code, "COORDINATOR_LEASE_NOT_ACTIVE");
+
+  const receipts = await request(baseUrl, "/api/local/projects/local/coordinator-lease/receipts");
+  assert.equal(receipts.response.status, 200);
+  assert.deepEqual(
+    receipts.body.receipts.map((receipt) => receipt.action),
+    ["released", "renewed", "acquired"],
+  );
+});
+
+test("Talking Window inbox delivery is durable and idempotent without interrupting active execution", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+  const rootBinding = {
+    threadId: "root-thread",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/inbox-delivery-worktree",
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: {
+      projectId: "local",
+      title: "Project Talking Window",
+      description: "Receive Owner input while execution continues.",
+      status: "todo",
+      priority: "high",
+      labels: ["project-inbox"],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/inbox-delivery",
+      },
+      workingLog: {
+        path: `${rootBinding.workspacePath}/WORKING-LOG.md`,
+        status: "active",
+      },
+    },
+  });
+  assert.equal(created.response.status, 201);
+
+  const claimed = await request(baseUrl, `/api/tasks/${created.body.task.id}/claim`, {
+    method: "POST",
+    body: {
+      version: created.body.task.version,
+      agentPath: "/root/worker",
+      agentThreadId: "worker-thread",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      writeScope: ["server/app.mjs"],
+    },
+  });
+  assert.equal(claimed.response.status, 200);
+  const coordinator = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "root",
+      holderThreadId: "root-thread",
+      expectedLeaseId: null,
+      leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(coordinator.response.status, 200);
+  const taskBefore = claimed.body.task;
+  const runBefore = claimed.body.run;
+
+  const deliveryBody = {
+    deliveryId: "owner-message-1",
+    body: "新想法已收到；当前执行不要停止。",
+    threadId: "talking-window-thread",
+  };
+  const first = await request(baseUrl, `/api/tasks/${created.body.task.id}/inbox-deliveries`, {
+    method: "POST",
+    body: deliveryBody,
+  });
+  assert.equal(first.response.status, 201);
+  assert.equal(first.body.applied, true);
+  assert.equal(first.body.receipt.status, "queued");
+  assert.equal(first.body.receipt.executionDisposition, "current_execution_continues");
+  assert.equal(first.body.receipt.sourceThreadId, "talking-window-thread");
+  assert.equal(first.body.comment.body, deliveryBody.body);
+
+  const duplicate = await request(baseUrl, `/api/tasks/${created.body.task.id}/inbox-deliveries`, {
+    method: "POST",
+    body: deliveryBody,
+  });
+  assert.equal(duplicate.response.status, 200);
+  assert.equal(duplicate.body.applied, false);
+  assert.deepEqual(duplicate.body.receipt, first.body.receipt);
+  assert.deepEqual(duplicate.body.comment, first.body.comment);
+
+  const conflictingDuplicate = await request(
+    baseUrl,
+    `/api/tasks/${created.body.task.id}/inbox-deliveries`,
+    {
+      method: "POST",
+      body: { ...deliveryBody, body: "同一 id 下的不同 Owner 消息不得被静默丢弃。" },
+    },
+  );
+  assert.equal(conflictingDuplicate.response.status, 409);
+  assert.equal(conflictingDuplicate.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const conflictingSourceThread = await request(
+    baseUrl,
+    `/api/tasks/${created.body.task.id}/inbox-deliveries`,
+    {
+      method: "POST",
+      body: { ...deliveryBody, threadId: "different-talking-window" },
+    },
+  );
+  assert.equal(conflictingSourceThread.response.status, 409);
+  assert.equal(conflictingSourceThread.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const conflictingBinding = await request(
+    baseUrl,
+    `/api/tasks/${created.body.task.id}/inbox-deliveries`,
+    {
+      method: "POST",
+      body: {
+        ...deliveryBody,
+        threadBinding: {
+          threadId: deliveryBody.threadId,
+          codexProjectId: "different-project",
+          codexProjectKind: "local",
+          codexHostId: "local",
+          workspacePath: "/tmp/different-workspace",
+        },
+      },
+    },
+  );
+  assert.equal(conflictingBinding.response.status, 409);
+  assert.equal(conflictingBinding.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const conflictingActor = await request(
+    baseUrl,
+    `/api/tasks/${created.body.task.id}/inbox-deliveries`,
+    {
+      method: "POST",
+      headers: {
+        "x-taskboard-user-id": "different-owner",
+        "x-taskboard-user-name": encodeURIComponent("其他 Owner"),
+      },
+      body: deliveryBody,
+    },
+  );
+  assert.equal(conflictingActor.response.status, 409);
+  assert.equal(conflictingActor.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const taskAfter = await request(baseUrl, `/api/tasks/${created.body.task.id}`);
+  const capsuleAfter = await request(baseUrl, `/api/tasks/${created.body.task.id}/capsule`);
+  const runAfter = await request(baseUrl, `/api/runs/${runBefore.id}`);
+  const lanesAfter = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(taskAfter.response.status, 200);
+  assert.equal(capsuleAfter.response.status, 200);
+  assert.equal(taskAfter.body.task.status, taskBefore.status);
+  assert.equal(taskAfter.body.task.version, taskBefore.version);
+  assert.deepEqual(runAfter.body.run, runBefore);
+  assert.equal(capsuleAfter.body.capsule.inbox.pendingCount, 1);
+  assert.deepEqual(capsuleAfter.body.capsule.inbox.latestReceipt, first.body.receipt);
+  assert.equal(lanesAfter.body.coordination.coordinatorTaskId, "root");
+  assert.equal(lanesAfter.body.coordination.lease.id, coordinator.body.lease.id);
+  const talkingWindowTodo = lanesAfter.body.todos.find((todo) => todo.id === created.body.task.identifier);
+  assert.equal(talkingWindowTodo.inbox.pendingCount, 1);
+  assert.deepEqual(talkingWindowTodo.inbox.latestReceipt, first.body.receipt);
+  assert.equal(talkingWindowTodo.run.id, runBefore.id);
+
+  const receipts = await request(baseUrl, `/api/tasks/${created.body.task.id}/inbox-deliveries`);
+  const comments = await request(baseUrl, `/api/tasks/${created.body.task.id}/comments`);
+  assert.equal(receipts.response.status, 200);
+  assert.deepEqual(receipts.body.receipts, [first.body.receipt]);
+  assert.equal(comments.body.comments.length, 1);
+  assert.equal(comments.body.comments[0].id, first.body.comment.id);
+});
+
+test("connected Agent Lane opens its exact Codex thread through the local launcher", async () => {
+  const openedThreads = [];
+  const baseUrl = await startServer(() => ({
+    openCodexThread: async (threadId) => openedThreads.push(threadId),
+  }));
+  const threadId = "01a0035b-1d22-70b2-8233-d7a4ec283459";
+
+  const result = await request(baseUrl, `/api/local/codex-threads/${threadId}/open`, {
+    method: "POST",
+  });
+
+  assert.equal(result.response.status, 200);
+  assert.deepEqual(result.body, { opened: true });
+  assert.deepEqual(openedThreads, [threadId]);
 });
 
 test("launcher mode proves service identity and hides every route behind its instance token", async () => {
@@ -96,7 +1035,6 @@ test("launcher mode proves service identity and hides every route behind its ins
   const version = "0.2.0";
   const challenge = "8cbeea6e83e574def3f9d397cabddffc";
   const baseUrl = await startServer(() => ({ instanceToken, instanceSecret, version }));
-
   const unauthenticatedHealth = await request(baseUrl, "/health");
   assert.equal(unauthenticatedHealth.response.status, 401);
 
@@ -113,6 +1051,16 @@ test("launcher mode proves service identity and hides every route behind its ins
 
   const publicApi = await request(baseUrl, "/api/projects");
   assert.equal(publicApi.response.status, 404);
+
+  const boundaryPage = await fetch(`${baseUrl}/`);
+  const boundaryBody = await boundaryPage.text();
+  assert.equal(boundaryPage.status, 200);
+  assert.equal(boundaryPage.headers.get("cache-control"), "no-store");
+  assert.match(boundaryPage.headers.get("content-type"), /^text\/html\b/);
+  assert.match(boundaryBody, /Open Taskboard from Codex to use authenticated Agent Lanes/);
+  assert.match(boundaryBody, /No Taskboard data is exposed here/);
+  assert.doesNotMatch(boundaryBody, new RegExp(instanceToken));
+  assert.doesNotMatch(boundaryBody, /\/api\//);
 
   const launcherApi = await request(baseUrl, `/${instanceToken}/api/projects`, {
     headers: { origin: "null" },
@@ -492,7 +1440,6 @@ test("project and task CRUD flow", async () => {
       version: created.version,
       title: "Build polished task board",
       priority: "urgent",
-      threadId: "thread-456",
       developmentContext: { type: "branch", branch: "feature/polish" },
     },
   });
@@ -500,7 +1447,7 @@ test("project and task CRUD flow", async () => {
   const updated = patchResult.body.task;
   assert.equal(updated.title, "Build polished task board");
   assert.equal(updated.priority, "urgent");
-  assert.equal(updated.threadId, "thread-456");
+  assert.equal(updated.threadId, "thread-123");
   assert.deepEqual(updated.developmentContext, { type: "branch", branch: "feature/polish" });
   assert.equal(updated.version, 2);
 
@@ -510,7 +1457,7 @@ test("project and task CRUD flow", async () => {
   });
   assert.equal(archiveResult.response.status, 200);
   assert.equal(archiveResult.body.task.version, 3);
-  assert.equal(archiveResult.body.task.threadId, "thread-archive");
+  assert.equal(archiveResult.body.task.threadId, "thread-123");
   assert.match(archiveResult.body.task.archivedAt, /^\d{4}-\d{2}-\d{2}T/);
 
   const activeList = await request(baseUrl, "/api/tasks?projectId=website");
@@ -529,7 +1476,7 @@ test("project and task CRUD flow", async () => {
   assert.equal(restoreResult.response.status, 200);
   assert.equal(restoreResult.body.task.archivedAt, null);
   assert.equal(restoreResult.body.task.version, 4);
-  assert.equal(restoreResult.body.task.threadId, "thread-restore");
+  assert.equal(restoreResult.body.task.threadId, "thread-123");
 
   const activeAfterRestore = await request(baseUrl, "/api/tasks?projectId=website");
   assert.deepEqual(activeAfterRestore.body.tasks.map((task) => task.id), [created.id]);
@@ -553,7 +1500,7 @@ test("moving a task updates its status and sort order", async () => {
   assert.equal(moveResult.response.status, 200);
   assert.equal(moveResult.body.task.status, "in_progress");
   assert.equal(moveResult.body.task.sortOrder, 2500.5);
-  assert.equal(moveResult.body.task.threadId, "thread-move");
+  assert.equal(moveResult.body.task.threadId, null);
   assert.equal(moveResult.body.task.version, 2);
 });
 
@@ -683,7 +1630,7 @@ test("issues support parent, sub-issue, blocking, and related issue relationship
   const parentAdded = await mutateRelation("POST", child, "parent", parent);
   assert.equal(parentAdded.response.status, 200);
   assert.equal(parentAdded.body.task.version, child.version + 1);
-  assert.equal(parentAdded.body.task.threadId, "thread-relations");
+  assert.equal(parentAdded.body.task.threadId, null);
   assert.equal(parentAdded.body.task.relations.parent.id, parent.id);
   assert.equal(parentAdded.body.relatedTask.id, parent.id);
 
@@ -844,9 +1791,16 @@ test("task and comment mutations keep content-specific conversation attribution"
   });
   assert.equal(updateResult.body.task.threadId, "thread-original");
 
-  const repeatedUpdate = await request(baseUrl, `/api/tasks/${task.id}`, {
+  const rejectedRebind = await request(baseUrl, `/api/tasks/${task.id}`, {
     method: "PATCH",
     body: { version: updateResult.body.task.version, title: "Still attributed again", threadId: "thread-original" },
+  });
+  assert.equal(rejectedRebind.response.status, 400);
+  assert.equal(rejectedRebind.body.error.code, "INVALID_FIELD");
+
+  const repeatedUpdate = await request(baseUrl, `/api/tasks/${task.id}`, {
+    method: "PATCH",
+    body: { version: updateResult.body.task.version, title: "Still attributed again" },
   });
   assert.equal(repeatedUpdate.body.task.threadId, "thread-original");
 
