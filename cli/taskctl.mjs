@@ -53,6 +53,7 @@ const COMMAND_OPTIONS = new Map([
       "worktree-branch",
       "working-log-path",
       "working-log-status",
+      "workflow-profile",
       "start-date",
       "due-date",
       "recurrence-interval",
@@ -76,6 +77,7 @@ const COMMAND_OPTIONS = new Map([
       "working-log-path",
       "working-log-status",
       "clear-working-log",
+      "workflow-profile",
       "binding-thread-id",
       "binding-codex-project-id",
       "binding-codex-project-kind",
@@ -185,6 +187,7 @@ Actions:
     [--thread-id ID]
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
     [--working-log-path PATH --working-log-status planned|active|blocked|complete]
+    [--workflow-profile formal|vibe]
     [--start-date YYYY-MM-DD] [--due-date YYYY-MM-DD]
     [--recurrence-interval N --recurrence-unit day|week|month|year] [--json]
   update ISSUE_ID
@@ -194,6 +197,7 @@ Actions:
     [--git-branch BRANCH | --worktree-path PATH [--worktree-branch BRANCH]]
     [--working-log-path PATH --working-log-status planned|active|blocked|complete
      | --clear-working-log]
+    [--workflow-profile formal|vibe]
     [--binding-thread-id ID
       [--binding-codex-project-id ID --binding-codex-project-kind local|remote
        --binding-codex-host-id ID --binding-workspace-path PATH]
@@ -939,6 +943,7 @@ async function createIssue(api, options, overrides) {
   const priority = options.priority ?? "none";
   assertStatus(status);
   assertPriority(priority);
+  if (options["workflow-profile"] !== undefined) assertWorkflowProfile(options["workflow-profile"]);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
   const workingLog = workingLogFromOptions(options, overrides);
@@ -951,6 +956,7 @@ async function createIssue(api, options, overrides) {
     status,
     priority,
     labels: parseLabels(options.labels),
+    ...optionalField("workflowProfile", options["workflow-profile"]),
     threadId,
     ...optionalField("developmentContext", developmentContext),
     ...optionalField("workingLog", workingLog),
@@ -963,6 +969,7 @@ async function createIssue(api, options, overrides) {
 async function updateIssue(api, taskId, options, overrides) {
   if (options.status !== undefined) assertStatus(options.status);
   if (options.priority !== undefined) assertPriority(options.priority);
+  if (options["workflow-profile"] !== undefined) assertWorkflowProfile(options["workflow-profile"]);
 
   const developmentContext = developmentContextFromOptions(options, overrides);
   const workingLog = workingLogFromOptions(options, overrides);
@@ -976,6 +983,7 @@ async function updateIssue(api, taskId, options, overrides) {
     ...optionalField("labels", options.labels === undefined ? undefined : parseLabels(options.labels)),
     ...optionalField("developmentContext", developmentContext),
     ...optionalField("workingLog", workingLog),
+    ...optionalField("workflowProfile", options["workflow-profile"]),
     ...optionalField("threadBinding", threadBinding),
     ...optionalField("startDate", options["start-date"]),
     ...optionalField("dueDate", options["due-date"]),
@@ -1385,6 +1393,12 @@ function assertStatus(status) {
 function assertPriority(priority) {
   if (!isTaskPriority(priority)) {
     throw usageError(`Invalid priority: ${priority}`);
+  }
+}
+
+function assertWorkflowProfile(profile) {
+  if (profile !== "formal" && profile !== "vibe") {
+    throw usageError(`Invalid workflow profile: ${profile}. Expected formal or vibe`);
   }
 }
 

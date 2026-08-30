@@ -1389,6 +1389,7 @@ test("project and task CRUD flow", async () => {
       status: "todo",
       priority: "high",
       labels: ["frontend", "mvp"],
+      workflowProfile: "vibe",
       threadId: "thread-123",
       developmentContext: {
         type: "worktree",
@@ -1406,6 +1407,7 @@ test("project and task CRUD flow", async () => {
   assert.equal(created.sortOrder, 1000);
   assert.equal(created.archivedAt, null);
   assert.deepEqual(created.labels, ["frontend", "mvp"]);
+  assert.equal(created.workflowProfile, "vibe");
   assert.equal(created.threadId, "thread-123");
   assert.equal(created.creatorType, "user");
   assert.equal(created.creatorId, "local-user");
@@ -1440,6 +1442,7 @@ test("project and task CRUD flow", async () => {
       version: created.version,
       title: "Build polished task board",
       priority: "urgent",
+      workflowProfile: "formal",
       developmentContext: { type: "branch", branch: "feature/polish" },
     },
   });
@@ -1447,6 +1450,7 @@ test("project and task CRUD flow", async () => {
   const updated = patchResult.body.task;
   assert.equal(updated.title, "Build polished task board");
   assert.equal(updated.priority, "urgent");
+  assert.equal(updated.workflowProfile, "formal");
   assert.equal(updated.threadId, "thread-123");
   assert.deepEqual(updated.developmentContext, { type: "branch", branch: "feature/polish" });
   assert.equal(updated.version, 2);

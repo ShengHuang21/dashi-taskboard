@@ -313,6 +313,7 @@ function taskFromRow(row) {
     status: row.status,
     priority: row.priority,
     labels: JSON.parse(row.labels),
+    workflowProfile: row.workflow_profile ?? "formal",
     sortOrder: row.sort_order,
     threadId: row.thread_id,
     threadBinding: threadBindingFromRow(row),
@@ -624,6 +625,7 @@ export class TaskboardDatabase {
         )),
         priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
         labels TEXT NOT NULL DEFAULT '[]',
+        workflow_profile TEXT NOT NULL DEFAULT 'formal' CHECK (workflow_profile IN ('formal', 'vibe')),
         sort_order REAL NOT NULL,
         thread_id TEXT,
         thread_codex_project_id TEXT,
@@ -1017,6 +1019,9 @@ export class TaskboardDatabase {
     if (!migratedTaskColumns.some((column) => column.name === "working_log_path")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_path TEXT");
     }
+    if (!migratedTaskColumns.some((column) => column.name === "workflow_profile")) {
+      this.database.exec("ALTER TABLE tasks ADD COLUMN workflow_profile TEXT NOT NULL DEFAULT 'formal' CHECK (workflow_profile IN ('formal', 'vibe'))");
+    }
     if (!migratedTaskColumns.some((column) => column.name === "working_log_status")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN working_log_status TEXT");
     }
@@ -1301,6 +1306,7 @@ export class TaskboardDatabase {
           )),
           priority TEXT NOT NULL CHECK (priority IN ('none', 'urgent', 'high', 'medium', 'low')),
           labels TEXT NOT NULL DEFAULT '[]',
+          workflow_profile TEXT NOT NULL DEFAULT 'formal' CHECK (workflow_profile IN ('formal', 'vibe')),
           sort_order REAL NOT NULL,
           thread_id TEXT,
           thread_codex_project_id TEXT,
@@ -1321,14 +1327,14 @@ export class TaskboardDatabase {
         );
 
         INSERT INTO tasks_status_migration (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
         )
         SELECT
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, 'formal',
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path, git_branch, worktree_path, worktree_branch,
           start_date, due_date, recurrence_interval, recurrence_unit,
@@ -1471,7 +1477,7 @@ export class TaskboardDatabase {
       }
       const insertTask = this.database.prepare(`
         INSERT INTO tasks (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
@@ -1482,7 +1488,7 @@ export class TaskboardDatabase {
           archived_at, version, created_at, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, NULL, NULL, NULL, NULL, NULL,
+          'formal', ?, NULL, NULL, NULL, NULL, NULL,
           ?, ?, ?, ?,
           ?, ?, ?, ?,
           NULL, NULL, NULL,
@@ -2838,7 +2844,7 @@ export class TaskboardDatabase {
       );
       this.database.prepare(`
         INSERT INTO tasks (
-          id, identifier, project_id, title, description, status, priority, labels,
+          id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           creator_type, creator_id, creator_name, creator_avatar_url,
@@ -2847,7 +2853,7 @@ export class TaskboardDatabase {
           working_log_path, working_log_status, working_log_updated_at,
           start_date, due_date, recurrence_interval, recurrence_unit,
           archived_at, version, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
       `).run(
         id,
         identifier,
@@ -2857,6 +2863,7 @@ export class TaskboardDatabase {
         input.status,
         input.priority,
         JSON.stringify(input.labels),
+        input.workflowProfile ?? "formal",
         sortOrder,
         ...(storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null]),
         input.actor.type,
@@ -2944,6 +2951,7 @@ export class TaskboardDatabase {
       status: "status",
       priority: "priority",
       labels: "labels",
+      workflowProfile: "workflow_profile",
       startDate: "start_date",
       dueDate: "due_date",
     };

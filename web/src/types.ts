@@ -409,6 +409,7 @@ export interface Task {
   status: TaskStatus;
   priority: TaskPriority;
   labels: string[];
+  workflowProfile: "formal" | "vibe";
   sortOrder: number;
   threadId: string | null;
   threadBinding: CodexThreadBinding | null;
@@ -665,6 +666,10 @@ export interface CoordinationTodoSnapshot {
     automaticExecution: false;
   };
   dispatchTarget: CoordinationDispatchTarget | null;
+  workflow: {
+    profile: "formal" | "vibe";
+    workingLogRequired: boolean;
+  };
   workingLog: CoordinationWorkingLogSnapshot | null;
   run: CoordinationRunSnapshot | null;
   readyWork: CoordinationReadyWorkSnapshot;

@@ -13,6 +13,7 @@ function task(overrides = {}) {
     title: "Coordinate authorization gates",
     description: "Keep safe local work moving while delivery gates remain closed.",
     labels: [],
+    workflowProfile: "formal",
     status: "todo",
     version: 7,
     archivedAt: null,
@@ -271,6 +272,137 @@ function capsule(comments, overrides = {}, inputs = {}) {
     ...inputs,
   });
 }
+
+function checkpoint(nextAction, overrides = {}) {
+  return {
+    id: "checkpoint-1",
+    taskId: "task-1",
+    body: `Agent Checkpoint\nNext action: ${nextAction}`,
+    threadId: "root-thread",
+    authorType: "agent",
+    authorId: "codex-agent",
+    authorName: "Codex Agent",
+    authorAvatarUrl: null,
+    attachments: [],
+    version: 1,
+    createdAt: "2026-08-26T00:02:00.000Z",
+    updatedAt: "2026-08-26T00:02:00.000Z",
+    ...overrides,
+  };
+}
+
+test("vibe tasks remain recoverable without a Working Log while formal tasks fail closed", () => {
+  const formal = capsule([], { workingLog: null });
+  const vibe = capsule([], { workflowProfile: "vibe", workingLog: null });
+
+  assert.ok(formal.readyWork.reasonCodes.includes("WORKING_LOG_MISSING"));
+  assert.ok(!vibe.readyWork.reasonCodes.includes("WORKING_LOG_MISSING"));
+  assert.deepEqual(vibe.workflow, {
+    profile: "vibe",
+    workingLogRequired: false,
+  });
+});
+
+test("a newer Agent Checkpoint supersedes an older completed run", () => {
+  const result = capsule([
+    checkpoint("continue from the authoritative checkpoint", {
+      updatedAt: "2026-08-26T00:11:00.000Z",
+    }),
+  ], {}, {
+    latestRun: {
+      id: "run-complete",
+      taskId: "task-1",
+      projectId: "capstone-dev",
+      role: "worker",
+      status: "completed",
+      version: 2,
+      rootThreadId: "root-thread",
+      agentPath: "/root/worker",
+      agentThreadId: "worker-thread",
+      worktree: { path: WORKTREE, branch: "codex/cap-4" },
+      writeScope: ["server"],
+      startedAt: "2026-08-26T00:00:00.000Z",
+      updatedAt: "2026-08-26T00:10:00.000Z",
+      finishedAt: "2026-08-26T00:10:00.000Z",
+      summary: "old completion",
+      nextAction: "stale run action",
+    },
+  });
+
+  assert.equal(result.readyWork.nextAction.text, "continue from the authoritative checkpoint");
+  assert.equal(result.readyWork.nextAction.source.type, "checkpoint");
+  assert.equal(result.currentFrontier.observedAt, "2026-08-26T00:11:00.000Z");
+});
+
+test("structured handoff recency uses server creation time instead of sender time", () => {
+  const handoff = (eventId, createdAt, senderTimestamp, nextAction) => ({
+    eventId,
+    commentId: `comment-${eventId}`,
+    createdAt,
+    envelope: {
+      timestamp: senderTimestamp,
+      nextAction,
+      requiresAck: false,
+    },
+    acknowledgements: [],
+  });
+  const result = capsule([], {}, {
+    coordinationEvents: [
+      handoff("old-future", "2026-08-26T00:10:00.000Z", "2099-01-01T00:00:00.000Z", "stale handoff"),
+      handoff("new-server", "2026-08-26T00:11:00.000Z", "2026-08-26T00:00:00.000Z", "current handoff"),
+    ],
+  });
+
+  assert.equal(result.handoffs.latestEvent.eventId, "new-server");
+  assert.equal(result.readyWork.nextAction.text, "current handoff");
+  assert.equal(result.readyWork.nextAction.source.type, "structured_handoff");
+});
+
+test("an active run wins a semantic tie with a completed latest run", () => {
+  const run = (id, status, nextAction) => ({
+    id,
+    taskId: "task-1",
+    projectId: "capstone-dev",
+    role: "worker",
+    status,
+    version: 1,
+    rootThreadId: "root-thread",
+    agentPath: `/root/${id}`,
+    agentThreadId: `${id}-thread`,
+    worktree: { path: WORKTREE, branch: "codex/cap-4" },
+    writeScope: ["server"],
+    startedAt: "2026-08-26T00:00:00.000Z",
+    updatedAt: "2026-08-26T00:10:00.000Z",
+    finishedAt: status === "completed" ? "2026-08-26T00:10:00.000Z" : null,
+    summary: id,
+    nextAction,
+  });
+  const result = capsule([], {}, {
+    currentRun: run("active-run", "active", "continue active run"),
+    latestRun: run("completed-run", "completed", "stale completed run"),
+  });
+
+  assert.equal(result.readyWork.nextAction.text, "continue active run");
+  assert.equal(result.readyWork.nextAction.source.runId, "active-run");
+});
+
+test("a newer checkpoint prevents dispatch of an older authorized action", () => {
+  const result = capsule([
+    envelopeComment(envelope({
+      gates: [gate("local", "edit", "authorized", { evidence: "Owner authorized edit", receipt: "turn:edit" })],
+      actions: [action("old-edit", 10, "local", "old edit action")],
+    })),
+    checkpoint("reconcile the newer checkpoint", {
+      createdAt: "2026-08-26T00:03:00.000Z",
+      updatedAt: "2026-08-26T00:03:00.000Z",
+    }),
+  ]);
+
+  assert.equal(result.readyWork.nextAction.text, "reconcile the newer checkpoint");
+  assert.deepEqual(result.readyWork.safeActions, []);
+  assert.ok(result.readyWork.reasonCodes.includes("AUTHORIZATION_ACTION_SUPERSEDED"));
+  assert.equal(result.readyWork.eligible, false);
+});
 
 test("projects pending handoff acknowledgements with deterministic latest-event ordering", () => {
   const event = (eventId, requiresAck, acknowledgements = []) => ({

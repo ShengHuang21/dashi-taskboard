@@ -276,6 +276,25 @@ test("issue update sends an explicit optimistic concurrency version", async () =
   });
 });
 
+test("issue create and update accept an explicit workflow profile", async () => {
+  const bodies = [];
+  const fetchImpl = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return response({ task: { id: "TASK-1", version: bodies.length } }, bodies.length === 1 ? 201 : 200);
+  };
+  const created = await run([
+    "issue", "create", "--project", "local", "--title", "Personal skill", "--workflow-profile", "vibe",
+  ], fetchImpl);
+  const updated = await run([
+    "issue", "update", "TASK-1", "--workflow-profile", "formal", "--if-version", "1",
+  ], fetchImpl);
+
+  assert.equal(created.exitCode, 0);
+  assert.equal(updated.exitCode, 0);
+  assert.equal(bodies[0].workflowProfile, "vibe");
+  assert.deepEqual(bodies[1], { workflowProfile: "formal", version: 1 });
+});
+
 test("issue update binds one worktree context", async () => {
   let requestBody;
   const repositoryPath = path.resolve("/work/repo");
