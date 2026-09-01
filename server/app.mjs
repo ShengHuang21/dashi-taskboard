@@ -366,6 +366,60 @@ function parseCoordinatorLeaseClaim(value) {
   };
 }
 
+function parseCoordinationWindowRegistration(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "role", "taskId", "label", "threadId", "expectedRevision", "idempotencyKey",
+  ]));
+  const role = stringField(value.role, "role", { required: true, maxLength: 32 });
+  if (role !== "owner_root" && role !== "coordinator") {
+    throw new ApiError(400, "INVALID_FIELD", "'role' must be owner_root or coordinator");
+  }
+  const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
+    required: true, maxLength: 64,
+  });
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+  }
+  return {
+    role,
+    taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
+    label: stringField(value.label, "label", { required: true, maxLength: 120 }),
+    threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }),
+    expectedRevision,
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", {
+      required: true, maxLength: 256,
+    }),
+  };
+}
+
+function parseCoordinatorLeaseRenew(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "holderTaskId", "holderThreadId", "holderCodexHostId", "holderWorkspacePath",
+    "expectedLeaseId", "leaseDurationSeconds",
+  ]));
+  const claim = parseCoordinatorLeaseClaim({
+    holderTaskId: value.holderTaskId,
+    holderThreadId: value.holderThreadId,
+    expectedLeaseId: value.expectedLeaseId,
+    leaseDurationSeconds: value.leaseDurationSeconds,
+  });
+  const holderWorkspacePath = stringField(value.holderWorkspacePath, "holderWorkspacePath", {
+    required: true, maxLength: 4096,
+  });
+  if (!path.isAbsolute(holderWorkspacePath) || holderWorkspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'holderWorkspacePath' must be an absolute path");
+  }
+  return {
+    ...claim,
+    holderCodexHostId: stringField(value.holderCodexHostId, "holderCodexHostId", {
+      required: true, maxLength: 256,
+    }),
+    holderWorkspacePath: path.resolve(holderWorkspacePath),
+  };
+}
+
 function parseCoordinatorLeaseRelease(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set(["holderTaskId", "holderThreadId", "expectedLeaseId"]));
@@ -373,6 +427,94 @@ function parseCoordinatorLeaseRelease(value) {
     holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
     holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
     expectedLeaseId: stringField(value.expectedLeaseId, "expectedLeaseId", { required: true, maxLength: 256 }),
+  };
+}
+
+function parseDomainTodoAssignment(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "domainId", "taskVersion", "holderTaskId", "holderThreadId", "expectedCoordinatorLeaseId",
+  ]));
+  return {
+    domainId: stringField(value.domainId, "domainId", { required: true, maxLength: 64 }),
+    taskVersion: parseVersion(value.taskVersion),
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    expectedCoordinatorLeaseId: stringField(
+      value.expectedCoordinatorLeaseId,
+      "expectedCoordinatorLeaseId",
+      { required: true, maxLength: 256 },
+    ),
+  };
+}
+
+function parseCoordinationDomainConfiguration(value, { remove = false } = {}) {
+  assertPlainObject(value);
+  const commonKeys = [
+    "expectedRevision", "idempotencyKey", "holderTaskId", "holderThreadId",
+    "expectedCoordinatorLeaseId",
+  ];
+  assertAllowedKeys(value, new Set(remove ? commonKeys : [
+    ...commonKeys, "label", "writeScope", "eligibleTaskIds",
+  ]));
+  const expectedRevision = stringField(value.expectedRevision, "expectedRevision", { required: true, maxLength: 64 });
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+  }
+  const common = {
+    expectedRevision,
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    expectedCoordinatorLeaseId: stringField(value.expectedCoordinatorLeaseId, "expectedCoordinatorLeaseId", { required: true, maxLength: 256 }),
+  };
+  if (remove) return { ...common, domain: null };
+  if (!Array.isArray(value.writeScope) || !Array.isArray(value.eligibleTaskIds)) {
+    throw new ApiError(400, "INVALID_FIELD", "'writeScope' and 'eligibleTaskIds' must be arrays");
+  }
+  return {
+    ...common,
+    domain: {
+      label: stringField(value.label, "label", { required: true, maxLength: 80 }),
+      writeScope: value.writeScope,
+      eligibleTaskIds: value.eligibleTaskIds,
+    },
+  };
+}
+
+function parseDomainTodoAssignmentClear(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "taskVersion", "holderTaskId", "holderThreadId", "expectedCoordinatorLeaseId",
+  ]));
+  return {
+    domainId: null,
+    taskVersion: parseVersion(value.taskVersion),
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    expectedCoordinatorLeaseId: stringField(
+      value.expectedCoordinatorLeaseId,
+      "expectedCoordinatorLeaseId",
+      { required: true, maxLength: 256 },
+    ),
+  };
+}
+
+function parseCrossDomainDependencyClearance(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "sourceTaskId", "idempotencyKey", "holderTaskId", "holderThreadId", "expectedTargetDomainLeaseId",
+  ]));
+  return {
+    sourceTaskId: stringField(value.sourceTaskId, "sourceTaskId", { required: true, maxLength: 256 }),
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    expectedTargetDomainLeaseId: stringField(
+      value.expectedTargetDomainLeaseId,
+      "expectedTargetDomainLeaseId",
+      { required: true, maxLength: 256 },
+    ),
   };
 }
 
@@ -725,6 +867,67 @@ function sameOwnerDecisionDeliveryRequest(left, right) {
     && path.resolve(left.route?.rootWorkspacePath ?? "") === path.resolve(right.route?.rootWorkspacePath ?? ""));
 }
 
+function parseCrossDomainHandoffDeliveryClaim(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "projectId", "sourceTaskId", "sourceIdentifier", "targetTaskId", "targetIdentifier",
+    "fingerprint", "sourceDomainId", "targetDomainId", "expectedTargetDomainLeaseId",
+    "targetHolderTaskId", "route",
+  ]));
+  assertPlainObject(body.route);
+  assertAllowedKeys(body.route, new Set(["targetThreadId", "codexHostId", "targetWorkspacePath"]));
+  const targetWorkspacePath = stringField(body.route.targetWorkspacePath, "route.targetWorkspacePath", {
+    required: true,
+    maxLength: 4096,
+  });
+  if (!path.isAbsolute(targetWorkspacePath)) {
+    throw new ApiError(400, "INVALID_FIELD", "Cross-domain handoff target workspace must be absolute");
+  }
+  return {
+    projectId: stringField(body.projectId, "projectId", { required: true, maxLength: 256 }),
+    sourceTaskId: stringField(body.sourceTaskId, "sourceTaskId", { required: true, maxLength: 256 }),
+    sourceIdentifier: stringField(body.sourceIdentifier, "sourceIdentifier", { required: true, maxLength: 256 }),
+    targetTaskId: stringField(body.targetTaskId, "targetTaskId", { required: true, maxLength: 256 }),
+    targetIdentifier: stringField(body.targetIdentifier, "targetIdentifier", { required: true, maxLength: 256 }),
+    fingerprint: stringField(body.fingerprint, "fingerprint", { required: true, maxLength: 64 }),
+    sourceDomainId: stringField(body.sourceDomainId, "sourceDomainId", { required: true, maxLength: 256 }),
+    targetDomainId: stringField(body.targetDomainId, "targetDomainId", { required: true, maxLength: 256 }),
+    expectedTargetDomainLeaseId: stringField(body.expectedTargetDomainLeaseId, "expectedTargetDomainLeaseId", { required: true, maxLength: 256 }),
+    targetHolderTaskId: stringField(body.targetHolderTaskId, "targetHolderTaskId", { required: true, maxLength: 256 }),
+    route: {
+      targetThreadId: stringField(body.route.targetThreadId, "route.targetThreadId", { required: true, maxLength: 256 }),
+      codexHostId: stringField(body.route.codexHostId, "route.codexHostId", { required: true, maxLength: 256 }),
+      targetWorkspacePath,
+    },
+  };
+}
+
+function parseCrossDomainHandoffDeliveryConfirmation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["deliveryId", "deliveryTurnId"]));
+  return {
+    deliveryId: stringField(body.deliveryId, "deliveryId", { required: true, maxLength: 256 }),
+    deliveryTurnId: stringField(body.deliveryTurnId, "deliveryTurnId", { required: true, maxLength: 256 }),
+  };
+}
+
+function sameCrossDomainHandoffDeliveryRequest(left, right) {
+  return Boolean(left && right
+    && left.projectId === right.projectId
+    && left.sourceTaskId === right.sourceTaskId
+    && left.sourceIdentifier === right.sourceIdentifier
+    && left.targetTaskId === right.targetTaskId
+    && left.targetIdentifier === right.targetIdentifier
+    && left.fingerprint === right.fingerprint
+    && left.sourceDomainId === right.sourceDomainId
+    && left.targetDomainId === right.targetDomainId
+    && left.expectedTargetDomainLeaseId === right.expectedTargetDomainLeaseId
+    && left.targetHolderTaskId === right.targetHolderTaskId
+    && left.route?.targetThreadId === right.route?.targetThreadId
+    && left.route?.codexHostId === right.route?.codexHostId
+    && path.resolve(left.route?.targetWorkspacePath ?? "") === path.resolve(right.route?.targetWorkspacePath ?? ""));
+}
+
 function parseProjectReadmeSave(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["content", "version"]));
@@ -813,6 +1016,34 @@ function assertInjectorProof(request, instanceSecret) {
     || createHmac("sha256", instanceSecret).update(nonce).digest("hex") !== proof.toLowerCase()) {
     throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", "Owner decision delivery reservations require the authenticated host Injector");
   }
+}
+
+function assertCoordinatorRenewProof(request, instanceSecret, pathname, body, consumedNonces) {
+  const nonce = requestHeader(request, "x-codex-taskboard-injector-nonce");
+  const issuedAt = requestHeader(request, "x-codex-taskboard-injector-issued-at");
+  const proof = requestHeader(request, "x-codex-taskboard-injector-proof");
+  const issuedAtMs = typeof issuedAt === "string" ? Number(issuedAt) : Number.NaN;
+  const currentTime = Date.now();
+  for (const [key, expiresAt] of consumedNonces) {
+    if (expiresAt <= currentTime) consumedNonces.delete(key);
+  }
+  const expected = typeof nonce === "string" && typeof issuedAt === "string" && instanceSecret
+    ? createHmac("sha256", instanceSecret).update(JSON.stringify({
+        nonce, issuedAt, method: request.method, pathname, body,
+      })).digest("hex")
+    : null;
+  if (!instanceSecret
+    || typeof nonce !== "string"
+    || !/^[a-f0-9]{32,128}$/i.test(nonce)
+    || !Number.isSafeInteger(issuedAtMs)
+    || Math.abs(currentTime - issuedAtMs) > 30_000
+    || typeof proof !== "string"
+    || !/^[a-f0-9]{64}$/i.test(proof)
+    || expected !== proof.toLowerCase()
+    || consumedNonces.has(nonce)) {
+    throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", "Coordinator renewal requires a fresh request-bound host Injector proof");
+  }
+  consumedNonces.set(nonce, currentTime + 60_000);
 }
 
 function actorFromRequest(request) {
@@ -964,7 +1195,10 @@ function parseMove(body) {
 
 function parseAgentClaim(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["version", "agentPath", "agentThreadId", "leaseExpiresAt", "writeScope"]));
+  assertAllowedKeys(body, new Set([
+    "version", "agentPath", "agentThreadId", "rootThreadId", "leaseExpiresAt", "writeScope",
+    "admissionReceiptId", "admissionAttemptId",
+  ]));
   const agentPath = stringField(body.agentPath, "agentPath", { required: true, maxLength: 240 });
   if (!agentPath.startsWith("/root/")) {
     throw new ApiError(400, "INVALID_FIELD", "'agentPath' must identify a Root Sub-Agent");
@@ -986,14 +1220,72 @@ function parseAgentClaim(body) {
     version: parseVersion(body.version),
     agentPath,
     agentThreadId,
+    rootThreadId: parseThreadId(body.rootThreadId) ?? null,
     leaseExpiresAt: leaseDate.toISOString(),
     writeScope,
+    admissionReceiptId: body.admissionReceiptId === undefined
+      ? null
+      : stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
+    admissionAttemptId: body.admissionAttemptId === undefined
+      ? null
+      : stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+  };
+}
+
+function parseSafeActionAdmissionDeferral(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "rootThreadId", "expectedResumeToken", "safeActionId", "admissionReceiptId", "admissionAttemptId",
+  ]));
+  return {
+    rootThreadId: parseThreadId(body.rootThreadId),
+    expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 128 }),
+    safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
+    admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
+    admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+  };
+}
+
+function parseSafeActionAdmissionPreparation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "rootThreadId", "expectedResumeToken", "safeActionId", "admissionReceiptId",
+    "admissionAttemptId", "writeScope",
+  ]));
+  if (!Array.isArray(body.writeScope) || body.writeScope.length === 0 || body.writeScope.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'writeScope' must contain 1 to 32 paths");
+  }
+  return {
+    rootThreadId: parseThreadId(body.rootThreadId),
+    expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 128 }),
+    safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
+    admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
+    admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+    writeScope: body.writeScope.map((value) => stringField(value, "writeScope", { required: true, maxLength: 240 })),
+  };
+}
+
+function parseSafeActionAdmissionReconciliation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "rootThreadId", "expectedResumeToken", "safeActionId", "admissionReceiptId",
+    "admissionAttemptId", "admissionProbeId",
+  ]));
+  return {
+    rootThreadId: parseThreadId(body.rootThreadId),
+    expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 128 }),
+    safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
+    admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
+    admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+    admissionProbeId: stringField(body.admissionProbeId, "admissionProbeId", { required: true, maxLength: 128 }),
   };
 }
 
 function parseSafeActionBootstrapClaim(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["rootThreadId", "expectedResumeToken", "safeActionId"]));
+  assertAllowedKeys(body, new Set([
+    "rootThreadId", "expectedResumeToken", "safeActionId", "reservationLeaseId", "recoveryLeaseId", "deliveryTurnId",
+  ]));
   const rootThreadId = parseThreadId(body.rootThreadId);
   if (!rootThreadId) throw new ApiError(400, "INVALID_FIELD", "'rootThreadId' is required");
   const expectedResumeToken = stringField(body.expectedResumeToken, "expectedResumeToken", {
@@ -1007,6 +1299,15 @@ function parseSafeActionBootstrapClaim(body) {
     rootThreadId,
     expectedResumeToken,
     safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
+    reservationLeaseId: stringField(body.reservationLeaseId, "reservationLeaseId", {
+      required: true, maxLength: 64,
+    }),
+    ...(body.recoveryLeaseId === undefined ? {} : {
+      recoveryLeaseId: stringField(body.recoveryLeaseId, "recoveryLeaseId", { required: true, maxLength: 64 }),
+    }),
+    ...(body.deliveryTurnId === undefined ? {} : {
+      deliveryTurnId: stringField(body.deliveryTurnId, "deliveryTurnId", { required: true, maxLength: 256 }),
+    }),
   };
 }
 
@@ -1104,6 +1405,201 @@ function parseInboxDelivery(body) {
     body: stringField(body.body, "body", { required: true, maxLength: 100_000 }),
     threadId,
     threadBinding,
+  };
+}
+
+function parseOwnerIntent(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "intentId", "deliveryId", "kind", "goal", "constraints", "targetIntentId",
+    "ownerRootTaskId", "ownerRootThreadId", "ownerTurnId", "rootCaptureTurnId", "evidence",
+  ]));
+  if (!["append", "supersede", "clarify", "cancel"].includes(body.kind)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'kind' must be append, supersede, clarify, or cancel",
+    );
+  }
+  if (!Array.isArray(body.constraints) || body.constraints.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'constraints' must be an array of at most 32 strings");
+  }
+  const constraints = body.constraints.map((value, index) => stringField(
+    value,
+    `constraints[${index}]`,
+    { required: true, maxLength: 2_000 },
+  ));
+  assertNoSensitiveCoordinationText([body.goal, body.evidence, ...constraints]);
+  return {
+    intentId: stringField(body.intentId, "intentId", { required: true, maxLength: 256 }),
+    deliveryId: stringField(body.deliveryId, "deliveryId", { required: true, maxLength: 256 }),
+    kind: body.kind,
+    goal: stringField(body.goal, "goal", { required: true, maxLength: 20_000 }),
+    constraints,
+    targetIntentId: stringField(body.targetIntentId ?? null, "targetIntentId", {
+      nullable: true,
+      maxLength: 256,
+    }),
+    ownerRootTaskId: stringField(body.ownerRootTaskId, "ownerRootTaskId", {
+      required: true,
+      maxLength: 256,
+    }),
+    ownerRootThreadId: stringField(body.ownerRootThreadId, "ownerRootThreadId", {
+      required: true,
+      maxLength: 256,
+    }),
+    ownerTurnId: stringField(body.ownerTurnId, "ownerTurnId", { required: true, maxLength: 256 }),
+    rootCaptureTurnId: stringField(body.rootCaptureTurnId, "rootCaptureTurnId", {
+      required: true,
+      maxLength: 256,
+    }),
+    evidence: stringField(body.evidence, "evidence", { required: true, maxLength: 2_000 }),
+  };
+}
+
+function parseOwnerIntentAdoptionClaim(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "coordinatorTaskId", "coordinatorThreadId", "coordinatorEpoch",
+  ]));
+  return {
+    coordinatorTaskId: stringField(body.coordinatorTaskId, "coordinatorTaskId", {
+      required: true,
+      maxLength: 256,
+    }),
+    coordinatorThreadId: stringField(body.coordinatorThreadId, "coordinatorThreadId", {
+      required: true,
+      maxLength: 256,
+    }),
+    coordinatorEpoch: stringField(body.coordinatorEpoch, "coordinatorEpoch", {
+      required: true,
+      maxLength: 512,
+    }),
+  };
+}
+
+function parseOwnerIntentAdoptionConfirmation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["adoptionId", "deliveryTurnId"]));
+  return {
+    adoptionId: stringField(body.adoptionId, "adoptionId", { required: true, maxLength: 256 }),
+    deliveryTurnId: stringField(body.deliveryTurnId, "deliveryTurnId", {
+      required: true,
+      maxLength: 256,
+    }),
+  };
+}
+
+function parseOwnerIntentPlanRetry(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "adoptionId", "coordinatorEpoch", "failureKey",
+  ]));
+  return {
+    adoptionId: stringField(body.adoptionId, "adoptionId", { required: true, maxLength: 256 }),
+    coordinatorEpoch: stringField(body.coordinatorEpoch, "coordinatorEpoch", {
+      required: true,
+      maxLength: 512,
+    }),
+    failureKey: stringField(body.failureKey, "failureKey", { required: true, maxLength: 512 }),
+  };
+}
+
+function parseOwnerIntentPlan(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "revisionId", "intentVersion", "adoptionId", "coordinatorTaskId",
+    "coordinatorThreadId", "coordinatorEpoch", "classification", "summary",
+    "parentTaskId", "items",
+  ]));
+  const classifications = new Set([
+    "bounded_delivery", "new_product_scope", "financial_decision",
+    "metric_policy", "missing_authority",
+  ]);
+  if (!classifications.has(body.classification)) {
+    throw new ApiError(400, "INVALID_FIELD", "Invalid Owner Intent plan classification");
+  }
+  if (!Array.isArray(body.items) || body.items.length > 16) {
+    throw new ApiError(400, "INVALID_FIELD", "'items' must be an array of at most 16 bounded Todos");
+  }
+  if (body.classification !== "bounded_delivery" && body.items.length > 0) {
+    throw new ApiError(400, "DECISION_PLAN_MUST_NOT_EXECUTE", "A needs-decision plan cannot create executable Todos");
+  }
+  const outcomeKeys = new Set();
+  const items = body.items.map((item, index) => {
+    assertPlainObject(item);
+    assertAllowedKeys(item, new Set([
+      "outcomeKey", "title", "description", "priority", "blockedByOutcomeKeys",
+    ]));
+    const outcomeKey = stringField(item.outcomeKey, `items[${index}].outcomeKey`, {
+      required: true,
+      maxLength: 128,
+    });
+    if (!/^[a-z0-9][a-z0-9._-]*$/i.test(outcomeKey) || outcomeKeys.has(outcomeKey)) {
+      throw new ApiError(400, "INVALID_FIELD", "Plan outcome keys must be unique bounded identifiers");
+    }
+    outcomeKeys.add(outcomeKey);
+    if (!Array.isArray(item.blockedByOutcomeKeys) || item.blockedByOutcomeKeys.length > 16) {
+      throw new ApiError(400, "INVALID_FIELD", "blockedByOutcomeKeys must be an array of at most 16 keys");
+    }
+    return {
+      outcomeKey,
+      title: stringField(item.title, `items[${index}].title`, { required: true, maxLength: 240 }),
+      description: stringField(item.description ?? "", `items[${index}].description`, {
+        maxLength: 20_000,
+      }),
+      priority: parsePriority(item.priority, "medium"),
+      blockedByOutcomeKeys: item.blockedByOutcomeKeys.map((value, dependencyIndex) => stringField(
+        value,
+        `items[${index}].blockedByOutcomeKeys[${dependencyIndex}]`,
+        { required: true, maxLength: 128 },
+      )),
+    };
+  });
+  for (const item of items) {
+    if (item.blockedByOutcomeKeys.some((key) => !outcomeKeys.has(key) || key === item.outcomeKey)) {
+      throw new ApiError(
+        400,
+        "INVALID_FIELD",
+        "Plan dependencies must reference another outcome in the same revision",
+      );
+    }
+  }
+  const dependencies = new Map(items.map((item) => [item.outcomeKey, item.blockedByOutcomeKeys]));
+  const visiting = new Set();
+  const visited = new Set();
+  const visit = (key) => {
+    if (visiting.has(key)) return true;
+    if (visited.has(key)) return false;
+    visiting.add(key);
+    for (const dependency of dependencies.get(key) ?? []) {
+      if (visit(dependency)) return true;
+    }
+    visiting.delete(key);
+    visited.add(key);
+    return false;
+  };
+  if ([...dependencies.keys()].some(visit)) {
+    throw new ApiError(400, "PLAN_DEPENDENCY_CYCLE", "Plan dependency graph must be acyclic");
+  }
+  assertNoSensitiveCoordinationText([
+    body.summary,
+    ...items.flatMap((item) => [item.title, item.description]),
+  ]);
+  if (!Number.isInteger(body.intentVersion) || body.intentVersion < 1) {
+    throw new ApiError(400, "INVALID_FIELD", "'intentVersion' must be a positive integer");
+  }
+  return {
+    revisionId: stringField(body.revisionId, "revisionId", { required: true, maxLength: 256 }),
+    intentVersion: body.intentVersion,
+    adoptionId: stringField(body.adoptionId, "adoptionId", { required: true, maxLength: 256 }),
+    coordinatorTaskId: stringField(body.coordinatorTaskId, "coordinatorTaskId", { required: true, maxLength: 256 }),
+    coordinatorThreadId: stringField(body.coordinatorThreadId, "coordinatorThreadId", { required: true, maxLength: 256 }),
+    coordinatorEpoch: stringField(body.coordinatorEpoch, "coordinatorEpoch", { required: true, maxLength: 512 }),
+    classification: body.classification,
+    summary: stringField(body.summary, "summary", { required: true, maxLength: 4_000 }),
+    parentTaskId: stringField(body.parentTaskId ?? null, "parentTaskId", { nullable: true, maxLength: 256 }),
+    items,
   };
 }
 
@@ -2110,10 +2606,13 @@ export function createTaskboardServer(options = {}) {
     });
   });
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
-  const database = new TaskboardDatabase(resolved.databasePath);
+  const database = new TaskboardDatabase(resolved.databasePath, {
+    admissionTtlMs: options.admissionTtlMs,
+  });
   const worktreeRepositoryCache = new Map();
   const events = new EventHub();
   const panelPresence = options.panelPresence ?? createTaskboardPanelPresence();
+  const coordinatorRenewNonces = new Map();
   let clientStorageWrite = Promise.resolve();
 
   async function refreshTaskWorktreeRepository(taskId, { force = false } = {}) {
@@ -2467,9 +2966,13 @@ export function createTaskboardServer(options = {}) {
     getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
+    getAdmission: (taskId) => database.getTaskSafeActionAdmission(taskId),
     getTaskCapsule: (taskId) => verifiedTaskCapsule(taskId),
+    getTaskDomainAssignment: (taskId) => database.getAgentTaskDomainAssignment(taskId),
     getTask: (identifier) => database.getTask(identifier),
     listComments: (taskId) => database.listComments(taskId),
+    getPendingOwnerIntent: (projectId) => database.getPendingProjectOwnerIntent(projectId),
+    getPendingOwnerIntentPlan: (projectId) => database.getPendingProjectOwnerIntentPlan(projectId),
     recordProgress: async (progress) => {
       const candidates = database.listTasks({ projectId: progress.projectId, archived: "false" }).filter((task) => {
         const claim = database.getAgentTaskClaim(task.id);
@@ -2899,6 +3402,42 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, result);
       }
 
+      const coordinatorLeaseRenewRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-lease\/renew$/,
+      );
+      if (coordinatorLeaseRenewRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-lease/renew");
+        const projectId = decodeRouteSegment(coordinatorLeaseRenewRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.claimAgentLaneCoordinator(
+          projectId,
+          { ...parseCoordinatorLeaseRenew(body), renewOnly: true },
+        ));
+      }
+
+      const coordinatorLeaseRecoverRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-lease\/recover$/,
+      );
+      if (coordinatorLeaseRecoverRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-lease/recover");
+        const projectId = decodeRouteSegment(coordinatorLeaseRecoverRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.claimAgentLaneCoordinator(
+          projectId,
+          { ...parseCoordinatorLeaseRenew(body), recoverOnly: true },
+        ));
+      }
+
       const coordinatorLeaseRoute = pathname.match(
         /^\/api\/local\/projects\/([^/]+)\/coordinator-lease$/,
       );
@@ -2912,6 +3451,270 @@ export function createTaskboardServer(options = {}) {
           parseCoordinatorLeaseClaim(await readJson(request)),
         );
         return sendJson(response, 200, result);
+      }
+
+      const coordinationWindowsRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordination-windows$/,
+      );
+      if (coordinationWindowsRoute) {
+        assertNoQuery(url.searchParams, `${request.method} /api/local/projects/:id/coordination-windows`);
+        const projectId = decodeRouteSegment(coordinationWindowsRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (request.headers["x-taskboard-client"] !== "taskctl") {
+          throw new ApiError(
+            403,
+            "TASKCTL_REQUIRED",
+            "Coordination window configuration is available only through protected taskctl",
+          );
+        }
+        if (request.method === "GET") {
+          return sendJson(response, 200, database.getAgentLaneCoordinationWindows(projectId));
+        }
+        if (request.method === "POST") {
+          const input = parseCoordinationWindowRegistration(await readJson(request));
+          const threadBinding = currentHostThreadIdentity(input.threadId);
+          if (!threadBinding) {
+            throw new ApiError(
+              409,
+              "HOST_IDENTITY_UNAVAILABLE",
+              "The registered window must be the fresh protected Codex host identity",
+            );
+          }
+          return sendJson(response, 200, database.registerAgentLaneCoordinationWindow(
+            projectId,
+            input,
+            threadBinding,
+          ));
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const domainCoordinatorLeaseRenewRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-leases\/([^/]+)\/renew$/,
+      );
+
+      const coordinationDomainsRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordination-domains(?:\/([^/]+))?$/,
+      );
+      if (coordinationDomainsRoute) {
+        const projectId = decodeRouteSegment(coordinationDomainsRoute[1], "Project id");
+        const domainId = coordinationDomainsRoute[2]
+          ? decodeRouteSegment(coordinationDomainsRoute[2], "Coordination domain id")
+          : null;
+        validateProjectId(projectId);
+        if (domainId !== null && !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(domainId)) {
+          throw new ApiError(400, "INVALID_COORDINATION_DOMAIN", "Coordination domain id is invalid");
+        }
+        assertNoQuery(url.searchParams, `${request.method} /api/local/projects/:id/coordination-domains`);
+        if (request.headers["x-taskboard-client"] !== "taskctl") {
+          throw new ApiError(403, "TASKCTL_REQUIRED", "Coordination domain configuration is available only through protected taskctl");
+        }
+        if (request.method === "GET" && domainId === null) {
+          return sendJson(response, 200, database.getAgentLaneCoordinationDomains(projectId));
+        }
+        if (request.method === "PUT" && domainId !== null) {
+          return sendJson(response, 200, database.configureAgentLaneCoordinationDomain(
+            projectId, domainId, parseCoordinationDomainConfiguration(await readJson(request)),
+          ));
+        }
+        if (request.method === "DELETE" && domainId !== null) {
+          return sendJson(response, 200, database.configureAgentLaneCoordinationDomain(
+            projectId, domainId, parseCoordinationDomainConfiguration(await readJson(request), { remove: true }),
+          ));
+        }
+        return methodNotAllowed(response, domainId === null ? ["GET"] : ["PUT", "DELETE"]);
+      }
+      if (domainCoordinatorLeaseRenewRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-coordinator-leases/:domainId/renew");
+        const projectId = decodeRouteSegment(domainCoordinatorLeaseRenewRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorLeaseRenewRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(
+          projectId,
+          domainId,
+          { ...parseCoordinatorLeaseRenew(body), renewOnly: true },
+        ));
+      }
+
+      const domainCoordinatorLeaseRecoverRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-leases\/([^/]+)\/recover$/,
+      );
+      if (domainCoordinatorLeaseRecoverRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-coordinator-leases/:domainId/recover");
+        const projectId = decodeRouteSegment(domainCoordinatorLeaseRecoverRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorLeaseRecoverRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(
+          projectId,
+          domainId,
+          { ...parseCoordinatorLeaseRenew(body), recoverOnly: true },
+        ));
+      }
+
+      const domainCoordinatorLeaseRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-leases\/([^/]+)$/,
+      );
+      if (domainCoordinatorLeaseRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-coordinator-leases/:domainId");
+        const projectId = decodeRouteSegment(domainCoordinatorLeaseRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorLeaseRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(
+          projectId,
+          domainId,
+          parseCoordinatorLeaseClaim(await readJson(request)),
+        ));
+      }
+
+      const domainCoordinatorLeaseReleaseRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-leases\/([^/]+)\/release$/,
+      );
+      if (domainCoordinatorLeaseReleaseRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-coordinator-leases/:domainId/release");
+        const projectId = decodeRouteSegment(domainCoordinatorLeaseReleaseRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorLeaseReleaseRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        return sendJson(response, 200, database.releaseAgentLaneDomainCoordinator(
+          projectId,
+          domainId,
+          parseCoordinatorLeaseRelease(await readJson(request)),
+        ));
+      }
+
+      const domainCoordinatorLeaseReceiptsRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-leases\/([^/]+)\/receipts$/,
+      );
+      if (domainCoordinatorLeaseReceiptsRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/projects/:id/domain-coordinator-leases/:domainId/receipts");
+        const projectId = decodeRouteSegment(domainCoordinatorLeaseReceiptsRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorLeaseReceiptsRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        return sendJson(response, 200, {
+          receipts: database.listAgentLaneDomainCoordinatorReceipts(projectId, domainId),
+        });
+      }
+
+      const domainTodoAssignmentRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-todo-assignments\/([^/]+)$/,
+      );
+
+      const crossDomainDependencyClearanceRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/cross-domain-dependency-clearances\/([^/]+)$/,
+      );
+
+      const crossDomainHandoffDeliveryRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/cross-domain-handoff-delivery\/(claim|confirm)$/,
+      );
+      if (crossDomainHandoffDeliveryRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/cross-domain-handoff-delivery/:action");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const projectId = decodeRouteSegment(crossDomainHandoffDeliveryRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (crossDomainHandoffDeliveryRoute[2] === "confirm") {
+          return sendJson(response, 200, database.confirmCrossDomainHandoffDelivery(
+            projectId,
+            parseCrossDomainHandoffDeliveryConfirmation(await readJson(request)),
+          ));
+        }
+        const deliveryRequest = parseCrossDomainHandoffDeliveryClaim(await readJson(request));
+        let snapshot;
+        try {
+          snapshot = await agentLanes.getProjectSnapshot(projectId);
+        } catch (error) {
+          if (["AGENT_LANES_NOT_CONFIGURED", "AGENT_LANES_CONFIG_UNAVAILABLE"].includes(error?.code)) {
+            throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_DELIVERY_STALE", "Target Domain Coordinator is not currently available");
+          }
+          throw error;
+        }
+        if (!sameCrossDomainHandoffDeliveryRequest(
+          snapshot?.coordination?.pendingCrossDomainHandoff,
+          deliveryRequest,
+        )) {
+          throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_DELIVERY_STALE", "Cross-domain handoff frontier or exact target route changed before delivery");
+        }
+        const result = database.claimCrossDomainHandoffDelivery(projectId, deliveryRequest);
+        return sendJson(response, result.claimed ? 201 : 200, result);
+      }
+      if (crossDomainDependencyClearanceRoute) {
+        const projectId = decodeRouteSegment(crossDomainDependencyClearanceRoute[1], "Project id");
+        const taskId = decodeRouteSegment(crossDomainDependencyClearanceRoute[2], "Task id");
+        validateProjectId(projectId);
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (task.projectId !== projectId) {
+          throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_PROJECT_MISMATCH", "Dependency clearance must stay inside one project");
+        }
+        if (request.method === "GET") {
+          assertNoQuery(url.searchParams, "GET /api/local/projects/:id/cross-domain-dependency-clearances/:taskId");
+          return sendJson(response, 200, {
+            clearances: database.listCrossDomainDependencyClearances(task.id),
+          });
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST /api/local/projects/:id/cross-domain-dependency-clearances/:taskId");
+          if (request.headers["x-taskboard-client"] !== "taskctl") {
+            throw new ApiError(403, "TASKCTL_REQUIRED", "Cross-domain dependency clearance is available only through protected taskctl");
+          }
+          return sendJson(response, 200, database.acceptCrossDomainDependencyClearance(
+            task.id,
+            parseCrossDomainDependencyClearance(await readJson(request)),
+          ));
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      if (domainTodoAssignmentRoute) {
+        const projectId = decodeRouteSegment(domainTodoAssignmentRoute[1], "Project id");
+        const taskId = decodeRouteSegment(domainTodoAssignmentRoute[2], "Task id");
+        validateProjectId(projectId);
+        const task = database.getTask(taskId);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+        if (task.projectId !== projectId) {
+          throw new ApiError(409, "DOMAIN_TODO_PROJECT_MISMATCH", "Domain Todo assignment must stay inside one project");
+        }
+        if (request.method === "GET") {
+          assertNoQuery(url.searchParams, "GET /api/local/projects/:id/domain-todo-assignments/:taskId");
+          return sendJson(response, 200, {
+            assignment: database.getAgentTaskDomainAssignment(task.id),
+          });
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-todo-assignments/:taskId");
+          if (request.headers["x-taskboard-client"] !== "taskctl") {
+            throw new ApiError(403, "TASKCTL_REQUIRED", "Domain Todo assignment is available only through protected taskctl");
+          }
+          return sendJson(response, 200, database.setAgentTaskDomain(
+            projectId,
+            task.id,
+            parseDomainTodoAssignment(await readJson(request)),
+          ));
+        }
+        if (request.method === "DELETE") {
+          assertNoQuery(url.searchParams, "DELETE /api/local/projects/:id/domain-todo-assignments/:taskId");
+          if (request.headers["x-taskboard-client"] !== "taskctl") {
+            throw new ApiError(403, "TASKCTL_REQUIRED", "Domain Todo assignment is available only through protected taskctl");
+          }
+          return sendJson(response, 200, database.setAgentTaskDomain(
+            projectId,
+            task.id,
+            parseDomainTodoAssignmentClear(await readJson(request)),
+          ));
+        }
+        return methodNotAllowed(response, ["GET", "POST", "DELETE"]);
       }
 
       const coordinatorLeaseReleaseRoute = pathname.match(
@@ -3001,6 +3804,120 @@ export function createTaskboardServer(options = {}) {
         }
         const result = database.claimOwnerDecisionDelivery(projectId, deliveryRequest);
         return sendJson(response, result.claimed ? 201 : 200, result);
+      }
+
+      const ownerIntentsRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/owner-intents$/);
+      if (ownerIntentsRoute) {
+        const projectId = decodeRouteSegment(ownerIntentsRoute[1], "Project id");
+        validateProjectId(projectId);
+        if (request.method === "GET") {
+          assertNoQuery(url.searchParams, "GET /api/local/projects/:id/owner-intents");
+          return sendJson(response, 200, { intents: database.listProjectOwnerIntents(projectId) });
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST /api/local/projects/:id/owner-intents");
+          assertInjectorProof(request, resolved.instanceSecret);
+          const input = parseOwnerIntent(await readJson(request));
+          const sourceThreadBinding = currentHostThreadIdentity(input.ownerRootThreadId);
+          if (!sourceThreadBinding) {
+            throw new ApiError(
+              409,
+              "HOST_IDENTITY_UNAVAILABLE",
+              "Owner Intent must come from the fresh protected Owner Root host identity",
+            );
+          }
+          const result = database.recordProjectOwnerIntent(
+            projectId,
+            input,
+            sourceThreadBinding,
+            CODEX_AGENT_ACTOR,
+          );
+          return sendJson(response, result.applied ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const ownerIntentAdoptionRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/owner-intents\/([^/]+)\/adoption\/(claim|confirm)$/,
+      );
+      if (ownerIntentAdoptionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(
+          url.searchParams,
+          "POST /api/local/projects/:projectId/owner-intents/:intentId/adoption/:action",
+        );
+        assertInjectorProof(request, resolved.instanceSecret);
+        const projectId = decodeRouteSegment(ownerIntentAdoptionRoute[1], "Project id");
+        const intentId = decodeRouteSegment(ownerIntentAdoptionRoute[2], "Owner Intent id");
+        validateProjectId(projectId);
+        if (ownerIntentAdoptionRoute[3] === "confirm") {
+          return sendJson(response, 200, database.confirmProjectOwnerIntentAdoption(
+            projectId,
+            intentId,
+            parseOwnerIntentAdoptionConfirmation(await readJson(request)),
+          ));
+        }
+        const result = database.claimProjectOwnerIntentAdoption(
+          projectId,
+          intentId,
+          parseOwnerIntentAdoptionClaim(await readJson(request)),
+        );
+        return sendJson(response, result.claimed ? 201 : 200, result);
+      }
+
+      const ownerIntentPlanRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/owner-intents\/([^/]+)\/plan-revisions$/,
+      );
+      const ownerIntentPlanRetryRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/owner-intents\/([^/]+)\/plan-retry$/,
+      );
+      if (ownerIntentPlanRetryRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:projectId/owner-intents/:intentId/plan-retry");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const projectId = decodeRouteSegment(ownerIntentPlanRetryRoute[1], "Project id");
+        const intentId = decodeRouteSegment(ownerIntentPlanRetryRoute[2], "Owner Intent id");
+        validateProjectId(projectId);
+        const result = database.retryProjectOwnerIntentPlan(
+          projectId,
+          intentId,
+          parseOwnerIntentPlanRetry(await readJson(request)),
+        );
+        return sendJson(response, result.applied ? 201 : 200, result);
+      }
+      if (ownerIntentPlanRoute) {
+        const projectId = decodeRouteSegment(ownerIntentPlanRoute[1], "Project id");
+        const intentId = decodeRouteSegment(ownerIntentPlanRoute[2], "Owner Intent id");
+        validateProjectId(projectId);
+        if (request.method === "GET") {
+          assertNoQuery(url.searchParams, "GET /api/local/projects/:projectId/owner-intents/:intentId/plan-revisions");
+          return sendJson(response, 200, {
+            revisions: database.listProjectOwnerIntentPlan(projectId)
+              .filter((revision) => revision.intentId === intentId),
+          });
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST /api/local/projects/:projectId/owner-intents/:intentId/plan-revisions");
+          assertInjectorProof(request, resolved.instanceSecret);
+          const result = database.applyProjectOwnerIntentPlan(
+            projectId,
+            intentId,
+            parseOwnerIntentPlan(await readJson(request)),
+          );
+          return sendJson(response, result.applied ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const ownerIntentPlanFrontierRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/owner-intent-plan$/,
+      );
+      if (ownerIntentPlanFrontierRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/projects/:projectId/owner-intent-plan");
+        const projectId = decodeRouteSegment(ownerIntentPlanFrontierRoute[1], "Project id");
+        validateProjectId(projectId);
+        return sendJson(response, 200, { revisions: database.listProjectOwnerIntentPlan(projectId) });
       }
 
       const agentLaneRoute = pathname.match(/^\/api\/local\/projects\/([^/]+)\/agent-lanes$/);
@@ -4029,12 +4946,25 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-claim");
         const claim = parseSafeActionBootstrapClaim(await readJson(request));
-        await refreshTaskWorktreeRepository(id, { force: true });
+        const task = await refreshTaskWorktreeRepository(id, { force: true });
         await assertStandingActionExecutionScope(id, claim.safeActionId);
-        return sendJson(response, 200, database.claimTaskSafeAction(
+        const result = database.claimTaskSafeAction(
           id,
           claim,
-        ));
+        );
+        const safeAction = database.getTaskCapsule(id).readyWork.safeActions[0];
+        return sendJson(response, 200, {
+          ...result,
+          ...(result.recovering === true && result.available === true ? {
+            executionIdentity: {
+              worktreePath: result.recoveryRoute.worktreePath,
+              branch: result.recoveryRoute.branch,
+              repository: task.developmentContext.repository,
+              verifiedAt: task.developmentContext.repositoryVerifiedAt,
+              standingScope: safeAction?.standingAuthority ? safeAction.standingScope : null,
+            },
+          } : {}),
+        });
       }
 
       const safeActionBootstrapDeliveryRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/bootstrap-delivery$/);
@@ -4057,6 +4987,75 @@ export function createTaskboardServer(options = {}) {
             standingScope: safeAction.standingAuthority ? safeAction.standingScope : null,
           },
         });
+      }
+
+      const safeActionBootstrapCompleteRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/bootstrap-complete$/);
+      if (safeActionBootstrapCompleteRoute) {
+        const id = decodeRouteSegment(safeActionBootstrapCompleteRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-complete");
+        const completion = parseSafeActionBootstrapClaim(await readJson(request));
+        if (!completion.deliveryTurnId) {
+          throw new ApiError(400, "INVALID_FIELD", "'deliveryTurnId' is required");
+        }
+        return sendJson(response, 200, database.completeTaskSafeActionDelivery(id, completion));
+      }
+
+      const safeActionAdmissionDeferralRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-defer$/);
+      if (safeActionAdmissionDeferralRoute) {
+        const id = decodeRouteSegment(safeActionAdmissionDeferralRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-defer");
+        const deferral = parseSafeActionAdmissionDeferral(await readJson(request));
+        return sendJson(response, 200, database.deferTaskSafeActionAdmission(id, deferral));
+      }
+
+      const safeActionAdmissionPreparationRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-prepare$/);
+      if (safeActionAdmissionPreparationRoute) {
+        const id = decodeRouteSegment(safeActionAdmissionPreparationRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-prepare");
+        const preparation = parseSafeActionAdmissionPreparation(await readJson(request));
+        return sendJson(response, 200, database.prepareTaskSafeActionAdmission(id, preparation));
+      }
+
+      const safeActionAdmissionUncertainRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-uncertain$/);
+      if (safeActionAdmissionUncertainRoute) {
+        const id = decodeRouteSegment(safeActionAdmissionUncertainRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-uncertain");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const binding = parseSafeActionAdmissionDeferral(await readJson(request));
+        return sendJson(response, 200, database.markTaskSafeActionAdmissionUncertain(id, binding));
+      }
+
+      const safeActionAdmissionReconcileRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-reconcile$/);
+      if (safeActionAdmissionReconcileRoute) {
+        const id = decodeRouteSegment(safeActionAdmissionReconcileRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-reconcile");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const binding = parseSafeActionAdmissionReconciliation(await readJson(request));
+        const task = database.getTask(id);
+        if (!task) throw new ApiError(404, "TASK_NOT_FOUND", "Task not found");
+        const snapshot = await agentLanes.getProjectSnapshot(task.projectId);
+        const tree = snapshot.windowSubagentTrees?.find((candidate) => (
+          candidate.rootThreadId === binding.rootThreadId
+        ));
+        return sendJson(response, 200, database.reconcileTaskSafeActionAdmission(id, {
+          ...binding,
+          registryObservation: tree?.registryObservation ?? null,
+        }));
+      }
+
+      const safeActionAdmissionProbeRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-probe$/);
+      if (safeActionAdmissionProbeRoute) {
+        const id = decodeRouteSegment(safeActionAdmissionProbeRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-probe");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const binding = parseSafeActionAdmissionDeferral(await readJson(request));
+        return sendJson(response, 200, database.claimTaskSafeActionAdmissionProbe(id, binding));
       }
 
       const ownerDecisionRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/owner-decisions$/);

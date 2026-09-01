@@ -5,6 +5,30 @@ import test from "node:test";
 const appSource = await readFile(new URL("../web/src/App.tsx", import.meta.url), "utf8");
 const boardSource = await readFile(new URL("../web/src/components/AgentLaneBoard.tsx", import.meta.url), "utf8");
 const apiSource = await readFile(new URL("../web/src/api.ts", import.meta.url), "utf8");
+const typesSource = await readFile(new URL("../web/src/types.ts", import.meta.url), "utf8");
+
+test("Owner Intent snapshot types distinguish queued capture from adopted planning", () => {
+  assert.match(
+    typesSource,
+    /interface CoordinationQueuedOwnerIntentSnapshot[\s\S]*?status: "queued";[\s\S]*?adoptionReceipt\?: never;/,
+  );
+  assert.match(
+    typesSource,
+    /interface CoordinationRecoverableOwnerIntentSnapshot[\s\S]*?status: "adopted";[\s\S]*?adoptionReceipt\?: never;/,
+  );
+  assert.match(
+    typesSource,
+    /interface CoordinationOwnerIntentPlanSnapshot[\s\S]*?status: "adopted";[\s\S]*?adoptionReceipt:/,
+  );
+  assert.match(
+    typesSource,
+    /pendingOwnerIntentPlan: CoordinationOwnerIntentPlanSnapshot \| null;/,
+  );
+  assert.match(
+    typesSource,
+    /OwnerIntentPlanCannotBePendingIntent = AssertFalse<[\s\S]*?CoordinationOwnerIntentPlanSnapshot extends CoordinationOwnerIntentSnapshot \? true : false/,
+  );
+});
 
 test("every configured project opens its own Agent Lanes view", () => {
   assert.match(appSource, /type BoardView = [^;]*"lanes"/);

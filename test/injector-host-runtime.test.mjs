@@ -3,21 +3,245 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import {
+  classifyOwnerIntentPlanHttpFailure,
   deliverTaskboardCoordination,
+  deliverTaskboardCrossDomainHandoff,
   deliverTaskboardOwnerDecision,
+  deliverTaskboardOwnerIntent,
   findResidentInjectorPids,
   handleHostBindingPayload,
   observeTaskboardOwnerDecision,
+  observeTaskboardOwnerIntentCapture,
+  observeTaskboardOwnerIntentPlan,
   reconcileInjectionRuntime,
   runOwnerDecisionMonitorOnce,
+  runOwnerIntentAdoptionMonitorOnce,
+  runOwnerIntentCaptureMonitorOnce,
+  runOwnerIntentPlanningMonitorOnce,
+  runCoordinatorLeaseKeepaliveMonitorOnce,
+  runCoordinatorLeaseRecoveryMonitorOnce,
+  runCrossDomainHandoffMonitorOnce,
+  runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
 } from "../scripts/codex-injector-runtime.mjs";
+
+const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("Owner Intent plan HTTP failures distinguish replan validation from stale state", () => {
+  assert.equal(classifyOwnerIntentPlanHttpFailure(400, "PLAN_DEPENDENCY_CYCLE"), "invalid-plan");
+  assert.equal(
+    classifyOwnerIntentPlanHttpFailure(409, "OWNER_DECISION_CLASSIFICATION_REQUIRED"),
+    "invalid-plan",
+  );
+  assert.equal(classifyOwnerIntentPlanHttpFailure(409, "OWNER_INTENT_REVISION_STALE"), "stale-plan");
+  assert.equal(classifyOwnerIntentPlanHttpFailure(409, "COORDINATOR_ROUTE_STALE"), "stale-plan");
+  assert.equal(classifyOwnerIntentPlanHttpFailure(503, "SERVICE_UNAVAILABLE"), null);
+});
+
+function coordinatorKeepaliveSnapshot({ expiresAt, domainExpiresAt = expiresAt } = {}) {
+  return {
+    projectId: "taskboard-core",
+    coordination: {
+      coordinatorTaskId: "global",
+      lease: {
+        id: "global-lease",
+        status: "active",
+        acquiredAt: "2026-08-31T00:00:00.000Z",
+        expiresAt,
+      },
+      domainCoordinators: [{
+        domainId: "frontend",
+        coordinatorTaskId: "frontend",
+        lease: {
+          id: "frontend-lease",
+          status: "active",
+          acquiredAt: "2026-08-31T00:00:00.000Z",
+          expiresAt: domainExpiresAt,
+        },
+      }],
+    },
+    taskLanes: [
+      {
+        id: "global",
+        threadId: coordinatorThreadId,
+        codexHostId: "host-global",
+        workspacePath: "/tmp/taskboard/global",
+      },
+      {
+        id: "frontend",
+        threadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
+        codexHostId: "host-frontend",
+        workspacePath: "/tmp/taskboard/frontend",
+      },
+    ],
+  };
+}
+
+test("coordinator keepalive renews exact near-expiry Global and domain leases independently", async () => {
+  const renewed = [];
+  const now = Date.parse("2026-08-31T01:00:00.000Z");
+  const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => now,
+    readSnapshot: async () => coordinatorKeepaliveSnapshot({
+      expiresAt: "2026-08-31T01:00:30.000Z",
+      domainExpiresAt: "2026-08-31T01:00:35.000Z",
+    }),
+    readThread: async (route) => ({
+      thread: { id: route.threadId, cwd: route.workspacePath, turns: [] },
+    }),
+    renewLease: async (request) => {
+      renewed.push(request);
+      if (request.scope === "global") throw new Error("global renewal unavailable");
+      return { lease: { id: request.expectedLeaseId, status: "active" } };
+    },
+  });
+  assert.deepEqual(renewed.map(({ scope, domainId }) => [scope, domainId ?? null]), [
+    ["global", null],
+    ["domain", "frontend"],
+  ]);
+  assert.equal(result.renewed, 1);
+  assert.equal(result.failed, 1);
+});
+
+test("coordinator keepalive fails closed for busy, drifted, or non-active holders", async () => {
+  const now = Date.parse("2026-08-31T01:00:00.000Z");
+  let renewed = 0;
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T01:00:30.000Z",
+    domainExpiresAt: "2026-08-31T00:59:59.000Z",
+  });
+  snapshot.coordination.domainCoordinators[0].lease.status = "expired";
+  const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => now,
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => ({
+      thread: {
+        id: route.threadId,
+        cwd: route.workspacePath,
+        turns: [{ id: "busy", status: "inProgress" }],
+      },
+    }),
+    renewLease: async () => { renewed += 1; },
+  });
+  assert.equal(renewed, 0);
+  assert.deepEqual(result, { renewed: 0, failed: 0, skipped: 2 });
+});
+
+test("coordinator keepalive fails closed when thread busy state is unavailable", async () => {
+  let renewed = 0;
+  const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => Date.parse("2026-08-31T01:00:00.000Z"),
+    readSnapshot: async () => coordinatorKeepaliveSnapshot({
+      expiresAt: "2026-08-31T01:00:30.000Z",
+      domainExpiresAt: "2026-08-31T02:00:00.000Z",
+    }),
+    readThread: async (route) => ({
+      thread: { id: route.threadId, cwd: route.workspacePath },
+    }),
+    renewLease: async () => { renewed += 1; },
+  });
+  assert.equal(renewed, 0);
+  assert.deepEqual(result, { renewed: 0, failed: 0, skipped: 2 });
+});
+
+test("coordinator recovery restores only exact naturally expired Global and domain holders", async () => {
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T00:59:00.000Z",
+    domainExpiresAt: "2026-08-31T00:59:00.000Z",
+  });
+  snapshot.coordination.lease = {
+    ...snapshot.coordination.lease,
+    holderTaskId: "global",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  snapshot.coordination.domainCoordinators[0].lease = {
+    ...snapshot.coordination.domainCoordinators[0].lease,
+    holderTaskId: "frontend",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  const recovered = [];
+  const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => ({
+      thread: { id: route.threadId, cwd: route.workspacePath, turns: [] },
+    }),
+    recoverLease: async (request) => {
+      recovered.push(request);
+      return { lease: { id: `${request.scope}-recovered`, status: "active" } };
+    },
+  });
+  assert.deepEqual(recovered.map(({ scope, domainId }) => [scope, domainId ?? null]), [
+    ["global", null],
+    ["domain", "frontend"],
+  ]);
+  assert.deepEqual(result, { recovered: 2, failed: 0, skipped: 0 });
+});
+
+test("coordinator recovery skips explicit release and busy holders", async () => {
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T00:59:00.000Z",
+    domainExpiresAt: "2026-08-31T00:59:00.000Z",
+  });
+  snapshot.coordination.lease = {
+    ...snapshot.coordination.lease,
+    holderTaskId: "global",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  snapshot.coordination.domainCoordinators[0].lease = {
+    ...snapshot.coordination.domainCoordinators[0].lease,
+    holderTaskId: "frontend",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: "2026-08-31T00:59:00.000Z",
+  };
+  let recovered = 0;
+  const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => ({
+      thread: { id: route.threadId, cwd: route.workspacePath, turns: [{ status: "inProgress" }] },
+    }),
+    recoverLease: async () => { recovered += 1; },
+  });
+  assert.equal(recovered, 0);
+  assert.deepEqual(result, { recovered: 0, failed: 0, skipped: 2 });
+});
 
 const coordinationAuthorization = {
   safeActionId: "safe-action",
   expectedResumeToken: "a".repeat(64),
   rootWorkspacePath: "/tmp/taskboard/project",
+  deliveryReceipt: {
+    id: "coordination-receipt",
+    reservationLeaseId: "reservation-lease",
+    admissionAttemptId: "admission-attempt",
+  },
 };
 const deliverCoordination = (request, rpc, validateExecutionTarget = async () => {}) => (
   deliverTaskboardCoordination(request, rpc, validateExecutionTarget)
@@ -60,22 +284,26 @@ test("background continuation delivers one eligible first safe action without a 
         expectedResumeToken: "b".repeat(64),
       });
       const key = `${claim.todoId}:${claim.expectedResumeToken}`;
-      if (receipts.has(key)) return false;
+      if (receipts.has(key)) return { available: false, completed: true, receipt: { id: "receipt" } };
       receipts.add(key);
-      return true;
+      return {
+        available: true, completed: false,
+        receipt: { id: "receipt", reservationLeaseId: "lease" },
+      };
     },
     confirmDelivery: async () => confirmedIdentity,
     deliver: async (request) => {
       deliveries.push(request);
       return { delivery: "started", turnId: "turn-background" };
     },
+    completeDelivery: async () => ({ completed: true }),
   };
 
   const first = await runTaskboardContinuationMonitorOnce(options);
   const duplicate = await runTaskboardContinuationMonitorOnce(options);
 
   assert.deepEqual(first, { delivered: true, todoId: todo.id, actionId: "safe-first" });
-  assert.deepEqual(duplicate, { delivered: false, reason: "reservation-unavailable" });
+  assert.deepEqual(duplicate, { delivered: false, reason: "already-delivered" });
   assert.equal(deliveries.length, 1);
   assert.deepEqual(deliveries[0], {
     projectId: "taskboard-core",
@@ -86,8 +314,501 @@ test("background continuation delivers one eligible first safe action without a 
     targetRoot: "/tmp/taskboard/project",
     safeActionId: "safe-first",
     expectedResumeToken: "b".repeat(64),
+    deliveryReceipt: { id: "receipt", reservationLeaseId: "lease" },
+    observeOnly: false,
     executionIdentity: { ...confirmedIdentity, standingAuthority: false },
   });
+});
+
+test("background continuation durably defers explicit model capacity and retries the same route", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const todo = {
+    id: "CAP-26",
+    taskId: "378b3aed-d664-4417-be3c-903e1227e2bf",
+    run: null,
+    dispatchTarget: {
+      rootThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/project",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: "b".repeat(64),
+    },
+  };
+  let attempt = 0;
+  let observedNow = Date.parse("2026-08-31T00:00:30.000Z");
+  const deferred = [];
+  const deliveredRoutes = [];
+  const options = {
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 4,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => observedNow,
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [todo],
+      coordination: {
+        coordinatorTaskId: "coordinator",
+        lease: { id: "global-lease", status: "active" },
+      },
+      windowSubagentTrees: [{
+        rootThreadId,
+        observed: true,
+        summary: { active: 0 },
+        capacityObservation: {
+          source: "list_agents",
+          observedAt: "2026-08-31T00:00:00.000Z",
+        },
+      }],
+    }),
+    claimReceipt: async () => {
+      attempt += 1;
+      return {
+        available: true,
+        completed: false,
+        receipt: {
+          id: `receipt-${attempt}`,
+          reservationLeaseId: `lease-${attempt}`,
+          admissionAttemptId: `attempt-${attempt}`,
+        },
+      };
+    },
+    confirmDelivery: async () => confirmedIdentity,
+    deliver: async (request) => {
+      deliveredRoutes.push({
+        rootThreadId: request.rootThreadId,
+        codexHostId: request.codexHostId,
+        targetRoot: request.targetRoot,
+      });
+      if (attempt === 1) {
+        throw new Error("Selected model is at capacity. Please try a different model.");
+      }
+      return { delivery: "started", turnId: "turn-after-capacity" };
+    },
+    deferAdmission: async (request) => {
+      deferred.push(request);
+      todo.admission = {
+        receiptId: request.admissionReceiptId,
+        attemptId: request.admissionAttemptId,
+        state: "deferred",
+        rootThreadId,
+        resumeToken: todo.readyWork.resumeToken,
+        safeActionId: todo.readyWork.safeActions[0].id,
+        deferredReason: "model_capacity",
+        retryCount: 1,
+        retryAfter: "2026-08-31T00:00:45.000Z",
+        rootHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard/project",
+        globalCoordinatorLeaseId: "global-lease",
+        globalCoordinatorTaskId: "coordinator",
+        globalCoordinatorThreadId: rootThreadId,
+        coordinationDomainId: null,
+        domainCoordinatorLeaseId: null,
+        domainCoordinatorTaskId: null,
+        domainCoordinatorThreadId: null,
+      };
+      return {
+        applied: true,
+        receipt: {
+          id: request.admissionReceiptId,
+          admissionAttemptId: request.admissionAttemptId,
+          admissionState: "deferred",
+          admissionDeferredReason: "model_capacity",
+          admissionRetryCount: 1,
+          admissionRetryAfter: "2026-08-31T00:00:45.000Z",
+        },
+      };
+    },
+    completeDelivery: async () => ({ awaitingAdmission: true }),
+  };
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    todoId: todo.id,
+    actionId: "safe-first",
+    reason: "model-capacity-deferred",
+  });
+  assert.equal(deferred.length, 1);
+  assert.equal(deferred[0].admissionReceiptId, "receipt-1");
+  assert.equal(deferred[0].admissionAttemptId, "attempt-1");
+
+  observedNow = Date.parse("2026-08-31T00:00:40.000Z");
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    reason: "model-capacity-backoff",
+  });
+  assert.equal(attempt, 1);
+
+  observedNow = Date.parse("2026-08-31T00:01:01.000Z");
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true,
+    todoId: todo.id,
+    actionId: "safe-first",
+  });
+  assert.equal(attempt, 2);
+  assert.deepEqual(deliveredRoutes, [deliveredRoutes[0], deliveredRoutes[0]]);
+});
+
+test("stale capacity markers neither starve later Todos nor block a fresh frontier", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const makeTodo = (id, token) => ({
+    id,
+    taskId: `${id.toLowerCase()}-task`,
+    run: null,
+    dispatchTarget: {
+      rootThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/project",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: token,
+    },
+  });
+  const staleRoute = makeTodo("CAP-26-A", "a".repeat(64));
+  staleRoute.admission = {
+    receiptId: "stale-receipt",
+    attemptId: "stale-attempt",
+    state: "deferred",
+    rootThreadId,
+    resumeToken: staleRoute.readyWork.resumeToken,
+    safeActionId: "safe-first",
+    deferredReason: "model_capacity",
+    retryCount: 1,
+    retryAfter: "2026-08-31T00:00:15.000Z",
+    rootHostId: "local",
+    rootWorkspacePath: "/tmp/taskboard/project",
+    globalCoordinatorLeaseId: "old-global-lease",
+    globalCoordinatorTaskId: "coordinator",
+    globalCoordinatorThreadId: rootThreadId,
+    coordinationDomainId: null,
+    domainCoordinatorLeaseId: null,
+    domainCoordinatorTaskId: null,
+    domainCoordinatorThreadId: null,
+  };
+  const generic = makeTodo("CAP-26-B", "b".repeat(64));
+  const claimed = [];
+  let todos = [staleRoute, generic];
+  const options = {
+    policy: {
+      enabled: true, projectId: "taskboard-core",
+      maxActiveAgents: 4, capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => Date.parse("2026-08-31T00:00:30.000Z"),
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos,
+      coordination: {
+        coordinatorTaskId: "coordinator",
+        lease: { id: "current-global-lease", status: "active" },
+      },
+      windowSubagentTrees: [{
+        rootThreadId,
+        observed: true,
+        summary: { active: 0 },
+        capacityObservation: {
+          source: "list_agents", observedAt: "2026-08-31T00:00:30.000Z",
+        },
+      }],
+    }),
+    claimReceipt: async (request) => {
+      claimed.push(request.todoId);
+      return {
+        available: true,
+        completed: false,
+        receipt: {
+          id: `receipt-${request.todoId}`,
+          reservationLeaseId: `reservation-${request.todoId}`,
+          admissionAttemptId: `attempt-${request.todoId}`,
+        },
+      };
+    },
+    confirmDelivery: async () => confirmedIdentity,
+    deliver: async () => ({ delivery: "started", turnId: "turn-capacity-frontier" }),
+    completeDelivery: async () => ({ completed: true }),
+  };
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true, todoId: generic.id, actionId: "safe-first",
+  });
+  assert.deepEqual(claimed, [generic.id]);
+
+  const freshFrontier = makeTodo("CAP-26-C", "c".repeat(64));
+  freshFrontier.admission = {
+    ...staleRoute.admission,
+    globalCoordinatorLeaseId: "current-global-lease",
+    resumeToken: "d".repeat(64),
+  };
+  todos = [freshFrontier];
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true, todoId: freshFrontier.id, actionId: "safe-first",
+  });
+  assert.deepEqual(claimed, [generic.id, freshFrontier.id]);
+});
+
+test("background continuation does not reinterpret unrelated delivery failures as capacity", async () => {
+  let deferred = false;
+  await assert.rejects(runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "CAP-26",
+        taskId: "378b3aed-d664-4417-be3c-903e1227e2bf",
+        run: null,
+        dispatchTarget: {
+          rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard/project",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        readyWork: {
+          eligible: true,
+          safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+          deferredActions: [],
+          resumeToken: "b".repeat(64),
+        },
+      }],
+    }),
+    claimReceipt: async () => ({
+      available: true,
+      completed: false,
+      receipt: {
+        id: "receipt-1",
+        reservationLeaseId: "lease-1",
+        admissionAttemptId: "attempt-1",
+      },
+    }),
+    confirmDelivery: async () => confirmedIdentity,
+    deliver: async () => { throw new Error("Codex transport disconnected"); },
+    deferAdmission: async () => { deferred = true; },
+    completeDelivery: async () => assert.fail("failed delivery cannot complete"),
+  }), /Codex transport disconnected/);
+  assert.equal(deferred, false);
+});
+
+test("background continuation recovers an uncertain deterministic child without capacity admission or respawn", async () => {
+  const calls = [];
+  const admission = {
+    receiptId: "recovery-receipt",
+    attemptId: "recovery-attempt",
+    state: "prepared",
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    resumeToken: "b".repeat(64),
+    safeActionId: "safe-action",
+    agentName: "task_admission_1234",
+    agentPath: "/root/task_admission_1234",
+    writeScope: ["server"],
+    deadlineAt: "2026-08-31T00:00:00.000Z",
+    uncertainAt: null,
+    recoveredAgentThreadId: null,
+  };
+  const result = await runTaskboardContinuationMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 1,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => Date.parse("2026-08-31T00:01:00.000Z"),
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "TASKBOARD-23",
+        taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+        dispatchTarget: {
+          rootThreadId: admission.rootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        admission,
+      }],
+      windowSubagentTrees: [{
+        rootThreadId: admission.rootThreadId,
+        observed: true,
+        summary: { active: 1 },
+        capacityObservation: { source: "list_agents", observedAt: "2026-08-31T00:01:00.000Z" },
+      }],
+    }),
+    claimReceipt: async () => { throw new Error("recovery must not reserve or respawn"); },
+    confirmDelivery: async () => { throw new Error("recovery must not redeliver normal coordination"); },
+    deliver: async () => { throw new Error("recovery must not redeliver normal coordination"); },
+    completeDelivery: async () => { throw new Error("recovery must not complete normal delivery"); },
+    markAdmissionUncertain: async () => {
+      calls.push("uncertain");
+      return { receipt: { admissionState: "admission_uncertain", admissionUncertainAt: "2026-08-31T00:01:00.000Z" } };
+    },
+    claimAdmissionProbe: async () => {
+      calls.push("probe-claim");
+      return { receipt: { admissionProbeId: "probe-1", admissionProbeRequestedAt: "2026-08-31T00:01:00.000Z" } };
+    },
+    deliverAdmissionRecovery: async (request) => {
+      calls.push(request.mode);
+      return { delivery: "steered", turnId: "turn-recovery" };
+    },
+    reconcileAdmission: async () => {
+      calls.push("reconcile");
+      return {
+        outcome: "present",
+        receipt: {
+          admissionState: "recovery_confirmed",
+          admissionAgentName: admission.agentName,
+          admissionAgentPath: admission.agentPath,
+          admissionWriteScope: admission.writeScope,
+          admissionRecoveredAgentThreadId: "child-thread",
+        },
+      };
+    },
+  });
+  assert.deepEqual(calls, ["uncertain", "probe-claim", "probe", "reconcile", "claim"]);
+  assert.deepEqual(result, {
+    delivered: true,
+    todoId: "TASKBOARD-23",
+    reason: "admission-recovery-instructed",
+  });
+});
+
+test("background continuation waits for observed Root capacity and backfills after a slot opens", async () => {
+  const calls = { claim: 0, deliver: 0, complete: 0 };
+  let active = 3;
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const todo = {
+    id: "CAP-21",
+    taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+    run: null,
+    dispatchTarget: {
+      rootThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/project",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: "b".repeat(64),
+    },
+  };
+  const options = {
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 4,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => Date.parse("2026-08-31T02:00:30.000Z"),
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [todo],
+      windowSubagentTrees: [{
+        rootThreadId,
+        observed: true,
+        summary: { active },
+        capacityObservation: {
+          source: "list_agents",
+          observedAt: "2026-08-31T02:00:00.000Z",
+        },
+      }, {
+        rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
+        observed: true,
+        summary: { active: 3 },
+        capacityObservation: {
+          source: "list_agents",
+          observedAt: "2026-08-31T02:00:00.000Z",
+        },
+      }],
+    }),
+    claimReceipt: async () => {
+      calls.claim += 1;
+      return {
+        available: true,
+        completed: false,
+        receipt: { id: "receipt", reservationLeaseId: "lease" },
+      };
+    },
+    confirmDelivery: async () => confirmedIdentity,
+    deliver: async () => {
+      calls.deliver += 1;
+      return { delivery: "started", turnId: "turn-background" };
+    },
+    completeDelivery: async () => {
+      calls.complete += 1;
+      return { completed: true };
+    },
+  };
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    reason: "waiting-capacity",
+  });
+  assert.deepEqual(calls, { claim: 0, deliver: 0, complete: 0 });
+
+  active = 2;
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true,
+    todoId: todo.id,
+    actionId: "safe-first",
+  });
+  assert.deepEqual(calls, { claim: 1, deliver: 1, complete: 1 });
+});
+
+test("background continuation fails closed when target Root capacity is not freshly observed", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const base = {
+    projectId: "taskboard-core",
+    todos: [{
+      id: "CAP-21",
+      taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+      run: null,
+      dispatchTarget: {
+        rootThreadId,
+        codexHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard/project",
+        worktreePath: "/tmp/taskboard/project",
+      },
+      readyWork: {
+        eligible: true,
+        safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+        deferredActions: [],
+        resumeToken: "b".repeat(64),
+      },
+    }],
+  };
+  const run = (windowSubagentTrees) => runTaskboardContinuationMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 4,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => Date.parse("2026-08-31T02:02:00.000Z"),
+    readSnapshot: async () => ({ ...base, windowSubagentTrees }),
+    claimReceipt: async () => assert.fail("capacity gate must run before bootstrap claim"),
+    confirmDelivery: async () => assert.fail("capacity gate must run before confirmation"),
+    deliver: async () => assert.fail("capacity gate must run before delivery"),
+    completeDelivery: async () => assert.fail("capacity gate must run before completion"),
+  });
+
+  assert.deepEqual(await run([]), { delivered: false, reason: "capacity-unobserved" });
+  assert.deepEqual(await run([{
+    rootThreadId,
+    observed: true,
+    summary: { active: 0 },
+    capacityObservation: {
+      source: "list_agents",
+      observedAt: "2026-08-31T02:00:00.000Z",
+    },
+  }]), { delivered: false, reason: "capacity-observation-stale" });
 });
 
 test("one project Owner decision is delivered only to its exact confirmed Root window", async () => {
@@ -142,6 +863,1077 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
   assert.match(calls[1][1].input[0].text, /Do not approve it yourself/);
   assert.match(calls[1][1].input[0].text, /delivery-1/);
   assert.doesNotMatch(calls[1][1].input[0].text, /attestation token/i);
+});
+
+test("queued Owner Intent never interrupts an active Coordinator turn", async () => {
+  const request = {
+    intentId: "intent-1",
+    goal: "Keep the current work running and revise the next plan",
+    constraints: ["Do not widen Git authority"],
+    coordinatorEpoch: "lease:coordinator-1",
+    route: {
+      coordinatorTaskId: "coordinator-1",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      coordinatorWorkspacePath: "/tmp/taskboard/coordinator",
+    },
+    adoptionReceipt: { id: "adoption-1" },
+  };
+  const calls = [];
+  const result = await deliverTaskboardOwnerIntent(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") {
+      return {
+        thread: {
+          id: request.route.coordinatorThreadId,
+          cwd: request.route.coordinatorWorkspacePath,
+          turns: [{ id: "turn-active", status: "inProgress" }],
+        },
+      };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  });
+  assert.deepEqual(result, { delivery: "queued", reason: "coordinator-busy" });
+  assert.deepEqual(calls.map(([method]) => method), ["thread/read"]);
+});
+
+test("completed Owner Root turn is captured as one stable append intent", async () => {
+  const route = {
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/taskboard/owner-root",
+  };
+  const observed = await observeTaskboardOwnerIntentCapture(
+    { projectId: "taskboard-core", route, capturedOwnerTurnIds: [] },
+    async (method, params) => {
+      assert.equal(method, "thread/read");
+      assert.deepEqual(params, { threadId: route.ownerRootThreadId, includeTurns: true });
+      return {
+        thread: {
+          id: route.ownerRootThreadId,
+          cwd: route.ownerRootWorkspacePath,
+          turns: [{
+            id: "01a05100-1111-7222-8333-444444444444",
+            status: "completed",
+            input: [{ type: "text", text: "继续把 Taskboard 做到我只需要说目标。" }],
+            items: [
+              {
+                type: "user_message",
+                role: "user",
+                content: "继续把 Taskboard 做到我只需要说目标。",
+              },
+              {
+                type: "agent_message",
+                role: "assistant",
+                content: [
+                  "可以，我会继续推进并在需要新权限时才找你。",
+                  `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+                    kind: "append", targetIntentId: null, constraints: [],
+                  })} -->`,
+                ].join("\n"),
+              },
+            ],
+          }],
+        },
+      };
+    },
+  );
+  assert.deepEqual(observed, {
+    intentId: "owner-intent-taskboard-core-996ee8e9-01a05100-1111-7222-8333-444444444444",
+    deliveryId: "owner-turn-taskboard-core-996ee8e9-01a05100-1111-7222-8333-444444444444",
+    kind: "append",
+    goal: "继续把 Taskboard 做到我只需要说目标。",
+    constraints: [],
+    targetIntentId: null,
+    ownerRootTaskId: route.ownerRootTaskId,
+    ownerRootThreadId: route.ownerRootThreadId,
+    ownerTurnId: "01a05100-1111-7222-8333-444444444444",
+    rootCaptureTurnId: "01a05100-1111-7222-8333-444444444444",
+    evidence: "Protected host observed one completed Owner Root turn.",
+  });
+});
+
+test("Owner Intent capture ids are scoped to the Taskboard project", async () => {
+  const route = {
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/taskboard/owner-root",
+  };
+  const ownerTurnId = "01a05100-1111-7222-8333-444444444444";
+  const rpc = async () => ({
+    thread: {
+      id: route.ownerRootThreadId,
+      cwd: route.ownerRootWorkspacePath,
+      turns: [{
+        id: ownerTurnId,
+        status: "completed",
+        input: [{ type: "text", text: "Continue this project." }],
+        items: [
+          { type: "user_message", role: "user", content: "Continue this project." },
+          {
+            type: "agent_message",
+            role: "assistant",
+            content: `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+              kind: "append", targetIntentId: null, constraints: [],
+            })} -->`,
+          },
+        ],
+      }],
+    },
+  });
+  const first = await observeTaskboardOwnerIntentCapture({
+    projectId: "project-a", route, capturedOwnerTurnIds: [],
+  }, rpc);
+  const second = await observeTaskboardOwnerIntentCapture({
+    projectId: "project-b", route, capturedOwnerTurnIds: [],
+  }, rpc);
+  assert.notEqual(first.intentId, second.intentId);
+  assert.notEqual(first.deliveryId, second.deliveryId);
+  assert.match(first.intentId, /^owner-intent-project-a-/);
+  assert.match(second.intentId, /^owner-intent-project-b-/);
+});
+
+test("Owner Root assistant route markers carry clarify, supersede, and cancel through the host monitor", async () => {
+  const producerSkill = await readFile(new URL("../skills/manage-taskboard/SKILL.md", import.meta.url), "utf8");
+  assert.match(producerSkill, /Do not ask the Owner for an intent id or protocol syntax/);
+  assert.match(producerSkill, /exactly one invisible HTML comment and no content after it/);
+  const ownerRootThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const ownerRootWorkspacePath = "/tmp/taskboard/owner-root";
+  for (const [index, kind] of ["clarify", "supersede", "cancel"].entries()) {
+    const ownerTurnId = `01a05100-1111-7222-8333-${String(index + 201).padStart(12, "0")}`;
+    const targetIntentId = "intent-target";
+    const snapshot = {
+      projectId: `typed-intent-${kind}`,
+      coordination: { ownerRootTaskId: "owner-root" },
+      taskLanes: [{
+        id: "owner-root", taskType: "root_task", threadId: ownerRootThreadId,
+        codexHostId: "local", workspacePath: ownerRootWorkspacePath,
+      }],
+    };
+    let recorded = null;
+    const result = await runOwnerIntentCaptureMonitorOnce({
+      policy: { enabled: true, projectId: snapshot.projectId },
+      readSnapshot: async () => snapshot,
+      listIntents: async () => [{ intentId: targetIntentId, ownerTurnId: "prior-owner-turn" }],
+      observeCapture: (request) => observeTaskboardOwnerIntentCapture(request, async () => ({
+        thread: {
+          id: ownerRootThreadId,
+          cwd: ownerRootWorkspacePath,
+          turns: [{
+            id: ownerTurnId,
+            status: "completed",
+            input: [{
+              type: "text",
+              text: kind === "cancel"
+                ? "Please cancel the previous goal and stop its queued work."
+                : kind === "supersede"
+                  ? "Replace the previous goal with this revised outcome."
+                  : "Clarify the previous goal with this additional constraint.",
+            }],
+            items: [{
+              type: "agent_message",
+              role: "assistant",
+              content: [
+                "I will route this exact change.",
+                `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+                  kind, targetIntentId, constraints: ["Preserve unrelated active work"],
+                })} -->`,
+              ].join("\n"),
+            }],
+          }],
+        },
+      })),
+      recordCapture: async (capture) => {
+        recorded = capture;
+        return { applied: true, intent: capture };
+      },
+    });
+    assert.deepEqual(result, {
+      captured: true,
+      intentId: recorded.intentId,
+      ownerTurnId,
+    });
+    assert.equal(recorded.kind, kind);
+    assert.equal(recorded.targetIntentId, targetIntentId);
+    assert.deepEqual(recorded.constraints, ["Preserve unrelated active work"]);
+    assert.equal(
+      recorded.evidence,
+      "Protected host observed one completed Owner Root turn with an exact assistant route marker.",
+    );
+  }
+});
+
+test("malformed or ambiguous Owner Intent route markers fail closed", async () => {
+  const route = {
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/taskboard/owner-root",
+  };
+  for (const [index, assistantContent] of [
+    "Normal acknowledgement without a required final marker.",
+    "TASKBOARD_OWNER_INTENT_ROUTE_V1 not-json",
+    `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({ kind: "append", constraints: [] })} -->`,
+    `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({ kind: "append", targetIntentId: null })} -->`,
+    `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+      kind: "append", targetIntentId: null, constraints: null,
+    })} -->`,
+    `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({ kind: "cancel", targetIntentId: null })} -->`,
+    `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+      kind: "append", targetIntentId: null, constraints: [],
+    })} -->\nMore assistant content after the marker.`,
+    [
+      `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({ kind: "cancel", targetIntentId: "intent-a" })} -->`,
+      `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({ kind: "cancel", targetIntentId: "intent-b" })} -->`,
+    ].join("\n"),
+  ].entries()) {
+    const observed = await observeTaskboardOwnerIntentCapture(
+      { projectId: "taskboard-core", route, capturedOwnerTurnIds: [] },
+      async () => ({
+        thread: {
+          id: route.ownerRootThreadId,
+          cwd: route.ownerRootWorkspacePath,
+          turns: [{
+            id: `01a05100-1111-7222-8333-${String(index + 301).padStart(12, "0")}`,
+            status: "completed",
+            input: [{ type: "text", text: "Change the current goal." }],
+            items: [{ type: "agent_message", role: "assistant", content: assistantContent }],
+          }],
+        },
+      }),
+    );
+    assert.equal(observed, null);
+  }
+});
+
+test("an exact typed route to an unknown intent never reaches the protected recorder", async () => {
+  const ownerRootThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const ownerRootWorkspacePath = "/tmp/taskboard/owner-root";
+  let recordCalls = 0;
+  const result = await runOwnerIntentCaptureMonitorOnce({
+    policy: { enabled: true, projectId: "typed-intent-unknown-target" },
+    readSnapshot: async () => ({
+      projectId: "typed-intent-unknown-target",
+      coordination: { ownerRootTaskId: "owner-root" },
+      taskLanes: [{
+        id: "owner-root", taskType: "root_task", threadId: ownerRootThreadId,
+        codexHostId: "local", workspacePath: ownerRootWorkspacePath,
+      }],
+    }),
+    listIntents: async () => [{ intentId: "known-intent", ownerTurnId: "prior-owner-turn" }],
+    observeCapture: (request) => observeTaskboardOwnerIntentCapture(request, async () => ({
+      thread: {
+        id: ownerRootThreadId,
+        cwd: ownerRootWorkspacePath,
+        turns: [{
+          id: "01a05100-1111-7222-8333-000000000401",
+          status: "completed",
+          input: [{ type: "text", text: "Cancel the intended work." }],
+          items: [{
+            type: "agent_message",
+            role: "assistant",
+            content: `<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+              kind: "cancel", targetIntentId: "unknown-intent", constraints: [],
+            })} -->`,
+          }],
+        }],
+      },
+    })),
+    recordCapture: async () => {
+      recordCalls += 1;
+      return { applied: true };
+    },
+  });
+  assert.deepEqual(result, { captured: false, reason: "owner-intent-target-unavailable" });
+  assert.equal(recordCalls, 0);
+});
+
+test("first activation baselines at the latest safe Owner turn and fails closed on sensitive text", async () => {
+  const route = {
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/taskboard/owner-root",
+  };
+  const makeTurn = (id, input) => ({
+    id,
+    status: "completed",
+    input: [{ type: "text", text: input }],
+    items: [{
+      type: "agent_message", role: "assistant",
+      content: `收到。\n<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+        kind: "append", targetIntentId: null, constraints: [],
+      })} -->`,
+    }],
+  });
+  const rpc = async () => ({
+    thread: {
+      id: route.ownerRootThreadId,
+      cwd: route.ownerRootWorkspacePath,
+      turns: [
+        makeTurn("01a05100-1111-7222-8333-000000000001", "很早以前的历史目标。"),
+        makeTurn("01a05100-1111-7222-8333-000000000002", "现在要继续的目标。"),
+      ],
+    },
+  });
+  const latest = await observeTaskboardOwnerIntentCapture(
+    { projectId: "taskboard-core", route, capturedOwnerTurnIds: [] },
+    rpc,
+  );
+  assert.equal(latest.ownerTurnId, "01a05100-1111-7222-8333-000000000002");
+  assert.equal(latest.goal, "现在要继续的目标。");
+
+  const sensitive = await observeTaskboardOwnerIntentCapture(
+    { projectId: "taskboard-core", route, capturedOwnerTurnIds: [] },
+    async () => ({
+      thread: {
+        id: route.ownerRootThreadId,
+        cwd: route.ownerRootWorkspacePath,
+        turns: [
+          makeTurn("01a05100-1111-7222-8333-000000000001", "很早以前的历史目标。"),
+          makeTurn("01a05100-1111-7222-8333-000000000003", "password=do-not-store"),
+        ],
+      },
+    }),
+  );
+  assert.equal(sensitive, null);
+});
+
+test("Codex environment, delegation, AGENTS, and control envelopes are never Owner Intents", async () => {
+  const route = {
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/taskboard/owner-root",
+  };
+  const controlInputs = [
+    "<heartbeat><automation_id>taskboard-loop</automation_id><instructions>continue work</instructions></heartbeat>",
+    "<environment_context><cwd>/tmp/internal</cwd></environment_context>",
+    "<codex_delegation><source_thread_id>internal</source_thread_id></codex_delegation>",
+    "# AGENTS.md instructions for /tmp/internal\n<INSTRUCTIONS>internal routing</INSTRUCTIONS>",
+    "Message Type: FINAL_ANSWER\nTask name: /root/internal\nPayload: internal control",
+    "Message Type: NEW_TASK\nTask name: /root/internal\nSender: /root\nPayload:\ninternal dispatch",
+    "taskctl issue bootstrap CAP-16 --json\nTaskboard Owner Intent adoption id: internal",
+  ];
+  for (const [index, input] of controlInputs.entries()) {
+    const observed = await observeTaskboardOwnerIntentCapture(
+      { projectId: "taskboard-core", route, capturedOwnerTurnIds: [] },
+      async () => ({
+        thread: {
+          id: route.ownerRootThreadId,
+          cwd: route.ownerRootWorkspacePath,
+          turns: [{
+            id: `01a05100-1111-7222-8333-${String(index + 10).padStart(12, "0")}`,
+            status: "completed",
+            input: [{ type: "text", text: input }],
+            items: [
+              { type: "user_message", role: "user", content: input },
+              { type: "agent_message", role: "assistant", content: "Internal response" },
+            ],
+          }],
+        },
+      }),
+    );
+    assert.equal(observed, null, input);
+  }
+
+  const adjacent = await observeTaskboardOwnerIntentCapture(
+    { projectId: "taskboard-core", route, capturedOwnerTurnIds: ["01a05100-1111-7222-8333-000000000101"] },
+    async () => ({
+      thread: {
+        id: route.ownerRootThreadId,
+        cwd: route.ownerRootWorkspacePath,
+        turns: [
+          {
+            id: "01a05100-1111-7222-8333-000000000101", status: "completed",
+            input: [{ type: "text", text: "已捕获目标" }],
+            items: [{ type: "agent_message", role: "assistant", content: "ok" }],
+          },
+          {
+            id: "01a05100-1111-7222-8333-000000000102", status: "completed",
+            input: [{ type: "text", text: "<heartbeat><automation_id>x</automation_id></heartbeat>" }],
+            items: [{ type: "agent_message", role: "assistant", content: "internal" }],
+          },
+          {
+            id: "01a05100-1111-7222-8333-000000000103", status: "completed",
+            input: [{ type: "text", text: "请继续完成真实目标" }],
+            items: [{
+              type: "agent_message", role: "assistant",
+              content: `ok\n<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+                kind: "append", targetIntentId: null, constraints: [],
+              })} -->`,
+            }],
+          },
+        ],
+      },
+    }),
+  );
+  assert.equal(adjacent.ownerTurnId, "01a05100-1111-7222-8333-000000000103");
+  assert.equal(adjacent.goal, "请继续完成真实目标");
+
+  let recordCalls = 0;
+  const frontier = [];
+  const newTaskInput = controlInputs.at(-2);
+  const monitorResult = await runOwnerIntentCaptureMonitorOnce({
+    policy: { enabled: true, projectId: "control-envelope-project" },
+    readSnapshot: async () => ({
+      projectId: "control-envelope-project",
+      coordination: { ownerRootTaskId: route.ownerRootTaskId },
+      taskLanes: [{
+        id: route.ownerRootTaskId,
+        taskType: "root_task",
+        threadId: route.ownerRootThreadId,
+        codexHostId: route.codexHostId,
+        workspacePath: route.ownerRootWorkspacePath,
+      }],
+    }),
+    listIntents: async () => frontier,
+    observeCapture: (request) => observeTaskboardOwnerIntentCapture(request, async () => ({
+      thread: {
+        id: route.ownerRootThreadId,
+        cwd: route.ownerRootWorkspacePath,
+        turns: [{
+          id: "01a05100-1111-7222-8333-000000000099",
+          status: "completed",
+          input: [{ type: "text", text: newTaskInput }],
+          items: [
+            { type: "user_message", role: "user", content: newTaskInput },
+            { type: "agent_message", role: "assistant", content: "Internal response" },
+          ],
+        }],
+      },
+    })),
+    recordCapture: async () => {
+      recordCalls += 1;
+      return { applied: true };
+    },
+  });
+  assert.deepEqual(monitorResult, { captured: false, reason: "no-owner-turn" });
+  assert.equal(recordCalls, 0);
+  assert.deepEqual(frontier, []);
+});
+
+test("Owner Intent capture skips Taskboard decision turns and replays exactly once", async () => {
+  const ownerRootThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const ownerRootWorkspacePath = "/tmp/taskboard/owner-root";
+  const ownerTurnId = "01a05100-1111-7222-8333-555555555555";
+  const snapshot = {
+    projectId: "taskboard-core",
+    coordination: { ownerRootTaskId: "owner-root" },
+    taskLanes: [{
+      id: "owner-root",
+      taskType: "root_task",
+      threadId: ownerRootThreadId,
+      codexHostId: "local",
+      workspacePath: ownerRootWorkspacePath,
+    }],
+  };
+  let recorded = [];
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => snapshot,
+    listIntents: async () => recorded.map((intent) => ({ ownerTurnId: intent.ownerTurnId })),
+    observeCapture: (request) => observeTaskboardOwnerIntentCapture(request, async () => ({
+      thread: {
+        id: ownerRootThreadId,
+        cwd: ownerRootWorkspacePath,
+        turns: [
+          {
+            id: "01a05100-1111-7222-8333-666666666666",
+            status: "completed",
+            input: [{
+              type: "text",
+              text: "Taskboard Owner decision delivery id: delivery-1\nAsk the Owner one question.",
+            }],
+            items: [{ type: "agent_message", role: "assistant", content: "Which policy?" }],
+          },
+          {
+            id: "01a05100-1111-7222-8333-777777777777",
+            status: "completed",
+            input: [{ type: "text", text: "Use the existing policy." }],
+            items: [{
+              type: "agent_message",
+              role: "assistant",
+              content: `TASKBOARD_OWNER_DECISION_V1 ${JSON.stringify({
+                requestId: "request-1", outcome: "authorized", evidence: "Owner chose it",
+              })}`,
+            }],
+          },
+          {
+            id: ownerTurnId,
+            status: "completed",
+            input: [{ type: "text", text: "然后继续实现自动恢复。" }],
+            items: [{
+              type: "agent_message", role: "assistant",
+              content: `收到。\n<!-- TASKBOARD_OWNER_INTENT_ROUTE_V1 ${JSON.stringify({
+                kind: "append", targetIntentId: null, constraints: [],
+              })} -->`,
+            }],
+          },
+        ],
+      },
+    })),
+    recordCapture: async (capture) => {
+      recorded.push(capture);
+      return { applied: true, intent: capture };
+    },
+  };
+
+  assert.deepEqual(await runOwnerIntentCaptureMonitorOnce(options), {
+    captured: true,
+    intentId: recorded[0].intentId,
+    ownerTurnId,
+  });
+  assert.deepEqual(await runOwnerIntentCaptureMonitorOnce(options), {
+    captured: false,
+    reason: "no-owner-turn",
+  });
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].goal, "然后继续实现自动恢复。");
+});
+
+test("queued Owner Intent is adopted exactly once at an idle Coordinator boundary", async () => {
+  const fullGoal = `Revise the next plan ${"goal".repeat(150)}`;
+  const fullConstraint = `Preserve one writer ${"constraint".repeat(60)}`;
+  const request = {
+    intentId: "intent-2",
+    kind: "append",
+    targetIntentId: null,
+    goal: "Revise the next plan…",
+    constraints: ["Preserve one writer…"],
+    coordinatorEpoch: "configured:coordinator-1",
+    route: {
+      coordinatorTaskId: "coordinator-1",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      coordinatorWorkspacePath: "/tmp/taskboard/coordinator",
+    },
+  };
+  const calls = [];
+  let confirmed;
+  const result = await runOwnerIntentAdoptionMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: { pendingOwnerIntent: request },
+    }),
+    claimAdoption: async () => ({
+      claimed: true,
+      receipt: { id: "adoption-2" },
+      executionIntent: {
+        intentId: request.intentId,
+        version: 2,
+        kind: request.kind,
+        targetIntentId: request.targetIntentId,
+        goal: fullGoal,
+        constraints: [fullConstraint],
+      },
+    }),
+    confirmAdoption: async (receipt, intentId) => {
+      confirmed = { receipt, intentId };
+      return { confirmed: true, receipt: { id: receipt.adoptionId } };
+    },
+    deliver: (current, options) => deliverTaskboardOwnerIntent(current, async (method, params) => {
+      calls.push([method, params]);
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id: request.route.coordinatorThreadId,
+            cwd: request.route.coordinatorWorkspacePath,
+            turns: [],
+          },
+        };
+      }
+      if (method === "thread/resume") return {};
+      if (method === "turn/start") return { turn: { id: "turn-adopt" } };
+      throw new Error(`Unexpected method: ${method}`);
+    }, options),
+  });
+  assert.deepEqual(result, {
+    delivered: true,
+    intentId: request.intentId,
+    delivery: "started",
+    adopted: true,
+  });
+  assert.deepEqual(calls.map(([method]) => method), ["thread/read", "thread/resume", "turn/start"]);
+  assert.deepEqual(confirmed, {
+    receipt: { adoptionId: "adoption-2", deliveryTurnId: "turn-adopt" },
+    intentId: request.intentId,
+  });
+  assert.match(calls[2][1].input[0].text, /without widening product, Git, deployment/);
+  assert.match(calls[2][1].input[0].text, new RegExp(fullGoal));
+  assert.match(calls[2][1].input[0].text, new RegExp(fullConstraint));
+  assert.match(calls[2][1].input[0].text, /TASKBOARD_OWNER_INTENT_PLAN_V1/);
+  assert.match(calls[2][1].input[0].text, /Owner Intent kind: append/);
+  assert.match(calls[2][1].input[0].text, /Target Owner Intent id: none/);
+  assert.doesNotMatch(calls[2][1].input[0].text, /turn\/steer/);
+});
+
+test("cancel Owner Intent instruction emits an empty executable frontier", async () => {
+  const request = {
+    projectId: "taskboard-core", intentId: "cancel-intent", kind: "cancel",
+    targetIntentId: "target-intent", version: 2, goal: "Cancel the target work.",
+    constraints: [], coordinatorEpoch: "configured:coordinator-1",
+    adoptionReceipt: { id: "cancel-adoption" },
+    route: {
+      coordinatorTaskId: "coordinator-1",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local", coordinatorWorkspacePath: "/tmp/taskboard/coordinator",
+    },
+  };
+  let instruction;
+  const result = await deliverTaskboardOwnerIntent(request, async (method, params) => {
+    if (method === "thread/read") return {
+      thread: { id: request.route.coordinatorThreadId, cwd: request.route.coordinatorWorkspacePath, turns: [] },
+    };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") {
+      instruction = params.input[0].text;
+      return { turn: { id: "cancel-turn" } };
+    }
+    throw new Error(`Unexpected method: ${method}`);
+  });
+  assert.deepEqual(result, { delivery: "started", turnId: "cancel-turn" });
+  assert.match(instruction, /Owner Intent kind: cancel/);
+  assert.match(instruction, /Target Owner Intent id: target-intent/);
+  const marker = instruction.split("TASKBOARD_OWNER_INTENT_PLAN_V1 ")[1].split(". Never emit", 1)[0];
+  assert.deepEqual(JSON.parse(marker).items, []);
+  assert.doesNotMatch(marker, /stable-outcome|bounded Todo/);
+});
+
+test("Coordinator plan marker is observed and persisted exactly once", async () => {
+  const request = {
+    intentId: "intent-plan-1",
+    version: 2,
+    adoptionReceipt: {
+      id: "adoption-plan-1",
+      deliveryTurnId: "turn-plan-1",
+      coordinatorEpoch: "configured:coordinator-1",
+    },
+    route: {
+      coordinatorTaskId: "coordinator-1",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      coordinatorWorkspacePath: "/tmp/taskboard/coordinator",
+    },
+  };
+  const plan = {
+    intentId: request.intentId,
+    adoptionId: request.adoptionReceipt.id,
+    coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+    revisionId: "plan-1",
+    classification: "bounded_delivery",
+    summary: "One bounded outcome",
+    parentTaskId: null,
+    items: [{
+      outcomeKey: "bounded-outcome",
+      title: "Bounded Todo",
+      description: "No authority widening",
+      priority: "high",
+      blockedByOutcomeKeys: [],
+    }],
+  };
+  const marker = `TASKBOARD_OWNER_INTENT_PLAN_V1 ${JSON.stringify(plan)}`;
+  const observed = await observeTaskboardOwnerIntentPlan(request, async () => ({
+    thread: {
+      id: request.route.coordinatorThreadId,
+      cwd: request.route.coordinatorWorkspacePath,
+      turns: [{
+        id: request.adoptionReceipt.deliveryTurnId,
+        status: "completed",
+        input: [{ type: "text", text: `Taskboard Owner Intent adoption id: ${request.adoptionReceipt.id}` }],
+        items: [{ type: "agent_message", role: "assistant", content: marker }],
+      }],
+    },
+  }));
+  assert.deepEqual(observed, plan);
+  const premature = await observeTaskboardOwnerIntentPlan(request, async () => ({
+    thread: {
+      id: request.route.coordinatorThreadId,
+      cwd: request.route.coordinatorWorkspacePath,
+      turns: [{
+        id: request.adoptionReceipt.deliveryTurnId,
+        status: "inProgress",
+        input: [{ type: "text", text: `Taskboard Owner Intent adoption id: ${request.adoptionReceipt.id}` }],
+        items: [{ type: "agent_message", role: "assistant", content: marker }],
+      }],
+    },
+  }));
+  assert.equal(premature, null);
+  const invalidMarker = `TASKBOARD_OWNER_INTENT_PLAN_V1 ${JSON.stringify({
+    ...plan,
+    revisionId: "invalid-plan",
+    items: [{}],
+  })}`;
+  const invalid = await observeTaskboardOwnerIntentPlan(request, async () => ({
+    thread: {
+      id: request.route.coordinatorThreadId,
+      cwd: request.route.coordinatorWorkspacePath,
+      turns: [{
+        id: request.adoptionReceipt.deliveryTurnId,
+        status: "completed",
+        input: [{ type: "text", text: `Taskboard Owner Intent adoption id: ${request.adoptionReceipt.id}` }],
+        items: [{ type: "agent_message", role: "assistant", content: invalidMarker }],
+      }],
+    },
+  }));
+  assert.deepEqual(invalid, { invalid: true, reason: "missing-or-malformed-plan" });
+  for (const malformedItems of [[null], [42], [{ outcomeKey: "missing-dependencies" }]]) {
+    const malformedMarker = `TASKBOARD_OWNER_INTENT_PLAN_V1 ${JSON.stringify({
+      ...plan,
+      revisionId: `malformed-${String(malformedItems[0]?.outcomeKey ?? malformedItems[0])}`,
+      items: malformedItems,
+    })}`;
+    const malformed = await observeTaskboardOwnerIntentPlan(request, async () => ({
+      thread: {
+        id: request.route.coordinatorThreadId,
+        cwd: request.route.coordinatorWorkspacePath,
+        turns: [{
+          id: request.adoptionReceipt.deliveryTurnId,
+          status: "completed",
+          input: [{ type: "text", text: `Taskboard Owner Intent adoption id: ${request.adoptionReceipt.id}` }],
+          items: [{ type: "agent_message", role: "assistant", content: malformedMarker }],
+        }],
+      },
+    }));
+    assert.deepEqual(malformed, { invalid: true, reason: "missing-or-malformed-plan" });
+  }
+  for (const cycleItems of [
+    [
+      { outcomeKey: "cycle-a", title: "A", description: "A", priority: "high", blockedByOutcomeKeys: ["cycle-b"] },
+      { outcomeKey: "cycle-b", title: "B", description: "B", priority: "high", blockedByOutcomeKeys: ["cycle-a"] },
+    ],
+    [
+      { outcomeKey: "cycle-x", title: "X", description: "X", priority: "high", blockedByOutcomeKeys: ["cycle-z"] },
+      { outcomeKey: "cycle-y", title: "Y", description: "Y", priority: "high", blockedByOutcomeKeys: ["cycle-x"] },
+      { outcomeKey: "cycle-z", title: "Z", description: "Z", priority: "high", blockedByOutcomeKeys: ["cycle-y"] },
+    ],
+  ]) {
+    const cycleMarker = `TASKBOARD_OWNER_INTENT_PLAN_V1 ${JSON.stringify({
+      ...plan,
+      revisionId: `cycle-plan-${cycleItems.length}`,
+      items: cycleItems,
+    })}`;
+    const cycle = await observeTaskboardOwnerIntentPlan(request, async () => ({
+      thread: {
+        id: request.route.coordinatorThreadId,
+        cwd: request.route.coordinatorWorkspacePath,
+        turns: [{
+          id: request.adoptionReceipt.deliveryTurnId,
+          status: "completed",
+          input: [{ type: "text", text: `Taskboard Owner Intent adoption id: ${request.adoptionReceipt.id}` }],
+          items: [{ type: "agent_message", role: "assistant", content: cycleMarker }],
+        }],
+      },
+    }));
+    assert.deepEqual(cycle, { invalid: true, reason: "missing-or-malformed-plan" });
+  }
+  let applied;
+  const result = await runOwnerIntentPlanningMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: { pendingOwnerIntentPlan: request },
+    }),
+    observePlan: async () => observed,
+    applyPlan: async (current, currentPlan) => {
+      applied = { current, currentPlan };
+      return { applied: true, revision: { id: plan.revisionId } };
+    },
+  });
+  assert.deepEqual(result, {
+    applied: true,
+    intentId: request.intentId,
+    revisionId: plan.revisionId,
+  });
+  assert.deepEqual(applied, { current: request, currentPlan: plan });
+});
+
+test("terminal Owner Intent planning turns enter durable bounded retry", async () => {
+  const projectId = "terminal-plan-retry-project";
+  const route = {
+    coordinatorTaskId: "coordinator-terminal-retry",
+    coordinatorThreadId,
+    codexHostId: "local",
+    coordinatorWorkspacePath: "/tmp/taskboard/coordinator-terminal-retry",
+  };
+  const attempts = ["failed", "interrupted", "failed"].map((status, index) => ({
+    intentId: "intent-terminal-retry",
+    version: index + 1,
+    adoptionReceipt: {
+      id: `adoption-terminal-retry-${index + 1}`,
+      deliveryTurnId: `turn-terminal-retry-${index + 1}`,
+      coordinatorEpoch: "configured:coordinator-terminal-retry",
+    },
+    route,
+    status,
+  }));
+  const durableFailures = new Set();
+  let durableRetryCount = 0;
+  let needsDecision = false;
+
+  for (const [index, request] of attempts.entries()) {
+    const options = {
+      policy: { enabled: true, projectId },
+      readSnapshot: async () => ({
+        projectId,
+        coordination: { pendingOwnerIntentPlan: request },
+      }),
+      observePlan: (current) => observeTaskboardOwnerIntentPlan(current, async () => ({
+        thread: {
+          id: route.coordinatorThreadId,
+          cwd: route.coordinatorWorkspacePath,
+          turns: [{
+            id: current.adoptionReceipt.deliveryTurnId,
+            status: current.status,
+            input: [{
+              type: "text",
+              text: `Taskboard Owner Intent adoption id: ${current.adoptionReceipt.id}`,
+            }],
+            items: [],
+          }],
+        },
+      })),
+      applyPlan: async () => assert.fail("terminal planning turns cannot apply a plan"),
+      scheduleRetry: async (current, failure) => {
+        const failureKey = `${current.adoptionReceipt.id}:${failure.reason}`;
+        if (!durableFailures.has(failureKey)) {
+          durableFailures.add(failureKey);
+          durableRetryCount += 1;
+          needsDecision = durableRetryCount >= 3;
+          return { applied: true, exhausted: needsDecision };
+        }
+        return { applied: false, exhausted: needsDecision };
+      },
+    };
+    const expectedReason = index === 2 ? "plan-retry-exhausted" : "plan-retry-scheduled";
+    assert.deepEqual(await runOwnerIntentPlanningMonitorOnce(options), {
+      applied: false,
+      reason: expectedReason,
+    });
+    assert.deepEqual(await runOwnerIntentPlanningMonitorOnce(options), {
+      applied: false,
+      reason: expectedReason,
+    });
+  }
+
+  assert.equal(durableRetryCount, 3);
+  assert.equal(durableFailures.size, 3);
+  assert.equal(needsDecision, true);
+});
+
+test("server-invalid Owner Intent plan schedules durable bounded replan and accepts a later revision", async () => {
+  const request = {
+    intentId: "intent-invalid-cache",
+    adoptionReceipt: { id: "adoption-invalid-cache", coordinatorEpoch: "configured:coordinator" },
+  };
+  const plan = { revisionId: "invalid-cache-plan" };
+  let applies = 0;
+  const retries = [];
+  let currentRequest = request;
+  let currentPlan = plan;
+  const options = {
+    policy: { enabled: true, projectId: "invalid-cache-project" },
+    readSnapshot: async () => ({
+      projectId: "invalid-cache-project",
+      coordination: { pendingOwnerIntentPlan: currentRequest },
+    }),
+    observePlan: async () => currentPlan,
+    applyPlan: async () => {
+      applies += 1;
+      return applies === 1
+        ? { applied: false, reason: "invalid-plan" }
+        : { applied: true };
+    },
+    scheduleRetry: async (retryRequest, failure) => {
+      retries.push({ retryRequest, failure });
+      return { applied: true, exhausted: false };
+    },
+  };
+  assert.deepEqual(await runOwnerIntentPlanningMonitorOnce(options), {
+    applied: false,
+    reason: "plan-retry-scheduled",
+  });
+  currentRequest = {
+    ...request,
+    version: 3,
+    adoptionReceipt: { id: "adoption-retry", coordinatorEpoch: "configured:coordinator" },
+  };
+  currentPlan = { revisionId: "valid-retry-plan" };
+  assert.deepEqual(await runOwnerIntentPlanningMonitorOnce(options), {
+    applied: true,
+    intentId: request.intentId,
+    revisionId: "valid-retry-plan",
+  });
+  assert.equal(applies, 2);
+  assert.deepEqual(retries, [{
+    retryRequest: request,
+    failure: { reason: "server-invalid-plan", revisionId: "invalid-cache-plan" },
+  }]);
+});
+
+test("Owner Intent adoption failure cannot starve continuation or Owner decision monitors", async () => {
+  const calls = [];
+  const results = await runTaskboardProjectMonitorSequence([
+    async () => { calls.push("planning"); return { applied: false }; },
+    async () => { calls.push("adoption"); throw new Error("Coordinator host unavailable"); },
+    async () => { calls.push("continuation"); return { delivered: true }; },
+    async () => { calls.push("owner-decision"); return { delivered: true }; },
+  ]);
+  assert.deepEqual(calls, ["planning", "adoption", "continuation", "owner-decision"]);
+  assert.deepEqual(results, [
+    { ok: true, result: { applied: false } },
+    { ok: false, error: "Coordinator host unavailable" },
+    { ok: true, result: { delivered: true } },
+    { ok: true, result: { delivered: true } },
+  ]);
+});
+
+test("cross-domain handoff waits for an idle Coordinator without steering", async () => {
+  const request = {
+    projectId: "taskboard-core",
+    sourceTaskId: "source-uuid",
+    sourceIdentifier: "CAP-24",
+    targetTaskId: "target-uuid",
+    targetIdentifier: "CAP-25",
+    fingerprint: "a".repeat(64),
+    sourceDomainId: "frontend",
+    targetDomainId: "backend",
+    expectedTargetDomainLeaseId: "backend-lease",
+    targetHolderTaskId: "backend",
+    route: {
+      targetThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      targetWorkspacePath: "/tmp/taskboard/backend",
+    },
+  };
+  const calls = [];
+  const result = await runCrossDomainHandoffMonitorOnce({
+    policy: { enabled: true, projectId: request.projectId },
+    readSnapshot: async () => ({
+      projectId: request.projectId,
+      coordination: { pendingCrossDomainHandoff: request },
+    }),
+    claimDelivery: async () => ({ claimed: true, receipt: { id: "handoff-busy" } }),
+    confirmDelivery: async () => assert.fail("busy delivery must not confirm"),
+    deliver: (deliveryRequest, options) => deliverTaskboardCrossDomainHandoff(
+      deliveryRequest,
+      async (method) => {
+        calls.push(method);
+        if (method === "thread/read") return {
+          thread: {
+            id: request.route.targetThreadId,
+            cwd: request.route.targetWorkspacePath,
+            turns: [{ id: "active", status: "inProgress" }],
+          },
+        };
+        assert.fail("busy handoff must not steer or start a turn");
+      },
+      options,
+    ),
+  });
+  assert.deepEqual(result, { delivered: false, reason: "coordinator-busy" });
+  assert.deepEqual(calls, ["thread/read"]);
+});
+
+test("cross-domain handoff starts and confirms exactly one idle Coordinator turn", async () => {
+  const request = {
+    projectId: "taskboard-core",
+    sourceTaskId: "source-uuid",
+    sourceIdentifier: "CAP-24",
+    targetTaskId: "target-uuid",
+    targetIdentifier: "CAP-25",
+    fingerprint: "b".repeat(64),
+    sourceDomainId: "frontend",
+    targetDomainId: "backend",
+    expectedTargetDomainLeaseId: "backend-lease",
+    targetHolderTaskId: "backend",
+    route: {
+      targetThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      targetWorkspacePath: "/tmp/taskboard/backend",
+    },
+  };
+  const calls = [];
+  let confirmed = null;
+  const result = await runCrossDomainHandoffMonitorOnce({
+    policy: { enabled: true, projectId: request.projectId },
+    readSnapshot: async () => ({ projectId: request.projectId, coordination: { pendingCrossDomainHandoff: request } }),
+    claimDelivery: async () => ({ claimed: true, receipt: { id: "handoff-once" } }),
+    confirmDelivery: async (value) => { confirmed = value; return { confirmed: true }; },
+    deliver: (deliveryRequest, options) => deliverTaskboardCrossDomainHandoff(
+      deliveryRequest,
+      async (method, params) => {
+        calls.push([method, params]);
+        if (method === "thread/read") return {
+          thread: { id: request.route.targetThreadId, cwd: request.route.targetWorkspacePath, turns: [] },
+        };
+        if (method === "turn/start") return { turn: { id: "handoff-turn" } };
+        return {};
+      },
+      options,
+    ),
+  });
+  assert.equal(result.delivered, true);
+  assert.deepEqual(calls.map(([method]) => method), ["thread/read", "thread/resume", "turn/start"]);
+  assert.deepEqual(confirmed, { deliveryId: "handoff-once", deliveryTurnId: "handoff-turn" });
+  const instruction = calls.at(-1)[1].input[0].text;
+  assert.match(instruction, /delivery invitation, not dependency acceptance/);
+  assert.match(instruction, /dependency-handoff status taskboard-core CAP-25/);
+  assert.match(instruction, /dependency-handoff accept taskboard-core CAP-25/);
+  assert.doesNotMatch(instruction, /list_agents|spawn_agent|turn\/steer/);
+});
+
+test("cross-domain handoff recovers a started marker without a second turn", async () => {
+  const request = {
+    projectId: "taskboard-core",
+    sourceTaskId: "source-uuid",
+    sourceIdentifier: "CAP-24",
+    targetTaskId: "target-uuid",
+    targetIdentifier: "CAP-25",
+    fingerprint: "c".repeat(64),
+    sourceDomainId: "frontend",
+    targetDomainId: "backend",
+    expectedTargetDomainLeaseId: "backend-lease",
+    targetHolderTaskId: "backend",
+    route: {
+      targetThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      targetWorkspacePath: "/tmp/taskboard/backend",
+    },
+  };
+  const calls = [];
+  let confirmed = null;
+  const result = await runCrossDomainHandoffMonitorOnce({
+    policy: { enabled: true, projectId: request.projectId },
+    readSnapshot: async () => ({ projectId: request.projectId, coordination: { pendingCrossDomainHandoff: request } }),
+    claimDelivery: async () => ({ claimed: false, reason: "reserved", receipt: { id: "handoff-recover" } }),
+    confirmDelivery: async (value) => { confirmed = value; return { confirmed: true }; },
+    deliver: (deliveryRequest, options) => deliverTaskboardCrossDomainHandoff(
+      deliveryRequest,
+      async (method) => {
+        calls.push(method);
+        if (method === "thread/read") return {
+          thread: {
+            id: request.route.targetThreadId,
+            cwd: request.route.targetWorkspacePath,
+            turns: [{
+              id: "existing-handoff-turn",
+              status: "completed",
+              input: [{ type: "text", text: "Taskboard cross-domain handoff delivery id: handoff-recover" }],
+            }],
+          },
+        };
+        assert.fail("marker recovery must not start another turn");
+      },
+      options,
+    ),
+  });
+  assert.equal(result.delivery, "observed");
+  assert.deepEqual(calls, ["thread/read"]);
+  assert.deepEqual(confirmed, { deliveryId: "handoff-recover", deliveryTurnId: "existing-handoff-turn" });
 });
 
 test("Owner decision observation requires an actual Owner turn in the exact Root thread", async () => {
@@ -327,6 +2119,7 @@ test("background continuation fails closed for disabled, open-run, or malformed 
     claimReceipt: async () => assert.fail("must not claim a receipt"),
     confirmDelivery: async () => assert.fail("must not confirm delivery"),
     deliver: async () => { delivered += 1; },
+    completeDelivery: async () => assert.fail("must not complete delivery"),
   };
   assert.deepEqual(
     await runTaskboardContinuationMonitorOnce(base),
@@ -361,8 +2154,11 @@ test("background continuation fails closed for disabled, open-run, or malformed 
   assert.equal(delivered, 0);
 });
 
-test("background continuation reserves the durable receipt before an uncertain delivery", async () => {
-  let claimed = false;
+test("background continuation resumes an expired reservation and records exactly one Root delivery", async () => {
+  let attempts = 0;
+  let delivered = 0;
+  let completed = 0;
+  const receipt = { id: "bootstrap-receipt", reservationLeaseId: "lease-retry" };
   const options = {
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
@@ -384,19 +2180,31 @@ test("background continuation reserves the durable receipt before an uncertain d
         },
       }],
     }),
-    claimReceipt: async () => {
-      if (claimed) return false;
-      claimed = true;
-      return true;
-    },
+    claimReceipt: async () => ({ available: true, completed: false, receipt }),
     confirmDelivery: async () => confirmedIdentity,
-    deliver: async () => { throw new Error("receipt unknown"); },
+    deliver: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("failed immediately after claim");
+      delivered += 1;
+      return { delivery: "started", turnId: "root-turn" };
+    },
+    completeDelivery: async (_authorization, delivery) => {
+      completed += 1;
+      assert.equal(delivery.turnId, "root-turn");
+      return { completed: true };
+    },
   };
-  await assert.rejects(runTaskboardContinuationMonitorOnce(options), /receipt unknown/);
+  await assert.rejects(runTaskboardContinuationMonitorOnce(options), /failed immediately after claim/);
   assert.deepEqual(
     await runTaskboardContinuationMonitorOnce(options),
-    { delivered: false, reason: "reservation-unavailable" },
+    { delivered: true, todoId: "UNCERTAIN", actionId: "safe-first" },
   );
+  options.claimReceipt = async () => ({ available: false, completed: true, receipt });
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false, reason: "already-delivered",
+  });
+  assert.equal(delivered, 1);
+  assert.equal(completed, 1);
 });
 
 test("background continuation fails closed when the authoritative reservation is rejected", async () => {
@@ -422,13 +2230,42 @@ test("background continuation fails closed when the authoritative reservation is
         },
       }],
     }),
-    claimReceipt: async () => false,
+    claimReceipt: async () => ({ available: false, completed: false, receipt: null }),
     confirmDelivery: async () => assert.fail("rejected reservations must not confirm delivery"),
     deliver: async () => { delivered = true; },
+    completeDelivery: async () => assert.fail("rejected reservations must not complete delivery"),
   });
 
   assert.deepEqual(result, { delivered: false, reason: "reservation-unavailable" });
   assert.equal(delivered, false);
+});
+
+test("background continuation does not reserve an unassigned Todo without a Global route", async () => {
+  let claimed = false;
+  const result = await runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "WAIT-GLOBAL",
+        taskId: "f727e1f4-e4da-44d3-9c55-4f4d8b487955",
+        run: null,
+        dispatchTarget: null,
+        readyWork: {
+          eligible: true,
+          safeActions: [{ id: "safe-first" }],
+          resumeToken: "f".repeat(64),
+        },
+      }],
+    }),
+    claimReceipt: async () => { claimed = true; },
+    confirmDelivery: async () => assert.fail("unrouted work must not confirm delivery"),
+    deliver: async () => assert.fail("unrouted work must not be delivered"),
+    completeDelivery: async () => assert.fail("unrouted work must not complete delivery"),
+  });
+
+  assert.deepEqual(result, { delivered: false, reason: "no-eligible-work" });
+  assert.equal(claimed, false);
 });
 
 test("the resident authenticated host polls durable opt-in policies without the Agent Lanes view", async () => {
@@ -480,12 +2317,20 @@ test("Agent Todo coordination steers an active Root turn", async () => {
   assert.deepEqual(result, { delivery: "steered", turnId: "turn-active" });
   assert.equal(calls[1][0], "turn/steer");
   assert.equal(calls[1][1].expectedTurnId, "turn-active");
-  assert.match(calls[1][1].input[0].text, /^taskctl issue bootstrap TASKBOARD-17 --json/);
+  assert.match(calls[1][1].input[0].text, /taskctl issue bootstrap TASKBOARD-17 --json/);
+  assert.match(calls[1][1].input[0].text, /Taskboard coordination delivery id: coordination-receipt/);
   assert.match(calls[1][1].input[0].text, /readyWork\.eligible/);
   assert.match(calls[1][1].input[0].text, /safeActions\[0\]\.id/);
   assert.match(calls[1][1].input[0].text, /Never execute any readyWork\.deferredActions/);
   assert.match(calls[1][1].input[0].text, /Todo: TASKBOARD-17/);
-  assert.match(calls[1][1].input[0].text, /spawn the smallest useful Sub-Agent/);
+  assert.match(calls[1][1].input[0].text, /spawn exactly one smallest useful Sub-Agent/);
+  assert.match(calls[1][1].input[0].text, /--admission-receipt-id and --admission-attempt-id/);
+  assert.match(calls[1][1].input[0].text, /Admission attempt id: admission-attempt/);
+  assert.match(calls[1][1].input[0].text, /issue admission-prepare/);
+  assert.match(calls[1][1].input[0].text, /rerouted=true/);
+  assert.match(calls[1][1].input[0].text, /exact admissionAgentName/);
+  assert.match(calls[1][1].input[0].text, /Exact Root thread id: 01a004bd-a749-7b53-81e2-af2d477f93ae/);
+  assert.match(calls[1][1].input[0].text, /--root-thread-id/);
 });
 
 test("Agent Todo coordination starts an idle Root turn", async () => {
@@ -509,6 +2354,102 @@ test("Agent Todo coordination starts an idle Root turn", async () => {
 
   assert.deepEqual(result, { delivery: "started", turnId: "turn-new" });
   assert.deepEqual(calls.map(([method]) => method), ["thread/read", "thread/resume", "turn/start"]);
+  assert.match(calls[2][1].input[0].text, /do not spawn or claim/);
+});
+
+test("Agent Todo coordination observes a prior durable Root delivery after restart", async () => {
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local", projectId: "taskboard-core", todoId: "TASKBOARD-OBSERVED",
+    targetRoot: "/tmp/taskboard/project", ...coordinationAuthorization,
+    deliveryReceipt: { id: "observed-receipt", reservationLeaseId: "observed-lease", admissionAttemptId: "observed-attempt" },
+  };
+  const calls = [];
+  const result = await deliverCoordination(request, async (method) => {
+    calls.push(method);
+    if (method === "thread/read") {
+      return {
+        thread: {
+          id: request.rootThreadId, cwd: request.rootWorkspacePath,
+          turns: [{
+            id: "already-delivered-turn", status: "completed",
+            input: [{ type: "text", text: "Taskboard coordination delivery id: observed-receipt:observed-attempt" }],
+          }],
+        },
+      };
+    }
+    assert.fail("an observed durable delivery must not create another Root turn");
+  }, async () => assert.fail("observed recovery must not validate an obsolete worktree"));
+  assert.deepEqual(result, { delivery: "observed", turnId: "already-delivered-turn" });
+  assert.deepEqual(calls, ["thread/read"]);
+});
+
+test("a rotated admission attempt is not swallowed by the prior receipt marker", async () => {
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local", projectId: "taskboard-core", todoId: "TASKBOARD-ROTATED",
+    targetRoot: "/tmp/taskboard/project", ...coordinationAuthorization,
+    deliveryReceipt: { id: "shared-receipt", reservationLeaseId: "new-lease", admissionAttemptId: "new-attempt" },
+  };
+  const calls = [];
+  const result = await deliverCoordination(request, async (method) => {
+    calls.push(method);
+    if (method === "thread/read") return {
+      thread: {
+        id: request.rootThreadId, cwd: request.rootWorkspacePath,
+        turns: [{
+          id: "old-turn", status: "completed",
+          input: [{ type: "text", text: "Taskboard coordination delivery id: shared-receipt:old-attempt" }],
+        }],
+      },
+    };
+    if (method === "turn/start") return { turn: { id: "new-turn" } };
+    return {};
+  });
+  assert.deepEqual(result, { delivery: "started", turnId: "new-turn" });
+  assert.deepEqual(calls, ["thread/read", "thread/resume", "turn/start"]);
+});
+
+test("in-memory coordination dedupe is scoped to the admission attempt", async () => {
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local", projectId: "taskboard-core", todoId: "TASKBOARD-ROTATED-MEMORY",
+    targetRoot: "/tmp/taskboard/project", ...coordinationAuthorization,
+    deliveryReceipt: { id: "memory-receipt", reservationLeaseId: "lease-old", admissionAttemptId: "attempt-old" },
+  };
+  let turnNumber = 0;
+  const rpc = async (method) => {
+    if (method === "thread/read") return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
+    if (method === "turn/start") return { turn: { id: `turn-${++turnNumber}` } };
+    return {};
+  };
+  const first = await deliverCoordination(request, rpc);
+  const second = await deliverCoordination({
+    ...request,
+    deliveryReceipt: { id: "memory-receipt", reservationLeaseId: "lease-new", admissionAttemptId: "attempt-new" },
+  }, rpc);
+  assert.deepEqual(first, { delivery: "started", turnId: "turn-1" });
+  assert.deepEqual(second, { delivery: "started", turnId: "turn-2" });
+});
+
+test("route-takeover recovery never sends a stale-token instruction when no old marker exists", async () => {
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local", projectId: "taskboard-core", todoId: "TASKBOARD-STALE-ROUTE",
+    targetRoot: "/tmp/taskboard/project", ...coordinationAuthorization,
+    deliveryReceipt: { id: "stale-route-receipt", reservationLeaseId: "original-lease" },
+    observeOnly: true,
+  };
+  const calls = [];
+  const result = await deliverCoordination(request, async (method) => {
+    calls.push(method);
+    if (method === "thread/read") {
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
+    }
+    assert.fail("observe-only recovery must not issue a Root RPC without the old marker");
+  }, async () => assert.fail("observe-only recovery must not validate an obsolete worktree"));
+  assert.deepEqual(result, { delivery: "not-observed", turnId: null });
+  assert.deepEqual(calls, ["thread/read"]);
 });
 
 test("the authenticated host binding accepts one bounded Agent Todo request", async () => {
@@ -569,6 +2510,7 @@ test("Agent Todo coordination can target a Git worktree outside the Root coordin
     targetRoot: "/tmp/capstone-execution-worktree",
     safeActionId: "safe-action-separate",
     expectedResumeToken: "f".repeat(64),
+    deliveryReceipt: { id: "separate-receipt", reservationLeaseId: "separate-lease" },
   };
   const result = await deliverCoordination(request, async (method, params) => {
     calls.push([method, params]);

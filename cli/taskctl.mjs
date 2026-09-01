@@ -39,6 +39,10 @@ const COMMAND_OPTIONS = new Map([
   ])],
   ["authority revoke", new Set(["evidence", "receipt", "json"])],
   ["coordinator status", new Set(["json"])],
+  ["coordinator windows", new Set(["json"])],
+  ["coordinator register-window", new Set([
+    "role", "task", "label", "thread-id", "expected-revision", "idempotency-key", "json",
+  ])],
   ["coordinator acquire", new Set([
     "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
   ])],
@@ -52,6 +56,38 @@ const COMMAND_OPTIONS = new Map([
     "holder-task", "holder-thread-id", "expected-lease-id", "if-version", "json",
   ])],
   ["coordinator receipts", new Set(["json"])],
+  ["owner-intent list", new Set(["json"])],
+  ["domain-coordinator status", new Set(["json"])],
+  ["domain-coordinator domains", new Set(["json"])],
+  ["domain-coordinator configure", new Set([
+    "label", "write-scope", "eligible-task", "holder-task", "holder-thread-id",
+    "expected-lease-id", "expected-revision", "idempotency-key", "json",
+  ])],
+  ["domain-coordinator remove", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "expected-revision",
+    "idempotency-key", "json",
+  ])],
+  ["domain-coordinator acquire", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
+  ])],
+  ["domain-coordinator renew", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "lease-seconds", "json",
+  ])],
+  ["domain-coordinator release", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "json",
+  ])],
+  ["domain-coordinator receipts", new Set(["json"])],
+  ["domain-todo status", new Set(["json"])],
+  ["domain-todo assign", new Set([
+    "domain", "holder-task", "holder-thread-id", "expected-lease-id", "if-version", "json",
+  ])],
+  ["domain-todo clear", new Set([
+    "holder-task", "holder-thread-id", "expected-lease-id", "if-version", "json",
+  ])],
+  ["dependency-handoff status", new Set(["json"])],
+  ["dependency-handoff accept", new Set([
+    "source", "idempotency-key", "holder-task", "holder-thread-id", "expected-lease-id", "json",
+  ])],
   ["activation audit", new Set(["json"])],
   ["activation apply-workflow-profile", new Set(["if-version", "json"])],
   ["cloud login", new Set(["url", "actor-name", "json"])],
@@ -127,7 +163,18 @@ const COMMAND_OPTIONS = new Map([
     "if-version",
     "json",
   ])],
-  ["issue claim", new Set(["agent-path", "thread-id", "if-version", "lease-minutes", "write-scope", "json"])],
+  ["issue claim", new Set([
+    "agent-path", "thread-id", "root-thread-id", "if-version", "lease-minutes", "write-scope",
+    "admission-receipt-id", "admission-attempt-id", "json",
+  ])],
+  ["issue admission-defer", new Set([
+    "root-thread-id", "expected-resume-token", "safe-action-id",
+    "admission-receipt-id", "admission-attempt-id", "json",
+  ])],
+  ["issue admission-prepare", new Set([
+    "root-thread-id", "expected-resume-token", "safe-action-id", "admission-receipt-id",
+    "admission-attempt-id", "write-scope", "json",
+  ])],
   ["issue archive", new Set(["thread-id", "if-version", "json"])],
   ["issue restore", new Set(["thread-id", "if-version", "json"])],
   ["issue relation", new Set(["type", "issue", "thread-id", "if-version", "json"])],
@@ -178,6 +225,9 @@ Commands:
     --granted-at ISO [--expires-at ISO]
   authority revoke PROJECT_ID AUTHORITY_ID --evidence TEXT --receipt ID
   coordinator status PROJECT_ID
+  coordinator windows PROJECT_ID
+  coordinator register-window PROJECT_ID --role owner_root|coordinator --task TASK
+    --label LABEL --thread-id THREAD --expected-revision SHA256 --idempotency-key KEY
   coordinator acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD
     --expected-lease-id none|ID --lease-seconds N
   coordinator renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD
@@ -187,11 +237,34 @@ Commands:
   coordinator repair-binding PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
     --expected-lease-id ID --if-version N
   coordinator receipts PROJECT_ID
+  owner-intent list PROJECT_ID
+  domain-coordinator status PROJECT_ID DOMAIN_ID
+  domain-coordinator domains PROJECT_ID
+  domain-coordinator configure PROJECT_ID DOMAIN_ID --label LABEL --write-scope PATH[,PATH]
+    --eligible-task TASK[,TASK] --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --expected-revision SHA256 --idempotency-key KEY
+  domain-coordinator remove PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --expected-revision SHA256 --idempotency-key KEY
+  domain-coordinator acquire PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id none|ID --lease-seconds N
+  domain-coordinator renew PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --lease-seconds N
+  domain-coordinator release PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID
+  domain-coordinator receipts PROJECT_ID DOMAIN_ID
+  domain-todo status PROJECT_ID ISSUE_ID
+  domain-todo assign PROJECT_ID ISSUE_ID --domain DOMAIN_ID
+    --holder-task TASK --holder-thread-id THREAD --expected-lease-id ID --if-version N
+  domain-todo clear PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --if-version N
   activation audit
   activation apply-workflow-profile ISSUE_ID --if-version N
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|bootstrap|create|update|move|archive|restore|relation
+  dependency-handoff status PROJECT_ID TARGET_ISSUE_ID
+  dependency-handoff accept PROJECT_ID TARGET_ISSUE_ID --source SOURCE_ISSUE_ID
+    --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
   handoff list ISSUE_ID
   handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
     --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
@@ -253,7 +326,14 @@ Actions:
     [--if-version N] [--json]
   archive ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   claim ISSUE_ID --agent-path /root/NAME --thread-id ID
-    --lease-minutes N --write-scope path[,path] [--if-version N] [--json]
+    --lease-minutes N --write-scope path[,path] [--root-thread-id ID]
+    [--admission-receipt-id ID --admission-attempt-id ID]
+    [--if-version N] [--json]
+  admission-prepare ISSUE_ID --root-thread-id ID --expected-resume-token TOKEN
+    --safe-action-id ID --admission-receipt-id ID --admission-attempt-id ID
+    --write-scope path[,path] [--json]
+  admission-defer ISSUE_ID --root-thread-id ID --expected-resume-token TOKEN
+    --safe-action-id ID --admission-receipt-id ID --admission-attempt-id ID [--json]
   restore ISSUE_ID [--thread-id ID] [--if-version N] [--json]
   relation add|remove ISSUE_ID --type parent|blocks|blocked_by|related
     --issue RELATED_ISSUE_ID [--thread-id ID] [--if-version N] [--json]
@@ -289,6 +369,9 @@ Actions: edit, test, scoped_delete, commit, ordinary_push, draft_pr`],
 
 Actions:
   status PROJECT_ID [--json]
+  windows PROJECT_ID [--json]
+  register-window PROJECT_ID --role owner_root|coordinator --task TASK --label LABEL
+    --thread-id THREAD --expected-revision SHA256 --idempotency-key KEY [--json]
   acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD
     --expected-lease-id none|ID --lease-seconds 30..3600 [--json]
   renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD
@@ -299,9 +382,41 @@ Actions:
     --expected-lease-id ID --if-version N [--json]
   receipts PROJECT_ID [--json]
 
+Register-window derives host identity from the protected current Codex runtime; callers never supply it.
 The holder task and thread must already be one exact configured Agent Lane binding.
 Binding repair derives host identity from the protected current Codex runtime; callers never supply it.
 Coordinator ownership does not grant task execution ownership.`],
+  ["domain-coordinator", `Usage: taskctl domain-coordinator ACTION PROJECT_ID DOMAIN_ID [options]
+
+Actions:
+  status PROJECT_ID DOMAIN_ID [--json]
+  domains PROJECT_ID [--json]
+  configure PROJECT_ID DOMAIN_ID --label LABEL --write-scope PATH[,PATH]
+    --eligible-task TASK[,TASK] --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --expected-revision SHA256 --idempotency-key KEY [--json]
+  remove PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --expected-revision SHA256 --idempotency-key KEY [--json]
+  acquire PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id none|ID --lease-seconds 30..3600 [--json]
+  renew PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --lease-seconds 30..3600 [--json]
+  release PROJECT_ID DOMAIN_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID [--json]
+  receipts PROJECT_ID DOMAIN_ID [--json]
+
+A domain lease delegates one configured disjoint source scope. It does not replace
+the Global Coordinator, claim a Todo, grant mutation authority, or own shared runtime state.`],
+  ["domain-todo", `Usage: taskctl domain-todo ACTION PROJECT_ID ISSUE_ID [options]
+
+Actions:
+  status PROJECT_ID ISSUE_ID [--json]
+  assign PROJECT_ID ISSUE_ID --domain DOMAIN_ID --holder-task TASK
+    --holder-thread-id THREAD --expected-lease-id ID --if-version N [--json]
+  clear PROJECT_ID ISSUE_ID --holder-task TASK --holder-thread-id THREAD
+    --expected-lease-id ID --if-version N [--json]
+
+Only the exact active Global Coordinator lease may assign an unclaimed Agent Todo.
+Assigned claims must pass --root-thread-id for the current domain coordinator route.`],
   ["activation", `Usage: taskctl activation ACTION [arguments] [options]
 
 Actions:
@@ -446,7 +561,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/acquire/renew/release/repair-binding/receipts, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -457,7 +572,11 @@ async function execute(parsed, overrides) {
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
   const usesCompanionControl = command.startsWith("cloud ")
     || command === "project map"
+    || command.startsWith("owner-intent ")
     || command.startsWith("coordinator ")
+    || command.startsWith("domain-coordinator ")
+    || command.startsWith("domain-todo ")
+    || command.startsWith("dependency-handoff ")
     || command.startsWith("activation ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
@@ -533,6 +652,16 @@ async function execute(parsed, overrides) {
       const snapshot = await api.request("GET", agentLaneProjectPath(projectId));
       return { projectId, coordination: snapshot.coordination ?? null };
     }
+    case "coordinator windows":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", coordinationWindowsPath(parsed.operands[0]));
+    case "coordinator register-window":
+      expectOperandCount(parsed, 1);
+      return registerCoordinationWindow(api, parsed.operands[0], parsed.options);
+    case "owner-intent list": {
+      expectOperandCount(parsed, 1);
+      return api.request("GET", ownerIntentProjectPath(parsed.operands[0]));
+    }
     case "coordinator acquire":
       expectOperandCount(parsed, 1);
       return mutateCoordinatorLease(
@@ -563,6 +692,73 @@ async function execute(parsed, overrides) {
     case "coordinator receipts":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${coordinatorLeasePath(parsed.operands[0])}/receipts`);
+    case "domain-coordinator status": {
+      expectOperandCount(parsed, 2);
+      const snapshot = await api.request("GET", agentLaneProjectPath(parsed.operands[0]));
+      return {
+        projectId: parsed.operands[0],
+        domainId: parsed.operands[1],
+        domainCoordinator: snapshot.coordination?.domainCoordinators?.find(
+          (domain) => domain.domainId === parsed.operands[1],
+        ) ?? null,
+      };
+    }
+    case "domain-coordinator domains":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", coordinationDomainsPath(parsed.operands[0]));
+    case "domain-coordinator configure":
+      expectOperandCount(parsed, 2);
+      return configureCoordinationDomain(api, parsed.operands[0], parsed.operands[1], parsed.options);
+    case "domain-coordinator remove":
+      expectOperandCount(parsed, 2);
+      return removeCoordinationDomain(api, parsed.operands[0], parsed.operands[1], parsed.options);
+    case "domain-coordinator acquire":
+      expectOperandCount(parsed, 2);
+      return mutateDomainCoordinatorLease(
+        api, parsed.operands[0], parsed.operands[1], parsed.options,
+        expectedCoordinatorLeaseId(parsed.options, { allowNone: true }),
+      );
+    case "domain-coordinator renew":
+      expectOperandCount(parsed, 2);
+      return mutateDomainCoordinatorLease(
+        api, parsed.operands[0], parsed.operands[1], parsed.options,
+        expectedCoordinatorLeaseId(parsed.options),
+      );
+    case "domain-coordinator release":
+      expectOperandCount(parsed, 2);
+      return releaseDomainCoordinatorLease(api, parsed.operands[0], parsed.operands[1], parsed.options);
+    case "domain-coordinator receipts":
+      expectOperandCount(parsed, 2);
+      return api.request("GET", `${domainCoordinatorLeasePath(parsed.operands[0], parsed.operands[1])}/receipts`);
+    case "domain-todo status":
+      expectOperandCount(parsed, 2);
+      return api.request("GET", domainTodoAssignmentPath(parsed.operands[0], parsed.operands[1]));
+    case "domain-todo assign":
+      expectOperandCount(parsed, 2);
+      return api.request("POST", domainTodoAssignmentPath(parsed.operands[0], parsed.operands[1]), {
+        domainId: requiredOption(parsed.options, "domain"),
+        taskVersion: explicitVersion(parsed.options["if-version"]),
+        ...coordinatorHolder(parsed.options),
+        expectedCoordinatorLeaseId: expectedCoordinatorLeaseId(parsed.options),
+      });
+    case "domain-todo clear":
+      expectOperandCount(parsed, 2);
+      return api.request("DELETE", domainTodoAssignmentPath(parsed.operands[0], parsed.operands[1]), {
+        taskVersion: explicitVersion(parsed.options["if-version"]),
+        ...coordinatorHolder(parsed.options),
+        expectedCoordinatorLeaseId: expectedCoordinatorLeaseId(parsed.options),
+      });
+    case "dependency-handoff status":
+      expectOperandCount(parsed, 2);
+      return api.request("GET", crossDomainDependencyClearancePath(parsed.operands[0], parsed.operands[1]));
+    case "dependency-handoff accept":
+      expectOperandCount(parsed, 2);
+      return api.request("POST", crossDomainDependencyClearancePath(parsed.operands[0], parsed.operands[1]), {
+        sourceTaskId: requiredOption(parsed.options, "source"),
+        idempotencyKey: requiredOption(parsed.options, "idempotency-key"),
+        ...coordinatorHolder(parsed.options),
+        expectedTargetDomainLeaseId: expectedCoordinatorLeaseId(parsed.options),
+      });
     case "activation audit":
       expectOperandCount(parsed, 0);
       return api.request("GET", "/api/local/activation-readiness");
@@ -608,6 +804,12 @@ async function execute(parsed, overrides) {
     case "issue claim":
       expectOperandCount(parsed, 1);
       return claimIssue(api, parsed.operands[0], parsed.options, overrides);
+    case "issue admission-defer":
+      expectOperandCount(parsed, 1);
+      return deferIssueAdmission(api, parsed.operands[0], parsed.options);
+    case "issue admission-prepare":
+      expectOperandCount(parsed, 1);
+      return prepareIssueAdmission(api, parsed.operands[0], parsed.options);
     case "issue archive":
       expectOperandCount(parsed, 1);
       return archiveIssue(api, parsed.operands[0], parsed.options, overrides, "archive");
@@ -1231,12 +1433,48 @@ async function claimIssue(api, taskId, options, overrides) {
   if (writeScope.length === 0 || writeScope.length > 32 || writeScope.some((value) => value.length > 240)) {
     throw usageError("--write-scope must contain 1 to 32 comma-separated paths");
   }
+  if (Boolean(options["admission-receipt-id"]) !== Boolean(options["admission-attempt-id"])) {
+    throw usageError("--admission-receipt-id and --admission-attempt-id must be supplied together");
+  }
   return api.request("POST", `${taskPath(taskId)}/claim`, {
     agentPath,
     agentThreadId: resolveThreadId(options, overrides),
+    ...(options["root-thread-id"] ? { rootThreadId: options["root-thread-id"] } : {}),
     leaseExpiresAt: new Date(Date.now() + leaseMinutes * 60_000).toISOString(),
     writeScope,
+    ...(options["admission-receipt-id"] ? {
+      admissionReceiptId: options["admission-receipt-id"],
+    } : {}),
+    ...(options["admission-attempt-id"] ? {
+      admissionAttemptId: options["admission-attempt-id"],
+    } : {}),
     version: await resolveVersion(api, taskId, options["if-version"]),
+  });
+}
+
+async function deferIssueAdmission(api, taskId, options) {
+  return api.request("POST", `${taskPath(taskId)}/admission-defer`, {
+    rootThreadId: requiredOption(options, "root-thread-id"),
+    expectedResumeToken: requiredOption(options, "expected-resume-token"),
+    safeActionId: requiredOption(options, "safe-action-id"),
+    admissionReceiptId: requiredOption(options, "admission-receipt-id"),
+    admissionAttemptId: requiredOption(options, "admission-attempt-id"),
+  });
+}
+
+async function prepareIssueAdmission(api, taskId, options) {
+  const writeScope = requiredOption(options, "write-scope")
+    .split(",").map((value) => value.trim()).filter(Boolean);
+  if (writeScope.length === 0 || writeScope.length > 32 || writeScope.some((value) => value.length > 240)) {
+    throw usageError("--write-scope must contain 1 to 32 comma-separated paths");
+  }
+  return api.request("POST", `${taskPath(taskId)}/admission-prepare`, {
+    rootThreadId: requiredOption(options, "root-thread-id"),
+    expectedResumeToken: requiredOption(options, "expected-resume-token"),
+    safeActionId: requiredOption(options, "safe-action-id"),
+    admissionReceiptId: requiredOption(options, "admission-receipt-id"),
+    admissionAttemptId: requiredOption(options, "admission-attempt-id"),
+    writeScope,
   });
 }
 
@@ -1245,9 +1483,73 @@ function agentLaneProjectPath(projectId) {
   return `/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`;
 }
 
+function ownerIntentProjectPath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`;
+}
+
 function coordinatorLeasePath(projectId) {
   if (!projectId) throw usageError("Missing project id");
   return `/api/local/projects/${encodeURIComponent(projectId)}/coordinator-lease`;
+}
+
+function coordinationWindowsPath(projectId) {
+  if (!projectId) throw usageError("Missing project id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/coordination-windows`;
+}
+
+function domainCoordinatorLeasePath(projectId, domainId) {
+  if (!projectId) throw usageError("Missing project id");
+  if (!domainId) throw usageError("Missing coordination domain id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/domain-coordinator-leases/${encodeURIComponent(domainId)}`;
+}
+
+function coordinationDomainsPath(projectId, domainId) {
+  if (!projectId) throw usageError("Missing project id");
+  const base = `/api/local/projects/${encodeURIComponent(projectId)}/coordination-domains`;
+  return domainId ? `${base}/${encodeURIComponent(domainId)}` : base;
+}
+
+function coordinationDomainControl(options) {
+  const expectedRevision = requiredOption(options, "expected-revision").trim();
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw usageError("--expected-revision must be a lowercase SHA-256 digest");
+  }
+  return {
+    holderTaskId: requiredOption(options, "holder-task"),
+    holderThreadId: requiredOption(options, "holder-thread-id"),
+    expectedCoordinatorLeaseId: requiredOption(options, "expected-lease-id"),
+    expectedRevision,
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+  };
+}
+
+function configureCoordinationDomain(api, projectId, domainId, options) {
+  const writeScope = requiredOption(options, "write-scope").split(",").map((entry) => entry.trim()).filter(Boolean);
+  const eligibleTaskIds = requiredOption(options, "eligible-task").split(",").map((entry) => entry.trim()).filter(Boolean);
+  if (writeScope.length === 0 || eligibleTaskIds.length === 0) {
+    throw usageError("--write-scope and --eligible-task must contain comma-separated values");
+  }
+  return api.request("PUT", coordinationDomainsPath(projectId, domainId), {
+    label: requiredOption(options, "label"), writeScope, eligibleTaskIds,
+    ...coordinationDomainControl(options),
+  });
+}
+
+function removeCoordinationDomain(api, projectId, domainId, options) {
+  return api.request("DELETE", coordinationDomainsPath(projectId, domainId), coordinationDomainControl(options));
+}
+
+function domainTodoAssignmentPath(projectId, taskId) {
+  if (!projectId) throw usageError("Missing project id");
+  if (!taskId) throw usageError("Missing task id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/domain-todo-assignments/${encodeURIComponent(taskId)}`;
+}
+
+function crossDomainDependencyClearancePath(projectId, taskId) {
+  if (!projectId) throw usageError("Missing project id");
+  if (!taskId) throw usageError("Missing task id");
+  return `/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-dependency-clearances/${encodeURIComponent(taskId)}`;
 }
 
 function coordinatorHolder(options) {
@@ -1285,11 +1587,51 @@ function mutateCoordinatorLease(api, projectId, options, expectedLeaseId) {
   });
 }
 
+function registerCoordinationWindow(api, projectId, options) {
+  const role = requiredOption(options, "role").trim();
+  if (role !== "owner_root" && role !== "coordinator") {
+    throw usageError("--role must be owner_root or coordinator");
+  }
+  const expectedRevision = requiredOption(options, "expected-revision").trim();
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw usageError("--expected-revision must be a lowercase SHA-256 digest");
+  }
+  return api.request("POST", coordinationWindowsPath(projectId), {
+    role,
+    taskId: requiredOption(options, "task"),
+    label: requiredOption(options, "label"),
+    threadId: requiredOption(options, "thread-id"),
+    expectedRevision,
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+  });
+}
+
 function releaseCoordinatorLease(api, projectId, options) {
   const expectedLeaseId = expectedCoordinatorLeaseId(options);
   return api.request("POST", `${coordinatorLeasePath(projectId)}/release`, {
     ...coordinatorHolder(options),
     expectedLeaseId,
+  });
+}
+
+function mutateDomainCoordinatorLease(api, projectId, domainId, options, expectedLeaseId) {
+  const leaseDurationSeconds = Number(requiredOption(options, "lease-seconds"));
+  if (!Number.isInteger(leaseDurationSeconds)
+    || leaseDurationSeconds < 30
+    || leaseDurationSeconds > 3600) {
+    throw usageError("--lease-seconds must be an integer from 30 to 3600");
+  }
+  return api.request("POST", domainCoordinatorLeasePath(projectId, domainId), {
+    ...coordinatorHolder(options),
+    expectedLeaseId,
+    leaseDurationSeconds,
+  });
+}
+
+function releaseDomainCoordinatorLease(api, projectId, domainId, options) {
+  return api.request("POST", `${domainCoordinatorLeasePath(projectId, domainId)}/release`, {
+    ...coordinatorHolder(options),
+    expectedLeaseId: expectedCoordinatorLeaseId(options),
   });
 }
 

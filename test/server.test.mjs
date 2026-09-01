@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
-import { access, chmod, mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { access, appendFile, chmod, mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -12,7 +12,9 @@ import { promisify } from "node:util";
 import { createTaskboardServer, resolveHost } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import {
+  classifyOwnerIntentPlanHttpFailure,
   deliverTaskboardCoordination,
+  runOwnerIntentPlanningMonitorOnce,
   runTaskboardContinuationMonitorOnce,
 } from "../scripts/codex-injector-runtime.mjs";
 
@@ -75,6 +77,22 @@ function signedInjectorHeaders(instanceSecret, nonce) {
   return {
     "x-codex-taskboard-injector-nonce": nonce,
     "x-codex-taskboard-injector-proof": createHmac("sha256", instanceSecret).update(nonce).digest("hex"),
+  };
+}
+
+function signedCoordinatorRenewHeaders(instanceSecret, nonce, pathname, body, issuedAt = Date.now()) {
+  const timestamp = String(issuedAt);
+  const proof = createHmac("sha256", instanceSecret).update(JSON.stringify({
+    nonce,
+    issuedAt: timestamp,
+    method: "POST",
+    pathname,
+    body,
+  })).digest("hex");
+  return {
+    "x-codex-taskboard-injector-nonce": nonce,
+    "x-codex-taskboard-injector-issued-at": timestamp,
+    "x-codex-taskboard-injector-proof": proof,
   };
 }
 
@@ -464,6 +482,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
       rootThreadId: "root-thread",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: capsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "bootstrap-lease",
     },
   });
   assert.equal(reservation.response.status, 200);
@@ -477,6 +496,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
       rootThreadId: "root-thread",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: "test",
+      reservationLeaseId: "bootstrap-lease",
     },
   });
   assert.equal(repeated.response.status, 200);
@@ -489,6 +509,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
       rootThreadId: "other-root-thread",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: "test",
+      reservationLeaseId: "wrong-root-lease",
     },
   });
   assert.equal(wrongRoot.response.status, 409);
@@ -500,6 +521,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
       rootThreadId: "root-thread",
       expectedResumeToken: "0".repeat(64),
       safeActionId: "test",
+      reservationLeaseId: "stale-lease",
     },
   });
   assert.equal(stale.response.status, 409);
@@ -515,10 +537,20 @@ test("the default host is loopback-only", () => {
   assert.equal(resolveHost("0.0.0.0"), "0.0.0.0");
 });
 
-test("Agent Lane snapshot reserves its internal task id and delivers one background continuation", async () => {
+test("Agent Lane admission is fenced from Root delivery through the exact durable child claim", async () => {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const instanceSecret = "6".repeat(64);
+  let rootSessionPath;
   let task;
   const baseUrl = await startServer(async (directory) => {
+    const sessionsDirectory = path.join(directory, "sessions", "2026", "08", "31");
+    await mkdir(sessionsDirectory, { recursive: true });
+    rootSessionPath = path.join(sessionsDirectory, `rollout-${rootThreadId}.jsonl`);
+    await writeFile(rootSessionPath, `${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      type: "session_meta",
+      payload: { session_id: rootThreadId },
+    })}\n`);
     const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
     database.upsertAgentLaneProject("local", {
       rootTaskId: "root",
@@ -579,12 +611,15 @@ test("Agent Lane snapshot reserves its internal task id and delivers one backgro
       actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
     });
     database.close();
-    return {};
+    return { instanceSecret, admissionTtlMs: 10, codexSessionsDirectory: path.join(directory, "sessions") };
   });
 
   const deliveries = [];
+  let deliveryAttempts = 0;
+  let firstReceipt;
   const options = {
     policy: { enabled: true, projectId: "local" },
+    now: () => 0,
     readSnapshot: async () => (await request(baseUrl, "/api/local/projects/local/agent-lanes")).body,
     claimReceipt: async (claim) => {
       assert.equal(claim.todoId, task.identifier);
@@ -598,12 +633,14 @@ test("Agent Lane snapshot reserves its internal task id and delivers one backgro
             rootThreadId: claim.rootThreadId,
             expectedResumeToken: claim.expectedResumeToken,
             safeActionId: claim.safeActionId,
+            reservationLeaseId: "snapshot-reservation",
           },
         },
       );
       assert.equal(reservation.response.status, 200);
       assert.equal(reservation.body.receipt.taskId, claim.taskId);
-      return reservation.body.reused === false;
+      firstReceipt ??= reservation.body.receipt;
+      return reservation.body;
     },
     confirmDelivery: async (delivery) => {
       const confirmation = await request(
@@ -615,6 +652,7 @@ test("Agent Lane snapshot reserves its internal task id and delivers one backgro
             rootThreadId: delivery.rootThreadId,
             expectedResumeToken: delivery.expectedResumeToken,
             safeActionId: delivery.safeActionId,
+            reservationLeaseId: delivery.deliveryReceipt.reservationLeaseId,
           },
         },
       );
@@ -622,21 +660,419 @@ test("Agent Lane snapshot reserves its internal task id and delivers one backgro
       return confirmation.body.executionIdentity;
     },
     deliver: async (delivery) => {
+      deliveryAttempts += 1;
+      if (deliveryAttempts === 1) throw new Error("injector stopped before first Root RPC");
       deliveries.push(delivery);
       return { delivery: "started", turnId: "turn-background" };
     },
+    completeDelivery: async (delivery, rootDelivery) => (await request(
+      baseUrl,
+      `/api/tasks/${encodeURIComponent(delivery.todoId)}/bootstrap-complete`,
+      {
+        method: "POST",
+        body: {
+          rootThreadId: delivery.rootThreadId,
+          expectedResumeToken: delivery.expectedResumeToken,
+          safeActionId: delivery.safeActionId,
+          reservationLeaseId: delivery.deliveryReceipt.reservationLeaseId,
+          recoveryLeaseId: delivery.recoveryLeaseId,
+          deliveryTurnId: rootDelivery.turnId,
+        },
+      },
+    )).body,
   };
 
-  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
-    delivered: true,
-    todoId: task.identifier,
-    actionId: "continue",
-  });
+  await assert.rejects(
+    runTaskboardContinuationMonitorOnce(options),
+    /injector stopped before first Root RPC/,
+  );
   assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
     delivered: false,
-    reason: "reservation-unavailable",
+    reason: "awaiting-admission",
   });
-  assert.equal(deliveries.length, 1);
+  assert.equal(deliveryAttempts, 1, "awaiting admission must not blindly redeliver the Root turn");
+
+  const bareClaimBody = {
+    version: task.version,
+    agentPath: "/root/unfenced-child",
+    agentThreadId: "unfenced-child-thread",
+    rootThreadId,
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    writeScope: ["src"],
+  };
+  const bareClaim = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: bareClaimBody,
+  });
+  assert.equal(bareClaim.response.status, 409);
+  assert.equal(bareClaim.body.error.code, "ADMISSION_BINDING_REQUIRED");
+  const afterBareClaim = await request(baseUrl, `/api/tasks/${task.identifier}`);
+  assert.equal(afterBareClaim.body.task.status, "todo");
+  assert.equal(afterBareClaim.body.task.version, task.version);
+
+  const firstPrepared = await request(baseUrl, `/api/tasks/${task.identifier}/admission-prepare`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+      writeScope: ["src"],
+    },
+  });
+  assert.equal(firstPrepared.response.status, 200, JSON.stringify(firstPrepared.body));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const firstUncertain = await request(baseUrl, `/api/tasks/${task.identifier}/admission-uncertain`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "1".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(firstUncertain.response.status, 200, JSON.stringify(firstUncertain.body));
+  const firstProbe = await request(baseUrl, `/api/tasks/${task.identifier}/admission-probe`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "2".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(firstProbe.response.status, 200, JSON.stringify(firstProbe.body));
+  assert.match(firstProbe.body.receipt.admissionProbeId, /^[0-9a-f-]{36}$/);
+  const preProbeObservation = await request(baseUrl, `/api/tasks/${task.identifier}/admission-reconcile`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "3".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+      admissionProbeId: firstProbe.body.receipt.admissionProbeId,
+    },
+  });
+  assert.equal(preProbeObservation.response.status, 200, JSON.stringify(preProbeObservation.body));
+  assert.equal(preProbeObservation.body.outcome, "unresolved");
+  assert.equal(preProbeObservation.body.receipt.admissionState, "admission_uncertain");
+  const absenceObservedAt = new Date(Date.now() + 10).toISOString();
+  await appendFile(rootSessionPath, [
+    JSON.stringify({
+      timestamp: absenceObservedAt,
+      type: "response_item",
+      payload: { type: "function_call", name: "list_agents", namespace: "collaboration", call_id: "absence-list-agents", arguments: "{}" },
+    }),
+    JSON.stringify({
+      timestamp: absenceObservedAt,
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "absence-list-agents",
+        output: JSON.stringify({ agents: [{ agent_name: "/root", agent_id: rootThreadId, agent_status: "running" }] }),
+      },
+    }),
+  ].join("\n") + "\n");
+  const absent = await request(baseUrl, `/api/tasks/${task.identifier}/admission-reconcile`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+      admissionProbeId: firstProbe.body.receipt.admissionProbeId,
+    },
+  });
+  assert.equal(absent.response.status, 200, JSON.stringify(absent.body));
+  assert.equal(absent.body.outcome, "absent");
+  assert.equal(absent.body.receipt.admissionState, "deferred");
+
+  const driftComment = await request(baseUrl, `/api/tasks/${task.identifier}/comments`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: { body: "Frontier changed after Root delivery", threadId: rootThreadId },
+  });
+  assert.equal(driftComment.response.status, 201);
+  const driftedCapsule = await request(baseUrl, `/api/tasks/${task.identifier}/capsule`);
+  assert.notEqual(driftedCapsule.body.capsule.resumeToken, firstReceipt.resumeToken);
+  const driftedClaim = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: {
+      ...bareClaimBody,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(driftedClaim.response.status, 409);
+  assert.equal(driftedClaim.body.error.code, "ADMISSION_ATTEMPT_MISMATCH");
+  const afterDriftedClaim = await request(baseUrl, `/api/tasks/${task.identifier}`);
+  assert.equal(afterDriftedClaim.body.task.status, "todo");
+  assert.equal(afterDriftedClaim.body.task.version, task.version);
+
+  const deferred = await request(baseUrl, `/api/tasks/${task.identifier}/admission-defer`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(deferred.response.status, 200);
+  assert.equal(deferred.body.applied, false);
+  const deferredReplay = await request(baseUrl, `/api/tasks/${task.identifier}/admission-defer`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: firstReceipt.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      admissionReceiptId: firstReceipt.id,
+      admissionAttemptId: firstReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(deferredReplay.response.status, 200);
+  assert.equal(deferredReplay.body.applied, false);
+
+  const nextReservation = await request(baseUrl, `/api/tasks/${task.identifier}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: driftedCapsule.body.capsule.resumeToken,
+      safeActionId: firstReceipt.safeActionId,
+      reservationLeaseId: "next-reservation",
+    },
+  });
+  assert.equal(nextReservation.response.status, 200);
+  assert.notEqual(nextReservation.body.receipt.admissionAttemptId, firstReceipt.admissionAttemptId);
+  const nextReceipt = nextReservation.body.receipt;
+  const nextConfirmation = await request(baseUrl, `/api/tasks/${task.identifier}/bootstrap-delivery`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      reservationLeaseId: nextReceipt.reservationLeaseId,
+    },
+  });
+  assert.equal(nextConfirmation.response.status, 200);
+  const prepared = await request(baseUrl, `/api/tasks/${task.identifier}/admission-prepare`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      admissionReceiptId: nextReceipt.id,
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+      writeScope: ["src"],
+    },
+  });
+  assert.equal(prepared.response.status, 200, JSON.stringify(prepared.body));
+  assert.equal(prepared.body.applied, true);
+  assert.match(prepared.body.receipt.admissionAgentName, /^[a-z0-9_]+$/);
+  assert.equal(
+    prepared.body.receipt.admissionAgentPath,
+    `/root/${prepared.body.receipt.admissionAgentName}`,
+  );
+  assert.deepEqual(prepared.body.receipt.admissionWriteScope, ["src"]);
+  const preparedReplay = await request(baseUrl, `/api/tasks/${task.identifier}/admission-prepare`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      admissionReceiptId: nextReceipt.id,
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+      writeScope: ["src"],
+    },
+  });
+  assert.equal(preparedReplay.response.status, 200);
+  assert.equal(preparedReplay.body.applied, false);
+  const claimBody = {
+    version: task.version,
+    agentPath: prepared.body.receipt.admissionAgentPath,
+    agentThreadId: "admitted-child-thread",
+    rootThreadId,
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    writeScope: ["src"],
+    admissionReceiptId: nextReceipt.id,
+  };
+  const staleClaim = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: { ...claimBody, admissionAttemptId: firstReceipt.admissionAttemptId },
+  });
+  assert.equal(staleClaim.response.status, 409);
+  assert.equal(staleClaim.body.error.code, "ADMISSION_ATTEMPT_MISMATCH");
+  const unchanged = await request(baseUrl, `/api/tasks/${task.identifier}`);
+  assert.equal(unchanged.body.task.status, "todo");
+  assert.equal(unchanged.body.task.version, task.version);
+
+  const wrongPreparedPath = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: {
+      ...claimBody,
+      agentPath: "/root/different-child",
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(wrongPreparedPath.response.status, 409);
+  assert.equal(wrongPreparedPath.body.error.code, "ADMISSION_AGENT_MISMATCH");
+  const wrongPreparedScope = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: {
+      ...claimBody,
+      writeScope: ["test"],
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(wrongPreparedScope.response.status, 409);
+  assert.equal(wrongPreparedScope.body.error.code, "ADMISSION_WRITE_SCOPE_MISMATCH");
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const uncertain = await request(baseUrl, `/api/tasks/${task.identifier}/admission-uncertain`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "6".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      admissionReceiptId: nextReceipt.id,
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(uncertain.response.status, 200, JSON.stringify(uncertain.body));
+  assert.equal(uncertain.body.receipt.admissionState, "admission_uncertain");
+  const recoveryProbe = await request(baseUrl, `/api/tasks/${task.identifier}/admission-probe`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "7".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      admissionReceiptId: nextReceipt.id,
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(recoveryProbe.response.status, 200, JSON.stringify(recoveryProbe.body));
+  const registryObservedAt = new Date(Date.now() + 10).toISOString();
+  await appendFile(rootSessionPath, [
+    JSON.stringify({
+      timestamp: registryObservedAt,
+      type: "response_item",
+      payload: { type: "function_call", name: "list_agents", namespace: "collaboration", call_id: "recovery-list-agents", arguments: "{}" },
+    }),
+    JSON.stringify({
+      timestamp: registryObservedAt,
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: "recovery-list-agents",
+        output: JSON.stringify({ agents: [
+          { agent_name: "/root", agent_id: rootThreadId, agent_status: "running" },
+          { agent_name: prepared.body.receipt.admissionAgentPath, agent_id: "admitted-child-thread", agent_status: "running" },
+        ] }),
+      },
+    }),
+  ].join("\n") + "\n");
+  const recoverySnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(recoverySnapshot.response.status, 200, JSON.stringify(recoverySnapshot.body));
+  const recoveryTree = recoverySnapshot.body.windowSubagentTrees.find((candidate) => candidate.rootThreadId === rootThreadId);
+  assert.equal(recoveryTree.registryObservation.agents[0].agentThreadId, "admitted-child-thread");
+  const reconciled = await request(baseUrl, `/api/tasks/${task.identifier}/admission-reconcile`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "8".repeat(32)),
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      admissionReceiptId: nextReceipt.id,
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+      admissionProbeId: recoveryProbe.body.receipt.admissionProbeId,
+    },
+  });
+  assert.equal(reconciled.response.status, 200, JSON.stringify(reconciled.body));
+  assert.equal(reconciled.body.outcome, "present", JSON.stringify(reconciled.body));
+  assert.equal(reconciled.body.receipt.admissionState, "recovery_confirmed");
+  assert.equal(reconciled.body.receipt.admissionRecoveredAgentThreadId, "admitted-child-thread");
+
+  const admitted = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: { ...claimBody, admissionAttemptId: nextReceipt.admissionAttemptId },
+  });
+  assert.equal(admitted.response.status, 200, JSON.stringify(admitted.body));
+  assert.equal(admitted.body.task.status, "in_progress");
+  assert.equal(admitted.body.claim.agentThreadId, "admitted-child-thread");
+  assert.equal(admitted.body.run.status, "active");
+  const widenedReplay = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: {
+      ...claimBody,
+      version: admitted.body.task.version,
+      writeScope: ["test"],
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(widenedReplay.response.status, 409);
+  assert.equal(widenedReplay.body.error.code, "ADMISSION_WRITE_SCOPE_MISMATCH");
+  const widenedRenewalWithoutAdmissionBinding = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: {
+      ...bareClaimBody,
+      version: admitted.body.task.version,
+      agentPath: prepared.body.receipt.admissionAgentPath,
+      agentThreadId: "admitted-child-thread",
+      writeScope: ["test"],
+    },
+  });
+  assert.equal(widenedRenewalWithoutAdmissionBinding.response.status, 409);
+  assert.equal(
+    widenedRenewalWithoutAdmissionBinding.body.error.code,
+    "ADMISSION_WRITE_SCOPE_MISMATCH",
+  );
+  const snapshotAfterRejectedRenewal = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshotAfterRejectedRenewal.response.status, 200);
+  const admittedTodo = snapshotAfterRejectedRenewal.body.todos.find(
+    (candidate) => candidate.taskId === task.id,
+  );
+  assert.deepEqual(admittedTodo.writeScope, ["src"]);
+  const exactRenewalWithoutAdmissionBinding = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
+    method: "POST",
+    body: {
+      ...bareClaimBody,
+      version: admitted.body.task.version,
+      agentPath: prepared.body.receipt.admissionAgentPath,
+      agentThreadId: "admitted-child-thread",
+      writeScope: ["src"],
+    },
+  });
+  assert.equal(exactRenewalWithoutAdmissionBinding.response.status, 200);
+  assert.deepEqual(exactRenewalWithoutAdmissionBinding.body.claim.writeScope, ["src"]);
+  assert.deepEqual(exactRenewalWithoutAdmissionBinding.body.run.writeScope, ["src"]);
+  const completionAfterFastClaim = await request(baseUrl, `/api/tasks/${task.identifier}/bootstrap-complete`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      reservationLeaseId: nextReceipt.reservationLeaseId,
+      recoveryLeaseId: nextReceipt.reservationLeaseId,
+      deliveryTurnId: "next-root-turn",
+    },
+  });
+  assert.equal(completionAfterFastClaim.response.status, 200);
+  assert.equal(completionAfterFastClaim.body.completed, true);
+  assert.equal(completionAfterFastClaim.body.receipt.admissionState, "admitted");
+  assert.equal(completionAfterFastClaim.body.receipt.admittedRunId, admitted.body.run.id);
+  assert.equal(deliveries.length, 0);
 });
 
 test("project Agent Lanes read durable database configuration through a local route", async () => {
@@ -703,7 +1139,7 @@ test("project Agent Lanes read durable database configuration through a local ro
   assert.equal(result.response.status, 200);
   assert.equal(result.body.readOnly, true);
   assert.equal(result.body.automaticRecoveryEnabled, false);
-  assert.equal(result.body.version, 4);
+  assert.equal(result.body.version, 7);
   assert.equal(result.body.taskLanes.length, 3);
   assert.equal(result.body.rootSubagents.length, 0);
   assert.equal(result.body.adapters.length, 2);
@@ -731,6 +1167,7 @@ test("project Agent Lanes read durable database configuration through a local ro
 
 test("Root records one immutable Owner decision receipt from the project-level request", async () => {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
   const instanceSecret = "b".repeat(64);
   let task;
   let dataDirectory;
@@ -738,15 +1175,24 @@ test("Root records one immutable Owner decision receipt from the project-level r
     dataDirectory = directory;
     const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
     database.upsertAgentLaneProject("local", {
-      rootTaskId: "root",
+      rootTaskId: "coordinator",
+      ownerRootTaskId: "owner-root",
       tasks: [{
-        id: "root", label: "Root", owner: "Codex Root", source: "codex",
-        threadId: rootThreadId, taskType: "root_task",
+        id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
+        threadId: rootThreadId, taskType: "root_task", codexHostId: "local",
+        workspacePath: "/tmp/root-owner-decision",
+      }, {
+        id: "coordinator", label: "Coordinator", owner: "Codex Root", source: "codex",
+        threadId: coordinatorThreadId, taskType: "root_task", codexHostId: "local",
+        workspacePath: "/tmp/coordinator-owner-decision",
       }],
       adapters: [],
       coordinatorLease: {
         id: "owner-decision-lease",
-        holderTaskId: "root",
+        holderTaskId: "coordinator",
+        holderThreadId: coordinatorThreadId,
+        holderCodexHostId: "local",
+        holderWorkspacePath: "/tmp/coordinator-owner-decision",
         acquiredAt: new Date(Date.now() - 1_000).toISOString(),
         expiresAt: new Date(Date.now() + 15_000).toISOString(),
       },
@@ -824,6 +1270,72 @@ test("Root records one immutable Owner decision receipt from the project-level r
     body: pending,
   });
   assert.equal(unsignedDelivery.response.status, 403);
+  for (const [nonce, route] of [
+    ["a".repeat(32), { ...pending.route, codexHostId: "wrong-host" }],
+    ["9".repeat(32), { ...pending.route, rootWorkspacePath: "/tmp/wrong-owner-decision" }],
+  ]) {
+    const mismatchedDelivery = await request(
+      baseUrl,
+      "/api/local/projects/local/owner-decision-delivery/claim",
+      {
+        method: "POST",
+        headers: injectorHeaders(nonce),
+        body: { ...pending, route },
+      },
+    );
+    assert.equal(mismatchedDelivery.response.status, 409);
+    assert.equal(mismatchedDelivery.body.error.code, "OWNER_DECISION_ROUTE_STALE");
+  }
+  const emptyDeliveryDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.equal(emptyDeliveryDatabase.prepare(
+    "SELECT COUNT(*) AS count FROM owner_decision_deliveries",
+  ).get().count, 0);
+  emptyDeliveryDatabase.close();
+  const routeEpochDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+  const exactRouteConfig = routeEpochDatabase.getAgentLaneProject("local");
+  const invalidCoordinatorLeases = [
+    {
+      ...exactRouteConfig.coordinatorLease,
+      id: "stale-owner-decision-epoch",
+    },
+    {
+      ...exactRouteConfig.coordinatorLease,
+      holderThreadId: "drifted-coordinator-thread",
+    },
+    {
+      ...exactRouteConfig.coordinatorLease,
+      releasedAt: new Date().toISOString(),
+    },
+    {
+      ...exactRouteConfig.coordinatorLease,
+      acquiredAt: new Date(Date.now() + 60_000).toISOString(),
+      expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    },
+  ];
+  routeEpochDatabase.close();
+  for (const [index, coordinatorLease] of invalidCoordinatorLeases.entries()) {
+    const mutationDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+    mutationDatabase.upsertAgentLaneProject("local", { ...exactRouteConfig, coordinatorLease });
+    mutationDatabase.close();
+    const staleEpochDelivery = await request(
+      baseUrl,
+      "/api/local/projects/local/owner-decision-delivery/claim",
+      {
+        method: "POST",
+        headers: injectorHeaders(String(index + 4).repeat(32)),
+        body: pending,
+      },
+    );
+    assert.equal(staleEpochDelivery.response.status, 409);
+    const unchangedDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+    assert.equal(unchangedDatabase.prepare(
+      "SELECT COUNT(*) AS count FROM owner_decision_deliveries",
+    ).get().count, 0);
+    unchangedDatabase.close();
+    const restoreDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+    restoreDatabase.upsertAgentLaneProject("local", exactRouteConfig);
+    restoreDatabase.close();
+  }
   const delivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     headers: injectorHeaders("c".repeat(32)),
@@ -874,13 +1386,22 @@ test("Root records one immutable Owner decision receipt from the project-level r
   const renewedDuringDecision = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
     method: "POST",
     body: {
-      holderTaskId: "root",
-      holderThreadId: rootThreadId,
+      holderTaskId: "coordinator",
+      holderThreadId: coordinatorThreadId,
       expectedLeaseId: "owner-decision-lease",
       leaseDurationSeconds: 60,
     },
   });
   assert.equal(renewedDuringDecision.response.status, 200);
+  const decisionLeaseReceipts = await request(
+    baseUrl,
+    "/api/local/projects/local/coordinator-lease/receipts",
+  );
+  const decisionRenewalReceipt = decisionLeaseReceipts.body.receipts.findLast((receipt) => (
+    receipt.leaseId === "owner-decision-lease" && receipt.action === "renewed"
+  ));
+  assert.equal(decisionRenewalReceipt.holderTaskId, "coordinator");
+  assert.equal(decisionRenewalReceipt.holderThreadId, coordinatorThreadId);
 
   const delayedDecisionDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
   const delayedDelivery = delayedDecisionDatabase.prepare(`
@@ -897,7 +1418,9 @@ test("Root records one immutable Owner decision receipt from the project-level r
     delayedConfig.coordinatorLease.expiresAt,
   );
   delayedDecisionDatabase.prepare(`
-    UPDATE owner_decision_deliveries SET delivered_at = ? WHERE id = ?
+    UPDATE owner_decision_deliveries
+    SET delivered_at = ?, decision_expires_at = NULL
+    WHERE id = ?
   `).run(new Date(Date.now() - 2 * 60 * 1_000).toISOString(), retriedDelivery.body.receipt.id);
   delayedDecisionDatabase.close();
   const delayedRouteMutationDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
@@ -928,6 +1451,23 @@ test("Root records one immutable Owner decision receipt from the project-level r
     reason: "already-delivered",
     receipt: { id: retriedDelivery.body.receipt.id, deliveryTurnId: "root-delivery-turn-1" },
   });
+  const backfilledDecisionDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  const backfilledDecision = backfilledDecisionDatabase.prepare(`
+    SELECT decision_expires_at FROM owner_decision_deliveries WHERE id = ?
+  `).get(retriedDelivery.body.receipt.id);
+  assert.ok(Date.parse(backfilledDecision.decision_expires_at) > Date.now() + 23 * 60 * 60 * 1_000);
+  backfilledDecisionDatabase.close();
+  const durableReplayAgain = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
+    method: "POST",
+    headers: injectorHeaders("0".repeat(32)),
+    body: pending,
+  });
+  assert.equal(durableReplayAgain.response.status, 200);
+  const stableBackfillDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.equal(stableBackfillDatabase.prepare(`
+    SELECT decision_expires_at FROM owner_decision_deliveries WHERE id = ?
+  `).get(retriedDelivery.body.receipt.id).decision_expires_at, backfilledDecision.decision_expires_at);
+  stableBackfillDatabase.close();
 
   const recorded = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
     method: "POST",
@@ -980,18 +1520,21 @@ test("Root records one immutable Owner decision receipt from the project-level r
 });
 
 test("project coordinator leases acquire and renew atomically without granting execution ownership", async () => {
+  const instanceSecret = "4".repeat(64);
+  let databasePath;
   const baseUrl = await startServer(async (directory) => {
-    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
     database.upsertAgentLaneProject("local", {
       rootTaskId: "root",
       tasks: [
-        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
-        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task" },
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/inbox-delivery-worktree" },
+        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexHostId: "host-visual", workspacePath: "/tmp/taskboard/visual" },
       ],
       adapters: [],
     });
     database.close();
-    return {};
+    return { instanceSecret };
   });
 
   const acquired = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
@@ -1047,20 +1590,79 @@ test("project coordinator leases acquire and renew atomically without granting e
   assert.equal(competing.response.status, 409);
   assert.equal(competing.body.error.code, "COORDINATOR_LEASE_ACTIVE");
 
-  const renewed = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+  const renewPath = "/api/local/projects/local/coordinator-lease/renew";
+  const renewBody = {
+    holderTaskId: "visual",
+    holderThreadId: "visual-thread",
+    holderCodexHostId: "host-visual",
+    holderWorkspacePath: "/tmp/taskboard/visual",
+    expectedLeaseId: acquired.body.lease.id,
+    leaseDurationSeconds: 120,
+  };
+  const renewHeaders = signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), renewPath, renewBody);
+  const renewed = await request(baseUrl, renewPath, {
     method: "POST",
-    body: {
-      holderTaskId: "visual",
-      holderThreadId: "visual-thread",
-      expectedLeaseId: acquired.body.lease.id,
-      leaseDurationSeconds: 120,
-    },
+    headers: renewHeaders,
+    body: renewBody,
   });
   assert.equal(renewed.response.status, 200);
   assert.equal(renewed.body.lease.id, acquired.body.lease.id);
   assert.equal(renewed.body.lease.acquiredAt, acquired.body.lease.acquiredAt);
   assert.ok(renewed.body.lease.expiresAt > acquired.body.lease.expiresAt);
   assert.equal(renewed.body.receipt.action, "renewed");
+
+  const replayedRenewal = await request(baseUrl, renewPath, {
+    method: "POST", headers: renewHeaders, body: renewBody,
+  });
+  assert.equal(replayedRenewal.response.status, 403);
+
+  const substitutedBody = { ...renewBody, leaseDurationSeconds: 3600 };
+  const substitutedRenewal = await request(baseUrl, renewPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), renewPath, renewBody),
+    body: substitutedBody,
+  });
+  assert.equal(substitutedRenewal.response.status, 403);
+
+  const mismatchedRouteBody = { ...renewBody, holderWorkspacePath: "/tmp/taskboard/drifted" };
+  const mismatchedRoute = await request(baseUrl, renewPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "8".repeat(32), renewPath, mismatchedRouteBody),
+    body: mismatchedRouteBody,
+  });
+  assert.equal(mismatchedRoute.response.status, 409);
+  assert.equal(mismatchedRoute.body.error.code, "COORDINATOR_BINDING_MISMATCH");
+
+  const rebindingDatabase = new TaskboardDatabase(databasePath);
+  const driftedConfig = {
+    rootTaskId: "root",
+    coordinatorLease: { ...renewed.body.lease, status: undefined },
+    tasks: [
+      { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+      { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "drifted-thread", taskType: "peer_task", codexHostId: "host-drifted", workspacePath: "/tmp/taskboard/drifted" },
+    ],
+    adapters: [],
+  };
+  assert.doesNotThrow(() => rebindingDatabase.upsertAgentLaneProject("local", driftedConfig));
+  rebindingDatabase.close();
+  const driftedRenewal = await request(baseUrl, renewPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "9".repeat(32), renewPath, renewBody),
+    body: renewBody,
+  });
+  assert.equal(driftedRenewal.response.status, 409);
+  assert.equal(driftedRenewal.body.error.code, "COORDINATOR_BINDING_MISMATCH");
+  const restoredDatabase = new TaskboardDatabase(databasePath);
+  restoredDatabase.upsertAgentLaneProject("local", {
+    rootTaskId: "root",
+    coordinatorLease: { ...renewed.body.lease, status: undefined },
+    tasks: [
+      { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+      { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexHostId: "host-visual", workspacePath: "/tmp/taskboard/visual" },
+    ],
+    adapters: [],
+  });
+  restoredDatabase.close();
 
   const stale = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
     method: "POST",
@@ -1092,6 +1694,15 @@ test("project coordinator leases acquire and renew atomically without granting e
   assert.equal(released.body.lease.status, "expired");
   assert.equal(released.body.receipt.action, "released");
 
+  const expiredRenewBody = { ...renewBody, expectedLeaseId: renewed.body.lease.id };
+  const expiredRenewal = await request(baseUrl, renewPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), renewPath, expiredRenewBody),
+    body: expiredRenewBody,
+  });
+  assert.equal(expiredRenewal.response.status, 409);
+  assert.equal(expiredRenewal.body.error.code, "COORDINATOR_LEASE_NOT_ACTIVE");
+
   const afterRelease = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(afterRelease.response.status, 200);
   assert.equal(afterRelease.body.coordination.assignment, "unassigned");
@@ -1116,6 +1727,1354 @@ test("project coordinator leases acquire and renew atomically without granting e
   );
 });
 
+test("Global lease acquisition rejects an incompletely bound explicit Owner Root without mutation", async () => {
+  let databasePath;
+  let configBefore;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "coordinator",
+      ownerRootTaskId: "owner",
+      tasks: [
+        {
+          id: "owner", label: "Owner", owner: "Codex Owner Root", source: "codex",
+          threadId: "owner-thread", taskType: "root_task",
+          codexHostId: "host-owner", workspacePath: "/tmp/owner",
+        },
+        {
+          id: "coordinator", label: "Coordinator", owner: "Codex Coordinator", source: "codex",
+          threadId: "coordinator-thread", taskType: "root_task",
+          codexHostId: "host-coordinator", workspacePath: "/tmp/coordinator",
+        },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+  const corrupted = new TaskboardDatabase(databasePath);
+  const validConfig = corrupted.getAgentLaneProject("local");
+  corrupted.upsertAgentLaneProject("local", {
+    ...validConfig,
+    tasks: validConfig.tasks.map((task) => task.id === "owner"
+      ? { ...task, codexHostId: null }
+      : task),
+  });
+  configBefore = corrupted.getAgentLaneProject("local");
+  corrupted.close();
+
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "coordinator", holderThreadId: "coordinator-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+
+  assert.equal(rejected.response.status, 409);
+  assert.equal(rejected.body.error.code, "OWNER_ROOT_BINDING_MISMATCH");
+  const database = new TaskboardDatabase(databasePath);
+  assert.deepEqual(database.getAgentLaneProject("local"), configBefore);
+  assert.deepEqual(database.listAgentLaneCoordinatorReceipts("local"), []);
+  database.close();
+});
+
+test("Global coordinator lease rejects the configured Owner Root", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "coordinator", ownerRootTaskId: "owner",
+      tasks: [
+        { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+        { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "owner", holderThreadId: "owner-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(rejected.response.status, 409);
+  assert.equal(rejected.body.error.code, "OWNER_ROOT_COORDINATOR_CONFLICT");
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.body.coordination.ownerRootTaskId, "owner");
+  assert.equal(snapshot.body.coordination.coordinatorTaskId, "coordinator");
+});
+
+test("Owner Root registration rejects an active legacy non-Root Global lease", async () => {
+  const instanceSecret = "4".repeat(64);
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-peer",
+      coordinatorLease: {
+        id: "legacy-peer-lease",
+        holderTaskId: "legacy-peer",
+        holderThreadId: "legacy-peer-thread",
+        holderCodexHostId: "host-legacy-peer",
+        holderWorkspacePath: "/tmp/legacy-peer",
+        acquiredAt: new Date(Date.now() - 30_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+      tasks: [
+        {
+          id: "legacy-peer", label: "Legacy peer", owner: "Codex", source: "codex",
+          threadId: "legacy-peer-thread", taskType: "peer_task",
+          codexHostId: "host-legacy-peer", workspacePath: "/tmp/legacy-peer",
+        },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const current = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(current.response.status, 200, JSON.stringify(current.body));
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
+    body: {
+      threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
+    },
+  });
+
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      role: "owner_root", taskId: "owner-root", label: "Owner Root",
+      threadId: "owner-thread", expectedRevision: current.body.revision,
+      idempotencyKey: "reject-legacy-peer-owner-registration",
+    },
+  });
+
+  assert.equal(rejected.response.status, 409);
+  assert.equal(rejected.body.error.code, "OWNER_ROOT_COORDINATOR_CONFLICT");
+  const after = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(after.body.ownerRootTaskId, null);
+  assert.equal(after.body.revision, current.body.revision);
+});
+
+test("domain coordinator leases allow disjoint parallel owners while preserving the Global Coordinator", async () => {
+  const instanceSecret = "5".repeat(64);
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        { id: "root", label: "Global", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+        { id: "frontend-a", label: "Frontend A", owner: "Codex", source: "codex", threadId: "frontend-a-thread", taskType: "peer_task", codexHostId: "host-frontend-a", workspacePath: "/tmp/taskboard/frontend-a" },
+        { id: "frontend-b", label: "Frontend B", owner: "Codex", source: "codex", threadId: "frontend-b-thread", taskType: "peer_task", codexHostId: "host-frontend-b", workspacePath: "/tmp/taskboard/frontend-b" },
+        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexHostId: "host-backend", workspacePath: "/tmp/taskboard/backend" },
+      ],
+      adapters: [],
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend-a", "frontend-b"] },
+        { id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["backend"] },
+      ],
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const frontend = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend-a", holderThreadId: "frontend-a-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  const backend = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/backend", {
+    method: "POST",
+    body: {
+      holderTaskId: "backend", holderThreadId: "backend-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(frontend.response.status, 200, JSON.stringify(frontend.body));
+  assert.equal(backend.response.status, 200, JSON.stringify(backend.body));
+  assert.deepEqual(frontend.body.lease.writeScope, ["web"]);
+  assert.deepEqual(backend.body.lease.writeScope, ["server"]);
+
+  const frontendRenewPath = "/api/local/projects/local/domain-coordinator-leases/frontend/renew";
+  const frontendRenewBody = {
+    holderTaskId: "frontend-a", holderThreadId: "frontend-a-thread",
+    holderCodexHostId: "host-frontend-a", holderWorkspacePath: "/tmp/taskboard/frontend-a",
+    expectedLeaseId: frontend.body.lease.id, leaseDurationSeconds: 120,
+  };
+  const renewedFrontend = await request(
+    baseUrl,
+    frontendRenewPath,
+    {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, "7".repeat(32), frontendRenewPath, frontendRenewBody,
+      ),
+      body: frontendRenewBody,
+    },
+  );
+  assert.equal(renewedFrontend.response.status, 200);
+  assert.equal(renewedFrontend.body.lease.id, frontend.body.lease.id);
+  assert.equal(renewedFrontend.body.receipt.action, "renewed");
+
+  const competing = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend-b", holderThreadId: "frontend-b-thread",
+      expectedLeaseId: frontend.body.lease.id, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(competing.response.status, 409);
+  assert.equal(competing.body.error.code, "DOMAIN_COORDINATOR_LEASE_ACTIVE");
+
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200);
+  assert.equal(snapshot.body.coordination.coordinatorTaskId, "root");
+  assert.equal(snapshot.body.coordination.runtimeOwnership, "single_writer");
+  assert.deepEqual(snapshot.body.coordination.domainCoordinators.map((domain) => [
+    domain.domainId, domain.coordinatorTaskId, domain.assignment,
+  ]), [
+    ["frontend", "frontend-a", "lease"],
+    ["backend", "backend", "lease"],
+  ]);
+
+  const receipts = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/receipts");
+  assert.equal(receipts.response.status, 200);
+  assert.deepEqual(receipts.body.receipts.map((receipt) => receipt.action), ["renewed", "acquired"]);
+
+  const released = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/release", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend-a", holderThreadId: "frontend-a-thread",
+      expectedLeaseId: frontend.body.lease.id,
+    },
+  });
+  assert.equal(released.response.status, 200);
+  const expiredFrontendRenewBody = {
+    ...frontendRenewBody, expectedLeaseId: frontend.body.lease.id,
+  };
+  const expiredRenewal = await request(
+    baseUrl,
+    frontendRenewPath,
+    {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, "8".repeat(32), frontendRenewPath, expiredFrontendRenewBody,
+      ),
+      body: expiredFrontendRenewBody,
+    },
+  );
+  assert.equal(expiredRenewal.response.status, 409);
+  assert.equal(expiredRenewal.body.error.code, "DOMAIN_COORDINATOR_LEASE_NOT_ACTIVE");
+  const afterImmediateRelease = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(afterImmediateRelease.response.status, 200);
+  assert.equal(
+    afterImmediateRelease.body.coordination.domainCoordinators.find(
+      (domain) => domain.domainId === "frontend",
+    ).assignment,
+    "unassigned",
+  );
+  const replacementLease = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend-b", holderThreadId: "frontend-b-thread",
+      expectedLeaseId: frontend.body.lease.id, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(replacementLease.response.status, 200);
+  assert.equal(replacementLease.body.lease.holderTaskId, "frontend-b");
+  assert.notEqual(replacementLease.body.lease.id, frontend.body.lease.id);
+});
+
+test("protected domain configuration creates the live routing path with optimistic idempotent writes", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: "/tmp/taskboard/global" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "host-frontend", workspacePath: "/tmp/taskboard/frontend" },
+        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexHostId: "host-backend", workspacePath: "/tmp/taskboard/backend" },
+      ],
+      adapters: [],
+    });
+    database.close();
+    return {};
+  });
+  const globalLease = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 120,
+    },
+  });
+  assert.equal(globalLease.response.status, 200, JSON.stringify(globalLease.body));
+
+  const protectedHeaders = { "x-taskboard-client": "taskctl" };
+  const initial = await request(baseUrl, "/api/local/projects/local/coordination-domains", {
+    headers: protectedHeaders,
+  });
+  assert.equal(initial.response.status, 200);
+  assert.deepEqual(initial.body.domains, []);
+  const frontendBody = {
+    label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+    expectedRevision: initial.body.revision, idempotencyKey: "configure-frontend-v1",
+    holderTaskId: "global", holderThreadId: "global-thread",
+    expectedCoordinatorLeaseId: globalLease.body.lease.id,
+  };
+  const configured = await request(baseUrl, "/api/local/projects/local/coordination-domains/frontend", {
+    method: "PUT", headers: protectedHeaders, body: frontendBody,
+  });
+  assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
+  assert.equal(configured.body.applied, true);
+  assert.deepEqual(configured.body.configuration.domains, [{
+    id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+  }]);
+
+  const replayed = await request(baseUrl, "/api/local/projects/local/coordination-domains/frontend", {
+    method: "PUT", headers: protectedHeaders, body: frontendBody,
+  });
+  assert.equal(replayed.response.status, 200);
+  assert.equal(replayed.body.applied, false);
+  assert.equal(replayed.body.receipt.id, configured.body.receipt.id);
+  const reusedKey = await request(baseUrl, "/api/local/projects/local/coordination-domains/frontend", {
+    method: "PUT", headers: protectedHeaders,
+    body: { ...frontendBody, label: "Different" },
+  });
+  assert.equal(reusedKey.response.status, 409);
+  assert.equal(reusedKey.body.error.code, "COORDINATION_DOMAIN_IDEMPOTENCY_CONFLICT");
+
+  const overlapping = await request(baseUrl, "/api/local/projects/local/coordination-domains/backend", {
+    method: "PUT", headers: protectedHeaders,
+    body: {
+      ...frontendBody, label: "Backend", writeScope: ["web/admin"], eligibleTaskIds: ["backend"],
+      expectedRevision: configured.body.configuration.revision, idempotencyKey: "configure-backend-v1",
+    },
+  });
+  assert.equal(overlapping.response.status, 409);
+  assert.equal(overlapping.body.error.code, "COORDINATION_DOMAIN_SCOPE_OVERLAP");
+  const afterOverlap = await request(baseUrl, "/api/local/projects/local/coordination-domains", {
+    headers: protectedHeaders,
+  });
+  assert.equal(afterOverlap.body.revision, configured.body.configuration.revision);
+
+  const frontendLease = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend", holderThreadId: "frontend-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 120,
+    },
+  });
+  assert.equal(frontendLease.response.status, 200, JSON.stringify(frontendLease.body));
+  const withLease = await request(baseUrl, "/api/local/projects/local/coordination-domains", {
+    headers: protectedHeaders,
+  });
+  const renameWhileReserved = await request(baseUrl, "/api/local/projects/local/coordination-domains/frontend", {
+    method: "PUT", headers: protectedHeaders,
+    body: {
+      ...frontendBody, label: "Frontend renamed", expectedRevision: withLease.body.revision,
+      idempotencyKey: "rename-frontend-reserved",
+    },
+  });
+  assert.equal(renameWhileReserved.response.status, 409);
+  assert.equal(renameWhileReserved.body.error.code, "DOMAIN_COORDINATOR_LEASE_RESERVED");
+  const removeWhileReserved = await request(baseUrl, "/api/local/projects/local/coordination-domains/frontend", {
+    method: "DELETE", headers: protectedHeaders,
+    body: {
+      expectedRevision: withLease.body.revision, idempotencyKey: "remove-frontend-reserved",
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.body.lease.id,
+    },
+  });
+  assert.equal(removeWhileReserved.response.status, 409);
+  assert.equal(removeWhileReserved.body.error.code, "DOMAIN_COORDINATOR_LEASE_RESERVED");
+
+  const released = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/release", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend", holderThreadId: "frontend-thread",
+      expectedLeaseId: frontendLease.body.lease.id,
+    },
+  });
+  assert.equal(released.response.status, 200);
+  const afterRelease = await request(baseUrl, "/api/local/projects/local/coordination-domains", {
+    headers: protectedHeaders,
+  });
+  const removed = await request(baseUrl, "/api/local/projects/local/coordination-domains/frontend", {
+    method: "DELETE", headers: protectedHeaders,
+    body: {
+      expectedRevision: afterRelease.body.revision, idempotencyKey: "remove-frontend-v1",
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.body.lease.id,
+    },
+  });
+  assert.equal(removed.response.status, 200, JSON.stringify(removed.body));
+  assert.equal(removed.body.applied, true);
+  assert.deepEqual(removed.body.configuration.domains, []);
+});
+
+test("domain creation rejects reserved orphan leases and clears expired migration residue", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-orphan-domain-test-"));
+  const nowMs = Date.now();
+  const orphanLease = (id, acquiredAt, expiresAt) => ({
+    id, holderTaskId: "peer", holderThreadId: "peer-thread",
+    holderCodexHostId: "host-peer", holderWorkspacePath: "/tmp/taskboard/peer",
+    acquiredAt: new Date(acquiredAt).toISOString(), expiresAt: new Date(expiresAt).toISOString(),
+  });
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  try {
+    const globalLease = {
+      id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+      holderCodexHostId: "host-global", holderWorkspacePath: "/tmp/taskboard/global",
+      acquiredAt: new Date(nowMs - 1_000).toISOString(), expiresAt: new Date(nowMs + 120_000).toISOString(),
+    };
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: "/tmp/taskboard/global" },
+        { id: "peer", label: "Peer", owner: "Codex", source: "codex", threadId: "peer-thread", taskType: "peer_task", codexHostId: "host-peer", workspacePath: "/tmp/taskboard/peer" },
+      ],
+      adapters: [],
+      coordinatorLease: globalLease,
+      domainCoordinatorLeases: {
+        ghost: orphanLease("ghost-lease", nowMs - 1_000, nowMs + 60_000),
+        expired: orphanLease("expired-lease", nowMs - 60_000, nowMs - 1_000),
+      },
+    });
+    const control = {
+      expectedRevision: database.getAgentLaneCoordinationDomains("local").revision,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.id,
+    };
+    assert.throws(
+      () => database.configureAgentLaneCoordinationDomain("local", "ghost", {
+        domain: { label: "Ghost", writeScope: ["ghost"], eligibleTaskIds: ["peer"] },
+        ...control, idempotencyKey: "configure-ghost-v1",
+      }),
+      (error) => error?.status === 409 && error?.code === "DOMAIN_COORDINATOR_LEASE_RESERVED",
+    );
+    const afterRejected = database.getAgentLaneProject("local");
+    assert.equal(afterRejected.coordinationDomains, undefined);
+    assert.equal(afterRejected.domainCoordinatorLeases.ghost.id, "ghost-lease");
+
+    const configured = database.configureAgentLaneCoordinationDomain("local", "expired", {
+      domain: { label: "Expired", writeScope: ["expired"], eligibleTaskIds: ["peer"] },
+      ...control, idempotencyKey: "configure-expired-v1",
+    });
+    assert.equal(configured.applied, true);
+    assert.equal(database.getAgentLaneProject("local").domainCoordinatorLeases.expired, undefined);
+    assert.equal(database.getAgentLaneProject("local").domainCoordinatorLeases.ghost.id, "ghost-lease");
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("naturally expired coordinator leases recover the same holders with new epochs", async () => {
+  const instanceSecret = "a".repeat(64);
+  const acquiredAt = new Date(Date.now() - 120_000).toISOString();
+  const expiresAt = new Date(Date.now() - 60_000).toISOString();
+  let databasePath;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: "/tmp/global" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "host-frontend", workspacePath: "/tmp/frontend" },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "expired-global", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "host-global", holderWorkspacePath: "/tmp/global",
+        acquiredAt, expiresAt,
+      },
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+      ],
+      domainCoordinatorLeases: {
+        frontend: {
+          id: "expired-frontend", domainId: "frontend", holderTaskId: "frontend",
+          holderThreadId: "frontend-thread", holderCodexHostId: "host-frontend",
+          holderWorkspacePath: "/tmp/frontend", acquiredAt, expiresAt, writeScope: ["web"],
+        },
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const before = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(before.body.coordination.assignment, "unassigned");
+  assert.deepEqual(
+    {
+      holderTaskId: before.body.coordination.lease.holderTaskId,
+      bindingValid: before.body.coordination.lease.bindingValid,
+      releasedAt: before.body.coordination.lease.releasedAt,
+    },
+    { holderTaskId: "global", bindingValid: true, releasedAt: null },
+  );
+
+  const globalPath = "/api/local/projects/local/coordinator-lease/recover";
+  const globalBody = {
+    holderTaskId: "global", holderThreadId: "global-thread",
+    holderCodexHostId: "host-global", holderWorkspacePath: "/tmp/global",
+    expectedLeaseId: "expired-global", leaseDurationSeconds: 120,
+  };
+  const global = await request(baseUrl, globalPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b".repeat(32), globalPath, globalBody),
+    body: globalBody,
+  });
+  assert.equal(global.response.status, 200);
+  assert.notEqual(global.body.lease.id, "expired-global");
+  assert.equal(global.body.receipt.action, "acquired");
+
+  const domainPath = "/api/local/projects/local/domain-coordinator-leases/frontend/recover";
+  const domainBody = {
+    holderTaskId: "frontend", holderThreadId: "frontend-thread",
+    holderCodexHostId: "host-frontend", holderWorkspacePath: "/tmp/frontend",
+    expectedLeaseId: "expired-frontend", leaseDurationSeconds: 120,
+  };
+  const domain = await request(baseUrl, domainPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "c".repeat(32), domainPath, domainBody),
+    body: domainBody,
+  });
+  assert.equal(domain.response.status, 200);
+  assert.notEqual(domain.body.lease.id, "expired-frontend");
+  assert.equal(domain.body.receipt.action, "acquired");
+
+  const active = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(active.body.coordination.assignment, "lease");
+  assert.equal(active.body.coordination.domainCoordinators[0].assignment, "lease");
+
+  const globalRelease = await request(baseUrl, "/api/local/projects/local/coordinator-lease/release", {
+    method: "POST",
+    body: {
+      holderTaskId: "global", holderThreadId: "global-thread", expectedLeaseId: global.body.lease.id,
+    },
+  });
+  assert.equal(globalRelease.response.status, 200);
+  const domainRelease = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/release", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: domain.body.lease.id,
+    },
+  });
+  assert.equal(domainRelease.response.status, 200);
+
+  const legacyDatabase = new TaskboardDatabase(databasePath);
+  const releasedConfig = legacyDatabase.getAgentLaneProject("local");
+  const { releasedAt: globalReleasedAt, ...legacyGlobalLease } = releasedConfig.coordinatorLease;
+  const { releasedAt: domainReleasedAt, ...legacyDomainLease } = (
+    releasedConfig.domainCoordinatorLeases.frontend
+  );
+  assert.ok(globalReleasedAt);
+  assert.ok(domainReleasedAt);
+  legacyDatabase.upsertAgentLaneProject("local", {
+    ...releasedConfig,
+    coordinatorLease: legacyGlobalLease,
+    domainCoordinatorLeases: { frontend: legacyDomainLease },
+  });
+  legacyDatabase.close();
+
+  const legacySnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(legacySnapshot.response.status, 200);
+  assert.ok(legacySnapshot.body.coordination.lease.releasedAt);
+  assert.ok(legacySnapshot.body.coordination.domainCoordinators[0].lease.releasedAt);
+
+  const releasedGlobalBody = { ...globalBody, expectedLeaseId: global.body.lease.id };
+  const releasedGlobal = await request(baseUrl, globalPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "d".repeat(32), globalPath, releasedGlobalBody),
+    body: releasedGlobalBody,
+  });
+  assert.equal(releasedGlobal.response.status, 409);
+  assert.equal(releasedGlobal.body.error.code, "COORDINATOR_LEASE_RECOVERY_NOT_AVAILABLE");
+  const releasedDomainBody = { ...domainBody, expectedLeaseId: domain.body.lease.id };
+  const releasedDomain = await request(baseUrl, domainPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "e".repeat(32), domainPath, releasedDomainBody),
+    body: releasedDomainBody,
+  });
+  assert.equal(releasedDomain.response.status, 409);
+  assert.equal(releasedDomain.body.error.code, "DOMAIN_COORDINATOR_LEASE_RECOVERY_NOT_AVAILABLE");
+
+  const globalReceipts = await request(baseUrl, "/api/local/projects/local/coordinator-lease/receipts");
+  const domainReceipts = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/receipts");
+  assert.deepEqual(globalReceipts.body.receipts.map((receipt) => receipt.action), ["released", "acquired"]);
+  assert.deepEqual(domainReceipts.body.receipts.map((receipt) => receipt.action), ["released", "acquired"]);
+});
+
+test("legacy unbound coordinator leases fail closed instead of upgrading to a new route", async () => {
+  const instanceSecret = "6".repeat(64);
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  let databasePath;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: process.cwd() },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "host-frontend", workspacePath: process.cwd() },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "legacy-global", holderTaskId: "global",
+        holderThreadId: "global-thread", holderCodexHostId: "host-global",
+        holderWorkspacePath: ".", acquiredAt: new Date().toISOString(), expiresAt,
+      },
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+      ],
+      domainCoordinatorLeases: {
+        frontend: {
+          id: "legacy-frontend", holderTaskId: "frontend",
+          holderThreadId: "frontend-thread", holderCodexHostId: "host-frontend",
+          holderWorkspacePath: ".", acquiredAt: new Date().toISOString(), expiresAt,
+          writeScope: ["web"],
+        },
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200);
+  assert.equal(snapshot.body.coordination.assignment, "unassigned");
+  assert.equal(snapshot.body.coordination.domainCoordinators[0].assignment, "unassigned");
+  const beforeDatabase = new TaskboardDatabase(databasePath);
+  const beforeConfig = beforeDatabase.getAgentLaneProject("local");
+  beforeDatabase.close();
+
+  for (const candidate of [
+    {
+      pathname: "/api/local/projects/local/coordinator-lease/renew",
+      body: {
+        holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "host-global", holderWorkspacePath: process.cwd(),
+        expectedLeaseId: "legacy-global", leaseDurationSeconds: 120,
+      },
+    },
+    {
+      pathname: "/api/local/projects/local/domain-coordinator-leases/frontend/renew",
+      body: {
+        holderTaskId: "frontend", holderThreadId: "frontend-thread",
+        holderCodexHostId: "host-frontend", holderWorkspacePath: process.cwd(),
+        expectedLeaseId: "legacy-frontend", leaseDurationSeconds: 120,
+      },
+    },
+  ]) {
+    const renewal = await request(baseUrl, candidate.pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, crypto.randomUUID().replaceAll("-", ""), candidate.pathname, candidate.body,
+      ),
+      body: candidate.body,
+    });
+    assert.equal(renewal.response.status, 409);
+  }
+  for (const candidate of [
+    {
+      pathname: "/api/local/projects/local/coordinator-lease",
+      body: { holderTaskId: "global", holderThreadId: "global-thread", expectedLeaseId: "legacy-global", leaseDurationSeconds: 120 },
+    },
+    {
+      pathname: "/api/local/projects/local/domain-coordinator-leases/frontend",
+      body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: "legacy-frontend", leaseDurationSeconds: 120 },
+    },
+  ]) {
+    const renewal = await request(baseUrl, candidate.pathname, {
+      method: "POST", body: candidate.body,
+    });
+    assert.equal(renewal.response.status, 409);
+  }
+  const globalReceipts = await request(baseUrl, "/api/local/projects/local/coordinator-lease/receipts");
+  const domainReceipts = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/receipts");
+  assert.deepEqual(globalReceipts.body.receipts, []);
+  assert.deepEqual(domainReceipts.body.receipts, []);
+  const afterDatabase = new TaskboardDatabase(databasePath);
+  const afterConfig = afterDatabase.getAgentLaneProject("local");
+  afterDatabase.close();
+  assert.deepEqual(afterConfig.coordinatorLease, beforeConfig.coordinatorLease);
+  assert.deepEqual(afterConfig.domainCoordinatorLeases, beforeConfig.domainCoordinatorLeases);
+});
+
+test("fresh coordinator acquisition rejects incomplete Global and domain window bindings", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    const invalidLegacyConfig = {
+      rootTaskId: "global",
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task" },
+      ],
+      adapters: [],
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+      ],
+    };
+    assert.throws(() => database.upsertAgentLaneProject("local", invalidLegacyConfig), (error) => (
+      error?.code === "COORDINATION_DOMAIN_BINDING_MISMATCH"
+    ));
+    database.upsertAgentLaneProject("local", {
+      ...invalidLegacyConfig,
+      tasks: invalidLegacyConfig.tasks.map((task) => task.id === "frontend"
+        ? { ...task, codexHostId: "local", workspacePath: "/tmp/frontend" }
+        : task),
+    });
+    database.close();
+    return {};
+  });
+  for (const candidate of [
+    {
+      pathname: "/api/local/projects/local/coordinator-lease",
+      body: { holderTaskId: "global", holderThreadId: "global-thread", expectedLeaseId: null, leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/local/domain-coordinator-leases/frontend",
+      body: { holderTaskId: "global", holderThreadId: "global-thread", expectedLeaseId: null, leaseDurationSeconds: 60 },
+    },
+  ]) {
+    const acquisition = await request(baseUrl, candidate.pathname, {
+      method: "POST", body: candidate.body,
+    });
+    assert.equal(acquisition.response.status, 409);
+    assert.ok([
+      "COORDINATOR_BINDING_MISMATCH",
+      "COORDINATION_DOMAIN_BINDING_MISMATCH",
+      "DOMAIN_COORDINATOR_BINDING_MISMATCH",
+    ].includes(acquisition.body.error.code));
+  }
+  const receipts = await request(baseUrl, "/api/local/projects/local/coordinator-lease/receipts");
+  const domainReceipts = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend/receipts");
+  assert.deepEqual(receipts.body.receipts, []);
+  assert.deepEqual(domainReceipts.body.receipts, []);
+});
+
+test("coordination domain configuration rejects overlapping and case-aliased write scopes", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-domain-overlap-"));
+  try {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    assert.throws(() => database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{ id: "root", label: "Root", owner: "Codex", source: "codex", threadId: "root-thread", taskType: "root_task" }],
+      adapters: [],
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["root"] },
+        { id: "frontend-tests", label: "Frontend tests", writeScope: ["web/test"], eligibleTaskIds: ["root"] },
+      ],
+    }), (error) => error?.code === "COORDINATION_DOMAIN_SCOPE_OVERLAP");
+    for (const rightScope of ["WEB", "WEB/src"]) {
+      assert.throws(() => database.upsertAgentLaneProject("local", {
+        rootTaskId: "root",
+        tasks: [{ id: "root", label: "Root", owner: "Codex", source: "codex", threadId: "root-thread", taskType: "root_task" }],
+        adapters: [],
+        coordinationDomains: [
+          { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["root"] },
+          { id: "frontend-alias", label: "Frontend alias", writeScope: [rightScope], eligibleTaskIds: ["root"] },
+        ],
+      }), (error) => error?.code === "COORDINATION_DOMAIN_SCOPE_OVERLAP");
+    }
+    database.close();
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("protected domain Todo assignment persists the Global Coordinator decision", async () => {
+  let todo;
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createProject({ id: "other", name: "Other", workspacePath: null });
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      ],
+      adapters: [],
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+      ],
+    });
+    const binding = {
+      threadId: "global-thread", codexProjectId: "local", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/global",
+    };
+    todo = database.createTask({
+      projectId: "local", title: "Frontend work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], threadId: binding.threadId, threadBinding: binding,
+      actor, assignee: actor, developmentContext: { type: "worktree", path: "/tmp/product", branch: "codex/domain" },
+      workingLog: null, workflowProfile: "vibe", startDate: null, dueDate: null, recurrence: null,
+    });
+    database.close();
+    return {};
+  });
+  const global = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: { holderTaskId: "global", holderThreadId: "global-thread", expectedLeaseId: null, leaseDurationSeconds: 120 },
+  });
+  assert.equal(global.response.status, 200);
+  const domain = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend", {
+    method: "POST",
+    body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: null, leaseDurationSeconds: 120 },
+  });
+  assert.equal(domain.response.status, 200);
+
+  const browserWrite = await request(baseUrl, `/api/local/projects/local/domain-todo-assignments/${todo.identifier}`, {
+    method: "POST",
+    body: {
+      domainId: "frontend", taskVersion: todo.version, holderTaskId: "global",
+      holderThreadId: "global-thread", expectedCoordinatorLeaseId: global.body.lease.id,
+    },
+  });
+  assert.equal(browserWrite.response.status, 403);
+  const assigned = await request(baseUrl, `/api/local/projects/local/domain-todo-assignments/${todo.identifier}`, {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      domainId: "frontend", taskVersion: todo.version, holderTaskId: "global",
+      holderThreadId: "global-thread", expectedCoordinatorLeaseId: global.body.lease.id,
+    },
+  });
+  assert.equal(assigned.response.status, 200, JSON.stringify(assigned.body));
+  assert.equal(assigned.body.assignment.taskId, todo.id);
+  assert.equal(assigned.body.assignment.domainId, "frontend");
+  assert.equal(assigned.body.task.version, todo.version + 1);
+  const status = await request(baseUrl, `/api/local/projects/local/domain-todo-assignments/${todo.identifier}`);
+  assert.equal(status.response.status, 200);
+  assert.equal(status.body.assignment.assignedByLeaseId, global.body.lease.id);
+  const crossProjectStatus = await request(
+    baseUrl,
+    `/api/local/projects/other/domain-todo-assignments/${todo.identifier}`,
+  );
+  assert.equal(crossProjectStatus.response.status, 409);
+  assert.equal(crossProjectStatus.body.error.code, "DOMAIN_TODO_PROJECT_MISMATCH");
+  assert.equal(crossProjectStatus.body.assignment, undefined);
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200);
+  const projected = snapshot.body.todos.find((candidate) => candidate.taskId === todo.id);
+  assert.equal(projected.domainAssignment.domainId, "frontend");
+  assert.equal(projected.dispatchTarget.rootThreadId, "frontend-thread");
+  assert.equal(projected.dispatchTarget.worktreePath, "/tmp/product");
+  const cleared = await request(baseUrl, `/api/local/projects/local/domain-todo-assignments/${todo.identifier}`, {
+    method: "DELETE",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      taskVersion: assigned.body.task.version, holderTaskId: "global",
+      holderThreadId: "global-thread", expectedCoordinatorLeaseId: global.body.lease.id,
+    },
+  });
+  assert.equal(cleared.response.status, 200);
+  assert.equal(cleared.body.assignment, null);
+  assert.equal(cleared.body.task.version, assigned.body.task.version + 1);
+});
+
+test("protected cross-domain clearance binds the exact target coordinator frontier", async () => {
+  let source;
+  let target;
+  const instanceSecret = "d".repeat(64);
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const expiresAt = "2099-01-01T00:00:00.000Z";
+    database.upsertAgentLaneProject("local", {
+      tasks: [
+        { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/backend" },
+      ],
+      adapters: [],
+      coordinatorLease: { id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread", holderCodexHostId: "local", holderWorkspacePath: "/tmp/global", acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt },
+      coordinationDomains: [
+        { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+        { id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["backend"] },
+      ],
+      domainCoordinatorLeases: {
+        frontend: { id: "frontend-lease", holderTaskId: "frontend", holderThreadId: "frontend-thread", holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend", acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt },
+        backend: { id: "backend-lease", holderTaskId: "backend", holderThreadId: "backend-thread", holderCodexHostId: "local", holderWorkspacePath: "/tmp/backend", acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt },
+      },
+    });
+    const binding = {
+      threadId: "global-thread", codexProjectId: "local", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/global",
+    };
+    const createTodo = (title) => database.createTask({
+      projectId: "local", title, description: "", status: "todo", priority: "high",
+      labels: ["agent-todo"], threadId: binding.threadId, threadBinding: binding,
+      actor, assignee: actor, developmentContext: { type: "worktree", path: "/tmp/product", branch: "codex/domain" },
+      workingLog: null, workflowProfile: "vibe", startDate: null, dueDate: null, recurrence: null,
+    });
+    source = createTodo("Frontend source");
+    target = createTodo("Backend target");
+    source = database.setAgentTaskDomain("local", source.id, {
+      domainId: "frontend", taskVersion: source.version, holderTaskId: "global",
+      holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+    }).task;
+    target = database.setAgentTaskDomain("local", target.id, {
+      domainId: "backend", taskVersion: target.version, holderTaskId: "global",
+      holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+    }).task;
+    source = database.addTaskRelation(
+      source.id, source.version, "blocks", target.id, binding.threadId, binding, actor,
+    ).task;
+    source = database.moveTask(source.id, source.version, "done", undefined, binding.threadId, binding, actor);
+    database.close();
+    return { instanceSecret };
+  });
+
+  const route = `/api/local/projects/local/cross-domain-dependency-clearances/${target.identifier}`;
+  const pending = await request(baseUrl, route);
+  assert.equal(pending.response.status, 200);
+  assert.equal(pending.body.clearances[0].status, "awaiting_handoff");
+  const agentLanes = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  const deliveryRequest = agentLanes.body.coordination.pendingCrossDomainHandoff;
+  assert.equal(deliveryRequest.sourceTaskId, source.id);
+  assert.equal(deliveryRequest.targetTaskId, target.id);
+  const deliveryRoute = "/api/local/projects/local/cross-domain-handoff-delivery/claim";
+  const unsignedDelivery = await request(baseUrl, deliveryRoute, {
+    method: "POST",
+    body: deliveryRequest,
+  });
+  assert.equal(unsignedDelivery.response.status, 403);
+  const claimedDelivery = await request(baseUrl, deliveryRoute, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "1".repeat(32)),
+    body: deliveryRequest,
+  });
+  assert.equal(claimedDelivery.response.status, 201, JSON.stringify(claimedDelivery.body));
+  const replayedDelivery = await request(baseUrl, deliveryRoute, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "2".repeat(32)),
+    body: deliveryRequest,
+  });
+  assert.equal(replayedDelivery.response.status, 200);
+  assert.equal(replayedDelivery.body.reason, "reserved");
+  assert.equal(replayedDelivery.body.receipt.id, claimedDelivery.body.receipt.id);
+  const confirmedDelivery = await request(
+    baseUrl,
+    "/api/local/projects/local/cross-domain-handoff-delivery/confirm",
+    {
+      method: "POST",
+      headers: signedInjectorHeaders(instanceSecret, "3".repeat(32)),
+      body: { deliveryId: claimedDelivery.body.receipt.id, deliveryTurnId: "backend-delivery-turn" },
+    },
+  );
+  assert.equal(confirmedDelivery.response.status, 200, JSON.stringify(confirmedDelivery.body));
+  const afterDelivery = await request(baseUrl, route);
+  assert.equal(afterDelivery.body.clearances[0].status, "awaiting_handoff");
+  assert.equal(afterDelivery.body.clearances[0].delivery.state, "delivered");
+  const unprotected = await request(baseUrl, route, {
+    method: "POST",
+    body: {
+      sourceTaskId: source.identifier, idempotencyKey: "api-clearance-1",
+      holderTaskId: "backend", holderThreadId: "backend-thread",
+      expectedTargetDomainLeaseId: "backend-lease",
+    },
+  });
+  assert.equal(unprotected.response.status, 403);
+  const wrongRoute = await request(baseUrl, route, {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      sourceTaskId: source.identifier, idempotencyKey: "api-clearance-1",
+      holderTaskId: "frontend", holderThreadId: "frontend-thread",
+      expectedTargetDomainLeaseId: "frontend-lease",
+    },
+  });
+  assert.equal(wrongRoute.response.status, 409);
+  assert.equal(wrongRoute.body.error.code, "CROSS_DOMAIN_HANDOFF_ROUTE_MISMATCH");
+  const accepted = await request(baseUrl, route, {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      sourceTaskId: source.identifier, idempotencyKey: "api-clearance-1",
+      holderTaskId: "backend", holderThreadId: "backend-thread",
+      expectedTargetDomainLeaseId: "backend-lease",
+    },
+  });
+  assert.equal(accepted.response.status, 200, JSON.stringify(accepted.body));
+  assert.equal(accepted.body.clearance.status, "accepted");
+  const projected = await request(baseUrl, `/api/tasks/${target.identifier}/capsule`);
+  assert.equal(projected.response.status, 200);
+  assert.ok(!projected.body.capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED"));
+});
+
+test("protected window registration separates Owner Root from a replaceable coordinator", async () => {
+  let databasePath;
+  const instanceSecret = "a".repeat(64);
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-root",
+      tasks: [
+        {
+          id: "legacy-root", label: "Legacy Root", owner: "Codex Root", source: "codex",
+          threadId: "legacy-thread", taskType: "root_task",
+        },
+      ],
+      adapters: [
+        {
+          id: "adapter-only", label: "External adapter", owner: "External",
+          source: "external", connection: "not_connected",
+        },
+      ],
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const initial = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(initial.response.status, 200, JSON.stringify(initial.body));
+  assert.equal(initial.body.ownerRootTaskId, null);
+  assert.match(initial.body.revision, /^[a-f0-9]{64}$/);
+
+  const ownerRegistration = {
+    role: "owner_root",
+    taskId: "owner-root",
+    label: "Owner conversation",
+    threadId: "owner-thread",
+    expectedRevision: initial.body.revision,
+    idempotencyKey: "owner-root-window-1",
+  };
+  const unprotected = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", body: ownerRegistration,
+  });
+  assert.equal(unprotected.response.status, 403);
+  assert.equal(unprotected.body.error.code, "TASKCTL_REQUIRED");
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
+    body: {
+      threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
+    },
+  });
+  const owner = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: ownerRegistration,
+  });
+  assert.equal(owner.response.status, 200, JSON.stringify(owner.body));
+  assert.equal(owner.body.applied, true);
+  assert.equal(owner.body.configuration.ownerRootTaskId, "owner-root");
+  assert.notEqual(owner.body.configuration.revision, initial.body.revision);
+  assert.deepEqual(owner.body.configuration.windows.find((window) => window.taskId === "owner-root"), {
+    taskId: "owner-root", label: "Owner conversation", role: "owner_root",
+    threadId: "owner-thread", codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
+  });
+
+  const replay = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: ownerRegistration,
+  });
+  assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
+  assert.equal(replay.body.applied, false);
+  assert.equal(replay.body.receipt.id, owner.body.receipt.id);
+  assert.equal(replay.body.configuration.revision, owner.body.configuration.revision);
+
+  const conflictingReplay = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: { ...ownerRegistration, label: "Different payload" },
+  });
+  assert.equal(conflictingReplay.response.status, 409);
+  assert.equal(conflictingReplay.body.error.code, "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT");
+  const afterConflict = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(afterConflict.body.revision, owner.body.configuration.revision);
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
+    body: {
+      threadId: "coordinator-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "host-coordinator", workspacePath: "/tmp/coordinator",
+    },
+  });
+  const coordinator = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      role: "coordinator", taskId: "global-coordinator", label: "Global Coordinator",
+      threadId: "coordinator-thread", expectedRevision: owner.body.configuration.revision,
+      idempotencyKey: "global-coordinator-window-1",
+    },
+  });
+  assert.equal(coordinator.response.status, 200, JSON.stringify(coordinator.body));
+  assert.equal(coordinator.body.configuration.ownerRootTaskId, "owner-root");
+  assert.equal(coordinator.body.configuration.coordinatorLease, null);
+
+  const lease = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "global-coordinator", holderThreadId: "coordinator-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(lease.response.status, 200, JSON.stringify(lease.body));
+  assert.equal(lease.body.lease.holderTaskId, "global-coordinator");
+
+  const beforeGlobalBindingConflict = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    { headers: { "x-taskboard-client": "taskctl" } },
+  );
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "f".repeat(32)),
+    body: {
+      threadId: "coordinator-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "host-coordinator-new", workspacePath: "/tmp/coordinator-new",
+    },
+  });
+  const globalBindingConflict = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    {
+      method: "POST", headers: { "x-taskboard-client": "taskctl" },
+      body: {
+        role: "coordinator", taskId: "global-coordinator", label: "Global Coordinator",
+        threadId: "coordinator-thread", expectedRevision: beforeGlobalBindingConflict.body.revision,
+        idempotencyKey: "global-binding-conflict-1",
+      },
+    },
+  );
+  assert.equal(globalBindingConflict.response.status, 409);
+  assert.equal(globalBindingConflict.body.error.code, "COORDINATOR_LEASE_ACTIVE");
+  const afterGlobalBindingConflict = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    { headers: { "x-taskboard-client": "taskctl" } },
+  );
+  assert.equal(afterGlobalBindingConflict.body.revision, beforeGlobalBindingConflict.body.revision);
+
+  const beforeAdapterConflict = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    { headers: { "x-taskboard-client": "taskctl" } },
+  );
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "e".repeat(32)),
+    body: {
+      threadId: "adapter-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "host-adapter", workspacePath: "/tmp/adapter-window",
+    },
+  });
+  const adapterConflict = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      role: "coordinator", taskId: "adapter-only", label: "Invalid collision",
+      threadId: "adapter-thread", expectedRevision: beforeAdapterConflict.body.revision,
+      idempotencyKey: "adapter-collision-1",
+    },
+  });
+  assert.equal(adapterConflict.response.status, 409);
+  assert.equal(adapterConflict.body.error.code, "COORDINATION_WINDOW_TASK_CONFLICT");
+  const afterAdapterConflict = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    { headers: { "x-taskboard-client": "taskctl" } },
+  );
+  assert.equal(afterAdapterConflict.body.revision, beforeAdapterConflict.body.revision);
+  const inspection = new DatabaseSync(databasePath);
+  assert.equal(inspection.prepare("SELECT COUNT(*) AS count FROM agent_coordination_window_receipts").get().count, 2);
+  inspection.close();
+});
+
+test("window registration cannot activate a legacy Global lease as the Owner Root", async () => {
+  let databasePath;
+  const instanceSecret = "c".repeat(64);
+  const acquiredAt = new Date(Date.now() - 1_000).toISOString();
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-holder",
+      tasks: [
+        {
+          id: "legacy-holder", label: "Legacy holder", owner: "Codex", source: "codex",
+          threadId: "legacy-holder-thread", taskType: "root_task",
+        },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "legacy-lease", holderTaskId: "legacy-holder",
+        holderThreadId: "legacy-holder-thread", holderCodexHostId: "legacy-host",
+        holderWorkspacePath: "/tmp/legacy-holder", acquiredAt, expiresAt,
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const before = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "c".repeat(32)),
+    body: {
+      threadId: "legacy-holder-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "remote",
+      codexHostId: "legacy-host", workspacePath: "/tmp/legacy-holder",
+    },
+  });
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      role: "owner_root", taskId: "legacy-holder", label: "Owner conversation",
+      threadId: "legacy-holder-thread", expectedRevision: before.body.revision,
+      idempotencyKey: "legacy-owner-conflict-1",
+    },
+  });
+  assert.equal(rejected.response.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, "OWNER_ROOT_COORDINATOR_CONFLICT");
+  const after = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(after.body.revision, before.body.revision);
+  const inspection = new DatabaseSync(databasePath);
+  assert.equal(inspection.prepare("SELECT COUNT(*) AS count FROM agent_coordination_window_receipts").get().count, 0);
+  inspection.close();
+});
+
+test("window registration cannot reserve a future Global lease holder as the Owner Root", async () => {
+  let databasePath;
+  const instanceSecret = "1".repeat(64);
+  const acquiredAt = new Date(Date.now() + 60_000).toISOString();
+  const expiresAt = new Date(Date.now() + 120_000).toISOString();
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "future-holder",
+      tasks: [
+        {
+          id: "future-holder", label: "Future holder", owner: "Codex", source: "codex",
+          threadId: "future-thread", taskType: "root_task",
+          codexHostId: "future-host", workspacePath: "/tmp/future-holder",
+        },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "future-lease", holderTaskId: "future-holder", holderThreadId: "future-thread",
+        holderCodexHostId: "future-host", holderWorkspacePath: "/tmp/future-holder",
+        acquiredAt, expiresAt,
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const before = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "1".repeat(32)),
+    body: {
+      threadId: "future-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "remote",
+      codexHostId: "future-host", workspacePath: "/tmp/future-holder",
+    },
+  });
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      role: "owner_root", taskId: "future-holder", label: "Owner conversation",
+      threadId: "future-thread", expectedRevision: before.body.revision,
+      idempotencyKey: "future-owner-conflict-1",
+    },
+  });
+  assert.equal(rejected.response.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, "OWNER_ROOT_COORDINATOR_CONFLICT");
+  const after = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(after.body.revision, before.body.revision);
+  const inspection = new DatabaseSync(databasePath);
+  assert.equal(inspection.prepare("SELECT COUNT(*) AS count FROM agent_coordination_window_receipts").get().count, 0);
+  inspection.close();
+});
+
+test("window registration preserves an active domain coordinator binding", async () => {
+  let databasePath;
+  const instanceSecret = "d".repeat(64);
+  const acquiredAt = new Date(Date.now() - 1_000).toISOString();
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [
+        {
+          id: "root", label: "Root", owner: "Codex", source: "codex",
+          threadId: "root-thread", taskType: "root_task",
+        },
+        {
+          id: "domain-root", label: "Domain Root", owner: "Codex", source: "codex",
+          threadId: "domain-thread", taskType: "peer_task",
+          codexHostId: "domain-host", workspacePath: "/tmp/domain-old",
+        },
+      ],
+      adapters: [],
+      coordinationDomains: [
+        { id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["domain-root"] },
+      ],
+      domainCoordinatorLeases: {
+        backend: {
+          id: "domain-lease", holderTaskId: "domain-root", holderThreadId: "domain-thread",
+          holderCodexHostId: "domain-host", holderWorkspacePath: "/tmp/domain-old",
+          acquiredAt, expiresAt,
+        },
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const before = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT", headers: signedInjectorHeaders(instanceSecret, "d".repeat(32)),
+    body: {
+      threadId: "domain-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "remote",
+      codexHostId: "domain-new-host", workspacePath: "/tmp/domain-new",
+    },
+  });
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      role: "coordinator", taskId: "domain-root", label: "Domain Root",
+      threadId: "domain-thread", expectedRevision: before.body.revision,
+      idempotencyKey: "domain-binding-conflict-1",
+    },
+  });
+  assert.equal(rejected.response.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, "COORDINATION_WINDOW_TASK_CONFLICT");
+  const after = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(after.body.revision, before.body.revision);
+  const inspection = new DatabaseSync(databasePath);
+  assert.equal(inspection.prepare("SELECT COUNT(*) AS count FROM agent_coordination_window_receipts").get().count, 0);
+  inspection.close();
+});
+
 test("active coordinator repairs one legacy Root binding from protected host identity", async () => {
   let legacyTask;
   const instanceSecret = "b".repeat(64);
@@ -1125,7 +3084,7 @@ test("active coordinator repairs one legacy Root binding from protected host ide
     database.upsertAgentLaneProject("local", {
       rootTaskId: "root",
       tasks: [
-        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/replacement-root" },
       ],
       adapters: [],
     });
@@ -1220,6 +3179,40 @@ test("active coordinator repairs one legacy Root binding from protected host ide
   assert.equal(afterStaleLease.body.task.threadBinding, null);
   assert.equal(afterStaleLease.body.task.version, legacyTask.version);
 
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
+    body: {
+      threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "drifted-host", workspacePath: "/tmp/drifted-repair-root",
+    },
+  });
+  const driftedHostRepair = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
+    method: "POST",
+    body: {
+      taskId: legacyTask.identifier, taskVersion: legacyTask.version,
+      holderTaskId: "root", holderThreadId: "root-thread",
+      expectedLeaseId: lease.body.lease.id,
+    },
+  });
+  assert.equal(driftedHostRepair.response.status, 409);
+  assert.equal(driftedHostRepair.body.error.code, "COORDINATOR_BINDING_MISMATCH");
+  const afterDriftedHost = await request(baseUrl, `/api/tasks/${legacyTask.identifier}`);
+  const activitiesAfterDriftedHost = await request(baseUrl, `/api/tasks/${legacyTask.identifier}/activities`);
+  assert.equal(afterDriftedHost.body.task.threadBinding, null);
+  assert.equal(afterDriftedHost.body.task.version, legacyTask.version);
+  assert.deepEqual(activitiesAfterDriftedHost.body.activities, []);
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "5".repeat(32)),
+    body: {
+      threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/replacement-root",
+    },
+  });
+
   const repaired = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
     method: "POST",
     body: {
@@ -1276,7 +3269,7 @@ test("Talking Window inbox delivery is durable and idempotent without interrupti
     database.upsertAgentLaneProject("local", {
       rootTaskId: "root",
       tasks: [
-        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
+        { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/inbox-delivery-worktree" },
       ],
       adapters: [],
     });
@@ -1444,6 +3437,736 @@ test("Talking Window inbox delivery is durable and idempotent without interrupti
   assert.deepEqual(receipts.body.receipts, [first.body.receipt]);
   assert.equal(comments.body.comments.length, 1);
   assert.equal(comments.body.comments[0].id, first.body.comment.id);
+});
+
+test("Owner Intent ingest is host-bound, idempotent, and cannot widen task authority", async () => {
+  const instanceSecret = "7".repeat(64);
+  const ownerThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  let taskIdentifier;
+  let databasePath;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "coordinator",
+      ownerRootTaskId: "owner-root",
+      tasks: [
+        {
+          id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
+          threadId: ownerThreadId, taskType: "root_task", codexHostId: "local",
+          workspacePath: "/tmp/owner-root-workspace",
+        },
+        {
+          id: "coordinator", label: "Coordinator", owner: "Codex Root", source: "codex",
+          threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", taskType: "root_task",
+          codexHostId: "local", workspacePath: "/tmp/coordinator-workspace",
+        },
+      ],
+      adapters: [],
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const task = database.createTask({
+      projectId: "local", title: "Existing bounded work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    taskIdentifier = task.identifier;
+    database.close();
+    return { instanceSecret };
+  });
+
+  const hostBinding = {
+    threadId: ownerThreadId,
+    codexProjectId: "owner-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/owner-root-workspace",
+  };
+  const host = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "8".repeat(32)),
+    body: {
+      ...hostBinding,
+      threadRunning: false,
+      threadTodoProgress: null,
+    },
+  });
+  assert.equal(host.response.status, 200);
+
+  const capsuleBefore = await request(baseUrl, `/api/tasks/${taskIdentifier}/capsule`);
+  const legacyInbox = await request(baseUrl, `/api/tasks/${taskIdentifier}/inbox-deliveries`, {
+    method: "POST",
+    body: {
+      deliveryId: "legacy-inbox-before-intent",
+      body: "Existing inbox receipt must remain unchanged.",
+      threadId: ownerThreadId,
+      threadBinding: hostBinding,
+    },
+  });
+  assert.equal(legacyInbox.response.status, 201);
+
+  const fullOwnerGoal = `Keep one Owner-facing Root and let the coordinator derive the Todo. ${"goal-boundary ".repeat(40)}`.trim();
+  const fullOwnerConstraint = `Do not grant commit, push, financial, or product-scope authority. ${"constraint-boundary ".repeat(20)}`.trim();
+  const intentBody = {
+    intentId: "owner-intent-1",
+    deliveryId: "owner-intent-delivery-1",
+    kind: "append",
+    goal: fullOwnerGoal,
+    constraints: [fullOwnerConstraint],
+    targetIntentId: null,
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: ownerThreadId,
+    ownerTurnId: "owner-turn-1",
+    rootCaptureTurnId: "root-capture-turn-1",
+    evidence: "Observed exact Owner turn followed by the Root capture marker.",
+  };
+  const unsigned = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    body: intentBody,
+  });
+  assert.equal(unsigned.response.status, 403);
+  assert.equal(unsigned.body.error.code, "INJECTOR_PROOF_REQUIRED");
+
+  const shiftedHost = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "01".repeat(32)),
+    body: {
+      ...hostBinding,
+      codexHostId: "replacement-host",
+      workspacePath: "/tmp/replaced-owner-root-workspace",
+      threadRunning: false,
+      threadTodoProgress: null,
+    },
+  });
+  assert.equal(shiftedHost.response.status, 200);
+  const staleBinding = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "02".repeat(32)),
+    body: intentBody,
+  });
+  assert.equal(staleBinding.response.status, 409);
+  assert.equal(staleBinding.body.error.code, "OWNER_ROOT_ROUTE_STALE");
+  const emptyAfterStale = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  assert.deepEqual(emptyAfterStale.body.intents, []);
+  const restoredHost = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "03".repeat(32)),
+    body: { ...hostBinding, threadRunning: false, threadTodoProgress: null },
+  });
+  assert.equal(restoredHost.response.status, 200);
+
+  const first = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "9".repeat(32)),
+    body: intentBody,
+  });
+  assert.equal(first.response.status, 201, JSON.stringify(first.body));
+  assert.equal(first.body.applied, true);
+  assert.equal(first.body.intent.status, "queued");
+  assert.equal(first.body.intent.executionDisposition, "current_execution_continues");
+  assert.deepEqual(first.body.intent.sourceThreadBinding, hostBinding);
+
+  const duplicate = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
+    body: intentBody,
+  });
+  assert.equal(duplicate.response.status, 200);
+  assert.equal(duplicate.body.applied, false);
+  assert.deepEqual(duplicate.body.intent, first.body.intent);
+
+  const conflict = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
+    body: { ...intentBody, goal: "A different outcome must not be silently dropped." },
+  });
+  assert.equal(conflict.response.status, 409);
+  assert.equal(conflict.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+  const listed = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  assert.equal(listed.response.status, 200);
+  assert.deepEqual(listed.body.intents, [first.body.intent]);
+  const capsuleAfter = await request(baseUrl, `/api/tasks/${taskIdentifier}/capsule`);
+  assert.deepEqual(capsuleAfter.body.capsule.authorization, capsuleBefore.body.capsule.authorization);
+  assert.deepEqual(capsuleAfter.body.capsule.readyWork, capsuleBefore.body.capsule.readyWork);
+  const inboxAfter = await request(baseUrl, `/api/tasks/${taskIdentifier}/inbox-deliveries`);
+  assert.deepEqual(inboxAfter.body.receipts, [legacyInbox.body.receipt]);
+
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200, JSON.stringify(snapshot.body));
+  assert.equal(snapshot.body.coordination.ownerRootTaskId, "owner-root");
+  assert.equal(snapshot.body.coordination.coordinatorTaskId, "coordinator");
+  assert.deepEqual(snapshot.body.coordination.ownerRootRoute, {
+    rootTaskId: "owner-root",
+    rootThreadId: ownerThreadId,
+    codexHostId: hostBinding.codexHostId,
+    rootWorkspacePath: hostBinding.workspacePath,
+  });
+  assert.equal(snapshot.body.coordination.pendingOwnerIntent.intentId, intentBody.intentId);
+  assert.equal(snapshot.body.coordination.pendingOwnerIntent.status, "queued");
+  assert.notEqual(snapshot.body.coordination.pendingOwnerIntent.goal, fullOwnerGoal);
+  assert.equal(snapshot.body.coordination.pendingOwnerIntent.goal.endsWith("…"), true);
+  assert.notEqual(snapshot.body.coordination.pendingOwnerIntent.constraints[0], fullOwnerConstraint);
+  assert.equal(snapshot.body.coordination.pendingOwnerIntent.constraints[0].endsWith("…"), true);
+  assert.deepEqual(snapshot.body.coordination.pendingOwnerIntent.route, {
+    coordinatorTaskId: "coordinator",
+    coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local",
+    coordinatorWorkspacePath: "/tmp/coordinator-workspace",
+  });
+
+  const adoptionPath = `/api/local/projects/local/owner-intents/${intentBody.intentId}/adoption`;
+  const unsignedAdoptionClaim = await request(baseUrl, `${adoptionPath}/claim`, {
+    method: "POST",
+    body: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      coordinatorEpoch: "configured:coordinator",
+    },
+  });
+  assert.equal(unsignedAdoptionClaim.response.status, 403);
+  const adoptionClaim = await request(baseUrl, `${adoptionPath}/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "c".repeat(32)),
+    body: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      coordinatorEpoch: "configured:coordinator",
+    },
+  });
+  assert.equal(adoptionClaim.response.status, 201, JSON.stringify(adoptionClaim.body));
+  assert.equal(adoptionClaim.body.claimed, true);
+  assert.deepEqual(Object.keys(adoptionClaim.body.executionIntent).sort(), [
+    "constraints", "goal", "intentId", "kind", "targetIntentId", "version",
+  ]);
+  assert.equal(adoptionClaim.body.executionIntent.kind, "append");
+  assert.equal(adoptionClaim.body.executionIntent.targetIntentId, null);
+  assert.equal(adoptionClaim.body.executionIntent.goal, fullOwnerGoal);
+  assert.deepEqual(adoptionClaim.body.executionIntent.constraints, [fullOwnerConstraint]);
+  const adoptionConfirm = await request(baseUrl, `${adoptionPath}/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "d".repeat(32)),
+    body: {
+      adoptionId: adoptionClaim.body.receipt.id,
+      deliveryTurnId: "coordinator-adoption-turn-1",
+    },
+  });
+  assert.equal(adoptionConfirm.response.status, 200, JSON.stringify(adoptionConfirm.body));
+  assert.equal(adoptionConfirm.body.confirmed, true);
+  const adoptedList = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  assert.equal(adoptedList.body.intents[0].status, "adopted");
+  const adoptedIntent = adoptedList.body.intents[0];
+  const noPending = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(noPending.body.coordination.pendingOwnerIntent, null);
+  assert.equal(noPending.body.coordination.pendingOwnerIntentPlan.status, "adopted");
+  assert.equal(
+    noPending.body.coordination.pendingOwnerIntentPlan.adoptionReceipt.id,
+    adoptionClaim.body.receipt.id,
+  );
+
+  let planBody = {
+    revisionId: "owner-plan-1",
+    intentVersion: adoptedIntent.version,
+    adoptionId: adoptionClaim.body.receipt.id,
+    coordinatorTaskId: "coordinator",
+    coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    coordinatorEpoch: "configured:coordinator",
+    classification: "bounded_delivery",
+    summary: "Derive two bounded delivery slices without widening authority.",
+    parentTaskId: null,
+    items: [
+      {
+        outcomeKey: "owner-root-boundary",
+        title: "Keep Owner Root separate",
+        description: "Preserve the single Owner-facing communication route.",
+        priority: "high",
+        blockedByOutcomeKeys: [],
+      },
+      {
+        outcomeKey: "replacement-recovery",
+        title: "Recover the plan after coordinator replacement",
+        description: "Read the durable frontier from Taskboard.",
+        priority: "medium",
+        blockedByOutcomeKeys: ["owner-root-boundary"],
+      },
+    ],
+  };
+  const planPath = `/api/local/projects/local/owner-intents/${intentBody.intentId}/plan-revisions`;
+  for (const [revisionId, items] of [
+    ["cycle-plan-2", [
+      { outcomeKey: "cycle-a", title: "A", description: "A", priority: "high", blockedByOutcomeKeys: ["cycle-b"] },
+      { outcomeKey: "cycle-b", title: "B", description: "B", priority: "high", blockedByOutcomeKeys: ["cycle-a"] },
+    ]],
+    ["cycle-plan-3", [
+      { outcomeKey: "cycle-x", title: "X", description: "X", priority: "high", blockedByOutcomeKeys: ["cycle-z"] },
+      { outcomeKey: "cycle-y", title: "Y", description: "Y", priority: "high", blockedByOutcomeKeys: ["cycle-x"] },
+      { outcomeKey: "cycle-z", title: "Z", description: "Z", priority: "high", blockedByOutcomeKeys: ["cycle-y"] },
+    ]],
+  ]) {
+    const cyclicPlan = await request(baseUrl, planPath, {
+      method: "POST",
+      headers: signedInjectorHeaders(instanceSecret, revisionId.endsWith("2") ? "0".repeat(32) : "1".repeat(32)),
+      body: { ...planBody, revisionId, items },
+    });
+    assert.equal(cyclicPlan.response.status, 400);
+    assert.equal(cyclicPlan.body.error.code, "PLAN_DEPENDENCY_CYCLE");
+  }
+  const retryPath = `/api/local/projects/local/owner-intents/${intentBody.intentId}/plan-retry`;
+  const retryBody = {
+    adoptionId: adoptionClaim.body.receipt.id,
+    coordinatorEpoch: "configured:coordinator",
+    failureKey: "invalid-cycle-plan-attempt-1",
+  };
+  const unsignedRetry = await request(baseUrl, retryPath, {
+    method: "POST",
+    body: retryBody,
+  });
+  assert.equal(unsignedRetry.response.status, 403);
+  const retry = await request(baseUrl, retryPath, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "12".repeat(16)),
+    body: retryBody,
+  });
+  assert.equal(retry.response.status, 201, JSON.stringify(retry.body));
+  assert.equal(retry.body.applied, true);
+  assert.equal(retry.body.exhausted, false);
+  assert.equal(retry.body.intent.status, "queued");
+  assert.equal(retry.body.intent.planRetryCount, 1);
+  const retryReplay = await request(baseUrl, retryPath, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "13".repeat(16)),
+    body: retryBody,
+  });
+  assert.equal(retryReplay.response.status, 200);
+  assert.equal(retryReplay.body.applied, false);
+
+  const retryClaim = await request(baseUrl, `${adoptionPath}/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "14".repeat(16)),
+    body: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      coordinatorEpoch: "configured:coordinator",
+    },
+  });
+  assert.equal(retryClaim.response.status, 201, JSON.stringify(retryClaim.body));
+  assert.notEqual(retryClaim.body.receipt.id, adoptionClaim.body.receipt.id);
+  const retryConfirm = await request(baseUrl, `${adoptionPath}/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "15".repeat(16)),
+    body: { adoptionId: retryClaim.body.receipt.id, deliveryTurnId: "coordinator-replan-turn-2" },
+  });
+  assert.equal(retryConfirm.body.confirmed, true);
+  const retriedIntents = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  const retriedIntent = retriedIntents.body.intents.find((item) => item.id === intentBody.intentId);
+  planBody = {
+    ...planBody,
+    intentVersion: retriedIntent.version,
+    adoptionId: retryClaim.body.receipt.id,
+  };
+  const plan = await request(baseUrl, planPath, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "e".repeat(32)),
+    body: planBody,
+  });
+  assert.equal(plan.response.status, 201, JSON.stringify(plan.body));
+  assert.equal(plan.body.revision.status, "applied");
+  assert.deepEqual(plan.body.revision.items.map((item) => item.disposition), ["created", "created"]);
+  assert.equal(plan.body.revision.items.every((item) => item.task.status === "todo"), true);
+  const planReplay = await request(baseUrl, planPath, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "f".repeat(32)),
+    body: planBody,
+  });
+  assert.equal(planReplay.response.status, 200, JSON.stringify(planReplay.body));
+  assert.equal(planReplay.body.applied, false);
+  assert.deepEqual(planReplay.body.revision, plan.body.revision);
+  const frontier = await request(baseUrl, "/api/local/projects/local/owner-intent-plan");
+  assert.deepEqual(frontier.body.revisions, [plan.body.revision]);
+  const plannedCapsule = await request(
+    baseUrl,
+    `/api/tasks/${plan.body.revision.items[0].task.identifier}/capsule`,
+  );
+  assert.equal(plannedCapsule.body.capsule.authorization.state, "absent");
+  assert.equal(plannedCapsule.body.capsule.readyWork.eligible, false);
+
+  const financialIntent = {
+    ...intentBody,
+    intentId: "owner-intent-financial",
+    deliveryId: "owner-intent-delivery-financial",
+    goal: "Decide a new capital-allocation policy and Q4 metric basis.",
+    ownerTurnId: "owner-turn-financial",
+    rootCaptureTurnId: "root-capture-turn-financial",
+  };
+  const financialRecorded = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "1".repeat(32)),
+    body: financialIntent,
+  });
+  assert.equal(financialRecorded.response.status, 201);
+  const financialSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  const financialPending = financialSnapshot.body.coordination.pendingOwnerIntent;
+  assert.equal(financialPending.intentId, financialIntent.intentId);
+  const financialClaimPath = `/api/local/projects/local/owner-intents/${financialIntent.intentId}/adoption`;
+  let previousFinancialAdoptionId = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const financialClaim = await request(baseUrl, `${financialClaimPath}/claim`, {
+      method: "POST",
+      headers: signedInjectorHeaders(instanceSecret, String(attempt + 1).repeat(32)),
+      body: {
+        coordinatorTaskId: "coordinator",
+        coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+        coordinatorEpoch: "configured:coordinator",
+      },
+    });
+    assert.equal(financialClaim.response.status, 201, JSON.stringify(financialClaim.body));
+    assert.notEqual(financialClaim.body.receipt.id, previousFinancialAdoptionId);
+    const deliveryTurnId = `financial-replan-turn-${attempt}`;
+    const financialConfirm = await request(baseUrl, `${financialClaimPath}/confirm`, {
+      method: "POST",
+      headers: signedInjectorHeaders(instanceSecret, String(attempt + 4).repeat(32)),
+      body: { adoptionId: financialClaim.body.receipt.id, deliveryTurnId },
+    });
+    assert.equal(financialConfirm.body.confirmed, true);
+    const financialIntents = await request(baseUrl, "/api/local/projects/local/owner-intents");
+    const financialAdopted = financialIntents.body.intents.find(
+      (item) => item.id === financialIntent.intentId,
+    );
+    const revisionId = `unsafe-owner-plan-financial-${attempt}`;
+    const unsafeFinancialPlan = await request(
+      baseUrl,
+      `/api/local/projects/local/owner-intents/${financialIntent.intentId}/plan-revisions`,
+      {
+        method: "POST",
+        headers: signedInjectorHeaders(instanceSecret, String(attempt + 7).repeat(32)),
+        body: {
+          revisionId,
+          intentVersion: financialAdopted.version,
+          adoptionId: financialClaim.body.receipt.id,
+          coordinatorTaskId: "coordinator",
+          coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+          coordinatorEpoch: "configured:coordinator",
+          classification: "bounded_delivery",
+          summary: "Incorrectly treat the financial policy as execution.",
+          parentTaskId: null,
+          items: [],
+        },
+      },
+    );
+    assert.equal(unsafeFinancialPlan.response.status, 409);
+    assert.equal(unsafeFinancialPlan.body.error.code, "OWNER_DECISION_CLASSIFICATION_REQUIRED");
+    const planFailureReason = classifyOwnerIntentPlanHttpFailure(
+      unsafeFinancialPlan.response.status,
+      unsafeFinancialPlan.body.error.code,
+    );
+    const monitorResult = await runOwnerIntentPlanningMonitorOnce({
+      policy: { enabled: true, projectId: "local" },
+      readSnapshot: async () => ({
+        projectId: "local",
+        coordination: {
+          pendingOwnerIntentPlan: {
+            intentId: financialIntent.intentId,
+            version: financialAdopted.version,
+            adoptionReceipt: financialClaim.body.receipt,
+          },
+        },
+      }),
+      observePlan: async () => ({ revisionId }),
+      applyPlan: async () => ({ applied: false, reason: planFailureReason }),
+      scheduleRetry: async (retryRequest) => {
+        const scheduled = await request(
+          baseUrl,
+          `/api/local/projects/local/owner-intents/${financialIntent.intentId}/plan-retry`,
+          {
+            method: "POST",
+            headers: signedInjectorHeaders(instanceSecret, String(attempt + 10).repeat(32)),
+            body: {
+              adoptionId: retryRequest.adoptionReceipt.id,
+              coordinatorEpoch: retryRequest.adoptionReceipt.coordinatorEpoch,
+              failureKey: `financial-semantic-plan-attempt-${attempt}`,
+            },
+          },
+        );
+        assert.equal(scheduled.response.status, 201, JSON.stringify(scheduled.body));
+        return scheduled.body;
+      },
+    });
+    assert.deepEqual(monitorResult, {
+      applied: false,
+      reason: attempt === 3 ? "plan-retry-exhausted" : "plan-retry-scheduled",
+    });
+    previousFinancialAdoptionId = financialClaim.body.receipt.id;
+  }
+  const exhaustedFinancialIntents = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  const exhaustedFinancialIntent = exhaustedFinancialIntents.body.intents.find(
+    (item) => item.id === financialIntent.intentId,
+  );
+  assert.equal(exhaustedFinancialIntent.status, "needs_decision");
+  assert.equal(exhaustedFinancialIntent.planRetryCount, 3);
+  const exhaustedFinancialSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(exhaustedFinancialSnapshot.body.coordination.pendingOwnerIntent, null);
+  assert.equal(exhaustedFinancialSnapshot.body.coordination.pendingOwnerIntentPlan, null);
+
+  const decisionIntent = {
+    ...financialIntent,
+    intentId: "owner-intent-financial-decision",
+    deliveryId: "owner-intent-delivery-financial-decision",
+    ownerTurnId: "owner-turn-financial-decision",
+    rootCaptureTurnId: "root-capture-turn-financial-decision",
+  };
+  const decisionRecorded = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "d1".repeat(16)),
+    body: decisionIntent,
+  });
+  assert.equal(decisionRecorded.response.status, 201);
+  const decisionClaimPath = `/api/local/projects/local/owner-intents/${decisionIntent.intentId}/adoption`;
+  const decisionClaim = await request(baseUrl, `${decisionClaimPath}/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "d2".repeat(16)),
+    body: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      coordinatorEpoch: "configured:coordinator",
+    },
+  });
+  const decisionConfirm = await request(baseUrl, `${decisionClaimPath}/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "d3".repeat(16)),
+    body: { adoptionId: decisionClaim.body.receipt.id, deliveryTurnId: "financial-decision-turn" },
+  });
+  assert.equal(decisionConfirm.body.confirmed, true);
+  const decisionIntents = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  const decisionAdopted = decisionIntents.body.intents.find((item) => item.id === decisionIntent.intentId);
+  const financialPlan = await request(
+    baseUrl,
+    `/api/local/projects/local/owner-intents/${decisionIntent.intentId}/plan-revisions`,
+    {
+      method: "POST",
+      headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
+      body: {
+        revisionId: "owner-plan-financial",
+        intentVersion: decisionAdopted.version,
+        adoptionId: decisionClaim.body.receipt.id,
+        coordinatorTaskId: "coordinator",
+        coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+        coordinatorEpoch: "configured:coordinator",
+        classification: "financial_decision",
+        summary: "Owner decision is required before deriving any executable work.",
+        parentTaskId: null,
+        items: [],
+      },
+    },
+  );
+  assert.equal(financialPlan.response.status, 201, JSON.stringify(financialPlan.body));
+  assert.equal(financialPlan.body.revision.status, "needs_decision");
+  assert.deepEqual(financialPlan.body.revision.items, []);
+
+  const activePlannedTask = plan.body.revision.items[0].task;
+  const moved = await request(baseUrl, `/api/tasks/${activePlannedTask.id}/move`, {
+    method: "POST",
+    body: {
+      version: activePlannedTask.version,
+      status: "in_progress",
+      sortOrder: 100,
+      threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    },
+  });
+  assert.equal(moved.response.status, 200);
+  const cancelIntent = {
+    ...intentBody,
+    intentId: "owner-intent-cancel",
+    deliveryId: "owner-intent-delivery-cancel",
+    kind: "cancel",
+    goal: "Cancel the queued plan while preserving work already in progress.",
+    targetIntentId: intentBody.intentId,
+    ownerTurnId: "owner-turn-cancel",
+    rootCaptureTurnId: "root-capture-turn-cancel",
+  };
+  const cancelRecorded = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "5".repeat(32)),
+    body: cancelIntent,
+  });
+  assert.equal(cancelRecorded.response.status, 201, JSON.stringify(cancelRecorded.body));
+  const cancelClaimPath = `/api/local/projects/local/owner-intents/${cancelIntent.intentId}/adoption`;
+  const cancelClaim = await request(baseUrl, `${cancelClaimPath}/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "6".repeat(32)),
+    body: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      coordinatorEpoch: "configured:coordinator",
+    },
+  });
+  await request(baseUrl, `${cancelClaimPath}/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "7".repeat(32)),
+    body: { adoptionId: cancelClaim.body.receipt.id, deliveryTurnId: "cancel-turn" },
+  });
+  const beforeCancelPlan = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  const cancelAdopted = beforeCancelPlan.body.intents.find((item) => item.id === cancelIntent.intentId);
+  const cancelPlan = await request(
+    baseUrl,
+    `/api/local/projects/local/owner-intents/${cancelIntent.intentId}/plan-revisions`,
+    {
+      method: "POST",
+      headers: signedInjectorHeaders(instanceSecret, "8".repeat(32)),
+      body: {
+        revisionId: "owner-plan-cancel",
+        intentVersion: cancelAdopted.version,
+        adoptionId: cancelClaim.body.receipt.id,
+        coordinatorTaskId: "coordinator",
+        coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+        coordinatorEpoch: "configured:coordinator",
+        classification: "bounded_delivery",
+        summary: "Cancel only unclaimed auto-planned work.",
+        parentTaskId: null,
+        items: [],
+      },
+    },
+  );
+  assert.equal(cancelPlan.response.status, 201, JSON.stringify(cancelPlan.body));
+  const preservedActive = await request(baseUrl, `/api/tasks/${activePlannedTask.id}`);
+  const canceledQueued = await request(baseUrl, `/api/tasks/${plan.body.revision.items[1].task.id}`);
+  assert.equal(preservedActive.body.task.status, "in_progress");
+  assert.equal(canceledQueued.body.task.status, "canceled");
+
+  const recoveryIntent = {
+    ...intentBody,
+    intentId: "owner-intent-recovery",
+    deliveryId: "owner-intent-delivery-recovery",
+    goal: "Recover this unplanned intent after replacing the coordinator.",
+    ownerTurnId: "owner-turn-recovery",
+    rootCaptureTurnId: "root-capture-turn-recovery",
+  };
+  const recoveryRecorded = await request(baseUrl, "/api/local/projects/local/owner-intents", {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "9".repeat(32)),
+    body: recoveryIntent,
+  });
+  assert.equal(recoveryRecorded.response.status, 201);
+  const recoveryPath = `/api/local/projects/local/owner-intents/${recoveryIntent.intentId}`;
+  const oldReserved = await request(baseUrl, `${recoveryPath}/adoption/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
+    body: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      coordinatorEpoch: "configured:coordinator",
+    },
+  });
+  assert.equal(oldReserved.response.status, 201);
+  const replacementConfig = (coordinatorId, coordinatorThreadId) => ({
+    rootTaskId: coordinatorId,
+    ownerRootTaskId: "owner-root",
+    tasks: [
+      {
+        id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
+        threadId: ownerThreadId, taskType: "root_task", codexHostId: "local",
+        workspacePath: "/tmp/owner-root-workspace",
+      },
+      {
+        id: coordinatorId, label: "Coordinator", owner: "Codex Root", source: "codex",
+        threadId: coordinatorThreadId, taskType: "root_task", codexHostId: "local",
+        workspacePath: `/tmp/${coordinatorId}-workspace`,
+      },
+    ],
+    adapters: [],
+  });
+  const replacementDatabase = new TaskboardDatabase(databasePath);
+  replacementDatabase.upsertAgentLaneProject(
+    "local",
+    replacementConfig("coordinator-b", "01a004bd-a749-7b53-81e2-af2d477f93af"),
+  );
+  replacementDatabase.close();
+  const replacementSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(replacementSnapshot.body.coordination.pendingOwnerIntent.intentId, recoveryIntent.intentId);
+  const replacementClaim = await request(baseUrl, `${recoveryPath}/adoption/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
+    body: {
+      coordinatorTaskId: "coordinator-b",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
+      coordinatorEpoch: "configured:coordinator-b",
+    },
+  });
+  assert.equal(replacementClaim.response.status, 201, JSON.stringify(replacementClaim.body));
+  const staleReservedConfirm = await request(baseUrl, `${recoveryPath}/adoption/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "c".repeat(32)),
+    body: { adoptionId: oldReserved.body.receipt.id, deliveryTurnId: "stale-turn" },
+  });
+  assert.equal(staleReservedConfirm.response.status, 409);
+  const replacementConfirm = await request(baseUrl, `${recoveryPath}/adoption/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "d".repeat(32)),
+    body: { adoptionId: replacementClaim.body.receipt.id, deliveryTurnId: "replacement-b-turn" },
+  });
+  assert.equal(replacementConfirm.body.confirmed, true);
+
+  const secondReplacementDatabase = new TaskboardDatabase(databasePath);
+  secondReplacementDatabase.upsertAgentLaneProject(
+    "local",
+    replacementConfig("coordinator-c", "01a004bd-a749-7b53-81e2-af2d477f93b0"),
+  );
+  secondReplacementDatabase.close();
+  const reAdoptSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(reAdoptSnapshot.body.coordination.pendingOwnerIntent.intentId, recoveryIntent.intentId);
+  assert.equal(reAdoptSnapshot.body.coordination.pendingOwnerIntentPlan, null);
+  const reAdoptClaim = await request(baseUrl, `${recoveryPath}/adoption/claim`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "e".repeat(32)),
+    body: {
+      coordinatorTaskId: "coordinator-c",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b0",
+      coordinatorEpoch: "configured:coordinator-c",
+    },
+  });
+  assert.equal(reAdoptClaim.response.status, 201, JSON.stringify(reAdoptClaim.body));
+  const stalePlan = await request(baseUrl, `${recoveryPath}/plan-revisions`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "f".repeat(32)),
+    body: {
+      revisionId: "stale-replacement-plan",
+      intentVersion: replacementSnapshot.body.coordination.pendingOwnerIntent.version + 1,
+      adoptionId: replacementClaim.body.receipt.id,
+      coordinatorTaskId: "coordinator-b",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
+      coordinatorEpoch: "configured:coordinator-b",
+      classification: "bounded_delivery",
+      summary: "This stale plan must fail.",
+      parentTaskId: null,
+      items: [],
+    },
+  });
+  assert.equal(stalePlan.response.status, 409);
+  const reAdoptConfirm = await request(baseUrl, `${recoveryPath}/adoption/confirm`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "0".repeat(32)),
+    body: { adoptionId: reAdoptClaim.body.receipt.id, deliveryTurnId: "replacement-c-turn" },
+  });
+  assert.equal(reAdoptConfirm.body.confirmed, true);
+  const finalRecoveryIntents = await request(baseUrl, "/api/local/projects/local/owner-intents");
+  const recoveredIntent = finalRecoveryIntents.body.intents.find((item) => item.id === recoveryIntent.intentId);
+  const recoveredPlan = await request(baseUrl, `${recoveryPath}/plan-revisions`, {
+    method: "POST",
+    headers: signedInjectorHeaders(instanceSecret, "1".repeat(31) + "2"),
+    body: {
+      revisionId: "recovered-plan",
+      intentVersion: recoveredIntent.version,
+      adoptionId: reAdoptClaim.body.receipt.id,
+      coordinatorTaskId: "coordinator-c",
+      coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b0",
+      coordinatorEpoch: "configured:coordinator-c",
+      classification: "bounded_delivery",
+      summary: "Recovered exactly once after replacement.",
+      parentTaskId: null,
+      items: [],
+    },
+  });
+  assert.equal(recoveredPlan.response.status, 201, JSON.stringify(recoveredPlan.body));
 });
 
 test("connected Agent Lane opens its exact Codex thread through the local launcher", async () => {
@@ -1701,6 +4424,49 @@ test("existing task and comment thread attribution remains content-specific", as
     .prepare("PRAGMA foreign_key_list(comments)")
     .all();
   assert.equal(commentForeignKeys.some((foreignKey) => foreignKey.table === "tasks"), true);
+});
+
+test("activation readiness redetects exact vibe candidates created after schema migration", async () => {
+  let identifier;
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const task = database.createTask({
+      projectId: "local",
+      title: "Late-labeled personal Taskboard work",
+      description: "",
+      status: "todo",
+      priority: "none",
+      labels: ["taskboard", "vibe-coding", "no-working-log"],
+      workflowProfile: "formal",
+      threadId: null,
+      actor,
+      assignee: actor,
+      developmentContext: null,
+      workingLog: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    identifier = task.identifier;
+    database.close();
+    return {};
+  });
+
+  const readiness = await request(baseUrl, "/api/local/activation-readiness");
+
+  assert.equal(readiness.response.status, 200);
+  assert.deepEqual(readiness.body.workflowProfileCandidates.map((candidate) => ({
+    identifier: candidate.identifier,
+    taskVersion: candidate.taskVersion,
+    suggestedProfile: candidate.suggestedProfile,
+    status: candidate.status,
+  })), [{
+    identifier,
+    taskVersion: 1,
+    suggestedProfile: "vibe",
+    status: "pending",
+  }]);
 });
 
 test("task thread migration excludes comment-only aggregate entries", async () => {
@@ -2616,6 +5382,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
       rootThreadId: rootBinding.threadId,
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "delete-link",
+      reservationLeaseId: "escaped-delete-reservation",
     },
   });
   assert.equal(escapedDeleteClaim.response.status, 409);
@@ -2628,6 +5395,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
       rootThreadId: rootBinding.threadId,
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "edit-link",
+      reservationLeaseId: "escaped-edit-reservation",
     },
   });
   assert.equal(escapedEditClaim.response.status, 409);
@@ -2648,10 +5416,11 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
           rootThreadId: claim.rootThreadId,
           expectedResumeToken: claim.expectedResumeToken,
           safeActionId: claim.safeActionId,
+          reservationLeaseId: "standing-reservation",
         },
       });
       assert.equal(result.response.status, 200);
-      return result.body.reused === false;
+      return result.body;
     },
     confirmDelivery: async (delivery) => {
       const result = await request(baseUrl, `/api/tasks/${delivery.todoId}/bootstrap-delivery`, {
@@ -2660,6 +5429,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
           rootThreadId: delivery.rootThreadId,
           expectedResumeToken: delivery.expectedResumeToken,
           safeActionId: delivery.safeActionId,
+          reservationLeaseId: delivery.deliveryReceipt.reservationLeaseId,
         },
       });
       assert.equal(result.response.status, 200);
@@ -2679,6 +5449,21 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
         validatedIdentity = executionIdentity;
       },
     ),
+    completeDelivery: async (delivery, rootDelivery) => (await request(
+      baseUrl,
+      `/api/tasks/${delivery.todoId}/bootstrap-complete`,
+      {
+        method: "POST",
+        body: {
+          rootThreadId: delivery.rootThreadId,
+          expectedResumeToken: delivery.expectedResumeToken,
+          safeActionId: delivery.safeActionId,
+          reservationLeaseId: delivery.deliveryReceipt.reservationLeaseId,
+          recoveryLeaseId: delivery.recoveryLeaseId,
+          deliveryTurnId: rootDelivery.turnId,
+        },
+      },
+    )).body,
   });
   assert.deepEqual(monitorResult, {
     delivered: true,
@@ -2736,6 +5521,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
       rootThreadId: rootBinding.threadId,
       expectedResumeToken: editCapsule.resumeToken,
       safeActionId: "edit-file",
+      reservationLeaseId: "edit-file-reservation",
     },
   });
   assert.equal(editClaim.response.status, 200);
@@ -2747,6 +5533,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
       rootThreadId: rootBinding.threadId,
       expectedResumeToken: editCapsule.resumeToken,
       safeActionId: "edit-file",
+      reservationLeaseId: "edit-file-reservation",
     },
   });
   assert.equal(swappedEditDelivery.response.status, 409);
@@ -2759,6 +5546,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
       rootThreadId: rootBinding.threadId,
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "push-branch",
+      reservationLeaseId: "standing-reservation",
     },
   });
   assert.equal(changedRemoteDelivery.response.status, 409);

@@ -65,6 +65,8 @@ taskctl issue bootstrap ISSUE_ID [--json]
 For a replaceable project coordinator, inspect and mutate only the exact configured Agent Lane task/thread binding:
 
 ```bash
+taskctl coordinator windows PROJECT_ID [--json]
+taskctl coordinator register-window PROJECT_ID --role owner_root|coordinator --task TASK --label LABEL --thread-id THREAD --expected-revision SHA256 --idempotency-key KEY [--json]
 taskctl coordinator status PROJECT_ID [--json]
 taskctl coordinator acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id none|LEASE_ID --lease-seconds 300 [--json]
 taskctl coordinator renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id LEASE_ID --lease-seconds 300 [--json]
@@ -72,7 +74,19 @@ taskctl coordinator release PROJECT_ID --holder-task TASK --holder-thread-id THR
 taskctl coordinator receipts PROJECT_ID [--json]
 ```
 
+Register the Owner-facing Root and replaceable coordinator from their respective live Codex windows. Registration is protected, optimistic, and idempotent: Taskboard derives host/workspace identity from the fresh authenticated Codex runtime, and the caller supplies only the semantic role plus exact current thread id. Do not reuse one task id for both roles or mutate SQLite/config files directly.
+
 Acquire requires an explicit expected identity: use `none` only when status has no stored lease, or pass the expired lease id when replacing an expired coordinator. Renew/release require the exact active lease id. Conflicts fail closed. Persist a checkpoint or handoff before release, and remember that coordinator ownership never grants execution ownership.
+
+The active Global Coordinator may create the durable disjoint routing map through protected Taskboard state:
+
+```bash
+taskctl domain-coordinator domains PROJECT_ID [--json]
+taskctl domain-coordinator configure PROJECT_ID DOMAIN_ID --label LABEL --write-scope PATH[,PATH] --eligible-task TASK[,TASK] --holder-task GLOBAL_TASK --holder-thread-id GLOBAL_THREAD --expected-lease-id GLOBAL_LEASE --expected-revision SHA256 --idempotency-key KEY [--json]
+taskctl domain-coordinator remove PROJECT_ID DOMAIN_ID --holder-task GLOBAL_TASK --holder-thread-id GLOBAL_THREAD --expected-lease-id GLOBAL_LEASE --expected-revision SHA256 --idempotency-key KEY [--json]
+```
+
+Read the current revision immediately before every configuration write. Scopes must be relative and disjoint, and eligible task ids must name configured peer windows. Taskboard rejects policy changes while a Todo remains assigned or a domain lease is reserved; release the lease and clear assignments first. Do not edit SQLite or the Agent Lane config directly.
 
 Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
 

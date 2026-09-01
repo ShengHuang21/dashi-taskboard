@@ -67,3 +67,17 @@ test("the taskboard skill coordinates safe issue execution and review handoff", 
     /Verify the requested operation path[\s\S]*Add a comment with the changes, verification result, outcome, and remaining risks[\s\S]*Read the issue again, then move it to `in_review` with its current `version`/i,
   );
 });
+
+test("the taskboard skill produces hidden final-only typed Owner Intent markers", () => {
+  assert.match(skillSource, /coordinator windows PROJECT_ID/);
+  assert.match(skillSource, /coordinator register-window/);
+  assert.match(skillSource, /Owner Root and active Global Coordinator must remain distinct/);
+  assert.match(cliReference, /Registration is protected, optimistic, and idempotent/);
+  assert.match(skillSource, /coordinator status PROJECT_ID --json/);
+  assert.match(skillSource, /owner-intent list PROJECT_ID --json/);
+  assert.match(skillSource, /Do not ask the Owner for an intent id or protocol syntax/);
+  assert.match(skillSource, /exactly one invisible HTML comment and no content after it/);
+  assert.match(skillSource, /TASKBOARD_OWNER_INTENT_ROUTE_V1/);
+  assert.match(skillSource, /never put it in commentary, quote it, explain it, or ask the Owner to copy it/);
+  assert.match(skillSource, /omit the marker so capture fails closed/);
+});

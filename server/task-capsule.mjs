@@ -605,10 +605,8 @@ function frontierFor(task, comments, coordinationEvents, activeRun, latestRun, a
     if (!candidate.text || !candidate.observedAt || Number.isNaN(Date.parse(candidate.observedAt))) return;
     candidates.push(candidate);
   };
-  const seenRunIds = new Set();
-  for (const run of [activeRun, latestRun]) {
-    if (!run?.id || seenRunIds.has(run.id) || !run.nextAction) continue;
-    seenRunIds.add(run.id);
+  for (const run of [activeRun]) {
+    if (!run?.id || !run.nextAction) continue;
     add({
       text: run.nextAction,
       source: { type: "agent_run", runId: run.id, runVersion: run.version },
@@ -677,6 +675,10 @@ const STRUCTURAL_NEXT_ACTIONS = new Map([
     "AUTHORIZATION_ENVELOPE_INVALID",
     "修复无效的 Task Authorization Envelope V1；在验证通过前不要派发工作或请求 Owner 授权。",
   ],
+  [
+    "CROSS_DOMAIN_HANDOFF_REQUIRED",
+    "等待目标 Domain 当前 Coordinator 接收精确依赖交接；在回执有效前不要派发该 Todo。",
+  ],
 ]);
 
 function structuralNextActionFor(reasonCode) {
@@ -700,6 +702,7 @@ function readyWorkFor(
   authorization,
   standingAuthority,
   requirementsRevision,
+  dependencyClearances,
 ) {
   const reasonCodes = [];
   const workflow = workflowFor(task);
@@ -711,6 +714,11 @@ function readyWorkFor(
   else if (task.status !== "todo") reasonCodes.push("TASK_STATUS_NOT_TODO");
   if (task.relations.blockedBy.some((blockedBy) => blockedBy.status !== "done")) {
     reasonCodes.push("BLOCKED_BY_INCOMPLETE");
+  }
+  if (dependencyClearances.some((clearance) => (
+    clearance.sourceStatus === "done" && clearance.status !== "accepted"
+  ))) {
+    reasonCodes.push("CROSS_DOMAIN_HANDOFF_REQUIRED");
   }
   if (execution.rootRoute.state !== "ready") {
     reasonCodes.push(...execution.rootRoute.reasonCodes);
@@ -859,6 +867,10 @@ export function createTaskCapsule({
   latestRun = null,
   standingAuthorities = [],
   ownerDecisionReceipts = [],
+  domainAssignment = null,
+  domainRoute = null,
+  globalCoordinatorFrontier = null,
+  dependencyClearances = [],
   now = new Date(),
 }) {
   const orderedComments = [...comments].sort((left, right) => (
@@ -891,6 +903,7 @@ export function createTaskCapsule({
     effectiveAuthorization,
     standingAuthority,
     requirementsRevision,
+    dependencyClearances,
   );
   const workflow = workflowFor(task);
   const currentFrontier = {
@@ -949,6 +962,9 @@ export function createTaskCapsule({
     handoffs,
     legacyClaim: latestRun ? null : claimEvidence(currentClaim),
     threadBinding: execution.threadBinding,
+    ...(domainAssignment ? { domainAssignment, domainRoute } : {}),
+    ...(!domainAssignment ? { globalCoordinatorFrontier } : {}),
+    dependencyClearances,
   });
   if (readyWork.approvalRequest) {
     readyWork.approvalRequest.expectedResumeToken = resumeToken;
@@ -983,6 +999,9 @@ export function createTaskCapsule({
     handoffs,
     conversation: conversationFor(task),
     planning: planningFor(task),
+    domainAssignment,
+    domainRoute,
+    dependencyClearances,
     execution,
     executionTarget: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     worktree: task.developmentContext?.type === "worktree" ? task.developmentContext : null,

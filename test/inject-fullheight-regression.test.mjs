@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
+import { once } from "node:events";
 import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -219,6 +220,11 @@ function fixtureHtml(origin) {
         document.getElementById("result").textContent = btoa(JSON.stringify(result));
         clearInterval(heartbeatTimer);
         window.__codexTaskboardInjection__?.destroy();
+        await fetch("/fixture-result", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(result),
+        });
       })();
     </script>
   </body>
@@ -232,8 +238,35 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
     return;
   }
 
+  let resolveFixtureResult;
+  let rejectFixtureResult;
+  const fixtureResultPromise = new Promise((resolve, reject) => {
+    resolveFixtureResult = resolve;
+    rejectFixtureResult = reject;
+  });
   const server = http.createServer((request, response) => {
     response.setHeader("connection", "close");
+    if (request.url === "/fixture-result" && request.method === "POST") {
+      let body = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 64 * 1024) request.destroy();
+      });
+      request.on("end", () => {
+        try {
+          resolveFixtureResult(JSON.parse(body));
+          response.statusCode = 204;
+          response.end();
+        } catch (error) {
+          rejectFixtureResult(error);
+          response.statusCode = 400;
+          response.end();
+        }
+      });
+      request.on("error", rejectFixtureResult);
+      return;
+    }
     if (request.url === "/attacker") {
       response.setHeader("content-type", "text/html; charset=utf-8");
       response.end("<!doctype html><title>attacker</title>");
@@ -271,32 +304,55 @@ test("Taskboard fills the workspace, opens HTTPS links and revokes hostile ifram
   const profile = await mkdtemp(path.join(os.tmpdir(), "taskboard-fullheight-chrome-"));
   t.after(() => rm(profile, { recursive: true, force: true }));
   const url = `http://127.0.0.1:${server.address().port}/fixture`;
-  let stdout;
+  const browser = spawn(chrome, [
+    "--headless=new",
+    "--disable-background-networking",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-sandbox",
+    `--user-data-dir=${profile}`,
+    url,
+  ], { stdio: ["ignore", "ignore", "pipe"] });
+  let browserError = "";
+  browser.stderr.setEncoding("utf8");
+  browser.stderr.on("data", (chunk) => {
+    browserError = `${browserError}${chunk}`.slice(-4_000);
+  });
+  const browserFailed = new Promise((_, reject) => {
+    browser.once("error", reject);
+    browser.once("exit", (code, signal) => {
+      reject(new Error(
+        `Chrome exited before reporting the fixture result (code=${code}, signal=${signal})${browserError ? `\n${browserError}` : ""}`,
+      ));
+    });
+  });
+  let timeoutId;
+  const fixtureTimedOut = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`fixture did not report an injection result${browserError ? `\n${browserError}` : ""}`));
+    }, 30_000);
+    timeoutId.unref();
+  });
+  let result;
   try {
-    ({ stdout } = await execFileAsync(chrome, [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-sandbox",
-      `--user-data-dir=${profile}`,
-      "--virtual-time-budget=12000",
-      "--dump-dom",
-      url,
-    ], { maxBuffer: 5 * 1024 * 1024, timeout: 20_000 }));
-  } catch (error) {
-    if (!String(error?.stdout ?? "").trim()) {
-      t.skip("Chrome or Chromium cannot run headless dump-dom in this environment");
-      return;
+    result = await Promise.race([fixtureResultPromise, browserFailed, fixtureTimedOut]);
+  } finally {
+    clearTimeout(timeoutId);
+    if (browser.exitCode === null && browser.signalCode === null) {
+      browser.kill("SIGTERM");
+      const stopped = await Promise.race([
+        once(browser, "exit").then(() => true),
+        new Promise((resolve) => {
+          const timer = setTimeout(() => resolve(false), 5_000);
+          timer.unref();
+        }),
+      ]);
+      if (!stopped && browser.exitCode === null && browser.signalCode === null) {
+        browser.kill("SIGKILL");
+        await once(browser, "exit");
+      }
     }
-    throw error;
   }
-  if (!stdout.trim()) {
-    t.skip("Chrome or Chromium cannot run headless dump-dom in this environment");
-    return;
-  }
-
-  const encodedResult = stdout.match(/<output id="result">([^<]+)<\/output>/)?.[1];
-  assert.ok(encodedResult, "fixture did not report an injection result");
-  const result = JSON.parse(Buffer.from(encodedResult, "base64").toString("utf8"));
   assert.deepEqual(result, {
     panelVisibleBefore: true,
     browserPanelClosed: true,

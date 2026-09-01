@@ -628,6 +628,20 @@ export interface WindowSubagentTreeSnapshot {
   stableIdentity: string;
   observed: boolean;
   subagents: RootSubagentSnapshot[];
+  capacityObservation: {
+    source: "list_agents";
+    observedAt: string;
+  } | null;
+  registryObservation: {
+    source: "list_agents";
+    observedAt: string;
+    complete: true;
+    agents: Array<{
+      agentPath: string;
+      agentThreadId: string | null;
+      status: string;
+    }>;
+  } | null;
   summary: {
     observed: number;
     active: number;
@@ -667,13 +681,80 @@ export interface CoordinationTodoSnapshot {
     automaticExecution: false;
   };
   dispatchTarget: CoordinationDispatchTarget | null;
+  domainAssignment: {
+    domainId: string;
+    status: "active" | "needs_coordinator";
+    coordinatorTaskId: string | null;
+    leaseId: string | null;
+  } | null;
   workflow: {
     profile: "formal" | "vibe";
     workingLogRequired: boolean;
   };
   workingLog: CoordinationWorkingLogSnapshot | null;
   run: CoordinationRunSnapshot | null;
+  admission: {
+    receiptId: string;
+    attemptId: string;
+    state: "reserved" | "deferred" | "awaiting_admission" | "prepared" | "admission_uncertain" | "recovery_confirmed";
+    rootThreadId: string;
+    resumeToken: string;
+    safeActionId: string;
+    agentName: string | null;
+    agentPath: string | null;
+    writeScope: string[] | null;
+    deadlineAt: string | null;
+    uncertainAt: string | null;
+    recoveredAgentThreadId: string | null;
+    deferredReason: "model_capacity" | "domain_reroute" | "admission_absent" | null;
+    retryCount: number;
+    retryAfter: string | null;
+    rootHostId: string;
+    rootWorkspacePath: string;
+    globalCoordinatorLeaseId: string | null;
+    globalCoordinatorTaskId: string | null;
+    globalCoordinatorThreadId: string | null;
+    coordinationDomainId: string | null;
+    domainCoordinatorLeaseId: string | null;
+    domainCoordinatorTaskId: string | null;
+    domainCoordinatorThreadId: string | null;
+  } | null;
   readyWork: CoordinationReadyWorkSnapshot;
+  dependencyClearances: Array<{
+    fingerprint: string;
+    projectId: string;
+    sourceTaskId: string;
+    sourceTaskVersion: number;
+    sourceIdentifier: string;
+    sourceStatus: string;
+    targetReady: boolean;
+    sourceDomainId: string;
+    sourceAssignedByLeaseId: string;
+    sourceAssignedByTaskId: string;
+    sourceAssignedByThreadId: string;
+    sourceAssignmentUpdatedAt: string;
+    targetTaskId: string;
+    targetTaskVersion: number;
+    targetDomainId: string;
+    targetAssignedByLeaseId: string;
+    targetAssignedByTaskId: string;
+    targetAssignedByThreadId: string;
+    targetAssignmentUpdatedAt: string;
+    edgeCreatedAt: string;
+    targetDomainLeaseId: string | null;
+    targetHolderTaskId: string | null;
+    targetHolderThreadId: string | null;
+    status: "awaiting_handoff" | "accepted";
+    clearanceId: string | null;
+    acceptedAt: string | null;
+    delivery: {
+      id: string;
+      state: "reserved" | "delivered";
+      reservationExpiresAt: string;
+      deliveredAt: string | null;
+      deliveryTurnId: string | null;
+    } | null;
+  }>;
   inbox: {
     pendingCount: number;
     latestReceipt: unknown | null;
@@ -752,8 +833,69 @@ export interface CoordinationOwnerDecisionRequest extends CoordinationApprovalRe
   };
 }
 
+interface CoordinationOwnerIntentSnapshotBase {
+  id: string;
+  intentId: string;
+  deliveryId: string;
+  projectId: string;
+  kind: "append" | "supersede" | "clarify" | "cancel";
+  goal: string;
+  constraints: string[];
+  targetIntentId: string | null;
+  ownerRootTaskId: string;
+  ownerRootThreadId: string;
+  ownerTurnId: string;
+  rootCaptureTurnId: string;
+  evidence: string;
+  executionDisposition: "current_execution_continues";
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+  coordinatorEpoch: string;
+  route: {
+    coordinatorTaskId: string;
+    coordinatorThreadId: string;
+    codexHostId: string;
+    coordinatorWorkspacePath: string;
+  };
+}
+
+export interface CoordinationQueuedOwnerIntentSnapshot
+  extends CoordinationOwnerIntentSnapshotBase {
+  status: "queued";
+  adoptionReceipt?: never;
+}
+
+export interface CoordinationRecoverableOwnerIntentSnapshot
+  extends CoordinationOwnerIntentSnapshotBase {
+  status: "adopted";
+  adoptionReceipt?: never;
+}
+
+export type CoordinationOwnerIntentSnapshot =
+  | CoordinationQueuedOwnerIntentSnapshot
+  | CoordinationRecoverableOwnerIntentSnapshot;
+
+export interface CoordinationOwnerIntentPlanSnapshot
+  extends CoordinationOwnerIntentSnapshotBase {
+  status: "adopted";
+  adoptionReceipt: {
+    id: string;
+    coordinatorTaskId: string;
+    coordinatorThreadId: string;
+    coordinatorEpoch: string;
+    deliveryTurnId: string;
+    adoptedAt: string;
+  };
+}
+
+type AssertFalse<Value extends false> = Value;
+type OwnerIntentPlanCannotBePendingIntent = AssertFalse<
+  CoordinationOwnerIntentPlanSnapshot extends CoordinationOwnerIntentSnapshot ? true : false
+>;
+
 export interface AgentLaneSnapshot {
-  version: 4;
+  version: 7;
   projectId: string;
   generatedAt: string;
   readOnly: true;
@@ -762,21 +904,70 @@ export interface AgentLaneSnapshot {
     model: "peer_windows_with_configured_coordinator" | "peer_windows_with_coordinator_lease";
     coordinatorTaskId: string | null;
     coordinatorStableIdentity: string | null;
+    ownerRootTaskId: string | null;
+    ownerRootStableIdentity: string | null;
+    ownerRootRoute: {
+      rootTaskId: string;
+      rootThreadId: string;
+      codexHostId: string;
+      rootWorkspacePath: string;
+    } | null;
     assignment: "configured" | "lease" | "unassigned";
     replaceable: boolean;
     scope: "project";
     lease?: {
       id: string;
+      holderTaskId: string;
+      bindingValid: boolean;
       status: "active" | "expired";
       acquiredAt: string;
       expiresAt: string;
+      releasedAt: string | null;
     };
     crossWindowProtocol: "task_capsule_claim_checkpoint_receipt";
     subagentAuthority: "window_root";
     stateAuthority: "self_learning_checkpoint";
     workAuthority: "todo_claim_lease";
     runtimeOwnership: "single_writer";
+    domainCoordinators: Array<{
+      domainId: string;
+      label: string;
+      writeScope: string[];
+      eligibleTaskIds: string[];
+      coordinatorTaskId: string | null;
+      coordinatorStableIdentity: string | null;
+      assignment: "lease" | "unassigned";
+      replaceable: true;
+      lease: {
+        id: string;
+        holderTaskId: string;
+        bindingValid: boolean;
+        status: "active" | "expired";
+        acquiredAt: string;
+        expiresAt: string;
+        releasedAt: string | null;
+      } | null;
+    }>;
+    pendingOwnerIntent: CoordinationOwnerIntentSnapshot | null;
+    pendingOwnerIntentPlan: CoordinationOwnerIntentPlanSnapshot | null;
     ownerDecisionRequest: CoordinationOwnerDecisionRequest | null;
+    pendingCrossDomainHandoff: {
+      projectId: string;
+      sourceTaskId: string;
+      sourceIdentifier: string;
+      targetTaskId: string;
+      targetIdentifier: string;
+      fingerprint: string;
+      sourceDomainId: string;
+      targetDomainId: string;
+      expectedTargetDomainLeaseId: string;
+      targetHolderTaskId: string;
+      route: {
+        targetThreadId: string;
+        codexHostId: string;
+        targetWorkspacePath: string;
+      };
+    } | null;
   };
   todos: CoordinationTodoSnapshot[];
   attentionQueue: string[];

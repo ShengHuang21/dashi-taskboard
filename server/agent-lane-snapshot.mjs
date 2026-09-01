@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { createInterface } from "node:readline";
 
-export const AGENT_LANE_SNAPSHOT_VERSION = 4;
+export const AGENT_LANE_SNAPSHOT_VERSION = 7;
 const MAX_TAIL_BYTES = 512 * 1024;
 const MAX_VISIBLE_SUBAGENTS = 12;
 const CONNECTED_SOURCES = new Set(["codex"]);
@@ -70,7 +70,22 @@ function validateConfigTask(value) {
     roleNote: text(value.roleNote),
     taskType: TASK_TYPES.has(value.taskType) ? value.taskType : "peer_task",
     issueIdentifier: text(value.issueIdentifier),
+    codexHostId: text(value.codexHostId),
+    workspacePath: text(value.workspacePath),
   };
+}
+
+function isFullyBoundCodexPeerTask(task) {
+  return Boolean(
+    task?.source === "codex"
+    && task?.taskType === "peer_task"
+    && typeof task.threadId === "string"
+    && task.threadId.trim()
+    && typeof task.codexHostId === "string"
+    && task.codexHostId.trim()
+    && typeof task.workspacePath === "string"
+    && path.isAbsolute(task.workspacePath),
+  );
 }
 
 function validateConfigAdapter(value) {
@@ -134,12 +149,43 @@ async function readConfig(configPath, projectId, getLaneConfig) {
     }
     project = parsed?.version === 2 ? parsed.projects?.[projectId] : null;
   }
-  const tasks = Array.isArray(project?.tasks) ? project.tasks.map(validateConfigTask) : [];
+  const rawTasks = Array.isArray(project?.tasks) ? project.tasks : [];
+  const tasks = rawTasks.map(validateConfigTask);
   const adapters = Array.isArray(project?.adapters) ? project.adapters.map(validateConfigAdapter) : [];
   const taskIds = tasks.flatMap((lane) => lane ? [lane.id] : []);
   const adapterIds = adapters.flatMap((lane) => lane ? [lane.id] : []);
   const coordinatorLease = project?.coordinatorLease;
   const coordinatorLeaseConfigured = coordinatorLease !== null && coordinatorLease !== undefined;
+  const coordinatorLeaseHolder = tasks.find((task) => task?.id === coordinatorLease?.holderTaskId);
+  const ownerRootTaskId = text(project?.ownerRootTaskId);
+  const ownerRootTask = tasks.find((task) => task?.id === ownerRootTaskId) ?? null;
+  const ownerRootValid = !ownerRootTaskId || Boolean(
+    ownerRootTask?.source === "codex"
+    && ownerRootTask?.taskType === "root_task"
+    && ownerRootTask.threadId
+    && ownerRootTask.codexHostId
+    && ownerRootTask.workspacePath
+    && path.isAbsolute(ownerRootTask.workspacePath)
+  );
+  const coordinatorLeaseBindingComplete = Boolean(
+    coordinatorLease?.holderThreadId
+    && coordinatorLease?.holderCodexHostId
+    && coordinatorLease?.holderWorkspacePath
+    && path.isAbsolute(coordinatorLease.holderWorkspacePath)
+    && path.isAbsolute(coordinatorLeaseHolder?.workspacePath ?? "")
+  );
+  const coordinatorLeaseBindingMatches = coordinatorLeaseBindingComplete && Boolean(
+    coordinatorLease?.holderThreadId === coordinatorLeaseHolder?.threadId
+    && coordinatorLease?.holderCodexHostId === coordinatorLeaseHolder?.codexHostId
+    && path.resolve(coordinatorLease?.holderWorkspacePath ?? "")
+      === path.resolve(coordinatorLeaseHolder?.workspacePath ?? "")
+    && (!ownerRootTaskId || (
+      ownerRootValid
+      && coordinatorLeaseHolder?.id !== ownerRootTaskId
+      && coordinatorLeaseHolder?.source === "codex"
+      && coordinatorLeaseHolder?.taskType === "root_task"
+    )),
+  );
   const hasCoordinatorLease = Boolean(
     coordinatorLease
     && text(coordinatorLease.id)
@@ -149,18 +195,66 @@ async function readConfig(configPath, projectId, getLaneConfig) {
     && text(coordinatorLease.expiresAt)
     && !Number.isNaN(Date.parse(coordinatorLease.acquiredAt))
     && !Number.isNaN(Date.parse(coordinatorLease.expiresAt))
-    && Date.parse(coordinatorLease.acquiredAt) < Date.parse(coordinatorLease.expiresAt),
+    && Date.parse(coordinatorLease.acquiredAt) <= Date.parse(coordinatorLease.expiresAt)
+    && (!coordinatorLease.releasedAt
+      || (!Number.isNaN(Date.parse(coordinatorLease.releasedAt))
+        && Date.parse(coordinatorLease.releasedAt) >= Date.parse(coordinatorLease.acquiredAt)))
   );
   const hasLegacyCoordinator = Boolean(
     text(project?.rootTaskId)
     && tasks.some((task) => task.id === project.rootTaskId && task.taskType === "root_task"),
   );
+  const hasOwnerRoot = ownerRootValid;
+  const coordinationDomains = Array.isArray(project?.coordinationDomains)
+    ? project.coordinationDomains.map((domain) => ({
+        id: text(domain?.id),
+        label: text(domain?.label),
+        writeScope: Array.isArray(domain?.writeScope)
+          ? domain.writeScope.map((entry) => text(entry)).filter(Boolean)
+          : [],
+        eligibleTaskIds: Array.isArray(domain?.eligibleTaskIds)
+          ? domain.eligibleTaskIds.map((entry) => text(entry)).filter(Boolean)
+          : [],
+      }))
+    : [];
+  const validDomains = coordinationDomains.every((domain) => (
+    domain.id
+    && domain.label
+    && domain.writeScope.length > 0
+    && domain.eligibleTaskIds.length > 0
+    && domain.eligibleTaskIds.every((taskId) => (
+      isFullyBoundCodexPeerTask(rawTasks.find((task) => task?.id === taskId))
+    ))
+  )) && new Set(coordinationDomains.map((domain) => domain.id)).size === coordinationDomains.length;
+  const rawDomainLeases = project?.domainCoordinatorLeases ?? {};
+  const validDomainLeases = rawDomainLeases && typeof rawDomainLeases === "object"
+    && !Array.isArray(rawDomainLeases)
+    && Object.entries(rawDomainLeases).every(([domainId, domainLease]) => {
+      const domain = coordinationDomains.find((entry) => entry.id === domainId);
+      const holder = rawTasks.find((task) => task?.id === domainLease?.holderTaskId);
+      return domain
+        && text(domainLease?.id)
+        && text(domainLease?.holderTaskId)
+        && isFullyBoundCodexPeerTask(holder)
+        && domain.eligibleTaskIds.includes(domainLease.holderTaskId)
+        && text(domainLease?.acquiredAt)
+        && text(domainLease?.expiresAt)
+        && !Number.isNaN(Date.parse(domainLease.acquiredAt))
+        && !Number.isNaN(Date.parse(domainLease.expiresAt))
+        && Date.parse(domainLease.acquiredAt) <= Date.parse(domainLease.expiresAt)
+        && (!domainLease.releasedAt
+          || (!Number.isNaN(Date.parse(domainLease.releasedAt))
+            && Date.parse(domainLease.releasedAt) >= Date.parse(domainLease.acquiredAt)));
+    });
   if (
     tasks.length === 0
     || tasks.some((lane) => lane === null)
     || adapters.some((lane) => lane === null)
     || new Set([...taskIds, ...adapterIds]).size !== taskIds.length + adapterIds.length
     || (coordinatorLeaseConfigured ? !hasCoordinatorLease : !hasLegacyCoordinator)
+    || !hasOwnerRoot
+    || !validDomains
+    || !validDomainLeases
   ) {
     throw new AgentLaneSnapshotError(
       "AGENT_LANES_NOT_CONFIGURED",
@@ -169,12 +263,32 @@ async function readConfig(configPath, projectId, getLaneConfig) {
   }
   return {
     rootTaskId: !coordinatorLeaseConfigured && hasLegacyCoordinator ? project.rootTaskId : null,
+    ownerRootTaskId: ownerRootTaskId ?? null,
     coordinatorLease: hasCoordinatorLease ? {
       id: coordinatorLease.id,
       holderTaskId: coordinatorLease.holderTaskId,
+      bindingValid: coordinatorLeaseBindingMatches,
       acquiredAt: coordinatorLease.acquiredAt,
       expiresAt: coordinatorLease.expiresAt,
+      releasedAt: coordinatorLease.releasedAt ?? null,
     } : null,
+    coordinationDomains,
+    domainCoordinatorLeases: validDomainLeases ? Object.fromEntries(
+      Object.entries(rawDomainLeases).map(([domainId, lease]) => {
+        const holder = tasks.find((task) => task?.id === lease.holderTaskId);
+        const bindingValid = Boolean(
+          lease.holderThreadId
+          && lease.holderCodexHostId
+          && lease.holderWorkspacePath
+          && path.isAbsolute(lease.holderWorkspacePath)
+          && path.isAbsolute(holder?.workspacePath ?? "")
+          && lease.holderThreadId === holder?.threadId
+          && lease.holderCodexHostId === holder?.codexHostId
+          && path.resolve(lease.holderWorkspacePath) === path.resolve(holder?.workspacePath ?? ""),
+        );
+        return [domainId, { ...lease, bindingValid }];
+      }),
+    ) : {},
     tasks,
     adapters,
   };
@@ -309,9 +423,25 @@ function readyWorkForTodo(capsule) {
   };
 }
 
-function dispatchTargetFor(capsule) {
+function dispatchTargetFor(capsule, domainCoordinator = undefined) {
   const binding = capsule?.execution?.threadBinding;
   const worktree = capsule?.executionTarget ?? capsule?.worktree;
+  if (domainCoordinator !== undefined) {
+    if (
+      !domainCoordinator
+      || !domainCoordinator.threadId
+      || !domainCoordinator.codexHostId
+      || !domainCoordinator.workspacePath
+      || worktree?.type !== "worktree"
+      || !worktree.path
+    ) return null;
+    return {
+      rootThreadId: domainCoordinator.threadId,
+      codexHostId: domainCoordinator.codexHostId,
+      rootWorkspacePath: domainCoordinator.workspacePath,
+      worktreePath: worktree.path,
+    };
+  }
   if (
     !binding?.threadId
     || !binding?.codexHostId
@@ -338,8 +468,8 @@ function workingLogFor(capsule) {
 }
 
 function runForTodo(capsule) {
-  const run = capsule?.activeRun ?? capsule?.latestRun;
-  if (!run?.id || !run?.state) return null;
+  const run = capsule?.activeRun;
+  if (!run?.id || !["active", "blocked"].includes(run.state)) return null;
   return {
     id: run.id,
     state: run.state,
@@ -354,11 +484,15 @@ function runForTodo(capsule) {
   };
 }
 
-async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComments, generatedAt, capsule) {
+async function taskTodoProjection(
+  task, projectId, taskLanes, getClaim, getAdmission, listComments, generatedAt, capsule,
+  domainAssignment, domainRoute, globalCoordinator, globalArbitrationRequired,
+) {
   const storedClaim = getClaim ? await getClaim(task.id) : null;
   const claim = ["in_progress", "in_review"].includes(task.status) ? storedClaim : null;
   const readyWork = readyWorkForTodo(capsule);
   const run = runForTodo(capsule);
+  const admission = getAdmission ? await getAdmission(task.id) : null;
   const owner = claim?.agentPath
     ? taskLanes.find((lane) => lane.threadId === claim.agentThreadId || lane.id === claim.agentPath.replace(/^\/root\//, ""))
     : null;
@@ -382,11 +516,50 @@ async function taskTodoProjection(task, projectId, taskLanes, getClaim, listComm
     evidenceRef: latest ? `comment:${latest.id}` : `task:${task.identifier}`,
     }, projectId, taskLanes, generatedAt),
     taskId: task.id,
-    dispatchTarget: dispatchTargetFor(capsule),
+    dispatchTarget: domainAssignment
+      ? dispatchTargetFor(capsule, domainRoute?.active ? domainRoute.holder : null)
+      : globalCoordinator
+        ? dispatchTargetFor(capsule, globalCoordinator)
+        : globalArbitrationRequired && readyWork.eligible && readyWork.safeActions.length > 0
+          ? null
+          : dispatchTargetFor(capsule),
+    domainAssignment: domainAssignment ? {
+      domainId: domainAssignment.domainId,
+      status: domainRoute?.active ? "active" : "needs_coordinator",
+      coordinatorTaskId: domainRoute?.active ? domainRoute.holder.id : null,
+      leaseId: domainRoute?.lease?.id ?? null,
+    } : null,
     workflow: capsule?.workflow ?? { profile: "formal", workingLogRequired: true },
     workingLog: workingLogFor(capsule),
     run,
+    admission: admission ? {
+      receiptId: admission.id,
+      attemptId: admission.admissionAttemptId,
+      state: admission.admissionState,
+      rootThreadId: admission.rootThreadId,
+      resumeToken: admission.resumeToken,
+      safeActionId: admission.safeActionId,
+      agentName: admission.admissionAgentName,
+      agentPath: admission.admissionAgentPath,
+      writeScope: admission.admissionWriteScope,
+      deadlineAt: admission.admissionDeadlineAt,
+      uncertainAt: admission.admissionUncertainAt,
+      recoveredAgentThreadId: admission.admissionRecoveredAgentThreadId,
+      deferredReason: admission.admissionDeferredReason,
+      retryCount: admission.admissionRetryCount,
+      retryAfter: admission.admissionRetryAfter,
+      rootHostId: admission.rootHostId,
+      rootWorkspacePath: admission.rootWorkspacePath,
+      globalCoordinatorLeaseId: admission.globalCoordinatorLeaseId,
+      globalCoordinatorTaskId: admission.globalCoordinatorTaskId,
+      globalCoordinatorThreadId: admission.globalCoordinatorThreadId,
+      coordinationDomainId: admission.coordinationDomainId,
+      domainCoordinatorLeaseId: admission.domainCoordinatorLeaseId,
+      domainCoordinatorTaskId: admission.domainCoordinatorTaskId,
+      domainCoordinatorThreadId: admission.domainCoordinatorThreadId,
+    } : null,
     readyWork,
+    dependencyClearances: capsule?.dependencyClearances ?? [],
     inbox: capsule?.inbox ?? { pendingCount: 0, latestReceipt: null },
     handoffs: capsule?.handoffs ?? { pendingAcknowledgementCount: 0, latestEvent: null },
   };
@@ -551,8 +724,22 @@ function subagentAction(payload) {
   };
 }
 
+function normalizedListAgentStatus(value) {
+  if (value === "running") return value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value);
+  if (entries.length !== 1
+    || !["completed", "failed", "interrupted", "blocked"].includes(entries[0][0])
+    || typeof entries[0][1] !== "string") return null;
+  return entries[0][0];
+}
+
 function applySubagentLine(state, line) {
-  if (!line.includes("sub_agent_activity") && !line.includes('"author":"/root/') && !line.includes('"agent_status"')) return;
+  if (!line.includes("sub_agent_activity")
+    && !line.includes('"author":"/root/')
+    && !line.includes('"name":"list_agents"')
+    && !line.includes("function_call_output")
+    && !line.includes("agent_status")) return;
   let entry;
   try {
     entry = JSON.parse(line);
@@ -560,6 +747,15 @@ function applySubagentLine(state, line) {
     return;
   }
   const at = text(entry.timestamp);
+  if (entry.type === "response_item"
+    && entry.payload?.type === "function_call"
+    && entry.payload.name === "list_agents"
+    && entry.payload.namespace === "collaboration"
+    && typeof entry.payload.call_id === "string"
+    && entry.payload.call_id) {
+    state.pendingListAgentCalls.add(entry.payload.call_id);
+    return;
+  }
   if (entry.type === "event_msg" && entry.payload?.type === "sub_agent_activity") {
     const agentPath = text(entry.payload.agent_path);
     if (!agentPath || agentPath === "/root") return;
@@ -577,8 +773,16 @@ function applySubagentLine(state, line) {
       current.lifecycleStatus = "running";
       current.startedAt = at ?? current.startedAt;
       current.lastActualAction = null;
+      if (state.activeRegistry) {
+        state.activeRegistry.add(agentPath);
+        state.registryObservedAt = at ?? state.registryObservedAt;
+      }
     } else if (entry.payload.kind === "interrupted") {
       current.lifecycleStatus = "interrupted";
+      if (state.activeRegistry) {
+        state.activeRegistry.delete(agentPath);
+        state.registryObservedAt = at ?? state.registryObservedAt;
+      }
     }
     state.agents.set(agentPath, current);
     return;
@@ -596,18 +800,52 @@ function applySubagentLine(state, line) {
       };
       current.lastActivityAt = at ?? current.lastActivityAt;
       current.lastActualAction = action.action ?? current.lastActualAction;
-      if (action.completed) current.lifecycleStatus = "completed";
+      if (action.completed) {
+        current.lifecycleStatus = "completed";
+        if (state.activeRegistry) {
+          state.activeRegistry.delete(action.agentPath);
+          state.registryObservedAt = at ?? state.registryObservedAt;
+        }
+      }
       state.agents.set(action.agentPath, current);
       return;
     }
     if (entry.payload?.type === "function_call_output" && typeof entry.payload.output === "string") {
+      if (!state.pendingListAgentCalls.delete(entry.payload.call_id)) return;
+      state.activeRegistry = null;
+      state.registryAgents = null;
+      state.registrySnapshotObservedAt = null;
+      state.registryObservedAt = null;
       try {
         const output = JSON.parse(entry.payload.output);
         if (Array.isArray(output?.agents)) {
-          state.activeRegistry = new Set(output.agents
-            .filter((agent) => agent?.agent_status === "running" && agent.agent_name !== "/root")
+          const normalizedRegistry = output.agents.map((agent) => {
+            if (!agent || typeof agent !== "object" || Array.isArray(agent)
+              || typeof agent.agent_name !== "string"
+              || !/^\/root(?:\/[a-z0-9_]+)*$/i.test(agent.agent_name)
+              || (agent.agent_id !== undefined && typeof agent.agent_id !== "string")
+              || (agent.agent_thread_id !== undefined && typeof agent.agent_thread_id !== "string")) return null;
+            const status = normalizedListAgentStatus(agent.agent_status);
+            if (!status) return null;
+            return { ...agent, normalizedStatus: status };
+          });
+          if (normalizedRegistry.some((agent) => agent === null)) return;
+          state.registryAgents = normalizedRegistry
+            .filter((agent) => agent.agent_name !== "/root")
+            .map((agent) => ({
+              agentPath: agent.agent_name,
+              agentThreadId: typeof agent.agent_id === "string" && agent.agent_id
+                ? agent.agent_id
+                : typeof agent.agent_thread_id === "string" && agent.agent_thread_id
+                  ? agent.agent_thread_id
+                  : state.agents.get(agent.agent_name)?.agentThreadId ?? null,
+              status: agent.normalizedStatus,
+            }));
+          state.activeRegistry = new Set(normalizedRegistry
+            .filter((agent) => agent.normalizedStatus === "running" && agent.agent_name !== "/root")
             .map((agent) => agent.agent_name));
           state.registryObservedAt = at;
+          state.registrySnapshotObservedAt = at;
         }
       } catch {}
     }
@@ -617,7 +855,18 @@ function applySubagentLine(state, line) {
 async function scanSubagents(filename, cached = null) {
   const details = await stat(filename);
   const reset = !cached || details.size < cached.offset;
-  const state = reset ? { offset: 0, agents: new Map(), activeRegistry: null, registryObservedAt: null } : cached;
+  const state = reset ? {
+    offset: 0,
+    agents: new Map(),
+    activeRegistry: null,
+    registryAgents: null,
+    registrySnapshotObservedAt: null,
+    registryObservedAt: null,
+    pendingListAgentCalls: new Set(),
+  } : cached;
+  state.pendingListAgentCalls ??= new Set();
+  state.registryAgents ??= null;
+  state.registrySnapshotObservedAt ??= null;
   if (details.size > state.offset) {
     const input = createReadStream(filename, { start: state.offset, end: details.size - 1, encoding: "utf8" });
     const lines = createInterface({ input, crlfDelay: Infinity });
@@ -640,11 +889,15 @@ export function createAgentLaneSnapshotProvider({
   getLaneConfig = null,
   listTasks = null,
   getClaim = null,
+  getAdmission = null,
   getTaskCapsule = null,
   recordProgress = null,
   recordCompletion = null,
   getTask = null,
   listComments = null,
+  getPendingOwnerIntent = null,
+  getPendingOwnerIntentPlan = null,
+  getTaskDomainAssignment = null,
 }) {
   const sessionFilePromises = new Map();
   const subagentStates = new Map();
@@ -718,11 +971,17 @@ export function createAgentLaneSnapshotProvider({
       }));
       const lease = configured.coordinatorLease ? {
         id: configured.coordinatorLease.id,
-        status: generatedAt.getTime() < Date.parse(configured.coordinatorLease.expiresAt)
+        holderTaskId: configured.coordinatorLease.holderTaskId,
+        bindingValid: configured.coordinatorLease.bindingValid === true,
+        status: configured.coordinatorLease.bindingValid === true
+          && !configured.coordinatorLease.releasedAt
+          && Date.parse(configured.coordinatorLease.acquiredAt) <= generatedAt.getTime()
+          && generatedAt.getTime() < Date.parse(configured.coordinatorLease.expiresAt)
           ? "active"
           : "expired",
         acquiredAt: configured.coordinatorLease.acquiredAt,
         expiresAt: configured.coordinatorLease.expiresAt,
+        releasedAt: configured.coordinatorLease.releasedAt,
       } : null;
       const coordinatorTaskId = lease
         ? lease.status === "active" ? configured.coordinatorLease.holderTaskId : null
@@ -732,9 +991,21 @@ export function createAgentLaneSnapshotProvider({
       for (const windowTask of configured.tasks.filter((task) => task.source === "codex")) {
         const sessionFile = await resolveSessionFile(windowTask.threadId);
         let allSubagents = [];
+        let capacityObservation = null;
+        let registryObservation = null;
         if (sessionFile) {
           const state = await scanSubagents(sessionFile, subagentStates.get(sessionFile));
           subagentStates.set(sessionFile, state);
+          capacityObservation = state.registryObservedAt ? {
+            source: "list_agents",
+            observedAt: state.registryObservedAt,
+          } : null;
+          registryObservation = state.registrySnapshotObservedAt && Array.isArray(state.registryAgents) ? {
+            source: "list_agents",
+            observedAt: state.registrySnapshotObservedAt,
+            complete: true,
+            agents: state.registryAgents.map((agent) => ({ ...agent })),
+          } : null;
           allSubagents = [...state.agents.values()].map((agent) => ({
             ...agent,
             label: agent.agentPath.split("/").at(-1),
@@ -753,6 +1024,8 @@ export function createAgentLaneSnapshotProvider({
           stableIdentity: `${projectId}:window:${windowTask.id}`,
           observed: Boolean(sessionFile),
           subagents,
+          capacityObservation,
+          registryObservation,
           summary: {
             observed: allSubagents.length,
             active: allSubagents.filter((agent) => agent.lifecycleStatus === "running").length,
@@ -764,16 +1037,45 @@ export function createAgentLaneSnapshotProvider({
       allSubagentsByProject.set(projectId, [...allSubagentsByWindow.values()].flat());
       const rootSubagents = allRootSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
       const observedSubagentCount = allRootSubagents.length;
+      const currentCoordinator = taskLanes.find((lane) => lane.id === coordinatorTaskId) ?? null;
+      const globalArbitrationCoordinator = lease?.status === "active"
+        && currentCoordinator?.threadId
+        && currentCoordinator.codexHostId
+        && currentCoordinator.workspacePath
+        ? currentCoordinator
+        : null;
       const projectTasks = listTasks ? await listTasks(projectId) : [];
       const todoEntries = await Promise.all(projectTasks
         .filter((task) => task.archivedAt === null)
         .map(async (task) => {
           const capsule = getTaskCapsule ? await getTaskCapsule(task.id) : null;
+          const domainAssignment = getTaskDomainAssignment ? await getTaskDomainAssignment(task.id) : null;
+          const assignedDomain = domainAssignment
+            ? configured.coordinationDomains.find((domain) => domain.id === domainAssignment.domainId)
+            : null;
+          const assignedLease = assignedDomain
+            ? configured.domainCoordinatorLeases[assignedDomain.id] ?? null
+            : null;
+          const assignedHolder = assignedLease
+            ? taskLanes.find((lane) => lane.id === assignedLease.holderTaskId) ?? null
+            : null;
+          const domainRoute = assignedDomain && assignedLease && assignedHolder
+            ? {
+                active: assignedLease.bindingValid === true
+                  && !assignedLease.releasedAt
+                  && Date.parse(assignedLease.acquiredAt) <= generatedAt.getTime()
+                  && generatedAt.getTime() < Date.parse(assignedLease.expiresAt),
+                lease: assignedLease,
+                holder: assignedHolder,
+              }
+            : null;
           return {
             task,
             capsule,
             todo: await taskTodoProjection(
-              task, projectId, taskLanes, getClaim, listComments, generatedAt, capsule,
+              task, projectId, taskLanes, getClaim, getAdmission, listComments, generatedAt, capsule,
+              domainAssignment, domainRoute, globalArbitrationCoordinator,
+              configured.rootTaskId === null,
             ),
           };
         }));
@@ -786,19 +1088,57 @@ export function createAgentLaneSnapshotProvider({
           || task.labels.includes("agent-todo")
         ))
         .map(({ todo }) => todo);
-      const currentCoordinator = taskLanes.find((lane) => lane.id === coordinatorTaskId) ?? null;
+      const domainCoordinators = configured.coordinationDomains.map((domain) => {
+        const domainLease = configured.domainCoordinatorLeases[domain.id] ?? null;
+        const active = domainLease?.bindingValid === true
+          && !domainLease.releasedAt
+          && Date.parse(domainLease.acquiredAt) <= generatedAt.getTime()
+          && generatedAt.getTime() < Date.parse(domainLease.expiresAt);
+        const domainCoordinatorTaskId = active ? domainLease.holderTaskId : null;
+        const domainCoordinator = taskLanes.find((lane) => lane.id === domainCoordinatorTaskId) ?? null;
+        return {
+          domainId: domain.id,
+          label: domain.label,
+          writeScope: domain.writeScope,
+          eligibleTaskIds: domain.eligibleTaskIds,
+          coordinatorTaskId: domainCoordinatorTaskId,
+          coordinatorStableIdentity: domainCoordinator?.stableIdentity ?? null,
+          assignment: active ? "lease" : "unassigned",
+          replaceable: true,
+          lease: domainLease ? {
+            id: domainLease.id,
+            holderTaskId: domainLease.holderTaskId,
+            bindingValid: domainLease.bindingValid === true,
+            status: active ? "active" : "expired",
+            acquiredAt: domainLease.acquiredAt,
+            expiresAt: domainLease.expiresAt,
+            releasedAt: domainLease.releasedAt ?? null,
+          } : null,
+        };
+      });
+      const ownerRootTaskId = configured.ownerRootTaskId ?? coordinatorTaskId;
+      const currentOwnerRoot = taskLanes.find((lane) => lane.id === ownerRootTaskId) ?? null;
       const coordinatorEpoch = lease
         ? lease.status === "active" ? `lease:${lease.id}` : null
         : `configured:${coordinatorTaskId}`;
       const decisionPriority = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
-      const ownerDecisionRequest = coordinatorEpoch && currentCoordinator?.threadId
+      const explicitOwnerRoute = configured.ownerRootTaskId && currentOwnerRoot?.threadId
+        && currentOwnerRoot.codexHostId && currentOwnerRoot.workspacePath
+        ? {
+            rootTaskId: ownerRootTaskId,
+            rootThreadId: currentOwnerRoot.threadId,
+            codexHostId: currentOwnerRoot.codexHostId,
+            rootWorkspacePath: currentOwnerRoot.workspacePath,
+          }
+        : null;
+      const ownerDecisionRequest = coordinatorEpoch && currentOwnerRoot?.threadId
         ? todos
           .filter((todo) => (
             todo.readyWork?.approvalRequest?.requestId
             && todo.readyWork.safeActions.length === 0
             && todo.readyWork.reasonCodes.length === 1
             && todo.readyWork.reasonCodes[0] === "AUTHORIZATION_REQUIRED"
-            && todo.dispatchTarget?.rootThreadId === currentCoordinator.threadId
+            && (explicitOwnerRoute || todo.dispatchTarget?.rootThreadId === currentCoordinator?.threadId)
           ))
           .sort((left, right) => (
             (decisionPriority[left.priority] ?? 9) - (decisionPriority[right.priority] ?? 9)
@@ -812,7 +1152,7 @@ export function createAgentLaneSnapshotProvider({
             identifier: todo.id,
             priority: todo.priority,
             coordinatorEpoch,
-            route: {
+            route: explicitOwnerRoute ?? {
               rootTaskId: coordinatorTaskId,
               rootThreadId: currentCoordinator.threadId,
               codexHostId: todo.dispatchTarget.codexHostId,
@@ -820,6 +1160,88 @@ export function createAgentLaneSnapshotProvider({
             },
           }))[0] ?? null
         : null;
+      const pendingIntent = getPendingOwnerIntent
+        ? await getPendingOwnerIntent(projectId)
+        : null;
+      const pendingOwnerIntent = pendingIntent
+        && coordinatorEpoch
+        && currentCoordinator?.threadId
+        && currentCoordinator.codexHostId
+        && currentCoordinator.workspacePath
+        ? {
+            ...pendingIntent,
+            projectId,
+            goal: compact(pendingIntent.goal, 360),
+            constraints: Array.isArray(pendingIntent.constraints)
+              ? pendingIntent.constraints.map((item) => compact(item, 240)).filter(Boolean)
+              : [],
+            coordinatorEpoch,
+            route: {
+              coordinatorTaskId,
+              coordinatorThreadId: currentCoordinator.threadId,
+              codexHostId: currentCoordinator.codexHostId,
+              coordinatorWorkspacePath: currentCoordinator.workspacePath,
+            },
+          }
+        : null;
+      const pendingPlanIntent = getPendingOwnerIntentPlan
+        ? await getPendingOwnerIntentPlan(projectId)
+        : null;
+      const pendingOwnerIntentPlan = pendingPlanIntent
+        && coordinatorEpoch
+        && currentCoordinator?.threadId
+        && currentCoordinator.codexHostId
+        && currentCoordinator.workspacePath
+        && pendingPlanIntent.adoptionReceipt?.coordinatorEpoch === coordinatorEpoch
+        ? {
+            ...pendingPlanIntent,
+            projectId,
+            goal: compact(pendingPlanIntent.goal, 360),
+            constraints: Array.isArray(pendingPlanIntent.constraints)
+              ? pendingPlanIntent.constraints.map((item) => compact(item, 240)).filter(Boolean)
+              : [],
+            route: {
+              coordinatorTaskId,
+              coordinatorThreadId: currentCoordinator.threadId,
+              codexHostId: currentCoordinator.codexHostId,
+              coordinatorWorkspacePath: currentCoordinator.workspacePath,
+            },
+          }
+        : null;
+      const pendingCrossDomainHandoff = todos
+        .flatMap((todo) => (todo.dependencyClearances ?? []).map((clearance) => ({ todo, clearance })))
+        .filter(({ todo, clearance }) => (
+          clearance.status === "awaiting_handoff"
+          && clearance.sourceStatus === "done"
+          && clearance.targetReady === true
+          && clearance.delivery?.state !== "delivered"
+          && clearance.targetHolderThreadId === todo.dispatchTarget?.rootThreadId
+          && todo.dispatchTarget?.codexHostId
+          && todo.dispatchTarget?.rootWorkspacePath
+        ))
+        .sort((left, right) => (
+          (decisionPriority[left.todo.priority] ?? 9) - (decisionPriority[right.todo.priority] ?? 9)
+          || left.clearance.edgeCreatedAt.localeCompare(right.clearance.edgeCreatedAt)
+          || left.clearance.sourceTaskId.localeCompare(right.clearance.sourceTaskId)
+          || left.clearance.targetTaskId.localeCompare(right.clearance.targetTaskId)
+        ))
+        .map(({ todo, clearance }) => ({
+          projectId,
+          sourceTaskId: clearance.sourceTaskId,
+          sourceIdentifier: clearance.sourceIdentifier,
+          targetTaskId: clearance.targetTaskId,
+          targetIdentifier: todo.id,
+          fingerprint: clearance.fingerprint,
+          sourceDomainId: clearance.sourceDomainId,
+          targetDomainId: clearance.targetDomainId,
+          expectedTargetDomainLeaseId: clearance.targetDomainLeaseId,
+          targetHolderTaskId: clearance.targetHolderTaskId,
+          route: {
+            targetThreadId: clearance.targetHolderThreadId,
+            codexHostId: todo.dispatchTarget.codexHostId,
+            targetWorkspacePath: todo.dispatchTarget.rootWorkspacePath,
+          },
+        }))[0] ?? null;
       return {
         version: AGENT_LANE_SNAPSHOT_VERSION,
         projectId,
@@ -832,6 +1254,9 @@ export function createAgentLaneSnapshotProvider({
             : "peer_windows_with_configured_coordinator",
           coordinatorTaskId,
           coordinatorStableIdentity: currentCoordinator?.stableIdentity ?? null,
+          ownerRootTaskId,
+          ownerRootStableIdentity: currentOwnerRoot?.stableIdentity ?? null,
+          ownerRootRoute: explicitOwnerRoute,
           assignment: lease ? lease.status === "active" ? "lease" : "unassigned" : "configured",
           replaceable: Boolean(lease),
           scope: "project",
@@ -841,7 +1266,11 @@ export function createAgentLaneSnapshotProvider({
           stateAuthority: "self_learning_checkpoint",
           workAuthority: "todo_claim_lease",
           runtimeOwnership: "single_writer",
+          domainCoordinators,
+          pendingOwnerIntent,
+          pendingOwnerIntentPlan,
           ownerDecisionRequest,
+          pendingCrossDomainHandoff,
         },
         todos,
         attentionQueue: todos

@@ -78,6 +78,82 @@ test("project list uses the default local service and adds schemaVersion", async
   assert.equal(calls[0].init.headers["x-taskboard-client"], "taskctl");
 });
 
+test("owner-intent list exposes the protected read-only frontier", async () => {
+  let requestUrl;
+  const result = await run(["owner-intent", "list", "taskboard-core", "--json"], async (url, init) => {
+    requestUrl = url.toString();
+    assert.equal(init.method, "GET");
+    return response({ intents: [{ intentId: "intent-1", kind: "append", status: "queued" }] });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestUrl, "http://127.0.0.1:47823/api/local/projects/taskboard-core/owner-intents");
+  assert.equal(result.stdout.intents[0].intentId, "intent-1");
+});
+
+test("coordinator window commands inspect and register the current protected window", async () => {
+  const calls = [];
+  const inspect = await run(["coordinator", "windows", "taskboard-core", "--json"], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return response({ projectId: "taskboard-core", revision: "a".repeat(64), windows: [] });
+  });
+  assert.equal(inspect.exitCode, 0, JSON.stringify(inspect.stderr));
+  assert.equal(calls[0].url, "http://127.0.0.1:47823/api/local/projects/taskboard-core/coordination-windows");
+  assert.equal(calls[0].init.method, "GET");
+
+  const register = await run([
+    "coordinator", "register-window", "taskboard-core",
+    "--role", "owner_root", "--task", "owner-root", "--label", "Owner conversation",
+    "--thread-id", "thread-current", "--expected-revision", "b".repeat(64),
+    "--idempotency-key", "owner-root-window-1", "--json",
+  ], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(register.exitCode, 0, JSON.stringify(register.stderr));
+  assert.equal(calls[1].url, "http://127.0.0.1:47823/api/local/projects/taskboard-core/coordination-windows");
+  assert.equal(calls[1].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    role: "owner_root", taskId: "owner-root", label: "Owner conversation",
+    threadId: "thread-current", expectedRevision: "b".repeat(64),
+    idempotencyKey: "owner-root-window-1",
+  });
+});
+
+test("owner-intent list uses only the loopback companion and rejects a remote-only origin", async () => {
+  const calls = [];
+  const result = await run(
+    ["owner-intent", "list", "taskboard-core", "--json"],
+    async (url) => {
+      calls.push(url.toString());
+      return response({ intents: [] });
+    },
+    {
+      env: {
+        CODEX_TASKBOARD_URL: "https://tasks.example.test",
+        CODEX_TASKBOARD_COMPANION_URL: "http://127.0.0.1:51550/runtime-token-1234",
+      },
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/taskboard-core/owner-intents",
+  ]);
+
+  let remoteFetches = 0;
+  const rejected = await run(
+    ["owner-intent", "list", "taskboard-core", "--json"],
+    async () => {
+      remoteFetches += 1;
+      return response({ intents: [] });
+    },
+    { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } },
+  );
+  assert.equal(rejected.exitCode, 2);
+  assert.equal(rejected.stderr.error.code, "USAGE_ERROR");
+  assert.match(rejected.stderr.error.message, /loopback/);
+  assert.equal(remoteFetches, 0);
+});
+
 test("standing authority CLI normalizes a narrow grant and supports list and revoke", async () => {
   const calls = [];
   const fetchImplementation = async (url, init) => {
@@ -195,6 +271,218 @@ test("coordinator CLI rejects unsafe duration and incomplete lease identity befo
   assert.equal(invalidDuration.exitCode, 2);
   assert.equal(missingLease.exitCode, 2);
   assert.equal(called, false);
+});
+
+test("domain coordinator CLI acquires two-operand scoped leases without changing Global Coordinator commands", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({
+        coordination: {
+          coordinatorTaskId: "global",
+          domainCoordinators: [{ domainId: "frontend", coordinatorTaskId: "frontend", assignment: "lease" }],
+        },
+      });
+    }
+    if (url.pathname.endsWith("/receipts")) return response({ receipts: [] });
+    return response({ lease: { id: "domain-lease", status: "active" }, receipt: { action: "acquired" } });
+  };
+
+  const status = await run(["domain-coordinator", "status", "personal", "frontend"], fetchImplementation);
+  const acquired = await run([
+    "domain-coordinator", "acquire", "personal", "frontend",
+    "--holder-task", "frontend", "--holder-thread-id", "frontend-thread",
+    "--expected-lease-id", "none", "--lease-seconds", "60",
+  ], fetchImplementation);
+  const released = await run([
+    "domain-coordinator", "release", "personal", "frontend",
+    "--holder-task", "frontend", "--holder-thread-id", "frontend-thread",
+    "--expected-lease-id", "domain-lease",
+  ], fetchImplementation);
+  const receipts = await run(["domain-coordinator", "receipts", "personal", "frontend"], fetchImplementation);
+
+  for (const result of [status, acquired, released, receipts]) assert.equal(result.exitCode, 0);
+  assert.equal(status.stdout.domainCoordinator.domainId, "frontend");
+  assert.deepEqual(calls, [
+    { pathname: "/api/local/projects/personal/agent-lanes", method: "GET", body: null },
+    {
+      pathname: "/api/local/projects/personal/domain-coordinator-leases/frontend", method: "POST",
+      body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: null, leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/personal/domain-coordinator-leases/frontend/release", method: "POST",
+      body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: "domain-lease" },
+    },
+    { pathname: "/api/local/projects/personal/domain-coordinator-leases/frontend/receipts", method: "GET", body: null },
+  ]);
+});
+
+test("domain coordinator CLI configures and removes durable routing domains", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    return response({ projectId: "personal", revision: "b".repeat(64), domains: [] });
+  };
+  const listed = await run(["domain-coordinator", "domains", "personal"], fetchImplementation);
+  const configured = await run([
+    "domain-coordinator", "configure", "personal", "frontend",
+    "--label", "Frontend", "--write-scope", "web,shared/ui",
+    "--eligible-task", "frontend-a,frontend-b",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--expected-revision", "a".repeat(64),
+    "--idempotency-key", "configure-frontend-v1",
+  ], fetchImplementation);
+  const removed = await run([
+    "domain-coordinator", "remove", "personal", "frontend",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--expected-revision", "b".repeat(64),
+    "--idempotency-key", "remove-frontend-v1",
+  ], fetchImplementation);
+  for (const result of [listed, configured, removed]) assert.equal(result.exitCode, 0, JSON.stringify(result.stderr));
+  assert.deepEqual(calls, [
+    { pathname: "/api/local/projects/personal/coordination-domains", method: "GET", body: null },
+    {
+      pathname: "/api/local/projects/personal/coordination-domains/frontend", method: "PUT",
+      body: {
+        label: "Frontend", writeScope: ["web", "shared/ui"], eligibleTaskIds: ["frontend-a", "frontend-b"],
+        holderTaskId: "global", holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+        expectedRevision: "a".repeat(64), idempotencyKey: "configure-frontend-v1",
+      },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordination-domains/frontend", method: "DELETE",
+      body: {
+        holderTaskId: "global", holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+        expectedRevision: "b".repeat(64), idempotencyKey: "remove-frontend-v1",
+      },
+    },
+  ]);
+});
+
+test("domain Todo CLI assigns through the exact active Global Coordinator lease", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url, init });
+    return response({ assignment: { taskId: "task-uuid", domainId: "frontend" } });
+  };
+  const result = await run([
+    "domain-todo", "assign", "personal", "CAP-20", "--domain", "frontend",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--if-version", "2",
+  ], fetchImplementation);
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/local/projects/personal/domain-todo-assignments/CAP-20");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    domainId: "frontend", taskVersion: 2, holderTaskId: "global",
+    holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+  });
+});
+
+test("domain Todo CLI clears through the same protected Global Coordinator boundary", async () => {
+  let requestRecord;
+  const result = await run([
+    "domain-todo", "clear", "personal", "CAP-20",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--if-version", "3",
+  ], async (url, init) => {
+    requestRecord = { url, init };
+    return response({ assignment: null, task: { identifier: "CAP-20", version: 4 } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestRecord.init.method, "DELETE");
+  assert.deepEqual(JSON.parse(requestRecord.init.body), {
+    taskVersion: 3, holderTaskId: "global", holderThreadId: "global-thread",
+    expectedCoordinatorLeaseId: "global-lease",
+  });
+});
+
+test("dependency handoff CLI accepts only through the exact target domain route", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    return response({ applied: true, clearance: { status: "accepted" } });
+  };
+  const status = await run([
+    "dependency-handoff", "status", "personal", "CAP-24",
+  ], fetchImplementation);
+  const accepted = await run([
+    "dependency-handoff", "accept", "personal", "CAP-24",
+    "--source", "CAP-20", "--idempotency-key", "handoff-1",
+    "--holder-task", "backend", "--holder-thread-id", "backend-thread",
+    "--expected-lease-id", "backend-lease",
+  ], fetchImplementation);
+  assert.equal(status.exitCode, 0);
+  assert.equal(accepted.exitCode, 0);
+  assert.deepEqual(calls, [
+    {
+      pathname: "/api/local/projects/personal/cross-domain-dependency-clearances/CAP-24",
+      method: "GET", body: null,
+    },
+    {
+      pathname: "/api/local/projects/personal/cross-domain-dependency-clearances/CAP-24",
+      method: "POST",
+      body: {
+        sourceTaskId: "CAP-20", idempotencyKey: "handoff-1",
+        holderTaskId: "backend", holderThreadId: "backend-thread",
+        expectedTargetDomainLeaseId: "backend-lease",
+      },
+    },
+  ]);
+});
+
+test("domain coordination controls and proxied business APIs use the configured loopback companion", async () => {
+  const calls = [];
+  const env = {
+    CODEX_TASKBOARD_URL: "https://tasks.example.test",
+    CODEX_TASKBOARD_COMPANION_URL: "http://127.0.0.1:51550/runtime-token-1234",
+  };
+  const fetchImplementation = async (url) => {
+    calls.push(url.toString());
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({ coordination: { domainCoordinators: [] } });
+    }
+    if (url.pathname.includes("domain-todo-assignments")) return response({ assignment: null });
+    if (url.pathname.includes("cross-domain-dependency-clearances")) return response({ clearances: [] });
+    return response({ task: { identifier: "CAP-20" } });
+  };
+
+  const domain = await run([
+    "domain-coordinator", "status", "personal", "frontend",
+  ], fetchImplementation, { env });
+  const todo = await run([
+    "domain-todo", "status", "personal", "CAP-20",
+  ], fetchImplementation, { env });
+  const handoff = await run([
+    "dependency-handoff", "status", "personal", "CAP-24",
+  ], fetchImplementation, { env });
+  const issue = await run(["issue", "get", "CAP-20"], fetchImplementation, { env });
+
+  for (const result of [domain, todo, handoff, issue]) assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/personal/agent-lanes",
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/personal/domain-todo-assignments/CAP-20",
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/personal/cross-domain-dependency-clearances/CAP-24",
+    "http://127.0.0.1:51550/runtime-token-1234/api/tasks/CAP-20",
+  ]);
+
+  let remoteControlFetches = 0;
+  const rejectedControl = await run([
+    "domain-todo", "status", "personal", "CAP-20",
+  ], async () => {
+    remoteControlFetches += 1;
+    return response({});
+  }, { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } });
+  assert.equal(rejectedControl.exitCode, 2);
+  assert.equal(remoteControlFetches, 0);
+
+  let ordinaryUrl;
+  const ordinaryRemote = await run(["issue", "get", "CAP-20"], async (url) => {
+    ordinaryUrl = url.toString();
+    return response({ task: { identifier: "CAP-20" } });
+  }, { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } });
+  assert.equal(ordinaryRemote.exitCode, 0);
+  assert.equal(ordinaryUrl, "https://tasks.example.test/api/tasks/CAP-20");
 });
 
 test("coordinator CLI repairs a legacy Root binding without caller-supplied host identity", async () => {
@@ -647,8 +935,9 @@ test("Root Sub-Agent claims a real To-Do with durable identity", async () => {
   const calls = [];
   const result = await run([
     "issue", "claim", "TASK-1", "--agent-path", "/root/review",
-    "--thread-id", "agent-thread", "--if-version", "3",
+    "--thread-id", "agent-thread", "--root-thread-id", "root-thread", "--if-version", "3",
     "--lease-minutes", "30", "--write-scope", "server/database.mjs,test/cli.test.mjs",
+    "--admission-receipt-id", "receipt-1", "--admission-attempt-id", "attempt-1",
   ], async (url, init) => {
     calls.push({ url, init });
     return response({ task: { id: "TASK-1", status: "in_progress", version: 4 } });
@@ -661,9 +950,62 @@ test("Root Sub-Agent claims a real To-Do with durable identity", async () => {
   assert.deepEqual({ ...claimBody, leaseExpiresAt: "future" }, {
     agentPath: "/root/review",
     agentThreadId: "agent-thread",
+    rootThreadId: "root-thread",
     leaseExpiresAt: "future",
     writeScope: ["server/database.mjs", "test/cli.test.mjs"],
+    admissionReceiptId: "receipt-1",
+    admissionAttemptId: "attempt-1",
     version: 3,
+  });
+});
+
+test("capacity deferral is bound to one exact durable admission attempt", async () => {
+  let requestBody;
+  const result = await run([
+    "issue", "admission-defer", "TASK-1",
+    "--root-thread-id", "root-thread",
+    "--expected-resume-token", "resume-token",
+    "--safe-action-id", "continue",
+    "--admission-receipt-id", "receipt-1",
+    "--admission-attempt-id", "attempt-1",
+  ], async (url, init) => {
+    assert.equal(url.pathname, "/api/tasks/TASK-1/admission-defer");
+    requestBody = JSON.parse(init.body);
+    return response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    rootThreadId: "root-thread",
+    expectedResumeToken: "resume-token",
+    safeActionId: "continue",
+    admissionReceiptId: "receipt-1",
+    admissionAttemptId: "attempt-1",
+  });
+});
+
+test("admission preparation persists one bounded write scope before spawn", async () => {
+  let requestBody;
+  const result = await run([
+    "issue", "admission-prepare", "TASK-1",
+    "--root-thread-id", "root-thread",
+    "--expected-resume-token", "resume-token",
+    "--safe-action-id", "continue",
+    "--admission-receipt-id", "receipt-1",
+    "--admission-attempt-id", "attempt-1",
+    "--write-scope", "server,test",
+  ], async (url, init) => {
+    assert.equal(url.pathname, "/api/tasks/TASK-1/admission-prepare");
+    requestBody = JSON.parse(init.body);
+    return response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    rootThreadId: "root-thread",
+    expectedResumeToken: "resume-token",
+    safeActionId: "continue",
+    admissionReceiptId: "receipt-1",
+    admissionAttemptId: "attempt-1",
+    writeScope: ["server", "test"],
   });
 });
 

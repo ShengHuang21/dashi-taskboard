@@ -19,14 +19,27 @@ import {
   taskboardAutomationPolicyOperation,
 } from "../shared/taskboard-automation.mjs";
 import {
+  classifyOwnerIntentPlanHttpFailure,
+  deliverTaskboardAdmissionRecovery,
   deliverTaskboardCoordination,
+  deliverTaskboardCrossDomainHandoff,
   deliverTaskboardOwnerDecision,
+  deliverTaskboardOwnerIntent,
   findResidentInjectorPids,
   handleHostBindingPayload,
   reconcileInjectionRuntime,
   restartResidentInjector,
   observeTaskboardOwnerDecision,
+  observeTaskboardOwnerIntentCapture,
+  observeTaskboardOwnerIntentPlan,
   runOwnerDecisionMonitorOnce,
+  runOwnerIntentAdoptionMonitorOnce,
+  runOwnerIntentCaptureMonitorOnce,
+  runOwnerIntentPlanningMonitorOnce,
+  runCoordinatorLeaseKeepaliveMonitorOnce,
+  runCoordinatorLeaseRecoveryMonitorOnce,
+  runCrossDomainHandoffMonitorOnce,
+  runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
 } from "./codex-injector-runtime.mjs";
 import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
@@ -104,6 +117,13 @@ const taskConversationOperations = new Map();
 const taskConversationFailureTtlMs = 120_000;
 const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
 const backgroundContinuationIntervalMs = 15_000;
+const coordinatorLeaseRenewWindowMs = 45_000;
+const coordinatorLeaseDurationSeconds = 120;
+const configuredMaxActiveAgents = (() => {
+  const value = Number(process.env.CODEX_TASKBOARD_MAX_ACTIVE_AGENTS ?? "4");
+  return Number.isSafeInteger(value) && value >= 1 && value <= 64 ? value : 4;
+})();
+const capacityObservationMaxAgeMs = 60_000;
 const quotaPolicyTimers = new Map();
 const quotaPolicyRecords = new Map();
 const quotaPolicyQueues = new Map();
@@ -1682,6 +1702,73 @@ async function readTaskboardAgentLaneSnapshot(projectId) {
   return response.json();
 }
 
+async function renewCoordinatorLease(request) {
+  const suffix = request.scope === "domain"
+    ? `/domain-coordinator-leases/${encodeURIComponent(request.domainId)}/renew`
+    : "/coordinator-lease/renew";
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}${suffix}`;
+  const body = {
+    holderTaskId: request.holderTaskId,
+    holderThreadId: request.holderThreadId,
+    holderCodexHostId: request.codexHostId,
+    holderWorkspacePath: request.workspacePath,
+    expectedLeaseId: request.expectedLeaseId,
+    leaseDurationSeconds: request.leaseDurationSeconds,
+  };
+  const response = await fetch(
+    `${taskboardBaseUrl}${pathname}`,
+    {
+      method: "POST",
+      headers: coordinatorRenewProofHeaders(pathname, body),
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (!response.ok) throw new Error(`Taskboard coordinator lease renewal returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function recoverCoordinatorLease(request) {
+  const suffix = request.scope === "domain"
+    ? `/domain-coordinator-leases/${encodeURIComponent(request.domainId)}/recover`
+    : "/coordinator-lease/recover";
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}${suffix}`;
+  const body = {
+    holderTaskId: request.holderTaskId,
+    holderThreadId: request.holderThreadId,
+    holderCodexHostId: request.codexHostId,
+    holderWorkspacePath: request.workspacePath,
+    expectedLeaseId: request.expectedLeaseId,
+    leaseDurationSeconds: request.leaseDurationSeconds,
+  };
+  const response = await fetch(
+    `${taskboardBaseUrl}${pathname}`,
+    {
+      method: "POST",
+      headers: coordinatorRenewProofHeaders(pathname, body),
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (!response.ok) throw new Error(`Taskboard coordinator lease recovery returned HTTP ${response.status}`);
+  return response.json();
+}
+
+function coordinatorRenewProofHeaders(pathname, body) {
+  const nonce = randomBytes(32).toString("hex");
+  const issuedAt = String(Date.now());
+  return {
+    "content-type": "application/json",
+    "x-codex-taskboard-injector-nonce": nonce,
+    "x-codex-taskboard-injector-issued-at": issuedAt,
+    "x-codex-taskboard-injector-proof": createHmac("sha256", taskboardInstanceSecret)
+      .update(JSON.stringify({ nonce, issuedAt, method: "POST", pathname, body }))
+      .digest("hex"),
+  };
+}
+
 function injectorProofHeaders() {
   const nonce = randomBytes(32).toString("hex");
   return {
@@ -1735,6 +1822,49 @@ async function confirmOwnerDecisionDelivery(request, projectId) {
   return result;
 }
 
+async function claimCrossDomainHandoffDelivery(request, projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/claim`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify(request),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { claimed: false, reason: "stale-route" };
+  if (!response.ok) throw new Error(`Taskboard cross-domain handoff reservation returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.claimed === false && typeof result.reason === "string" && typeof result?.receipt?.id === "string") {
+    return result;
+  }
+  if (result?.claimed !== true || typeof result?.receipt?.id !== "string") {
+    throw new Error("Taskboard returned an invalid cross-domain handoff reservation receipt");
+  }
+  return result;
+}
+
+async function confirmCrossDomainHandoffDelivery(request, projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/confirm`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify(request),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { confirmed: false };
+  if (!response.ok) throw new Error(`Taskboard cross-domain handoff confirmation returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.confirmed !== true || result.deliveryId !== request.deliveryId) {
+    throw new Error("Taskboard returned an invalid cross-domain handoff confirmation receipt");
+  }
+  return result;
+}
+
 async function recordOwnerDecision(request) {
   const response = await fetch(
     `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(request.taskId)}/owner-decisions`,
@@ -1765,7 +1895,175 @@ async function recordOwnerDecision(request) {
   return result;
 }
 
+async function claimOwnerIntentAdoption(request, projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/adoption/claim`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify({
+        coordinatorTaskId: request.route.coordinatorTaskId,
+        coordinatorThreadId: request.route.coordinatorThreadId,
+        coordinatorEpoch: request.coordinatorEpoch,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { claimed: false, reason: "stale-route" };
+  if (!response.ok) throw new Error(`Taskboard Owner Intent reservation returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.claimed !== "boolean"
+    || typeof result?.receipt?.id !== "string"
+    || result?.executionIntent?.intentId !== request.intentId
+    || !Number.isInteger(result.executionIntent.version)
+    || result.executionIntent.version < 1
+    || typeof result.executionIntent.goal !== "string"
+    || !result.executionIntent.goal.trim()
+    || !Array.isArray(result.executionIntent.constraints)
+    || result.executionIntent.constraints.some((item) => typeof item !== "string")) {
+    throw new Error("Taskboard returned an invalid Owner Intent adoption receipt");
+  }
+  return result;
+}
+
+async function listOwnerIntents(projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`,
+    { cache: "no-store", signal: AbortSignal.timeout(5_000) },
+  );
+  if (!response.ok) throw new Error(`Taskboard Owner Intent frontier returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (!Array.isArray(result?.intents)) {
+    throw new Error("Taskboard returned an invalid Owner Intent frontier");
+  }
+  return result.intents;
+}
+
+async function recordOwnerIntentCapture(request, projectId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify(request),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) {
+    const result = await response.json().catch(() => null);
+    if (["HOST_IDENTITY_UNAVAILABLE", "OWNER_ROOT_ROUTE_STALE"].includes(result?.error?.code)) {
+      return { applied: false, reason: "owner-root-host-unavailable" };
+    }
+  }
+  if (!response.ok) throw new Error(`Taskboard Owner Intent capture returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.applied !== "boolean" || typeof result?.intent?.intentId !== "string") {
+    throw new Error("Taskboard returned an invalid Owner Intent capture receipt");
+  }
+  return result;
+}
+
+async function confirmOwnerIntentAdoption(request, projectId, intentId) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(intentId)}/adoption/confirm`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify(request),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { confirmed: false, reason: "stale-route" };
+  if (!response.ok) throw new Error(`Taskboard Owner Intent confirmation returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.confirmed !== "boolean" || result?.receipt?.id !== request.adoptionId) {
+    throw new Error("Taskboard returned an invalid Owner Intent confirmation receipt");
+  }
+  return result;
+}
+
+async function applyOwnerIntentPlan(request, plan, projectId) {
+  const {
+    intentId: markerIntentId,
+    adoptionId: markerAdoptionId,
+    coordinatorEpoch: markerCoordinatorEpoch,
+    ...serverPlan
+  } = plan;
+  if (markerIntentId !== request.intentId
+    || markerAdoptionId !== request.adoptionReceipt.id
+    || markerCoordinatorEpoch !== request.adoptionReceipt.coordinatorEpoch) {
+    return { applied: false, reason: "stale-plan-marker" };
+  }
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-revisions`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify({
+        ...serverPlan,
+        intentVersion: request.version,
+        adoptionId: request.adoptionReceipt.id,
+        coordinatorTaskId: request.route.coordinatorTaskId,
+        coordinatorThreadId: request.route.coordinatorThreadId,
+        coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 400) return {
+    applied: false,
+    reason: classifyOwnerIntentPlanHttpFailure(response.status),
+  };
+  if (response.status === 409) {
+    const payload = await response.json().catch(() => null);
+    return {
+      applied: false,
+      reason: classifyOwnerIntentPlanHttpFailure(response.status, payload?.error?.code),
+    };
+  }
+  if (!response.ok) throw new Error(`Taskboard Owner Intent plan returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.applied !== "boolean" || result?.revision?.id !== plan.revisionId) {
+    throw new Error("Taskboard returned an invalid Owner Intent plan receipt");
+  }
+  return result;
+}
+
+async function scheduleOwnerIntentPlanRetry(request, failure, projectId) {
+  const failureKey = createHash("sha256").update(JSON.stringify({
+    adoptionId: request.adoptionReceipt.id,
+    reason: failure.reason,
+    revisionId: failure.revisionId ?? null,
+  })).digest("hex");
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-retry`,
+    {
+      method: "POST",
+      headers: injectorProofHeaders(),
+      body: JSON.stringify({
+        adoptionId: request.adoptionReceipt.id,
+        coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+        failureKey,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return { applied: false, reason: "stale-plan-retry" };
+  if (!response.ok) throw new Error(`Taskboard Owner Intent plan retry returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.applied !== "boolean" || typeof result?.exhausted !== "boolean") {
+    throw new Error("Taskboard returned an invalid Owner Intent plan retry receipt");
+  }
+  return result;
+}
+
 async function claimBackgroundContinuationReceipt(claim) {
+  const reservationLeaseId = randomUUID();
   const response = await fetch(
     `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`,
     {
@@ -1775,6 +2073,7 @@ async function claimBackgroundContinuationReceipt(claim) {
         rootThreadId: claim.rootThreadId,
         expectedResumeToken: claim.expectedResumeToken,
         safeActionId: claim.safeActionId,
+        reservationLeaseId,
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -1785,16 +2084,32 @@ async function claimBackgroundContinuationReceipt(claim) {
     throw new Error(`Taskboard bootstrap reservation returned HTTP ${response.status}`);
   }
   const result = await response.json();
+  const recovering = result?.recovering === true;
   if (
     result?.receipt?.taskId !== claim.taskId
-    || result.receipt.rootThreadId !== claim.rootThreadId
-    || result.receipt.resumeToken !== claim.expectedResumeToken
     || result.receipt.safeActionId !== claim.safeActionId
+    || typeof result.receipt.admissionAttemptId !== "string"
+    || !result.receipt.admissionAttemptId
     || typeof result.reused !== "boolean"
+    || typeof result.available !== "boolean"
+    || typeof result.completed !== "boolean"
+    || (!recovering && result.receipt.rootThreadId !== claim.rootThreadId)
+    || (!recovering && result.receipt.resumeToken !== claim.expectedResumeToken)
+    || (!recovering && result.available === true && result.receipt.reservationLeaseId !== reservationLeaseId)
+    || (recovering && result.available === true && (
+      result.recoveryLeaseId !== reservationLeaseId
+      || result.recoveryRoute?.rootThreadId !== result.receipt.rootThreadId
+      || result.recoveryRoute?.codexHostId !== result.receipt.rootHostId
+      || result.recoveryRoute?.rootWorkspacePath !== result.receipt.rootWorkspacePath
+      || result.recoveryRoute?.worktreePath !== result.receipt.worktreePath
+      || result.recoveryRoute?.branch !== result.receipt.worktreeBranch
+      || result.executionIdentity?.worktreePath !== result.receipt.worktreePath
+      || result.executionIdentity?.branch !== result.receipt.worktreeBranch
+    ))
   ) {
     throw new Error("Taskboard returned an invalid bootstrap reservation receipt");
   }
-  return result.reused === false;
+  return result;
 }
 
 async function confirmBackgroundContinuationDelivery(claim) {
@@ -1807,6 +2122,7 @@ async function confirmBackgroundContinuationDelivery(claim) {
         rootThreadId: claim.rootThreadId,
         expectedResumeToken: claim.expectedResumeToken,
         safeActionId: claim.safeActionId,
+        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
       }),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -1823,6 +2139,68 @@ async function confirmBackgroundContinuationDelivery(claim) {
     throw new Error("Taskboard returned an invalid bootstrap delivery receipt");
   }
   return result.executionIdentity;
+}
+
+async function completeBackgroundContinuationDelivery(claim, delivery) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-complete`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootThreadId: claim.rootThreadId,
+        expectedResumeToken: claim.expectedResumeToken,
+        safeActionId: claim.safeActionId,
+        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+        recoveryLeaseId: claim.recoveryLeaseId,
+        deliveryTurnId: delivery?.turnId,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return null;
+  if (!response.ok) throw new Error(`Taskboard bootstrap completion returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.completed !== true && result?.awaitingAdmission !== true) {
+    throw new Error("Taskboard did not return an admission-aware bootstrap completion receipt");
+  }
+  if (
+    result?.receipt?.taskId !== claim.taskId
+    || result.receipt.reservationLeaseId !== claim.deliveryReceipt.reservationLeaseId
+    || result.receipt.admissionAttemptId !== claim.deliveryReceipt.admissionAttemptId
+    || result.receipt.deliveryTurnId !== delivery?.turnId) {
+    throw new Error("Taskboard returned an invalid bootstrap completion receipt");
+  }
+  return result;
+}
+
+async function mutateBackgroundAdmission(claim, action) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/admission-${action}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", ...injectorProofHeaders() },
+      body: JSON.stringify({
+        rootThreadId: claim.rootThreadId,
+        expectedResumeToken: claim.expectedResumeToken,
+        safeActionId: claim.safeActionId,
+        admissionReceiptId: claim.admissionReceiptId,
+        admissionAttemptId: claim.admissionAttemptId,
+        ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return null;
+  if (!response.ok) throw new Error(`Taskboard admission ${action} returned HTTP ${response.status}`);
+  const result = await response.json();
+  if (result?.receipt?.id !== claim.admissionReceiptId
+    || result.receipt.admissionAttemptId !== claim.admissionAttemptId) {
+    throw new Error(`Taskboard returned an invalid admission ${action} receipt`);
+  }
+  return result;
 }
 
 function assertResolvedTargetInsideWorktree(worktreePath, resolvedTarget, message) {
@@ -1931,55 +2309,191 @@ async function runBackgroundContinuationMonitor(cdp) {
     .filter(Boolean)
     .sort();
   for (const projectId of projects) {
-    await runTaskboardContinuationMonitorOnce({
-      policy: { enabled: true, projectId },
-      readSnapshot: readTaskboardAgentLaneSnapshot,
-      claimReceipt: claimBackgroundContinuationReceipt,
-      confirmDelivery: confirmBackgroundContinuationDelivery,
-      deliver: (request) => deliverTaskboardCoordination(
-        request,
-        (method, params) => requestCodexAppServerViaCdp(
+    await runTaskboardProjectMonitorSequence([
+      () => runCoordinatorLeaseKeepaliveMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          renewWindowMs: coordinatorLeaseRenewWindowMs,
+          leaseDurationSeconds: coordinatorLeaseDurationSeconds,
+        },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        readThread: (route) => requestCodexAppServerViaCdp(
           cdp,
           undefined,
-          request.codexHostId,
-          method,
-          params,
+          route.codexHostId,
+          "thread/read",
+          { threadId: route.threadId, includeTurns: true },
           10_000,
         ),
-        validateGitExecutionTarget,
-      ),
-    });
-    await runOwnerDecisionMonitorOnce({
-      policy: { enabled: true, projectId },
-      readSnapshot: readTaskboardAgentLaneSnapshot,
-      claimDelivery: (request) => claimOwnerDecisionDelivery(request, projectId),
-      confirmDelivery: (request) => confirmOwnerDecisionDelivery(request, projectId),
-      deliver: (request, options) => deliverTaskboardOwnerDecision(
-        request,
-        (method, params) => requestCodexAppServerViaCdp(
+        renewLease: renewCoordinatorLease,
+      }),
+      () => runCoordinatorLeaseRecoveryMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          leaseDurationSeconds: coordinatorLeaseDurationSeconds,
+        },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        readThread: (route) => requestCodexAppServerViaCdp(
           cdp,
           undefined,
-          request.route.codexHostId,
-          method,
-          params,
+          route.codexHostId,
+          "thread/read",
+          { threadId: route.threadId, includeTurns: true },
           10_000,
         ),
-        options,
-      ),
-      observeDecision: (request, receipt) => observeTaskboardOwnerDecision(
-        request,
-        receipt,
-        (method, params) => requestCodexAppServerViaCdp(
-          cdp,
-          undefined,
-          request.route.codexHostId,
-          method,
-          params,
-          10_000,
+        recoverLease: recoverCoordinatorLease,
+      }),
+      () => runOwnerIntentCaptureMonitorOnce({
+        policy: { enabled: true, projectId },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        listIntents: () => listOwnerIntents(projectId),
+        observeCapture: (request) => observeTaskboardOwnerIntentCapture(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.route.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
         ),
-      ),
-      recordDecision: recordOwnerDecision,
-    });
+        recordCapture: (request) => recordOwnerIntentCapture(request, projectId),
+      }),
+      () => runOwnerIntentPlanningMonitorOnce({
+        policy: { enabled: true, projectId },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        observePlan: (request) => observeTaskboardOwnerIntentPlan(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.route.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+        ),
+        applyPlan: (request, plan) => applyOwnerIntentPlan(request, plan, projectId),
+        scheduleRetry: (request, failure) => scheduleOwnerIntentPlanRetry(
+          request,
+          failure,
+          projectId,
+        ),
+      }),
+      () => runOwnerIntentAdoptionMonitorOnce({
+        policy: { enabled: true, projectId },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        claimAdoption: (request) => claimOwnerIntentAdoption(request, projectId),
+        confirmAdoption: (request, intentId) => confirmOwnerIntentAdoption(
+          request,
+          projectId,
+          intentId,
+        ),
+        deliver: (request, options) => deliverTaskboardOwnerIntent(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.route.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+          options,
+        ),
+      }),
+      () => runCrossDomainHandoffMonitorOnce({
+        policy: { enabled: true, projectId },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        claimDelivery: (request) => claimCrossDomainHandoffDelivery(request, projectId),
+        confirmDelivery: (request) => confirmCrossDomainHandoffDelivery(request, projectId),
+        deliver: (request, options) => deliverTaskboardCrossDomainHandoff(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.route.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+          options,
+        ),
+      }),
+      () => runTaskboardContinuationMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          maxActiveAgents: configuredMaxActiveAgents,
+          capacityObservationMaxAgeMs,
+        },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        claimReceipt: claimBackgroundContinuationReceipt,
+        confirmDelivery: confirmBackgroundContinuationDelivery,
+        completeDelivery: completeBackgroundContinuationDelivery,
+        deferAdmission: (request) => mutateBackgroundAdmission(request, "defer"),
+        markAdmissionUncertain: (request) => mutateBackgroundAdmission(request, "uncertain"),
+        claimAdmissionProbe: (request) => mutateBackgroundAdmission(request, "probe"),
+        reconcileAdmission: (request) => mutateBackgroundAdmission(request, "reconcile"),
+        deliverAdmissionRecovery: (request) => deliverTaskboardAdmissionRecovery(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+        ),
+        deliver: (request) => deliverTaskboardCoordination(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+          validateGitExecutionTarget,
+        ),
+      }),
+      () => runOwnerDecisionMonitorOnce({
+        policy: { enabled: true, projectId },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        claimDelivery: (request) => claimOwnerDecisionDelivery(request, projectId),
+        confirmDelivery: (request) => confirmOwnerDecisionDelivery(request, projectId),
+        deliver: (request, options) => deliverTaskboardOwnerDecision(
+          request,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.route.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+          options,
+        ),
+        observeDecision: (request, receipt) => observeTaskboardOwnerDecision(
+          request,
+          receipt,
+          (method, params) => requestCodexAppServerViaCdp(
+            cdp,
+            undefined,
+            request.route.codexHostId,
+            method,
+            params,
+            10_000,
+          ),
+        ),
+        recordDecision: recordOwnerDecision,
+      }),
+    ]);
   }
 }
 
