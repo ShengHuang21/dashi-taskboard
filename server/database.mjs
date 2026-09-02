@@ -242,6 +242,28 @@ function coordinationWindowConfiguration(projectId, row) {
   };
 }
 
+function isValidCoordinatorProvisioningOwnerRoot(task) {
+  const nonBlankString = (value) => typeof value === "string" && value.trim().length > 0;
+  const connection = task?.connection ?? (task?.source === "codex" ? "connected" : null);
+  return Boolean(
+    task
+    && nonBlankString(task.id)
+    && nonBlankString(task.label)
+    && nonBlankString(task.owner)
+    && task.source === "codex"
+    && connection === "connected"
+    && task.taskType === "root_task"
+    && nonBlankString(task.threadId)
+    && nonBlankString(task.codexProjectId)
+    && ["local", "remote"].includes(task.codexProjectKind)
+    && nonBlankString(task.codexHostId)
+    && ((task.codexProjectKind === "local" && task.codexHostId === "local")
+      || (task.codexProjectKind === "remote" && task.codexHostId !== "local"))
+    && typeof task.workspacePath === "string"
+    && path.isAbsolute(task.workspacePath)
+  );
+}
+
 function modelCapacityRetryDelay(retryCount) {
   return Math.min(
     MODEL_CAPACITY_RETRY_MAX_MS,
@@ -3479,6 +3501,21 @@ export class TaskboardDatabase {
     return coordinationWindowConfiguration(projectId, row);
   }
 
+  getAgentLaneCoordinatorProvisioningPreflight(projectId) {
+    const configuration = this.getAgentLaneCoordinationWindows(projectId);
+    const normalized = this.getAgentLaneProject(projectId);
+    const ownerRoot = normalized?.tasks?.find(
+      (task) => task?.id === normalized.ownerRootTaskId,
+    ) ?? null;
+    return {
+      ...configuration,
+      coordinatorLease: normalized?.coordinatorLease ?? null,
+      ownerRootValid: isValidCoordinatorProvisioningOwnerRoot(ownerRoot),
+      durableWorkPending: this.hasAgentLaneCoordinatorDurableWork(projectId),
+      shutdownAttempt: this.getAgentLaneCoordinatorShutdownAttempt(projectId),
+    };
+  }
+
   getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey) {
     const row = idempotencyKey
       ? this.#prepare(`
@@ -3554,9 +3591,7 @@ export class TaskboardDatabase {
       const tasks = Array.isArray(config.tasks) ? config.tasks : [];
       const ownerRoot = tasks.find((task) => task?.id === config.ownerRootTaskId) ?? null;
       const expectedWorkspace = path.resolve(input.workspacePath);
-      if (!ownerRoot
-        || ownerRoot.source !== "codex"
-        || ownerRoot.taskType !== "root_task"
+      if (!isValidCoordinatorProvisioningOwnerRoot(ownerRoot)
         || ownerRoot.id !== input.ownerRootTaskId
         || ownerRoot.threadId !== input.ownerRootThreadId
         || ownerRoot.codexProjectId !== input.codexProjectId

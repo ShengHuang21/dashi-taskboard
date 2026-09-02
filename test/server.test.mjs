@@ -3775,6 +3775,160 @@ test("resident provisioning atomically retires exact stale Coordinator windows",
   assert.equal(replay.body.attempt.id, created.body.attempt.id);
 });
 
+test("protected Coordinator provisioning preflight survives an invalid stale Agent Lane", async () => {
+  const instanceSecret = "f".repeat(64);
+  let databasePath;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        taskType: "root_task", codexProjectId: "codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/sbkk",
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "released-lease", holderTaskId: "retired-coordinator",
+        holderThreadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+        holderCodexHostId: "local", holderWorkspacePath: "/tmp/sbkk",
+        acquiredAt: "2026-09-02T22:50:00.000Z", expiresAt: "2026-09-02T22:55:00.000Z",
+        releasedAt: "2026-09-02T22:55:00.000Z",
+      },
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "Ready replacement work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null,
+      recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const invalidDatabase = new TaskboardDatabase(databasePath);
+  const validConfig = invalidDatabase.getAgentLaneProject("local");
+  invalidDatabase.upsertAgentLaneProject("local", {
+    ...validConfig,
+    tasks: [...validConfig.tasks, {
+      id: "root", label: "Execution Coordinator", source: "codex",
+      connection: "connected", threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      taskType: "root_task", codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/sbkk",
+    }],
+  });
+  invalidDatabase.close();
+
+  const brokenSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(brokenSnapshot.response.status, 404);
+  const pathname = "/api/local/projects/local/coordinator-provisioning-preflight";
+  const unprotected = await request(baseUrl, pathname);
+  assert.equal(unprotected.response.status, 403);
+  const preflight = await request(baseUrl, pathname, {
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "8".repeat(32), pathname, null, Date.now(), "GET",
+    ),
+  });
+  assert.equal(preflight.response.status, 200, JSON.stringify(preflight.body));
+  assert.equal(preflight.body.projectId, "local");
+  assert.equal(preflight.body.ownerRootTaskId, "owner-root");
+  assert.equal(preflight.body.ownerRootValid, true);
+  assert.equal(preflight.body.durableWorkPending, true);
+  assert.equal(preflight.body.coordinatorLease.releasedAt, "2026-09-02T22:55:00.000Z");
+  assert.deepEqual(preflight.body.windows.map((window) => window.taskId), ["owner-root", "root"]);
+
+  const malformedOwnerDatabase = new TaskboardDatabase(databasePath);
+  const malformedConfig = malformedOwnerDatabase.getAgentLaneProject("local");
+  malformedOwnerDatabase.upsertAgentLaneProject("local", {
+    ...malformedConfig,
+    tasks: malformedConfig.tasks.map((task) => (
+      task.id === "owner-root" ? { ...task, owner: "   " } : task
+    )),
+  });
+  malformedOwnerDatabase.close();
+  const invalidOwnerPreflight = await request(baseUrl, pathname, {
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "b".repeat(32), pathname, null, Date.now(), "GET",
+    ),
+  });
+  assert.equal(invalidOwnerPreflight.response.status, 200, JSON.stringify(invalidOwnerPreflight.body));
+  assert.equal(invalidOwnerPreflight.body.ownerRootValid, false);
+  const rejectedPath = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const rejectedBody = {
+    idempotencyKey: "invalid-owner-replacement", taskId: "coordinator-local-next",
+    label: "Taskboard Execution Coordinator", threadSource: "invalid-owner-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: invalidOwnerPreflight.body.revision,
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    retireCoordinatorWindows: [invalidOwnerPreflight.body.windows[1]],
+  };
+  const rejected = await request(baseUrl, rejectedPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "c".repeat(32), rejectedPath, rejectedBody,
+    ),
+    body: rejectedBody,
+  });
+  assert.equal(rejected.response.status, 409);
+  assert.equal(rejected.body.error.code, "COORDINATOR_PROVISIONING_OWNER_ROOT_MISMATCH");
+  const repairOwnerDatabase = new TaskboardDatabase(databasePath);
+  const repairConfig = repairOwnerDatabase.getAgentLaneProject("local");
+  repairOwnerDatabase.upsertAgentLaneProject("local", {
+    ...repairConfig,
+    tasks: repairConfig.tasks.map((task) => (
+      task.id === "owner-root" ? { ...task, owner: "Codex Owner Root" } : task
+    )),
+  });
+  repairOwnerDatabase.close();
+  const repairedPreflight = await request(baseUrl, pathname, {
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "d".repeat(32), pathname, null, Date.now(), "GET",
+    ),
+  });
+  assert.equal(repairedPreflight.body.ownerRootValid, true);
+
+  const provisioningPath = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "invalid-stale-replacement", taskId: "coordinator-local-next",
+    label: "Taskboard Execution Coordinator", threadSource: "invalid-stale-replacement-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: repairedPreflight.body.revision,
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    retireCoordinatorWindows: [repairedPreflight.body.windows[1]],
+  };
+  const created = await request(baseUrl, provisioningPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "9".repeat(32), provisioningPath, body,
+    ),
+    body,
+  });
+  assert.equal(created.response.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.applied, true);
+  const recoveredSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(recoveredSnapshot.response.status, 200, JSON.stringify(recoveredSnapshot.body));
+  assert.equal(recoveredSnapshot.body.coordination.assignment, "unassigned");
+  const lookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
+  const lookup = await request(baseUrl, lookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "a".repeat(32), lookupPath, {},
+    ),
+    body: {},
+  });
+  assert.equal(lookup.response.status, 200, JSON.stringify(lookup.body));
+  assert.equal(lookup.body.attempt.id, created.body.attempt.id);
+});
+
 test("resident shutdown releases and retires one exact idle Coordinator attempt", async () => {
   let databasePath;
   const instanceSecret = "e".repeat(64);

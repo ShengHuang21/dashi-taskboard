@@ -1992,6 +1992,19 @@ async function readCoordinatorProvisioningWindows(projectId) {
   return response.json();
 }
 
+async function readCoordinatorProvisioningPreflight(projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/coordinator-provisioning-preflight`;
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    headers: coordinatorRenewProofHeaders(pathname, null, "GET"),
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Taskboard Coordinator provisioning preflight returned HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
 async function mutateCoordinatorProvisioning(pathname, body) {
   const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
     method: "POST",
@@ -2877,7 +2890,7 @@ async function runBackgroundContinuationMonitor(cdp) {
           model: automationPolicy?.model,
           reasoningEffort: automationPolicy?.reasoningEffort,
         },
-        readSnapshot: () => readTaskboardAgentLaneSnapshot(projectId),
+        readPreflight: () => readCoordinatorProvisioningPreflight(projectId),
         readWindows: () => readCoordinatorProvisioningWindows(projectId),
         readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
         getAttempt: getCoordinatorProvisioningAttempt,

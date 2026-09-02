@@ -3753,6 +3753,24 @@ export function createTaskboardServer(options = {}) {
         });
       }
 
+      const coordinatorProvisioningPreflightRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-provisioning-preflight$/,
+      );
+      if (coordinatorProvisioningPreflightRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/projects/:id/coordinator-provisioning-preflight");
+        const projectId = decodeRouteSegment(coordinatorProvisioningPreflightRoute[1], "Project id");
+        validateProjectId(projectId);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, null, coordinatorRenewNonces,
+        );
+        return sendJson(
+          response,
+          200,
+          database.getAgentLaneCoordinatorProvisioningPreflight(projectId),
+        );
+      }
+
       const coordinatorShutdownLookupRoute = pathname.match(
         /^\/api\/local\/projects\/([^/]+)\/coordinator-shutdown-attempts\/lookup$/,
       );

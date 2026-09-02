@@ -337,10 +337,44 @@ export async function runCoordinatorShutdownMonitorOnce(options) {
 
 async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   const { policy } = options;
-  const [snapshot, windows] = await Promise.all([
-    options.readSnapshot(),
-    options.readWindows(),
-  ]);
+  let snapshot;
+  let windows;
+  if (typeof options.readPreflight === "function") {
+    const preflight = await options.readPreflight();
+    windows = preflight;
+    const ownerRootTaskId = preflight?.ownerRootTaskId;
+    const ownerWindow = Array.isArray(preflight?.windows)
+      ? preflight.windows.find((window) => window?.taskId === ownerRootTaskId) ?? null
+      : null;
+    const lease = preflight?.coordinatorLease ?? null;
+    snapshot = {
+      projectId: preflight?.projectId,
+      coordination: {
+        assignment: lease && !lease.releasedAt ? "lease" : "unassigned",
+        durableWorkPending: preflight?.durableWorkPending,
+        ownerRootTaskId,
+        ownerRootRoute: ownerWindow ? {
+          rootTaskId: ownerRootTaskId,
+          rootThreadId: ownerWindow.threadId,
+          codexHostId: ownerWindow.codexHostId,
+          rootWorkspacePath: ownerWindow.workspacePath,
+        } : null,
+        lease: lease ? {
+          ...lease,
+          status: lease.releasedAt ? "expired" : "active",
+          bindingValid: false,
+        } : null,
+        shutdownAttempt: preflight?.shutdownAttempt ?? null,
+        ownerRootValid: preflight?.ownerRootValid === true,
+      },
+      taskLanes: ownerWindow ? [{ id: ownerRootTaskId, ...ownerWindow }] : [],
+    };
+  } else {
+    [snapshot, windows] = await Promise.all([
+      options.readSnapshot(),
+      options.readWindows(),
+    ]);
+  }
   if (snapshot?.projectId !== policy.projectId
     || windows?.projectId !== policy.projectId
     || !RESUME_TOKEN_PATTERN.test(windows?.revision ?? "")) {
@@ -348,6 +382,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   }
   if (snapshot?.coordination?.durableWorkPending !== true) {
     return { provisioned: false, reason: "no-eligible-work" };
+  }
+  if (snapshot?.coordination?.shutdownAttempt) {
+    return { provisioned: false, reason: "coordinator-shutdown-in-progress" };
   }
   const ownerRootTaskId = snapshot?.coordination?.ownerRootTaskId;
   const ownerRoute = snapshot?.coordination?.ownerRootRoute;
@@ -358,6 +395,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     ? windows.windows.find((window) => window?.taskId === ownerRootTaskId) ?? null
     : null;
   const ownerBindingValid = COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
+    && snapshot?.coordination?.ownerRootValid !== false
     && windows.ownerRootTaskId === ownerRootTaskId
     && ownerRoute?.rootTaskId === ownerRootTaskId
     && THREAD_ID_PATTERN.test(ownerRoute?.rootThreadId ?? "")
@@ -534,8 +572,8 @@ export async function runCoordinatorProvisioningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
-    || typeof options?.readSnapshot !== "function"
-    || typeof options?.readWindows !== "function"
+    || (typeof options?.readPreflight !== "function"
+      && (typeof options?.readSnapshot !== "function" || typeof options?.readWindows !== "function"))
     || typeof options?.requestAttempt !== "function"
     || typeof options?.findThread !== "function"
     || typeof options?.markStarting !== "function"

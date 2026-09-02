@@ -979,6 +979,119 @@ test("Coordinator provisioning retires only protected stale windows and starts o
   assert.equal(starts, 1);
 });
 
+test("Coordinator provisioning reaches protected stale inspection without reading an invalid full snapshot", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const stale = {
+    taskId: "root", label: "Execution Coordinator", role: "coordinator",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexProjectId: "local-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/taskboard",
+  };
+  let attempts = 0;
+  let inspections = 0;
+  let starts = 0;
+  let attempt = null;
+  const result = await runCoordinatorProvisioningMonitorOnce({
+    policy: {
+      enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
+    },
+    readSnapshot: async () => {
+      throw new Error("Taskboard Agent Lanes returned HTTP 404");
+    },
+    readWindows: async () => {
+      throw new Error("the protected preflight already contains the exact window revision");
+    },
+    readPreflight: async () => ({
+      projectId: "capstone-dev", revision: "9".repeat(64), ownerRootTaskId: owner.taskId,
+      coordinatorLease: {
+        id: "released-lease", holderTaskId: "retired-coordinator",
+        holderThreadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+        acquiredAt: "2026-09-02T22:50:00.000Z", expiresAt: "2026-09-02T22:55:00.000Z",
+        releasedAt: "2026-09-02T22:55:00.000Z",
+      },
+      durableWorkPending: true,
+      ownerRootValid: true,
+      shutdownAttempt: null,
+      windows: [{ ...owner, label: "Owner Root", role: "owner_root" }, stale],
+    }),
+    inspectCoordinatorWindow: async (window) => {
+      inspections += 1;
+      return { eligibility: "stale", reason: "missing", window };
+    },
+    getAttempt: async () => ({ attempt: null }),
+    requestAttempt: async (request) => {
+      attempts += 1;
+      assert.deepEqual(request.retireCoordinatorWindows, [stale]);
+      attempt = {
+        ...request, id: "attempt-invalid-stale", status: "pending", threadId: null,
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => null,
+    markStarting: async () => {
+      attempt.status = "starting";
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      starts += 1;
+      return { thread: {
+        id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+        cwd: settings.cwd, threadSource: settings.threadSource,
+      } };
+    },
+    attachThread: async ({ threadId }) => {
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => ({ delivery: "started", turnId: "turn-1" }),
+  });
+
+  assert.equal(result.provisioned, true);
+  assert.equal(inspections, 1);
+  assert.equal(attempts, 1);
+  assert.equal(starts, 1);
+});
+
+test("Coordinator provisioning preflight rejects an invalid Owner Root before stale inspection", async () => {
+  let inspections = 0;
+  let attempts = 0;
+  const result = await runCoordinatorProvisioningMonitorOnce({
+    policy: {
+      enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
+    },
+    readPreflight: async () => ({
+      projectId: "capstone-dev", revision: "8".repeat(64), ownerRootTaskId: "owner-root",
+      ownerRootValid: false, coordinatorLease: null, durableWorkPending: true,
+      shutdownAttempt: null,
+      windows: [{
+        taskId: "owner-root", label: "Owner Root", role: "owner_root",
+        threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+        workspacePath: "/tmp/taskboard",
+      }, {
+        taskId: "root", label: "Execution Coordinator", role: "coordinator",
+        threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+        workspacePath: "/tmp/taskboard",
+      }],
+    }),
+    inspectCoordinatorWindow: async () => { inspections += 1; },
+    requestAttempt: async () => { attempts += 1; },
+    findThread: async () => null,
+    markStarting: async () => null,
+    startThread: async () => null,
+    attachThread: async () => null,
+    deliverInstruction: async () => null,
+  });
+
+  assert.deepEqual(result, { provisioned: false, reason: "owner-root-invalid" });
+  assert.equal(inspections, 0);
+  assert.equal(attempts, 0);
+});
+
 test("Coordinator provisioning recovers the same attempt after stale-window retirement response loss", async () => {
   const owner = {
     taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
@@ -1000,23 +1113,26 @@ test("Coordinator provisioning recovers the same attempt after stale-window reti
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
-    readSnapshot: async () => ({
-      projectId: "capstone-dev",
-      coordination: {
-        assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
-        ownerRootRoute: {
-          rootTaskId: owner.taskId, rootThreadId: owner.threadId,
-          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
-        },
-        lease: null,
-      },
-      taskLanes: [{ id: owner.taskId, ...owner }],
-    }),
-    readWindows: async () => ({
+    readSnapshot: async () => {
+      throw new Error("the invalid full snapshot must not gate response-loss recovery");
+    },
+    readPreflight: async () => ({
       projectId: "capstone-dev", revision: retired ? afterRevision : beforeRevision,
       ownerRootTaskId: owner.taskId,
+      coordinatorLease: {
+        id: "released-lease", holderTaskId: "retired-coordinator",
+        holderThreadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+        acquiredAt: "2026-09-02T22:50:00.000Z", expiresAt: "2026-09-02T22:55:00.000Z",
+        releasedAt: "2026-09-02T22:55:00.000Z",
+      },
+      durableWorkPending: true,
+      ownerRootValid: true,
+      shutdownAttempt: null,
       windows: [{ ...owner, role: "owner_root" }, ...(retired ? [] : [stale])],
     }),
+    readWindows: async () => {
+      throw new Error("the protected preflight already contains the exact window revision");
+    },
     inspectCoordinatorWindow: async () => ({ eligibility: "stale", reason: "archived", window: stale }),
     getAttempt: async ({ idempotencyKey }) => ({
       attempt: idempotencyKey ? null : attempt ? { ...attempt } : null,
