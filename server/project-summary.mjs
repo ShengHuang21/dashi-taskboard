@@ -8,13 +8,29 @@ const STATUS_LABELS = {
   backlog: "积压事项",
   todo: "待办",
   in_progress: "处理中",
-  in_review: "等你确认",
+  in_review: "AI 审查中",
   blocked: "遇到阻碍",
   done: "完成",
   canceled: "取消",
 };
 
+const RETIRED_REVIEW_LABEL = "等你确认";
+const CURRENT_REVIEW_LABEL = "AI 审查中";
+const SUMMARY_CACHE_PREFIX = "TASKBOARD_SUMMARY_V2\n";
+
+function hasCurrentSummaryCache(summary) {
+  return summary.summary?.startsWith(SUMMARY_CACHE_PREFIX) === true;
+}
+
+function visibleProjectSummary(summary) {
+  if (!hasCurrentSummaryCache(summary)) return null;
+  return summary.summary
+    .slice(SUMMARY_CACHE_PREFIX.length)
+    .replaceAll(RETIRED_REVIEW_LABEL, CURRENT_REVIEW_LABEL);
+}
+
 function isDue(summary) {
+  if (summary.summary && !hasCurrentSummaryCache(summary) && !summary.error) return true;
   if (!summary.attemptedAt) return true;
   return Date.now() - new Date(summary.attemptedAt).getTime() >= DAY_MS;
 }
@@ -64,10 +80,11 @@ export class ProjectSummaryService {
     }
     const summary = this.database.getProjectSummary(projectId);
     if (isDue(summary)) void this.refresh(projectId);
+    const visibleSummary = visibleProjectSummary(summary);
     return {
       projectId,
-      summary: summary.summary,
-      updatedAt: summary.generatedAt,
+      summary: visibleSummary,
+      updatedAt: visibleSummary === null ? null : summary.generatedAt,
       refreshing: this.active.has(projectId),
       error: summary.error,
     };
@@ -133,7 +150,10 @@ export class ProjectSummaryService {
         throw new Error(terminalError || `Codex 退出码 ${result.exitCode}`);
       }
       if (!generatedSummary) throw new Error("Codex 没有返回项目总结");
-      this.database.saveProjectSummary(projectId, generatedSummary);
+      this.database.saveProjectSummary(
+        projectId,
+        `${SUMMARY_CACHE_PREFIX}${generatedSummary.replaceAll(RETIRED_REVIEW_LABEL, CURRENT_REVIEW_LABEL)}`,
+      );
     } catch (error) {
       if (!this.closed) {
         this.database.saveProjectSummaryError(
