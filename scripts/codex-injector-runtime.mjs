@@ -869,6 +869,63 @@ export async function runTaskboardProjectMonitorSequence(monitors) {
   return results;
 }
 
+export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+  projectId,
+  listHandshakes,
+  readThread,
+  confirmIdentity,
+}) {
+  if (!COORDINATION_ID_PATTERN.test(projectId ?? "")) {
+    return { confirmed: 0, skipped: 0, failed: 0, reason: "invalid-project" };
+  }
+  const response = await listHandshakes(projectId);
+  const handshakes = Array.isArray(response?.handshakes) ? response.handshakes : [];
+  let confirmed = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const handshake of handshakes) {
+    const expected = handshake?.expectedHostBinding;
+    if (handshake?.role !== "coordinator"
+      || handshake?.registration?.projectId !== projectId
+      || handshake.registration.role !== "coordinator"
+      || handshake.registration.threadId !== handshake.threadId
+      || !THREAD_ID_PATTERN.test(handshake?.threadId ?? "")
+      || typeof expected?.codexProjectId !== "string"
+      || !expected.codexProjectId
+      || !["local", "remote"].includes(expected.codexProjectKind)
+      || !COORDINATION_ID_PATTERN.test(expected.codexHostId ?? "")
+      || typeof expected?.workspacePath !== "string"
+      || !path.isAbsolute(expected.workspacePath)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      const result = await readThread({
+        threadId: handshake.threadId,
+        codexHostId: expected.codexHostId,
+      });
+      const thread = result?.thread;
+      if (thread?.id !== handshake.threadId
+        || typeof thread?.cwd !== "string"
+        || path.resolve(thread.cwd) !== path.resolve(expected.workspacePath)) {
+        skipped += 1;
+        continue;
+      }
+      await confirmIdentity(handshake.id, handshake.registration, {
+        threadId: handshake.threadId,
+        codexProjectId: expected.codexProjectId,
+        codexProjectKind: expected.codexProjectKind,
+        codexHostId: expected.codexHostId,
+        workspacePath: path.resolve(expected.workspacePath),
+      });
+      confirmed += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { confirmed, skipped, failed };
+}
+
 async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
   policy,
   readSnapshot,

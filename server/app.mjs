@@ -395,6 +395,26 @@ function parseCoordinationWindowRegistration(value) {
   };
 }
 
+function parseCoordinationIdentityHandshakeRegistration(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "projectId", "role", "taskId", "label", "threadId", "expectedRevision", "idempotencyKey",
+  ]));
+  const projectId = stringField(value.projectId, "registration.projectId", {
+    required: true, maxLength: 128,
+  });
+  validateProjectId(projectId);
+  const registration = parseCoordinationWindowRegistration({
+    role: value.role,
+    taskId: value.taskId,
+    label: value.label,
+    threadId: value.threadId,
+    expectedRevision: value.expectedRevision,
+    idempotencyKey: value.idempotencyKey,
+  });
+  return { projectId, ...registration };
+}
+
 function parseCoordinatorLeaseRenew(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
@@ -2888,21 +2908,23 @@ export function createTaskboardServer(options = {}) {
   }
   function currentHostThreadIdentity(threadId) {
     if (
-      !hostRuntime
-      || Date.now() - hostRuntime.updatedAt > HOST_RUNTIME_TTL_MS
-      || hostRuntime.threadId !== threadId
-      || !hostRuntime.codexProjectId
-      || !hostRuntime.codexProjectKind
-      || !hostRuntime.codexHostId
-      || !hostRuntime.workspacePath
-    ) return null;
-    return {
-      threadId,
-      codexProjectId: hostRuntime.codexProjectId,
-      codexProjectKind: hostRuntime.codexProjectKind,
-      codexHostId: hostRuntime.codexHostId,
-      workspacePath: hostRuntime.workspacePath,
-    };
+      hostRuntime
+      && Date.now() - hostRuntime.updatedAt <= HOST_RUNTIME_TTL_MS
+      && hostRuntime.threadId === threadId
+      && hostRuntime.codexProjectId
+      && hostRuntime.codexProjectKind
+      && hostRuntime.codexHostId
+      && hostRuntime.workspacePath
+    ) {
+      return {
+        threadId,
+        codexProjectId: hostRuntime.codexProjectId,
+        codexProjectKind: hostRuntime.codexProjectKind,
+        codexHostId: hostRuntime.codexHostId,
+        workspacePath: hostRuntime.workspacePath,
+      };
+    }
+    return null;
   }
   function observedHostThreadIdentity(threadId) {
     const identity = observedHostRuntimes.get(threadId) ?? null;
@@ -3584,13 +3606,19 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "POST") {
           const input = parseCoordinationWindowRegistration(await readJson(request));
-          const threadBinding = currentHostThreadIdentity(input.threadId);
+          let threadBinding = currentHostThreadIdentity(input.threadId);
           if (!threadBinding) {
-            throw new ApiError(
-              409,
-              "HOST_IDENTITY_UNAVAILABLE",
-              "The registered window must be the fresh protected Codex host identity",
+            const priorHandshake = database.getAgentLaneCoordinationIdentityHandshake(
+              projectId, input.idempotencyKey,
             );
+            if (priorHandshake?.status === "completed"
+              && database.hasAgentLaneCoordinationWindowReceipt(projectId, input.idempotencyKey)) {
+              threadBinding = priorHandshake.threadBinding;
+            }
+          }
+          if (!threadBinding) {
+            const handshake = database.requestAgentLaneCoordinationIdentityHandshake(projectId, input);
+            return sendJson(response, 202, { pending: true, handshake });
           }
           return sendJson(response, 200, database.registerAgentLaneCoordinationWindow(
             projectId,
@@ -3599,6 +3627,54 @@ export function createTaskboardServer(options = {}) {
           ));
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const coordinationIdentityHandshakesRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordination-identity-handshakes$/,
+      );
+      if (coordinationIdentityHandshakesRoute) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/projects/:id/coordination-identity-handshakes");
+        const projectId = decodeRouteSegment(coordinationIdentityHandshakesRoute[1], "Project id");
+        validateProjectId(projectId);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, null, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, {
+          handshakes: database.listAgentLaneCoordinationIdentityHandshakes(projectId),
+        });
+      }
+
+      const coordinationIdentityHandshakeConfirmRoute = pathname.match(
+        /^\/api\/local\/coordination-identity-handshakes\/([^/]+)\/confirm$/,
+      );
+      if (coordinationIdentityHandshakeConfirmRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/coordination-identity-handshakes/:id/confirm");
+        const handshakeId = decodeRouteSegment(coordinationIdentityHandshakeConfirmRoute[1], "Handshake id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["registration", "threadBinding"]));
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        const registration = parseCoordinationIdentityHandshakeRegistration(body.registration);
+        const threadBinding = parseThreadBinding(body.threadBinding);
+        if (!threadBinding?.codexProjectId) {
+          throw new ApiError(400, "INVALID_FIELD", "A complete protected thread identity is required");
+        }
+        const handshake = database.confirmAgentLaneCoordinationIdentityHandshake(
+          handshakeId, registration, threadBinding,
+        );
+        const registrationResult = database.registerAgentLaneCoordinationWindow(
+          registration.projectId, registration, threadBinding,
+        );
+        return sendJson(response, 200, {
+          handshake: database.getAgentLaneCoordinationIdentityHandshake(
+            registration.projectId, registration.idempotencyKey,
+          ) ?? handshake,
+          registration: registrationResult,
+        });
       }
 
       const domainCoordinatorLeaseRenewRoute = pathname.match(

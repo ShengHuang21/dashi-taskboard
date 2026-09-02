@@ -119,6 +119,44 @@ test("coordinator window commands inspect and register the current protected win
   });
 });
 
+test("background coordinator registration retries the same protected handshake request", async () => {
+  const calls = [];
+  const result = await run([
+    "coordinator", "register-window", "taskboard-core",
+    "--role", "coordinator", "--task", "background-coordinator", "--label", "Coordinator",
+    "--thread-id", "01a062c1-fd2b-7f61-9114-d483e695640e",
+    "--expected-revision", "c".repeat(64),
+    "--idempotency-key", "background-window-1", "--json",
+  ], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return calls.length === 1
+      ? response({ pending: true, handshake: { id: "handshake-1" } }, 202)
+      : response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(result.exitCode, 0, JSON.stringify(result.stderr));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, calls[1].url);
+  assert.equal(calls[0].init.body, calls[1].init.body);
+  assert.equal(result.stdout.receipt.id, "receipt-1");
+});
+
+test("background coordinator registration fails closed when the protected handshake stays pending", async () => {
+  let calls = 0;
+  const result = await run([
+    "coordinator", "register-window", "taskboard-core",
+    "--role", "coordinator", "--task", "background-coordinator", "--label", "Coordinator",
+    "--thread-id", "01a062c1-fd2b-7f61-9114-d483e695640e",
+    "--expected-revision", "d".repeat(64),
+    "--idempotency-key", "background-window-pending", "--json",
+  ], async () => {
+    calls += 1;
+    return response({ pending: true, handshake: { id: "handshake-1" } }, 202);
+  }, { waitForRetry: async () => {} });
+  assert.equal(calls, 81);
+  assert.equal(result.exitCode, 5);
+  assert.equal(result.stderr.error.code, "HOST_IDENTITY_UNAVAILABLE");
+});
+
 test("owner-intent list uses only the loopback companion and rejects a remote-only origin", async () => {
   const calls = [];
   const result = await run(

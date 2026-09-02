@@ -117,12 +117,12 @@ function signedInjectorHeaders(instanceSecret, nonce) {
   };
 }
 
-function signedCoordinatorRenewHeaders(instanceSecret, nonce, pathname, body, issuedAt = Date.now()) {
+function signedCoordinatorRenewHeaders(instanceSecret, nonce, pathname, body, issuedAt = Date.now(), method = "POST") {
   const timestamp = String(issuedAt);
   const proof = createHmac("sha256", instanceSecret).update(JSON.stringify({
     nonce,
     issuedAt: timestamp,
-    method: "POST",
+    method,
     pathname,
     body,
   })).digest("hex");
@@ -3109,6 +3109,237 @@ test("protected cross-domain clearance binds the exact target coordinator fronti
   const projected = await request(baseUrl, `/api/tasks/${target.identifier}/capsule`);
   assert.equal(projected.response.status, 200);
   assert.ok(!projected.body.capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED"));
+});
+
+test("background Coordinator registration requests a protected host identity handshake without UI focus", async () => {
+  let databasePath;
+  const instanceSecret = "c".repeat(64);
+  const backgroundThreadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/sbkk",
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const before = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const registration = {
+    role: "coordinator",
+    taskId: "background-coordinator",
+    label: "Background Coordinator",
+    threadId: backgroundThreadId,
+    expectedRevision: before.body.revision,
+    idempotencyKey: "background-coordinator-register-v1",
+  };
+
+  const pending = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: registration,
+  });
+
+  assert.equal(pending.response.status, 202, JSON.stringify(pending.body));
+  assert.equal(pending.body.pending, true);
+  assert.equal(pending.body.handshake.threadId, backgroundThreadId);
+  assert.equal(pending.body.handshake.taskId, "background-coordinator");
+  const inspection = new DatabaseSync(databasePath);
+  assert.equal(inspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_identity_handshakes",
+  ).get().count, 1);
+  assert.equal(inspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_window_receipts",
+  ).get().count, 0);
+  inspection.close();
+
+  const replayedPending = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: registration,
+  });
+  assert.equal(replayedPending.response.status, 202);
+  assert.equal(replayedPending.body.handshake.id, pending.body.handshake.id);
+  const conflictingPending = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: { ...registration, label: "Conflicting Coordinator" },
+  });
+  assert.equal(conflictingPending.response.status, 409);
+  assert.equal(conflictingPending.body.error.code, "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT");
+  const leaseBeforeRegistration = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "background-coordinator", holderThreadId: backgroundThreadId,
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(leaseBeforeRegistration.response.status, 409);
+
+  const listPath = "/api/local/projects/local/coordination-identity-handshakes";
+  const listed = await request(baseUrl, listPath, {
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "1".repeat(32), listPath, null, Date.now(), "GET",
+    ),
+  });
+  assert.equal(listed.response.status, 200, JSON.stringify(listed.body));
+  assert.equal(listed.body.handshakes.length, 1);
+  assert.deepEqual(listed.body.handshakes[0].expectedHostBinding, {
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+  });
+  const registrationProof = { projectId: "local", ...registration };
+
+  const confirmPath = `/api/local/coordination-identity-handshakes/${pending.body.handshake.id}/confirm`;
+  const wrongBody = { registration: registrationProof, threadBinding: {
+    threadId: backgroundThreadId, codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/wrong-workspace",
+  } };
+  const wrongConfirmation = await request(baseUrl, confirmPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), confirmPath, wrongBody),
+    body: wrongBody,
+  });
+  assert.equal(wrongConfirmation.response.status, 409);
+  assert.equal(wrongConfirmation.body.error.code, "COORDINATION_IDENTITY_MISMATCH");
+
+  const confirmBody = { registration: registrationProof, threadBinding: {
+    threadId: backgroundThreadId, codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+  } };
+  const unprotected = await request(baseUrl, confirmPath, { method: "POST", body: confirmBody });
+  assert.equal(unprotected.response.status, 403);
+  const staleConfirmation = await request(baseUrl, confirmPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), confirmPath, confirmBody, Date.now() - 31_000,
+    ),
+    body: confirmBody,
+  });
+  assert.equal(staleConfirmation.response.status, 403);
+  for (const [index, conflictingRegistration] of [
+    { ...registrationProof, projectId: "other" },
+    { ...registrationProof, idempotencyKey: "other-key" },
+    { ...registrationProof, taskId: "other-task" },
+    { ...registrationProof, role: "owner_root" },
+    { ...registrationProof, label: "Other payload" },
+  ].entries()) {
+    const conflictingBody = { ...confirmBody, registration: conflictingRegistration };
+    const conflict = await request(baseUrl, confirmPath, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, String(index + 5).repeat(32), confirmPath, conflictingBody,
+      ),
+      body: conflictingBody,
+    });
+    assert.equal(conflict.response.status, 409, JSON.stringify(conflict.body));
+  }
+  const confirmed = await request(baseUrl, confirmPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), confirmPath, confirmBody),
+    body: confirmBody,
+  });
+  assert.equal(confirmed.response.status, 200, JSON.stringify(confirmed.body));
+  assert.equal(confirmed.body.handshake.status, "completed");
+  assert.equal(confirmed.body.registration.applied, true);
+
+  const registered = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: registration,
+  });
+  assert.equal(registered.response.status, 200, JSON.stringify(registered.body));
+  assert.equal(registered.body.applied, false);
+  assert.equal(registered.body.configuration.ownerRootTaskId, "owner-root");
+  assert.equal(registered.body.configuration.windows.length, 2);
+  const replayedRegistration = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: registration,
+  });
+  assert.equal(replayedRegistration.response.status, 200);
+  assert.equal(replayedRegistration.body.applied, false);
+  assert.equal(replayedRegistration.body.receipt.id, registered.body.receipt.id);
+
+  const acquired = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "background-coordinator", holderThreadId: backgroundThreadId,
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(acquired.response.status, 200, JSON.stringify(acquired.body));
+  assert.equal(acquired.body.receipt.action, "acquired");
+  const uncertainAcquireRetry = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "background-coordinator", holderThreadId: backgroundThreadId,
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(uncertainAcquireRetry.response.status, 409);
+  assert.equal(uncertainAcquireRetry.body.error.code, "COORDINATOR_LEASE_CONFLICT");
+
+  const currentWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const expiringRequest = {
+    ...registration, taskId: "expiring-coordinator", threadId: "expiring-thread",
+    expectedRevision: currentWindows.body.revision, idempotencyKey: "expiring-window",
+  };
+  const expiring = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: expiringRequest,
+  });
+  assert.equal(expiring.response.status, 202);
+  const expiryInspection = new DatabaseSync(databasePath);
+  expiryInspection.prepare(`
+    UPDATE agent_coordination_identity_handshakes SET expires_at = ? WHERE id = ?
+  `).run(new Date(Date.now() - 1_000).toISOString(), expiring.body.handshake.id);
+  expiryInspection.close();
+  const afterExpiry = await request(baseUrl, listPath, {
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "a".repeat(32), listPath, null, Date.now(), "GET",
+    ),
+  });
+  assert.equal(afterExpiry.response.status, 200);
+  assert.deepEqual(afterExpiry.body.handshakes, []);
+
+  const drifting = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" },
+    body: { ...expiringRequest, taskId: "drifting-coordinator", threadId: "drifting-thread", idempotencyKey: "drifting-window" },
+  });
+  assert.equal(drifting.response.status, 202);
+  const driftInspection = new DatabaseSync(databasePath);
+  const storedProject = driftInspection.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get();
+  driftInspection.prepare(
+    "UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = 'local'",
+  ).run(JSON.stringify({ ...JSON.parse(storedProject.config_json), handshakeTestDrift: true }), new Date().toISOString());
+  driftInspection.close();
+  const afterDrift = await request(baseUrl, listPath, {
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "b".repeat(32), listPath, null, Date.now(), "GET",
+    ),
+  });
+  assert.equal(afterDrift.response.status, 200);
+  assert.deepEqual(afterDrift.body.handshakes, []);
+  const finalInspection = new DatabaseSync(databasePath);
+  assert.equal(finalInspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_identity_handshakes",
+  ).get().count, 3);
+  assert.deepEqual(finalInspection.prepare(`
+    SELECT status FROM agent_coordination_identity_handshakes ORDER BY created_at, id
+  `).all().map((row) => row.status).sort(), ["canceled", "completed", "expired"]);
+  assert.equal(finalInspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_window_receipts",
+  ).get().count, 1);
+  assert.equal(finalInspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordinator_lease_receipts WHERE action = 'acquired'",
+  ).get().count, 1);
+  finalInspection.close();
 });
 
 test("protected window registration separates Owner Root from a replaceable coordinator", async () => {

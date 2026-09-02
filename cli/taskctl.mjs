@@ -931,6 +931,9 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
   const baseUrl = normalizeBaseUrl(explicitBaseUrl ?? DEFAULT_API_URL);
 
   return {
+    waitForRetry: overrides.waitForRetry ?? ((milliseconds) => (
+      new Promise((resolve) => setTimeout(resolve, milliseconds))
+    )),
     async request(method, pathname, body) {
       let response;
       try {
@@ -1587,7 +1590,7 @@ function mutateCoordinatorLease(api, projectId, options, expectedLeaseId) {
   });
 }
 
-function registerCoordinationWindow(api, projectId, options) {
+async function registerCoordinationWindow(api, projectId, options) {
   const role = requiredOption(options, "role").trim();
   if (role !== "owner_root" && role !== "coordinator") {
     throw usageError("--role must be owner_root or coordinator");
@@ -1596,13 +1599,23 @@ function registerCoordinationWindow(api, projectId, options) {
   if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
     throw usageError("--expected-revision must be a lowercase SHA-256 digest");
   }
-  return api.request("POST", coordinationWindowsPath(projectId), {
+  const body = {
     role,
     taskId: requiredOption(options, "task"),
     label: requiredOption(options, "label"),
     threadId: requiredOption(options, "thread-id"),
     expectedRevision,
     idempotencyKey: requiredOption(options, "idempotency-key"),
+  };
+  const pathname = coordinationWindowsPath(projectId);
+  for (let attempt = 0; attempt < 81; attempt += 1) {
+    const result = await api.request("POST", pathname, body);
+    if (result.pending !== true || role !== "coordinator") return result;
+    if (attempt < 80) await api.waitForRetry(250);
+  }
+  throw new TaskctlError("Protected Coordinator identity handshake did not complete", {
+    code: "HOST_IDENTITY_UNAVAILABLE",
+    exitCode: 5,
   });
 }
 

@@ -21,6 +21,7 @@ import {
   runOwnerIntentAdoptionMonitorOnce,
   runOwnerIntentCaptureMonitorOnce,
   runOwnerIntentPlanningMonitorOnce,
+  runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
@@ -31,6 +32,65 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("background Coordinator identity handshake verifies the exact host thread without changing foreground focus", async () => {
+  const confirmations = [];
+  const result = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "local",
+    listHandshakes: async () => ({ handshakes: [{
+      id: "handshake-1", role: "coordinator", threadId: coordinatorThreadId,
+      registration: {
+        projectId: "local", role: "coordinator", taskId: "coordinator-task",
+        label: "Coordinator", threadId: coordinatorThreadId,
+        expectedRevision: "a".repeat(64), idempotencyKey: "handshake-1",
+      },
+      expectedHostBinding: {
+        codexProjectId: "codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/sbkk",
+      },
+    }] }),
+    readThread: async ({ threadId, codexHostId }) => {
+      assert.equal(threadId, coordinatorThreadId);
+      assert.equal(codexHostId, "local");
+      return { thread: { id: threadId, cwd: "/tmp/sbkk" } };
+    },
+    confirmIdentity: async (handshakeId, registration, binding) => (
+      confirmations.push({ handshakeId, registration, binding })
+    ),
+  });
+  assert.deepEqual(result, { confirmed: 1, skipped: 0, failed: 0 });
+  assert.deepEqual(confirmations, [{
+    handshakeId: "handshake-1",
+    registration: {
+      projectId: "local", role: "coordinator", taskId: "coordinator-task",
+      label: "Coordinator", threadId: coordinatorThreadId,
+      expectedRevision: "a".repeat(64), idempotencyKey: "handshake-1",
+    },
+    binding: {
+    threadId: coordinatorThreadId,
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+  } }]);
+
+  const wrongWorkspace = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "local",
+    listHandshakes: async () => ({ handshakes: [{
+      id: "handshake-2", role: "coordinator", threadId: coordinatorThreadId,
+      registration: {
+        projectId: "local", role: "coordinator", taskId: "coordinator-task",
+        label: "Coordinator", threadId: coordinatorThreadId,
+        expectedRevision: "a".repeat(64), idempotencyKey: "handshake-2",
+      },
+      expectedHostBinding: {
+        codexProjectId: "codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/sbkk",
+      },
+    }] }),
+    readThread: async () => ({ thread: { id: coordinatorThreadId, cwd: "/tmp/other" } }),
+    confirmIdentity: async () => { throw new Error("must not confirm"); },
+  });
+  assert.deepEqual(wrongWorkspace, { confirmed: 0, skipped: 1, failed: 0 });
+});
 
 test("each open generation resolves one fresh Coordinator route and coalesces retries", async () => {
   const coordinatorB = "01a004bd-a749-7b53-81e2-af2d477f93af";

@@ -39,6 +39,7 @@ import {
   runOwnerIntentAdoptionMonitorOnce,
   runOwnerIntentCaptureMonitorOnce,
   runOwnerIntentPlanningMonitorOnce,
+  runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
@@ -1935,7 +1936,7 @@ async function recoverCoordinatorLease(request) {
   return response.json();
 }
 
-function coordinatorRenewProofHeaders(pathname, body) {
+function coordinatorRenewProofHeaders(pathname, body, method = "POST") {
   const nonce = randomBytes(32).toString("hex");
   const issuedAt = String(Date.now());
   return {
@@ -1943,9 +1944,34 @@ function coordinatorRenewProofHeaders(pathname, body) {
     "x-codex-taskboard-injector-nonce": nonce,
     "x-codex-taskboard-injector-issued-at": issuedAt,
     "x-codex-taskboard-injector-proof": createHmac("sha256", taskboardInstanceSecret)
-      .update(JSON.stringify({ nonce, issuedAt, method: "POST", pathname, body }))
+      .update(JSON.stringify({ nonce, issuedAt, method, pathname, body }))
       .digest("hex"),
   };
+}
+
+async function listCoordinatorIdentityHandshakes(projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/coordination-identity-handshakes`;
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    headers: coordinatorRenewProofHeaders(pathname, null, "GET"),
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`Taskboard identity handshakes returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function confirmCoordinatorIdentityHandshake(handshakeId, registration, threadBinding) {
+  const pathname = `/api/local/coordination-identity-handshakes/${encodeURIComponent(handshakeId)}/confirm`;
+  const body = { registration, threadBinding };
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    method: "POST",
+    headers: coordinatorRenewProofHeaders(pathname, body),
+    body: JSON.stringify(body),
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`Taskboard identity handshake confirmation returned HTTP ${response.status}`);
+  return response.json();
 }
 
 function injectorProofHeaders() {
@@ -2489,6 +2515,19 @@ async function runBackgroundContinuationMonitor(cdp) {
     .sort();
   for (const projectId of projects) {
     await runTaskboardProjectMonitorSequence([
+      () => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+        projectId,
+        listHandshakes: listCoordinatorIdentityHandshakes,
+        readThread: (route) => requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          route.codexHostId,
+          "thread/read",
+          { threadId: route.threadId, includeTurns: false },
+          10_000,
+        ),
+        confirmIdentity: confirmCoordinatorIdentityHandshake,
+      }),
       () => runCoordinatorLeaseKeepaliveMonitorOnce({
         policy: {
           enabled: true,

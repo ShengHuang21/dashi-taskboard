@@ -18,6 +18,7 @@ const TASK_SAFE_ACTION_ADMISSION_TTL_MS = 60_000;
 const DATABASE_STATEMENT_CACHE_MAX = 512;
 const MODEL_CAPACITY_RETRY_BASE_MS = 15_000;
 const MODEL_CAPACITY_RETRY_MAX_MS = 5 * 60_000;
+const COORDINATION_IDENTITY_HANDSHAKE_TTL_MS = 2 * 60_000;
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -61,6 +62,46 @@ function coordinationWindowReceiptFromRow(row) {
     configRevision: row.config_revision,
     createdAt: row.created_at,
   };
+}
+
+function coordinationIdentityHandshakeFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    idempotencyKey: row.idempotency_key,
+    role: row.role,
+    taskId: row.task_id,
+    label: row.label,
+    threadId: row.thread_id,
+    expectedRevision: row.expected_revision,
+    status: row.status,
+    registration: {
+      projectId: row.project_id,
+      role: row.role,
+      taskId: row.task_id,
+      label: row.label,
+      threadId: row.thread_id,
+      expectedRevision: row.expected_revision,
+      idempotencyKey: row.idempotency_key,
+    },
+    expectedHostBinding: JSON.parse(row.expected_host_binding_json),
+    threadBinding: row.thread_binding_json ? JSON.parse(row.thread_binding_json) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function coordinationIdentityRequestFingerprint(projectId, input) {
+  return createHash("sha256").update(JSON.stringify({
+    projectId,
+    role: input.role,
+    taskId: input.taskId,
+    label: input.label,
+    threadId: input.threadId,
+    expectedRevision: input.expectedRevision,
+    idempotencyKey: input.idempotencyKey,
+  })).digest("hex");
 }
 
 function coordinationDomainReceiptFromRow(row) {
@@ -1266,6 +1307,28 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS agent_coordination_window_receipts_project_created
         ON agent_coordination_window_receipts(project_id, created_at DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS agent_coordination_identity_handshakes (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        role TEXT NOT NULL CHECK (role = 'coordinator'),
+        task_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        expected_revision TEXT NOT NULL,
+        expected_host_binding_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'completed', 'expired', 'canceled')),
+        thread_binding_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        UNIQUE(project_id, idempotency_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_coordination_identity_handshakes_pending
+        ON agent_coordination_identity_handshakes(project_id, status, created_at, id);
 
       CREATE TABLE IF NOT EXISTS agent_coordination_domain_receipts (
         id TEXT PRIMARY KEY,
@@ -3246,6 +3309,231 @@ export class TaskboardDatabase {
     return coordinationWindowConfiguration(projectId, row);
   }
 
+  requestAgentLaneCoordinationIdentityHandshake(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const requestFingerprint = coordinationIdentityRequestFingerprint(projectId, input);
+      const existing = this.#prepare(`
+        SELECT * FROM agent_coordination_identity_handshakes
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(projectId, input.idempotencyKey);
+      if (existing) {
+        if (existing.request_fingerprint !== requestFingerprint) {
+          throw new ApiError(409, "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT", "The idempotency key is bound to a different coordination window registration");
+        }
+        if (["expired", "canceled"].includes(existing.status)
+          || (["pending", "confirmed"].includes(existing.status)
+            && Date.parse(existing.expires_at) <= Date.now())) {
+          throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake is terminal and cannot be retried");
+        }
+        this.database.exec("COMMIT");
+        return coordinationIdentityHandshakeFromRow(existing);
+      }
+      if (input.role !== "coordinator") {
+        throw new ApiError(409, "HOST_IDENTITY_UNAVAILABLE", "Only a background Coordinator can request a protected host identity handshake");
+      }
+      const revision = agentLaneConfigRevision(row.config_json);
+      if (revision !== input.expectedRevision) {
+        throw new ApiError(409, "COORDINATION_WINDOW_REVISION_CONFLICT", "Agent Lane coordination windows changed since they were read", { actualRevision: revision });
+      }
+      const config = JSON.parse(row.config_json);
+      const ownerRoot = (Array.isArray(config.tasks) ? config.tasks : [])
+        .find((task) => task?.id === config.ownerRootTaskId) ?? null;
+      if (ownerRoot?.source !== "codex"
+        || ownerRoot.taskType !== "root_task"
+        || typeof ownerRoot.threadId !== "string"
+        || !ownerRoot.threadId
+        || typeof ownerRoot.codexProjectId !== "string"
+        || !ownerRoot.codexProjectId
+        || !["local", "remote"].includes(ownerRoot.codexProjectKind)
+        || typeof ownerRoot.codexHostId !== "string"
+        || !ownerRoot.codexHostId
+        || (ownerRoot.codexProjectKind === "local" && ownerRoot.codexHostId !== "local")
+        || (ownerRoot.codexProjectKind === "remote" && ownerRoot.codexHostId === "local")
+        || typeof ownerRoot.workspacePath !== "string"
+        || !path.isAbsolute(ownerRoot.workspacePath)) {
+        throw new ApiError(409, "OWNER_ROOT_HOST_IDENTITY_UNAVAILABLE", "The configured Owner Root does not have an exact protected host identity");
+      }
+      const expectedHostBinding = {
+        codexProjectId: ownerRoot.codexProjectId,
+        codexProjectKind: ownerRoot.codexProjectKind,
+        codexHostId: ownerRoot.codexHostId,
+        workspacePath: path.resolve(ownerRoot.workspacePath),
+      };
+      const timestamp = now();
+      const expiresAt = new Date(Date.parse(timestamp) + COORDINATION_IDENTITY_HANDSHAKE_TTL_MS).toISOString();
+      const handshakeRow = {
+        id: randomUUID(), project_id: projectId, idempotency_key: input.idempotencyKey,
+        request_fingerprint: requestFingerprint, role: input.role, task_id: input.taskId,
+        label: input.label, thread_id: input.threadId, expected_revision: input.expectedRevision,
+        expected_host_binding_json: JSON.stringify(expectedHostBinding), status: "pending",
+        thread_binding_json: null, created_at: timestamp, updated_at: timestamp, expires_at: expiresAt,
+      };
+      this.#prepare(`
+        INSERT INTO agent_coordination_identity_handshakes (
+          id, project_id, idempotency_key, request_fingerprint, role, task_id, label,
+          thread_id, expected_revision, expected_host_binding_json, status,
+          thread_binding_json, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(...Object.values(handshakeRow));
+      this.database.exec("COMMIT");
+      return coordinationIdentityHandshakeFromRow(handshakeRow);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listAgentLaneCoordinationIdentityHandshakes(projectId) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const project = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!project) throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      const timestamp = now();
+      const revision = agentLaneConfigRevision(project.config_json);
+      this.#prepare(`
+        UPDATE agent_coordination_identity_handshakes SET status = 'expired', updated_at = ?
+        WHERE project_id = ? AND status IN ('pending', 'confirmed') AND expires_at <= ?
+      `).run(timestamp, projectId, timestamp);
+      this.#prepare(`
+        UPDATE agent_coordination_identity_handshakes SET status = 'canceled', updated_at = ?
+        WHERE project_id = ? AND status IN ('pending', 'confirmed')
+          AND expires_at > ? AND expected_revision <> ?
+      `).run(timestamp, projectId, timestamp, revision);
+      const rows = this.#prepare(`
+        SELECT handshake.*
+        FROM agent_coordination_identity_handshakes AS handshake
+        LEFT JOIN agent_coordination_window_receipts AS receipt
+          ON receipt.project_id = handshake.project_id
+         AND receipt.idempotency_key = handshake.idempotency_key
+        WHERE handshake.project_id = ?
+          AND handshake.status IN ('pending', 'confirmed')
+          AND handshake.expires_at > ?
+          AND receipt.id IS NULL
+        ORDER BY handshake.created_at, handshake.id
+      `).all(projectId, timestamp);
+      this.database.exec("COMMIT");
+      return rows.map(coordinationIdentityHandshakeFromRow);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getAgentLaneCoordinationIdentityHandshake(projectId, idempotencyKey) {
+    const row = this.#prepare(`
+      SELECT * FROM agent_coordination_identity_handshakes
+      WHERE project_id = ? AND idempotency_key = ?
+    `).get(projectId, idempotencyKey);
+    return row ? coordinationIdentityHandshakeFromRow(row) : null;
+  }
+
+  hasAgentLaneCoordinationWindowReceipt(projectId, idempotencyKey) {
+    return Boolean(this.#prepare(`
+      SELECT 1 FROM agent_coordination_window_receipts
+      WHERE project_id = ? AND idempotency_key = ?
+    `).get(projectId, idempotencyKey));
+  }
+
+  confirmAgentLaneCoordinationIdentityHandshake(handshakeId, registration, threadBinding) {
+    const preliminary = this.#prepare(
+      "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
+    ).get(handshakeId);
+    if (!preliminary) throw new ApiError(404, "COORDINATION_IDENTITY_HANDSHAKE_NOT_FOUND", "The protected identity handshake does not exist");
+    if (preliminary.request_fingerprint !== coordinationIdentityRequestFingerprint(
+      registration.projectId, registration,
+    )) {
+      throw new ApiError(409, "COORDINATION_IDENTITY_REQUEST_MISMATCH", "The authenticated proof does not match the complete original Coordinator registration");
+    }
+    if (preliminary.status === "completed") {
+      const expected = JSON.parse(preliminary.expected_host_binding_json);
+      const binding = {
+        threadId: threadBinding.threadId,
+        codexProjectId: threadBinding.codexProjectId,
+        codexProjectKind: threadBinding.codexProjectKind,
+        codexHostId: threadBinding.codexHostId,
+        workspacePath: path.resolve(threadBinding.workspacePath),
+      };
+      if (binding.threadId !== preliminary.thread_id
+        || binding.codexProjectId !== expected.codexProjectId
+        || binding.codexProjectKind !== expected.codexProjectKind
+        || binding.codexHostId !== expected.codexHostId
+        || binding.workspacePath !== path.resolve(expected.workspacePath)
+        || preliminary.thread_binding_json !== JSON.stringify(binding)) {
+        throw new ApiError(409, "COORDINATION_IDENTITY_MISMATCH", "The authenticated host identity does not match the completed handshake");
+      }
+      return coordinationIdentityHandshakeFromRow(preliminary);
+    }
+    const timestamp = now();
+    if (["expired", "canceled"].includes(preliminary.status)
+      || (["pending", "confirmed"].includes(preliminary.status)
+        && Date.parse(preliminary.expires_at) <= Date.parse(timestamp))) {
+      this.#prepare(`
+        UPDATE agent_coordination_identity_handshakes SET status = 'expired', updated_at = ?
+        WHERE id = ? AND status IN ('pending', 'confirmed')
+      `).run(timestamp, handshakeId);
+      throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake has expired");
+    }
+    const preliminaryProject = this.#prepare(
+      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+    ).get(preliminary.project_id);
+    if (!preliminaryProject
+      || agentLaneConfigRevision(preliminaryProject.config_json) !== preliminary.expected_revision) {
+      this.#prepare(
+        "UPDATE agent_coordination_identity_handshakes SET status = 'canceled', updated_at = ? WHERE id = ?",
+      ).run(timestamp, handshakeId);
+      throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_CANCELED", "The Agent Lane configuration changed before identity confirmation");
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
+      ).get(handshakeId);
+      if (!row) throw new ApiError(404, "COORDINATION_IDENTITY_HANDSHAKE_NOT_FOUND", "The protected identity handshake does not exist");
+      const expected = JSON.parse(row.expected_host_binding_json);
+      const binding = {
+        threadId: threadBinding.threadId,
+        codexProjectId: threadBinding.codexProjectId,
+        codexProjectKind: threadBinding.codexProjectKind,
+        codexHostId: threadBinding.codexHostId,
+        workspacePath: path.resolve(threadBinding.workspacePath),
+      };
+      if (binding.threadId !== row.thread_id
+        || binding.codexProjectId !== expected.codexProjectId
+        || binding.codexProjectKind !== expected.codexProjectKind
+        || binding.codexHostId !== expected.codexHostId
+        || binding.workspacePath !== path.resolve(expected.workspacePath)) {
+        throw new ApiError(409, "COORDINATION_IDENTITY_MISMATCH", "The authenticated host identity does not match the requested thread and configured workspace");
+      }
+      if (row.thread_binding_json && row.thread_binding_json !== JSON.stringify(binding)) {
+        throw new ApiError(409, "COORDINATION_IDENTITY_CONFLICT", "The handshake is already bound to a different protected host identity");
+      }
+      if (row.status === "completed") {
+        this.database.exec("COMMIT");
+        return coordinationIdentityHandshakeFromRow(row);
+      }
+      this.#prepare(`
+        UPDATE agent_coordination_identity_handshakes
+        SET status = 'confirmed', thread_binding_json = ?, updated_at = ? WHERE id = ?
+      `).run(JSON.stringify(binding), timestamp, handshakeId);
+      this.database.exec("COMMIT");
+      return coordinationIdentityHandshakeFromRow({
+        ...row, status: "confirmed", thread_binding_json: JSON.stringify(binding), updated_at: timestamp,
+      });
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   getAgentLaneCoordinationDomains(projectId) {
     const row = this.#prepare(
       "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
@@ -3386,6 +3674,15 @@ export class TaskboardDatabase {
         codexHostId: threadBinding.codexHostId,
         workspacePath: path.resolve(threadBinding.workspacePath),
       };
+      const identityHandshakeRow = this.#prepare(`
+        SELECT * FROM agent_coordination_identity_handshakes
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(projectId, input.idempotencyKey);
+      if (identityHandshakeRow
+        && identityHandshakeRow.request_fingerprint
+          !== coordinationIdentityRequestFingerprint(projectId, input)) {
+        throw new ApiError(409, "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT", "The idempotency key is bound to a different coordination window registration");
+      }
       const fingerprint = createHash("sha256").update(JSON.stringify({
         role: input.role,
         taskId: input.taskId,
@@ -3410,6 +3707,17 @@ export class TaskboardDatabase {
           receipt: coordinationWindowReceiptFromRow(existingReceiptRow),
           configuration: coordinationWindowConfiguration(projectId, row),
         };
+      }
+
+      if (identityHandshakeRow) {
+        if (!identityHandshakeRow.thread_binding_json
+          || identityHandshakeRow.thread_binding_json !== JSON.stringify(binding)) {
+          throw new ApiError(409, "COORDINATION_IDENTITY_MISMATCH", "Window registration must consume the exact protected handshake identity");
+        }
+        if (!["pending", "confirmed"].includes(identityHandshakeRow.status)
+          || Date.parse(identityHandshakeRow.expires_at) <= Date.now()) {
+          throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "Window registration cannot consume a terminal protected identity handshake");
+        }
       }
 
       const revision = agentLaneConfigRevision(row.config_json);
@@ -3562,6 +3870,12 @@ export class TaskboardDatabase {
           task_id, thread_id, config_revision, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(...Object.values(receiptRow));
+      if (identityHandshakeRow) {
+        this.#prepare(`
+          UPDATE agent_coordination_identity_handshakes
+          SET status = 'completed', updated_at = ? WHERE id = ?
+        `).run(timestamp, identityHandshakeRow.id);
+      }
       this.database.exec("COMMIT");
       return {
         applied: true,
