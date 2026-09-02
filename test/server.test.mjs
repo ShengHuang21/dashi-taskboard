@@ -2550,6 +2550,173 @@ test("naturally expired coordinator leases recover the same holders with new epo
   assert.deepEqual(domainReceipts.body.receipts.map((receipt) => receipt.action), ["released", "acquired"]);
 });
 
+test("a fresh host runtime drift makes persisted Global and domain coordinator bindings unusable", async () => {
+  const instanceSecret = "7".repeat(64);
+  const acquiredAt = new Date(Date.now() - 1_000).toISOString();
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  let databasePath;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "coordinator",
+      tasks: [
+        {
+          id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex",
+          threadId: "coordinator-thread", taskType: "root_task",
+          codexProjectId: "sbkk-project", codexProjectKind: "local",
+          codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
+        },
+        {
+          id: "frontend", label: "Frontend", owner: "Codex", source: "codex",
+          threadId: "frontend-thread", taskType: "peer_task",
+          codexProjectId: "sbkk-project", codexProjectKind: "local",
+          codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+        },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "coordinator-lease", holderTaskId: "coordinator",
+        holderThreadId: "coordinator-thread", holderCodexHostId: "host-coordinator",
+        holderWorkspacePath: "/tmp/sbkk", acquiredAt, expiresAt,
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+      domainCoordinatorLeases: {
+        frontend: {
+          id: "frontend-lease", holderTaskId: "frontend", holderThreadId: "frontend-thread",
+          holderCodexHostId: "host-frontend", holderWorkspacePath: "/tmp/sbkk/frontend",
+          acquiredAt, expiresAt, writeScope: ["web"],
+        },
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+
+  const published = await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "7".repeat(32)),
+    body: {
+      threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "market-project", codexProjectKind: "local",
+      codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
+    },
+  });
+  assert.equal(published.response.status, 200);
+
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200);
+  assert.equal(snapshot.body.coordination.lease.bindingValid, false);
+  assert.equal(snapshot.body.coordination.assignment, "unassigned");
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "c".repeat(32)),
+    body: {
+      threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "sbkk-project", codexProjectKind: "remote",
+      codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
+    },
+  });
+  const globalKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(globalKindSnapshot.body.coordination.lease.bindingValid, false);
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "8".repeat(32)),
+    body: {
+      threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "market-project", codexProjectKind: "local",
+      codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+    },
+  });
+  const domainSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(domainSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
+  assert.equal(domainSnapshot.body.coordination.domainCoordinators[0].assignment, "unassigned");
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "d".repeat(32)),
+    body: {
+      threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "sbkk-project", codexProjectKind: "remote",
+      codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+    },
+  });
+  const domainKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(domainKindSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
+    body: {
+      threadId: "unrelated-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "unrelated-project", codexProjectKind: "local",
+      codexHostId: "unrelated-host", workspacePath: "/tmp/unrelated",
+    },
+  });
+  const switchedSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(switchedSnapshot.body.coordination.lease.bindingValid, false);
+  assert.equal(switchedSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
+
+  const inspection = new TaskboardDatabase(databasePath);
+  inspection.upsertAgentLaneProject("local", {
+    ...inspection.getAgentLaneProject("local"),
+    coordinatorLease: null,
+    domainCoordinatorLeases: {},
+  });
+  inspection.close();
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "9".repeat(32)),
+    body: {
+      threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "market-project", codexProjectKind: "local",
+      codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
+    },
+  });
+  const rejected = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "coordinator", holderThreadId: "coordinator-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 60,
+    },
+  });
+  assert.equal(rejected.response.status, 409);
+  assert.equal(rejected.body.error.code, "COORDINATOR_BINDING_MISMATCH");
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
+    body: {
+      threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
+      codexProjectId: "market-project", codexProjectKind: "local",
+      codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+    },
+  });
+  const rejectedDomain = await request(
+    baseUrl,
+    "/api/local/projects/local/domain-coordinator-leases/frontend",
+    {
+      method: "POST",
+      body: {
+        holderTaskId: "frontend", holderThreadId: "frontend-thread",
+        expectedLeaseId: null, leaseDurationSeconds: 60,
+      },
+    },
+  );
+  assert.equal(rejectedDomain.response.status, 409);
+  assert.equal(rejectedDomain.body.error.code, "DOMAIN_COORDINATOR_BINDING_MISMATCH");
+  const receipts = await request(baseUrl, "/api/local/projects/local/coordinator-lease/receipts");
+  assert.deepEqual(receipts.body.receipts, []);
+  const domainReceipts = await request(
+    baseUrl,
+    "/api/local/projects/local/domain-coordinator-leases/frontend/receipts",
+  );
+  assert.deepEqual(domainReceipts.body.receipts, []);
+});
+
 test("legacy unbound coordinator leases fail closed instead of upgrading to a new route", async () => {
   const instanceSecret = "6".repeat(64);
   const expiresAt = new Date(Date.now() + 60_000).toISOString();

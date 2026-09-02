@@ -2868,6 +2868,7 @@ export function createTaskboardServer(options = {}) {
     fetch: options.jiraFetch ?? globalThis.fetch,
   });
   let hostRuntime = null;
+  const observedHostRuntimes = new Map();
   function currentHostThreadBinding(threadId) {
     if (
       !hostRuntime
@@ -2902,6 +2903,38 @@ export function createTaskboardServer(options = {}) {
       codexHostId: hostRuntime.codexHostId,
       workspacePath: hostRuntime.workspacePath,
     };
+  }
+  function observedHostThreadIdentity(threadId) {
+    const identity = observedHostRuntimes.get(threadId) ?? null;
+    return identity && Date.now() - identity.updatedAt <= HOST_RUNTIME_TTL_MS
+      ? identity
+      : null;
+  }
+  function assertCurrentCoordinatorHostBinding(projectId, input, errorCode = "COORDINATOR_BINDING_MISMATCH") {
+    const identity = observedHostThreadIdentity(input.holderThreadId);
+    if (!identity) return;
+    const config = database.getAgentLaneProject(projectId);
+    const holder = Array.isArray(config?.tasks)
+      ? config.tasks.find((task) => task?.id === input.holderTaskId) ?? null
+      : null;
+    const mismatch = !holder
+      || holder.threadId !== identity.threadId
+      || !path.isAbsolute(holder.workspacePath ?? "")
+      || !path.isAbsolute(identity.workspacePath)
+      || holder.codexHostId !== identity.codexHostId
+      || path.resolve(holder.workspacePath ?? "") !== path.resolve(identity.workspacePath)
+      || (holder.codexProjectId && holder.codexProjectId !== identity.codexProjectId)
+      || (holder.codexProjectKind && holder.codexProjectKind !== identity.codexProjectKind)
+      || (input.holderCodexHostId && input.holderCodexHostId !== identity.codexHostId)
+      || (input.holderWorkspacePath
+        && path.resolve(input.holderWorkspacePath) !== path.resolve(identity.workspacePath));
+    if (mismatch) {
+      throw new ApiError(
+        409,
+        errorCode,
+        "Coordinator lease holder does not match the current protected host identity",
+      );
+    }
   }
   function resolveInputThreadBinding(input) {
     if (input.threadBinding !== undefined) return input;
@@ -3049,6 +3082,7 @@ export function createTaskboardServer(options = {}) {
     listComments: (taskId) => database.listComments(taskId),
     getPendingOwnerIntent: (projectId) => database.getPendingProjectOwnerIntent(projectId),
     getPendingOwnerIntentPlan: (projectId) => database.getPendingProjectOwnerIntentPlan(projectId),
+    getCurrentHostIdentity: (threadId) => observedHostThreadIdentity(threadId),
     recordProgress: async (progress) => {
       const candidates = database.listTasks({ projectId: progress.projectId, archived: "false" }).filter((task) => {
         const claim = database.getAgentTaskClaim(task.id);
@@ -3435,6 +3469,11 @@ export function createTaskboardServer(options = {}) {
             }),
             updatedAt: Date.now(),
           };
+          observedHostRuntimes.delete(threadId);
+          observedHostRuntimes.set(threadId, { ...hostRuntime });
+          if (observedHostRuntimes.size > 512) {
+            observedHostRuntimes.delete(observedHostRuntimes.keys().next().value);
+          }
           return sendJson(response, 200, { runtime: hostRuntime });
         }
         return methodNotAllowed(response, ["GET", "PUT"]);
@@ -3490,10 +3529,9 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        return sendJson(response, 200, database.claimAgentLaneCoordinator(
-          projectId,
-          { ...parseCoordinatorLeaseRenew(body), renewOnly: true },
-        ));
+        const input = { ...parseCoordinatorLeaseRenew(body), renewOnly: true };
+        assertCurrentCoordinatorHostBinding(projectId, input);
+        return sendJson(response, 200, database.claimAgentLaneCoordinator(projectId, input));
       }
 
       const coordinatorLeaseRecoverRoute = pathname.match(
@@ -3508,10 +3546,9 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        return sendJson(response, 200, database.claimAgentLaneCoordinator(
-          projectId,
-          { ...parseCoordinatorLeaseRenew(body), recoverOnly: true },
-        ));
+        const input = { ...parseCoordinatorLeaseRenew(body), recoverOnly: true };
+        assertCurrentCoordinatorHostBinding(projectId, input);
+        return sendJson(response, 200, database.claimAgentLaneCoordinator(projectId, input));
       }
 
       const coordinatorLeaseRoute = pathname.match(
@@ -3522,10 +3559,9 @@ export function createTaskboardServer(options = {}) {
         assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-lease");
         const projectId = decodeRouteSegment(coordinatorLeaseRoute[1], "Project id");
         validateProjectId(projectId);
-        const result = database.claimAgentLaneCoordinator(
-          projectId,
-          parseCoordinatorLeaseClaim(await readJson(request)),
-        );
+        const input = parseCoordinatorLeaseClaim(await readJson(request));
+        assertCurrentCoordinatorHostBinding(projectId, input);
+        const result = database.claimAgentLaneCoordinator(projectId, input);
         return sendJson(response, 200, result);
       }
 
@@ -3610,11 +3646,9 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(
-          projectId,
-          domainId,
-          { ...parseCoordinatorLeaseRenew(body), renewOnly: true },
-        ));
+        const input = { ...parseCoordinatorLeaseRenew(body), renewOnly: true };
+        assertCurrentCoordinatorHostBinding(projectId, input, "DOMAIN_COORDINATOR_BINDING_MISMATCH");
+        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(projectId, domainId, input));
       }
 
       const domainCoordinatorLeaseRecoverRoute = pathname.match(
@@ -3630,11 +3664,9 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(
-          projectId,
-          domainId,
-          { ...parseCoordinatorLeaseRenew(body), recoverOnly: true },
-        ));
+        const input = { ...parseCoordinatorLeaseRenew(body), recoverOnly: true };
+        assertCurrentCoordinatorHostBinding(projectId, input, "DOMAIN_COORDINATOR_BINDING_MISMATCH");
+        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(projectId, domainId, input));
       }
 
       const domainCoordinatorLeaseRoute = pathname.match(
@@ -3646,11 +3678,9 @@ export function createTaskboardServer(options = {}) {
         const projectId = decodeRouteSegment(domainCoordinatorLeaseRoute[1], "Project id");
         const domainId = decodeRouteSegment(domainCoordinatorLeaseRoute[2], "Coordination domain id");
         validateProjectId(projectId);
-        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(
-          projectId,
-          domainId,
-          parseCoordinatorLeaseClaim(await readJson(request)),
-        ));
+        const input = parseCoordinatorLeaseClaim(await readJson(request));
+        assertCurrentCoordinatorHostBinding(projectId, input, "DOMAIN_COORDINATOR_BINDING_MISMATCH");
+        return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(projectId, domainId, input));
       }
 
       const domainCoordinatorLeaseReleaseRoute = pathname.match(

@@ -71,6 +71,8 @@ function validateConfigTask(value) {
     roleNote: text(value.roleNote),
     taskType: TASK_TYPES.has(value.taskType) ? value.taskType : "peer_task",
     issueIdentifier: text(value.issueIdentifier),
+    codexProjectId: text(value.codexProjectId),
+    codexProjectKind: text(value.codexProjectKind),
     codexHostId: text(value.codexHostId),
     workspacePath: text(value.workspacePath),
   };
@@ -1141,6 +1143,7 @@ export function createAgentLaneSnapshotProvider({
   getPendingOwnerIntent = null,
   getPendingOwnerIntentPlan = null,
   getTaskDomainAssignment = null,
+  getCurrentHostIdentity = null,
 }) {
   const sessionFilePromises = new Map();
   const taskSessionStates = new Map();
@@ -1161,6 +1164,25 @@ export function createAgentLaneSnapshotProvider({
   const provider = {
     async getProjectSnapshot(projectId) {
       const configured = await readConfig(configPath, projectId, getLaneConfig);
+      const currentHostMatches = (holderTaskId) => {
+        const holder = configured.tasks.find((task) => task?.id === holderTaskId) ?? null;
+        const currentHostIdentity = typeof getCurrentHostIdentity === "function"
+          ? getCurrentHostIdentity(holder?.threadId ?? null)
+          : null;
+        if (!currentHostIdentity || currentHostIdentity.threadId !== holder?.threadId) return true;
+        return path.isAbsolute(currentHostIdentity.workspacePath ?? "")
+          && path.isAbsolute(holder.workspacePath ?? "")
+          && currentHostIdentity.codexHostId === holder.codexHostId
+          && path.resolve(currentHostIdentity.workspacePath ?? "") === path.resolve(holder.workspacePath ?? "")
+          && (!holder.codexProjectId || currentHostIdentity.codexProjectId === holder.codexProjectId)
+          && (!holder.codexProjectKind || currentHostIdentity.codexProjectKind === holder.codexProjectKind);
+      };
+      if (configured.coordinatorLease && !currentHostMatches(configured.coordinatorLease.holderTaskId)) {
+        configured.coordinatorLease.bindingValid = false;
+      }
+      for (const lease of Object.values(configured.domainCoordinatorLeases ?? {})) {
+        if (!currentHostMatches(lease.holderTaskId)) lease.bindingValid = false;
+      }
       const generatedAt = now();
       const observedTasks = await Promise.all(configured.tasks.map((taskLane) => (
         taskLane.connection === "connected" && taskLane.source === "codex"
