@@ -13,6 +13,7 @@ const ownerIntentPlanningMonitorRuns = new Map();
 const crossDomainHandoffMonitorRuns = new Map();
 const coordinatorLeaseKeepaliveMonitorRuns = new Map();
 const coordinatorLeaseRecoveryMonitorRuns = new Map();
+const coordinatorProvisioningMonitorRuns = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
 const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
@@ -73,6 +74,205 @@ export async function loadResidentCoordinatorMonitorProjects({
     continuationPolicyEntries,
     continuationPolicyPrefix,
   });
+}
+
+function coordinatorProvisioningIdentity(projectId, revision, ownerRootTaskId) {
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify({ projectId, revision, ownerRootTaskId }))
+    .digest("hex");
+  return {
+    taskId: `coordinator-${projectId}-${fingerprint.slice(0, 12)}`,
+    label: "Taskboard Execution Coordinator",
+    idempotencyKey: `coordinator-provision-${fingerprint}`,
+    threadSource: `taskboard-coordinator-provision-${fingerprint}`,
+  };
+}
+
+async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
+  const { policy } = options;
+  const [snapshot, windows] = await Promise.all([
+    options.readSnapshot(),
+    options.readWindows(),
+  ]);
+  if (snapshot?.projectId !== policy.projectId
+    || windows?.projectId !== policy.projectId
+    || !RESUME_TOKEN_PATTERN.test(windows?.revision ?? "")) {
+    return { provisioned: false, reason: "invalid-project-state" };
+  }
+  const ownerRootTaskId = snapshot?.coordination?.ownerRootTaskId;
+  const ownerRoute = snapshot?.coordination?.ownerRootRoute;
+  const ownerLane = Array.isArray(snapshot?.taskLanes)
+    ? snapshot.taskLanes.find((lane) => lane?.id === ownerRootTaskId) ?? null
+    : null;
+  const ownerWindow = Array.isArray(windows?.windows)
+    ? windows.windows.find((window) => window?.taskId === ownerRootTaskId) ?? null
+    : null;
+  const ownerBindingValid = COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
+    && windows.ownerRootTaskId === ownerRootTaskId
+    && ownerRoute?.rootTaskId === ownerRootTaskId
+    && THREAD_ID_PATTERN.test(ownerRoute?.rootThreadId ?? "")
+    && ownerRoute.rootThreadId === ownerLane?.threadId
+    && ownerRoute.rootThreadId === ownerWindow?.threadId
+    && ownerWindow?.role === "owner_root"
+    && ownerLane?.codexProjectId === ownerWindow?.codexProjectId
+    && ownerLane?.codexProjectKind === ownerWindow?.codexProjectKind
+    && ownerLane?.codexHostId === ownerRoute?.codexHostId
+    && ownerLane?.codexHostId === ownerWindow?.codexHostId
+    && path.isAbsolute(ownerRoute?.rootWorkspacePath ?? "")
+    && path.resolve(ownerRoute.rootWorkspacePath) === path.resolve(ownerLane?.workspacePath ?? "")
+    && path.resolve(ownerRoute.rootWorkspacePath) === path.resolve(ownerWindow?.workspacePath ?? "");
+  if (!ownerBindingValid) return { provisioned: false, reason: "owner-root-invalid" };
+  if (snapshot?.coordination?.assignment !== "unassigned") {
+    return { provisioned: false, reason: "coordinator-assigned" };
+  }
+  const lease = snapshot?.coordination?.lease;
+  if (lease?.status === "active") return { provisioned: false, reason: "coordinator-active" };
+  if (lease?.status === "expired" && lease.bindingValid === true && !lease.releasedAt) {
+    return { provisioned: false, reason: "same-holder-recoverable" };
+  }
+  const coordinatorWindows = windows.windows.filter((window) => window?.role === "coordinator");
+  if (coordinatorWindows.length > 0) {
+    return { provisioned: false, reason: "coordinator-window-exists" };
+  }
+
+  const identity = coordinatorProvisioningIdentity(
+    policy.projectId, windows.revision, ownerRootTaskId,
+  );
+  let result = typeof options.getAttempt === "function"
+    ? await options.getAttempt({
+        projectId: policy.projectId,
+        idempotencyKey: identity.idempotencyKey,
+      })
+    : null;
+  let attempt = result?.attempt ?? null;
+  if (!attempt) {
+    let selectedModel = {
+      model: policy.model,
+      reasoningEffort: policy.reasoningEffort,
+    };
+    if ((!selectedModel.model || !selectedModel.reasoningEffort)
+      && typeof options.readDefaultModel === "function") {
+      selectedModel = await options.readDefaultModel({
+        codexHostId: ownerLane.codexHostId,
+        workspacePath: ownerRoute.rootWorkspacePath,
+      });
+    }
+    if (typeof selectedModel?.model !== "string" || !selectedModel.model
+      || typeof selectedModel?.reasoningEffort !== "string" || !selectedModel.reasoningEffort) {
+      return { provisioned: false, reason: "model-policy-unavailable" };
+    }
+    result = await options.requestAttempt({
+      ...identity,
+      model: selectedModel.model,
+      reasoningEffort: selectedModel.reasoningEffort,
+      projectId: policy.projectId,
+      expectedRevision: windows.revision,
+      ownerRootTaskId,
+      ownerRootThreadId: ownerRoute.rootThreadId,
+      codexProjectId: ownerLane.codexProjectId,
+      codexProjectKind: ownerLane.codexProjectKind,
+      codexHostId: ownerLane.codexHostId,
+      workspacePath: ownerRoute.rootWorkspacePath,
+    });
+    attempt = result?.attempt ?? null;
+  }
+  if (!attempt?.id) return { provisioned: false, reason: "attempt-unavailable" };
+  if (attempt.projectId !== policy.projectId
+    || attempt.idempotencyKey !== identity.idempotencyKey
+    || attempt.taskId !== identity.taskId
+    || attempt.threadSource !== identity.threadSource
+    || attempt.expectedRevision !== windows.revision
+    || attempt.ownerRootTaskId !== ownerRootTaskId
+    || attempt.ownerRootThreadId !== ownerRoute.rootThreadId
+    || attempt.codexProjectId !== ownerLane.codexProjectId
+    || attempt.codexProjectKind !== ownerLane.codexProjectKind
+    || attempt.codexHostId !== ownerLane.codexHostId
+    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(ownerRoute.rootWorkspacePath)
+    || typeof attempt.model !== "string" || !attempt.model
+    || typeof attempt.reasoningEffort !== "string" || !attempt.reasoningEffort) {
+    return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+  }
+  if (["completed", "canceled", "expired"].includes(attempt.status)) {
+    return { provisioned: attempt.status === "completed", reason: `attempt-${attempt.status}`, attemptId: attempt.id };
+  }
+
+  let thread = await options.findThread(attempt);
+  if (!thread && attempt.status === "started") {
+    return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
+  }
+  if (!thread && attempt.status === "starting") {
+    return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
+  }
+  if (!thread) {
+    result = await options.markStarting({ attemptId: attempt.id });
+    attempt = result?.attempt ?? attempt;
+    try {
+      const started = await options.startThread({
+        codexHostId: attempt.codexHostId,
+        cwd: attempt.workspacePath,
+        runtimeWorkspaceRoots: [attempt.workspacePath],
+        model: attempt.model,
+        config: { model_reasoning_effort: attempt.reasoningEffort },
+        approvalPolicy: "on-request",
+        approvalsReviewer: "auto_review",
+        sandbox: "workspace-write",
+        threadSource: attempt.threadSource,
+      });
+      thread = started?.thread ?? null;
+    } catch (error) {
+      if (isSelectedModelCapacityError(error) && typeof options.resetAttempt === "function") {
+        await options.resetAttempt({ attemptId: attempt.id });
+        return { provisioned: false, reason: "model-capacity", attemptId: attempt.id };
+      }
+      return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
+    }
+  }
+  if (!THREAD_ID_PATTERN.test(thread?.id ?? "")
+    || thread.threadSource !== attempt.threadSource
+    || path.resolve(thread?.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
+    return { provisioned: false, reason: "thread-binding-mismatch", attemptId: attempt.id };
+  }
+  if (attempt.threadId !== thread.id || attempt.status !== "started") {
+    result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
+    attempt = result?.attempt ?? attempt;
+  }
+  const delivery = await options.deliverInstruction({
+    attempt,
+    threadId: thread.id,
+    projectId: policy.projectId,
+  });
+  return {
+    provisioned: true,
+    reason: delivery?.delivery === "observed" ? "thread-observed" : "thread-started",
+    attemptId: attempt.id,
+  };
+}
+
+export async function runCoordinatorProvisioningMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
+  if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
+    || typeof options?.readSnapshot !== "function"
+    || typeof options?.readWindows !== "function"
+    || typeof options?.requestAttempt !== "function"
+    || typeof options?.findThread !== "function"
+    || typeof options?.markStarting !== "function"
+    || typeof options?.startThread !== "function"
+    || typeof options?.attachThread !== "function"
+    || typeof options?.deliverInstruction !== "function") {
+    return { provisioned: false, reason: "invalid-monitor" };
+  }
+  const existing = coordinatorProvisioningMonitorRuns.get(policy.projectId);
+  if (existing) return existing;
+  const run = runCoordinatorProvisioningMonitorOnceUnlocked(options);
+  coordinatorProvisioningMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (coordinatorProvisioningMonitorRuns.get(policy.projectId) === run) {
+      coordinatorProvisioningMonitorRuns.delete(policy.projectId);
+    }
+  }
 }
 
 function projectScopedCoordinationKey(projectId) {

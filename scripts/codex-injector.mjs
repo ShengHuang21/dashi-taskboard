@@ -41,6 +41,7 @@ import {
   runOwnerIntentCaptureMonitorOnce,
   runOwnerIntentPlanningMonitorOnce,
   runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
+  runCoordinatorProvisioningMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
@@ -1978,6 +1979,140 @@ async function listCoordinatorIdentityHandshakes(projectId) {
   return response.json();
 }
 
+async function readCoordinatorProvisioningWindows(projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/coordination-windows`;
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    headers: { "x-taskboard-client": "taskctl" },
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`Taskboard coordination windows returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function mutateCoordinatorProvisioning(pathname, body) {
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    method: "POST",
+    headers: coordinatorRenewProofHeaders(pathname, body),
+    body: JSON.stringify(body),
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error(`Taskboard Coordinator provisioning returned HTTP ${response.status}`);
+  return response.json();
+}
+
+async function requestCoordinatorProvisioningAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-provisioning-attempts`;
+  const { projectId: _projectId, ...body } = request;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function getCoordinatorProvisioningAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-provisioning-attempts/lookup`;
+  return mutateCoordinatorProvisioning(pathname, { idempotencyKey: request.idempotencyKey });
+}
+
+async function transitionCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
+  const pathname = `/api/local/coordinator-provisioning-attempts/${encodeURIComponent(attemptId)}/${action}`;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function findCoordinatorProvisioningThread(cdp, attempt) {
+  let cursor = null;
+  const matches = [];
+  for (let page = 0; page < 10; page += 1) {
+    const result = await requestCodexAppServerViaCdp(
+      cdp,
+      undefined,
+      attempt.codexHostId,
+      "thread/list",
+      {
+        cwd: attempt.workspacePath,
+        archived: false,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      },
+      10_000,
+    );
+    for (const thread of Array.isArray(result?.data) ? result.data : []) {
+      if (thread?.threadSource === attempt.threadSource
+        && typeof thread.cwd === "string"
+        && path.resolve(thread.cwd) === path.resolve(attempt.workspacePath)) {
+        matches.push(thread);
+      }
+    }
+    cursor = typeof result?.nextCursor === "string" && result.nextCursor
+      ? result.nextCursor
+      : null;
+    if (!cursor) break;
+  }
+  if (matches.length > 1) {
+    throw new Error("Codex returned duplicate threads for one Coordinator provisioning marker");
+  }
+  return matches[0] ?? null;
+}
+
+async function readDefaultCoordinatorModel(cdp, route) {
+  const result = await requestCodexAppServerViaCdp(
+    cdp, undefined, route.codexHostId, "model/list", { includeHidden: false, limit: 100 }, 10_000,
+  );
+  const defaults = (Array.isArray(result?.data) ? result.data : []).filter(
+    (model) => model?.isDefault === true,
+  );
+  if (defaults.length !== 1
+    || typeof defaults[0].id !== "string" || !defaults[0].id
+    || typeof defaults[0].defaultReasoningEffort !== "string"
+    || !defaults[0].defaultReasoningEffort) {
+    throw new Error("Codex did not return one exact default model for Coordinator provisioning");
+  }
+  return {
+    model: defaults[0].id,
+    reasoningEffort: defaults[0].defaultReasoningEffort,
+  };
+}
+
+async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId, projectId) {
+  const rpc = (method, params) => requestCodexAppServerViaCdp(
+    cdp, undefined, attempt.codexHostId, method, params, 10_000,
+  );
+  const threadResult = await rpc("thread/read", { threadId, includeTurns: true });
+  const thread = threadResult?.thread;
+  if (thread?.id !== threadId
+    || thread.threadSource !== attempt.threadSource
+    || typeof thread.cwd !== "string"
+    || path.resolve(thread.cwd) !== path.resolve(attempt.workspacePath)) {
+    throw new Error("Codex did not confirm the exact provisioned Coordinator thread");
+  }
+  const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const observed = turns.find((turn) => JSON.stringify(turn).includes(marker));
+  if (observed?.id) return { delivery: "observed", turnId: observed.id };
+  if (turns.some((turn) => turn?.status === "inProgress")) {
+    return { delivery: "busy", turnId: null };
+  }
+  await rpc("thread/resume", { threadId });
+  const registrationKey = `${attempt.idempotencyKey}-window`;
+  const instruction = [
+    marker,
+    "You are a separate Taskboard Execution Coordinator window. Never become or alter Owner Root.",
+    `Use only node ${path.join(projectRoot, "cli", "taskctl.mjs")} --runtime-file ${taskboardRuntimeFile} for Taskboard reads and writes; never read or expose the runtime token and never edit SQLite directly.`,
+    `Bootstrap CAP-15 and its current children for project ${projectId}; read complete Capsules before choosing work and do not create duplicate issues.`,
+    `Register exactly this window with task identity ${attempt.taskId}, role coordinator, label ${JSON.stringify(attempt.label)}, exact thread id ${threadId}, and stable idempotency key ${registrationKey}.`,
+    "First read protected coordination windows and use their exact current revision. Allow the resident protected host handshake to authenticate the exact project, kind, host, and workspace; do not self-report or bypass host identity.",
+    "After exact registration, read Coordinator status. Acquire one 300-second Global Coordinator lease only if still unassigned, using this same task/thread and the exact expected current lease id (or null). Replay the same registration after success to verify one receipt; never create a second window or lease.",
+    "On selected-model capacity, retry the same task and thread with the same model. On uncertainty, inspect durable state before retrying. Preserve one writer and the standing safety boundaries in AGENTS.md.",
+  ].join("\n");
+  const started = await rpc("turn/start", {
+    threadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a provisioning delivery turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
+}
+
 async function confirmCoordinatorIdentityHandshake(handshakeId, registration, threadBinding) {
   const pathname = `/api/local/coordination-identity-handshakes/${encodeURIComponent(handshakeId)}/confirm`;
   const body = { registration, threadBinding };
@@ -2525,12 +2660,14 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
 }
 
 async function runBackgroundContinuationMonitor(cdp) {
+  await ensureQuotaPoliciesLoaded();
   const projects = await loadResidentCoordinatorMonitorProjects({
     listLifecycleProjects: listResidentCoordinatorMonitorProjects,
     readContinuationPolicyEntries: readTaskboardClientStorageEntries,
     continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
   });
   for (const { projectId, continuationEnabled } of projects) {
+    const automationPolicy = quotaPolicyRecords.get(projectId)?.request ?? null;
     const monitors = [];
     if (continuationEnabled) monitors.push(
       () => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
@@ -2584,6 +2721,35 @@ async function runBackgroundContinuationMonitor(cdp) {
           10_000,
         ),
         recoverLease: recoverCoordinatorLease,
+      }),
+      () => runCoordinatorProvisioningMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          model: automationPolicy?.model,
+          reasoningEffort: automationPolicy?.reasoningEffort,
+        },
+        readSnapshot: () => readTaskboardAgentLaneSnapshot(projectId),
+        readWindows: () => readCoordinatorProvisioningWindows(projectId),
+        readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
+        getAttempt: getCoordinatorProvisioningAttempt,
+        requestAttempt: requestCoordinatorProvisioningAttempt,
+        findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
+        markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+          attemptId, "starting",
+        ),
+        startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
+          cdp, undefined, codexHostId, "thread/start", params, 10_000,
+        ),
+        attachThread: ({ attemptId, threadId }) => transitionCoordinatorProvisioningAttempt(
+          attemptId, "attach", { threadId },
+        ),
+        resetAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+          attemptId, "reset",
+        ),
+        deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
+          cdp, attempt, threadId, projectId,
+        ),
       }),
       () => runOwnerIntentCaptureMonitorOnce({
         policy: { enabled: true, projectId },

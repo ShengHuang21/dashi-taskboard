@@ -415,6 +415,74 @@ function parseCoordinationIdentityHandshakeRegistration(value) {
   return { projectId, ...registration };
 }
 
+function parseCoordinatorProvisioningRequest(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "idempotencyKey", "taskId", "label", "threadSource", "model", "reasoningEffort",
+    "expectedRevision",
+    "ownerRootTaskId", "ownerRootThreadId", "codexProjectId", "codexProjectKind",
+    "codexHostId", "workspacePath",
+  ]));
+  const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
+    required: true, maxLength: 64,
+  });
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+  }
+  const codexProjectKind = stringField(value.codexProjectKind, "codexProjectKind", {
+    required: true, maxLength: 16,
+  });
+  if (codexProjectKind !== "local" && codexProjectKind !== "remote") {
+    throw new ApiError(400, "INVALID_FIELD", "'codexProjectKind' must be local or remote");
+  }
+  const workspacePath = stringField(value.workspacePath, "workspacePath", {
+    required: true, maxLength: 4096,
+  });
+  if (!path.isAbsolute(workspacePath) || workspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be an absolute path");
+  }
+  const codexHostId = stringField(value.codexHostId, "codexHostId", {
+    required: true, maxLength: 256,
+  });
+  if ((codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")) {
+    throw new ApiError(400, "INVALID_FIELD", "Coordinator provisioning project identity is invalid");
+  }
+  return {
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
+    label: stringField(value.label, "label", { required: true, maxLength: 120 }),
+    threadSource: stringField(value.threadSource, "threadSource", { required: true, maxLength: 256 }),
+    model: stringField(value.model, "model", { required: true, maxLength: 256 }),
+    reasoningEffort: stringField(value.reasoningEffort, "reasoningEffort", {
+      required: true, maxLength: 100,
+    }),
+    expectedRevision,
+    ownerRootTaskId: stringField(value.ownerRootTaskId, "ownerRootTaskId", { required: true, maxLength: 256 }),
+    ownerRootThreadId: stringField(value.ownerRootThreadId, "ownerRootThreadId", { required: true, maxLength: 256 }),
+    codexProjectId: stringField(value.codexProjectId, "codexProjectId", { required: true, maxLength: 256 }),
+    codexProjectKind,
+    codexHostId,
+    workspacePath: path.resolve(workspacePath),
+  };
+}
+
+function parseCoordinatorProvisioningTransition(value, action) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, action === "attach" ? new Set(["threadId"]) : new Set());
+  return action === "attach"
+    ? { threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }) }
+    : {};
+}
+
+function parseCoordinatorProvisioningLookup(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["idempotencyKey"]));
+  return stringField(value.idempotencyKey, "idempotencyKey", {
+    required: true, maxLength: 256,
+  });
+}
+
 function parseCoordinatorLeaseRenew(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
@@ -3552,6 +3620,60 @@ export function createTaskboardServer(options = {}) {
         );
         if (result.applied) events.emit("task.updated", { task: result.task });
         return sendJson(response, 200, result);
+      }
+
+      const coordinatorProvisioningLookupRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-provisioning-attempts\/lookup$/,
+      );
+      if (coordinatorProvisioningLookupRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-provisioning-attempts/lookup");
+        const projectId = decodeRouteSegment(coordinatorProvisioningLookupRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        const idempotencyKey = parseCoordinatorProvisioningLookup(body);
+        return sendJson(response, 200, {
+          attempt: database.getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey),
+        });
+      }
+
+      const coordinatorProvisioningRequestRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-provisioning-attempts$/,
+      );
+      if (coordinatorProvisioningRequestRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-provisioning-attempts");
+        const projectId = decodeRouteSegment(coordinatorProvisioningRequestRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        const input = parseCoordinatorProvisioningRequest(body);
+        return sendJson(response, 200, database.requestAgentLaneCoordinatorProvisioningAttempt(
+          projectId, input,
+        ));
+      }
+
+      const coordinatorProvisioningTransitionRoute = pathname.match(
+        /^\/api\/local\/coordinator-provisioning-attempts\/([^/]+)\/(starting|attach|reset)$/,
+      );
+      if (coordinatorProvisioningTransitionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/coordinator-provisioning-attempts/:id/:action");
+        const attemptId = decodeRouteSegment(coordinatorProvisioningTransitionRoute[1], "Attempt id");
+        const action = coordinatorProvisioningTransitionRoute[2];
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        const input = parseCoordinatorProvisioningTransition(body, action);
+        return sendJson(response, 200, database.transitionAgentLaneCoordinatorProvisioningAttempt(
+          attemptId, action, input,
+        ));
       }
 
       const coordinatorLeaseRenewRoute = pathname.match(

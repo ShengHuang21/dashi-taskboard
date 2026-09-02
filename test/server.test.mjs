@@ -3379,6 +3379,270 @@ test("background Coordinator registration requests a protected host identity han
   finalInspection.close();
 });
 
+test("resident provisioning persists one protected idempotent attempt before replacement thread start", async () => {
+  let databasePath;
+  const instanceSecret = "d".repeat(64);
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/sbkk",
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "coordinator-provision-a",
+    taskId: "coordinator-local-a",
+    label: "Taskboard Execution Coordinator",
+    threadSource: "taskboard-coordinator-provision-a",
+    model: "gpt-5",
+    reasoningEffort: "high",
+    expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "owner-thread",
+    codexProjectId: "codex-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/sbkk",
+  };
+  const unprotected = await request(baseUrl, pathname, { method: "POST", body });
+  assert.equal(unprotected.response.status, 403);
+  const created = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), pathname, body),
+    body,
+  });
+  assert.equal(created.response.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.applied, true);
+  assert.equal(created.body.attempt.status, "pending");
+  assert.equal(created.body.attempt.threadId, null);
+
+  const replayed = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), pathname, body),
+    body,
+  });
+  assert.equal(replayed.response.status, 200, JSON.stringify(replayed.body));
+  assert.equal(replayed.body.applied, false);
+  assert.equal(replayed.body.attempt.id, created.body.attempt.id);
+  const lookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
+  const lookupBody = { idempotencyKey: body.idempotencyKey };
+  const lookup = await request(baseUrl, lookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "a".repeat(32), lookupPath, lookupBody),
+    body: lookupBody,
+  });
+  assert.equal(lookup.response.status, 200, JSON.stringify(lookup.body));
+  assert.equal(lookup.body.attempt.model, "gpt-5");
+  assert.equal(lookup.body.attempt.reasoningEffort, "high");
+
+  const conflictBody = { ...body, label: "Different replacement" };
+  const conflict = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), pathname, conflictBody),
+    body: conflictBody,
+  });
+  assert.equal(conflict.response.status, 409);
+  assert.equal(conflict.body.error.code, "COORDINATOR_PROVISIONING_IDEMPOTENCY_CONFLICT");
+  const inspection = new DatabaseSync(databasePath);
+  assert.equal(inspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+  ).get().count, 1);
+  inspection.close();
+
+  const secondBody = {
+    ...body,
+    idempotencyKey: "coordinator-provision-b",
+    threadSource: "taskboard-coordinator-provision-b",
+  };
+  const second = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), pathname, secondBody),
+    body: secondBody,
+  });
+  assert.equal(second.response.status, 409);
+  assert.equal(second.body.error.code, "COORDINATOR_PROVISIONING_IN_PROGRESS");
+
+  const startingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
+  const starting = await request(baseUrl, startingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), startingPath, {}),
+    body: {},
+  });
+  assert.equal(starting.response.status, 200, JSON.stringify(starting.body));
+  assert.equal(starting.body.attempt.status, "starting");
+  const shortExpiry = new Date(Date.now() + 1_000).toISOString();
+  const expiryInspection = new DatabaseSync(databasePath);
+  expiryInspection.prepare(`
+    UPDATE agent_coordinator_provisioning_attempts SET expires_at = ? WHERE id = ?
+  `).run(shortExpiry, created.body.attempt.id);
+  expiryInspection.close();
+  const resetPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/reset`;
+  const reset = await request(baseUrl, resetPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), resetPath, {}),
+    body: {},
+  });
+  assert.equal(reset.response.status, 200, JSON.stringify(reset.body));
+  assert.equal(reset.body.attempt.status, "pending");
+  assert.equal(reset.body.attempt.retryCount, 1);
+  assert.ok(Date.parse(reset.body.attempt.expiresAt) > Date.parse(shortExpiry) + 9 * 60_000);
+  const restarted = await request(baseUrl, startingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), startingPath, {}),
+    body: {},
+  });
+  assert.equal(restarted.response.status, 200, JSON.stringify(restarted.body));
+  assert.equal(restarted.body.attempt.status, "starting");
+  const attachPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/attach`;
+  const attachBody = { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" };
+  const attached = await request(baseUrl, attachPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "8".repeat(32), attachPath, attachBody),
+    body: attachBody,
+  });
+  assert.equal(attached.response.status, 200, JSON.stringify(attached.body));
+  assert.equal(attached.body.attempt.status, "started");
+  assert.equal(attached.body.attempt.threadId, attachBody.threadId);
+  const repeatedAttach = await request(baseUrl, attachPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "9".repeat(32), attachPath, attachBody),
+    body: attachBody,
+  });
+  assert.equal(repeatedAttach.response.status, 200);
+  assert.equal(repeatedAttach.body.attempt.threadId, attachBody.threadId);
+
+  await request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
+    body: {
+      threadId: attachBody.threadId, threadRunning: true, threadTodoProgress: null,
+      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/sbkk",
+    },
+  });
+  const exactRegistrationBody = {
+    role: "coordinator", taskId: body.taskId, label: body.label,
+    threadId: attachBody.threadId, expectedRevision: body.expectedRevision,
+    idempotencyKey: `${body.idempotencyKey}-window`,
+  };
+  for (const terminalStatus of ["expired", "canceled"]) {
+    const terminalInspection = new DatabaseSync(databasePath);
+    terminalInspection.prepare(`
+      UPDATE agent_coordinator_provisioning_attempts SET status = ? WHERE id = ?
+    `).run(terminalStatus, created.body.attempt.id);
+    terminalInspection.close();
+    const lateRegistration = await request(
+      baseUrl,
+      "/api/local/projects/local/coordination-windows",
+      {
+        method: "POST",
+        headers: { "x-taskboard-client": "taskctl" },
+        body: exactRegistrationBody,
+      },
+    );
+    assert.equal(lateRegistration.response.status, 409);
+    assert.equal(
+      lateRegistration.body.error.code,
+      "COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH",
+    );
+    const zeroTerminalMutationInspection = new DatabaseSync(databasePath);
+    assert.equal(zeroTerminalMutationInspection.prepare(
+      "SELECT status FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.body.attempt.id).status, terminalStatus);
+    assert.equal(zeroTerminalMutationInspection.prepare(
+      "SELECT COUNT(*) AS count FROM agent_coordination_window_receipts",
+    ).get().count, 0);
+    zeroTerminalMutationInspection.close();
+  }
+  const resumeInspection = new DatabaseSync(databasePath);
+  resumeInspection.prepare(`
+    UPDATE agent_coordinator_provisioning_attempts SET status = 'started' WHERE id = ?
+  `).run(created.body.attempt.id);
+  resumeInspection.close();
+  const mismatchedRegistration = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    {
+      method: "POST",
+      headers: { "x-taskboard-client": "taskctl" },
+      body: {
+        role: "coordinator", taskId: body.taskId, label: "Different replacement",
+        threadId: attachBody.threadId, expectedRevision: body.expectedRevision,
+        idempotencyKey: "different-window-key",
+      },
+    },
+  );
+  assert.equal(mismatchedRegistration.response.status, 409);
+  assert.equal(
+    mismatchedRegistration.body.error.code,
+    "COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH",
+  );
+  const zeroMutationInspection = new DatabaseSync(databasePath);
+  assert.equal(zeroMutationInspection.prepare(
+    "SELECT status FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+  ).get(created.body.attempt.id).status, "started");
+  assert.equal(zeroMutationInspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_window_receipts",
+  ).get().count, 0);
+  zeroMutationInspection.close();
+  const registered = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    method: "POST",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: exactRegistrationBody,
+  });
+  assert.equal(registered.response.status, 200, JSON.stringify(registered.body));
+  const replayedRegistration = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    {
+      method: "POST",
+      headers: { "x-taskboard-client": "taskctl" },
+      body: exactRegistrationBody,
+    },
+  );
+  assert.equal(replayedRegistration.response.status, 200);
+  assert.equal(replayedRegistration.body.applied, false);
+  assert.equal(replayedRegistration.body.receipt.id, registered.body.receipt.id);
+  const postCompletionMismatch = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    {
+      method: "POST",
+      headers: { "x-taskboard-client": "taskctl" },
+      body: {
+        role: "owner_root", taskId: body.taskId, label: body.label,
+        threadId: attachBody.threadId, expectedRevision: body.expectedRevision,
+        idempotencyKey: `${body.idempotencyKey}-window`,
+      },
+    },
+  );
+  assert.equal(postCompletionMismatch.response.status, 409);
+  assert.equal(
+    postCompletionMismatch.body.error.code,
+    "COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH",
+  );
+  const completedInspection = new DatabaseSync(databasePath);
+  assert.equal(completedInspection.prepare(`
+    SELECT status FROM agent_coordinator_provisioning_attempts WHERE id = ?
+  `).get(created.body.attempt.id).status, "completed");
+  completedInspection.close();
+});
+
 test("protected window registration separates Owner Root from a replaceable coordinator", async () => {
   let databasePath;
   const instanceSecret = "a".repeat(64);
@@ -3442,7 +3706,9 @@ test("protected window registration separates Owner Root from a replaceable coor
   assert.notEqual(owner.body.configuration.revision, initial.body.revision);
   assert.deepEqual(owner.body.configuration.windows.find((window) => window.taskId === "owner-root"), {
     taskId: "owner-root", label: "Owner conversation", role: "owner_root",
-    threadId: "owner-thread", codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
+    threadId: "owner-thread", codexHostId: "host-owner",
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    workspacePath: "/tmp/owner-root",
   });
 
   const replay = await request(baseUrl, "/api/local/projects/local/coordination-windows", {

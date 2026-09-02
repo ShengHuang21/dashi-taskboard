@@ -25,6 +25,7 @@ import {
   runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
+  runCoordinatorProvisioningMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
@@ -423,6 +424,254 @@ test("resident keepalive survives an unavailable continuation policy without ena
     },
   });
   assert.deepEqual(projects, [{ projectId: "capstone-dev", continuationEnabled: false }]);
+});
+
+test("resident Coordinator provisioning persists one attempt before starting exactly one replacement thread", async () => {
+  const ownerRoot = {
+    taskId: "owner-root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  let attempt = null;
+  let startCalls = 0;
+  let deliveryCalls = 0;
+  let modelReads = 0;
+  const runTick = () => runCoordinatorProvisioningMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "capstone-dev",
+    },
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        assignment: "unassigned",
+        ownerRootTaskId: ownerRoot.taskId,
+        ownerRootRoute: {
+          rootTaskId: ownerRoot.taskId,
+          rootThreadId: ownerRoot.threadId,
+          codexHostId: ownerRoot.codexHostId,
+          rootWorkspacePath: ownerRoot.workspacePath,
+        },
+        lease: null,
+      },
+      taskLanes: [{
+        id: ownerRoot.taskId,
+        threadId: ownerRoot.threadId,
+        codexProjectId: ownerRoot.codexProjectId,
+        codexProjectKind: ownerRoot.codexProjectKind,
+        codexHostId: ownerRoot.codexHostId,
+        workspacePath: ownerRoot.workspacePath,
+      }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev",
+      revision: "a".repeat(64),
+      ownerRootTaskId: ownerRoot.taskId,
+      coordinatorLease: null,
+      windows: [{ ...ownerRoot, role: "owner_root" }],
+    }),
+    readDefaultModel: async () => {
+      modelReads += 1;
+      return { model: "gpt-5", reasoningEffort: "high" };
+    },
+    getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
+    requestAttempt: async (request) => {
+      if (!attempt) assert.equal(startCalls, 0, "the durable attempt must exist before thread/start");
+      attempt ??= {
+        ...request,
+        id: "attempt-1",
+        status: "pending",
+        threadId: null,
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async ({ threadSource }) => (
+      attempt?.threadId && attempt.threadSource === threadSource
+        ? { id: attempt.threadId, cwd: ownerRoot.workspacePath, threadSource }
+        : null
+    ),
+    markStarting: async () => {
+      attempt.status = "starting";
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      startCalls += 1;
+      assert.equal(settings.threadSource, attempt.threadSource);
+      assert.equal(settings.cwd, ownerRoot.workspacePath);
+      assert.equal(settings.model, "gpt-5");
+      assert.equal(settings.config.model_reasoning_effort, "high");
+      return { thread: { id: "01a062c1-fd2b-7f61-9114-d483e695640e", cwd: settings.cwd, threadSource: settings.threadSource } };
+    },
+    attachThread: async ({ threadId }) => {
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async ({ threadId }) => {
+      deliveryCalls += 1;
+      assert.equal(threadId, "01a062c1-fd2b-7f61-9114-d483e695640e");
+      return { delivery: deliveryCalls === 1 ? "started" : "observed", turnId: "turn-1" };
+    },
+  });
+
+  assert.deepEqual(await runTick(), { provisioned: true, reason: "thread-started", attemptId: "attempt-1" });
+  assert.deepEqual(await runTick(), { provisioned: true, reason: "thread-observed", attemptId: "attempt-1" });
+  assert.equal(startCalls, 1);
+  assert.equal(deliveryCalls, 2);
+  assert.equal(modelReads, 1);
+  assert.equal(attempt.threadId, "01a062c1-fd2b-7f61-9114-d483e695640e");
+});
+
+test("Coordinator provisioning retries selected-model capacity on the same attempt and fails closed on uncertainty", async () => {
+  const owner = {
+    taskId: "owner-root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const snapshot = {
+    projectId: "capstone-dev",
+    coordination: {
+      assignment: "unassigned",
+      ownerRootTaskId: owner.taskId,
+      ownerRootRoute: {
+        rootTaskId: owner.taskId,
+        rootThreadId: owner.threadId,
+        codexHostId: owner.codexHostId,
+        rootWorkspacePath: owner.workspacePath,
+      },
+      lease: null,
+    },
+    taskLanes: [{ id: owner.taskId, ...owner }],
+  };
+  const windows = {
+    projectId: "capstone-dev",
+    revision: "b".repeat(64),
+    ownerRootTaskId: owner.taskId,
+    windows: [{ ...owner, role: "owner_root" }],
+  };
+  const runScenario = async (failureMessage, expectRetry) => {
+    let attempt;
+    let starts = 0;
+    let resets = 0;
+    let modelReads = 0;
+    const options = {
+      policy: {
+        enabled: true, projectId: "capstone-dev",
+      },
+      readSnapshot: async () => snapshot,
+      readWindows: async () => windows,
+      getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
+      readDefaultModel: async () => ({
+        model: ++modelReads === 1 ? "gpt-5" : "gpt-6",
+        reasoningEffort: "high",
+      }),
+      requestAttempt: async (request) => {
+        attempt ??= {
+          ...request, id: `attempt-${expectRetry ? "capacity" : "uncertain"}`,
+          status: "pending", threadId: null,
+        };
+        return { attempt: { ...attempt } };
+      },
+      findThread: async () => null,
+      markStarting: async () => {
+        attempt.status = "starting";
+        return { attempt: { ...attempt } };
+      },
+      startThread: async (settings) => {
+        starts += 1;
+        assert.equal(settings.model, "gpt-5");
+        if (starts === 1) throw new Error(failureMessage);
+        return { thread: {
+          id: "01a062c1-fd2b-7f61-9114-d483e695640e",
+          cwd: settings.cwd,
+          threadSource: settings.threadSource,
+        } };
+      },
+      resetAttempt: async () => {
+        resets += 1;
+        attempt.status = "pending";
+        return { attempt: { ...attempt } };
+      },
+      attachThread: async ({ threadId }) => {
+        attempt = { ...attempt, status: "started", threadId };
+        return { attempt: { ...attempt } };
+      },
+      deliverInstruction: async () => ({ delivery: "started", turnId: "turn-1" }),
+    };
+    const first = await runCoordinatorProvisioningMonitorOnce(options);
+    const second = await runCoordinatorProvisioningMonitorOnce(options);
+    return { first, second, starts, resets, modelReads, attempt };
+  };
+
+  const capacity = await runScenario(
+    "Selected model is at capacity. Please try a different model.", true,
+  );
+  assert.equal(capacity.first.reason, "model-capacity");
+  assert.equal(capacity.second.reason, "thread-started");
+  assert.equal(capacity.starts, 2);
+  assert.equal(capacity.resets, 1);
+  assert.equal(capacity.modelReads, 1);
+  assert.equal(capacity.attempt.status, "started");
+
+  const uncertain = await runScenario("Codex App Server request timed out", false);
+  assert.equal(uncertain.first.reason, "thread-start-uncertain");
+  assert.equal(uncertain.second.reason, "thread-start-uncertain");
+  assert.equal(uncertain.starts, 1);
+  assert.equal(uncertain.resets, 0);
+  assert.equal(uncertain.attempt.status, "starting");
+});
+
+test("Coordinator provisioning performs zero mutation when a lease or Coordinator window exists", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const baseSnapshot = {
+    projectId: "capstone-dev",
+    coordination: {
+      assignment: "unassigned", ownerRootTaskId: owner.taskId,
+      ownerRootRoute: {
+        rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+        codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+      },
+      lease: null,
+    },
+    taskLanes: [{ id: owner.taskId, ...owner }],
+  };
+  let requests = 0;
+  for (const scenario of [
+    { lease: { status: "active" }, windows: [] },
+    { lease: { status: "expired", bindingValid: true, releasedAt: null }, windows: [] },
+    { lease: null, windows: [{ ...owner, taskId: "coordinator", role: "coordinator" }] },
+  ]) {
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: {
+        enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
+      },
+      readSnapshot: async () => ({
+        ...baseSnapshot,
+        coordination: { ...baseSnapshot.coordination, lease: scenario.lease },
+      }),
+      readWindows: async () => ({
+        projectId: "capstone-dev", revision: "c".repeat(64), ownerRootTaskId: owner.taskId,
+        windows: [{ ...owner, role: "owner_root" }, ...scenario.windows],
+      }),
+      requestAttempt: async () => { requests += 1; },
+      findThread: async () => null,
+      markStarting: async () => null,
+      startThread: async () => null,
+      attachThread: async () => null,
+      deliverInstruction: async () => null,
+    });
+    assert.equal(result.provisioned, false);
+  }
+  assert.equal(requests, 0);
 });
 
 test("coordinator keepalive fails closed for busy, drifted, or non-active holders", async () => {
@@ -2593,6 +2842,11 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /validateGitExecutionTarget/);
   assert.match(source, /runTaskboardContinuationMonitorOnce/);
   assert.match(source, /deliverTaskboardCoordination/);
+  assert.match(source, /runCoordinatorProvisioningMonitorOnce/);
+  assert.match(source, /coordinator-provisioning-attempts/);
+  assert.match(source, /"thread\/list"/);
+  assert.match(source, /"thread\/start"/);
+  assert.match(source, /TASKBOARD_COORDINATOR_PROVISIONING_V1/);
   assert.doesNotMatch(source, /background-continuation-receipts/);
   assert.match(source, /setInterval\(\(\) => void tick\(\), backgroundContinuationIntervalMs\)/);
 });

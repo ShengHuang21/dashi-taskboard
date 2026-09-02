@@ -19,6 +19,7 @@ const DATABASE_STATEMENT_CACHE_MAX = 512;
 const MODEL_CAPACITY_RETRY_BASE_MS = 15_000;
 const MODEL_CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 const COORDINATION_IDENTITY_HANDSHAKE_TTL_MS = 2 * 60_000;
+const COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS = 10 * 60_000;
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -104,6 +105,51 @@ function coordinationIdentityRequestFingerprint(projectId, input) {
   })).digest("hex");
 }
 
+function coordinatorProvisioningAttemptFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    idempotencyKey: row.idempotency_key,
+    taskId: row.task_id,
+    label: row.label,
+    threadSource: row.thread_source,
+    model: row.model,
+    reasoningEffort: row.reasoning_effort,
+    expectedRevision: row.expected_revision,
+    ownerRootTaskId: row.owner_root_task_id,
+    ownerRootThreadId: row.owner_root_thread_id,
+    codexProjectId: row.codex_project_id,
+    codexProjectKind: row.codex_project_kind,
+    codexHostId: row.codex_host_id,
+    workspacePath: row.workspace_path,
+    status: row.status,
+    threadId: row.thread_id,
+    retryCount: row.retry_count,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function coordinatorProvisioningFingerprint(projectId, input) {
+  return createHash("sha256").update(JSON.stringify({
+    projectId,
+    idempotencyKey: input.idempotencyKey,
+    taskId: input.taskId,
+    label: input.label,
+    threadSource: input.threadSource,
+    model: input.model,
+    reasoningEffort: input.reasoningEffort,
+    expectedRevision: input.expectedRevision,
+    ownerRootTaskId: input.ownerRootTaskId,
+    ownerRootThreadId: input.ownerRootThreadId,
+    codexProjectId: input.codexProjectId,
+    codexProjectKind: input.codexProjectKind,
+    codexHostId: input.codexHostId,
+    workspacePath: path.resolve(input.workspacePath),
+  })).digest("hex");
+}
+
 function coordinationDomainReceiptFromRow(row) {
   return {
     id: row.id, projectId: row.project_id, domainId: row.domain_id,
@@ -127,6 +173,8 @@ function coordinationWindowConfiguration(projectId, row) {
         role: task.id === config.ownerRootTaskId ? "owner_root" : "coordinator",
         threadId: task.threadId ?? null,
         codexHostId: task.codexHostId ?? null,
+        codexProjectId: task.codexProjectId ?? null,
+        codexProjectKind: task.codexProjectKind ?? null,
         workspacePath: task.workspacePath ?? null,
       })),
   };
@@ -1329,6 +1377,36 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS agent_coordination_identity_handshakes_pending
         ON agent_coordination_identity_handshakes(project_id, status, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS agent_coordinator_provisioning_attempts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        thread_source TEXT NOT NULL,
+        model TEXT NOT NULL,
+        reasoning_effort TEXT NOT NULL,
+        expected_revision TEXT NOT NULL,
+        owner_root_task_id TEXT NOT NULL,
+        owner_root_thread_id TEXT NOT NULL,
+        codex_project_id TEXT NOT NULL,
+        codex_project_kind TEXT NOT NULL CHECK (codex_project_kind IN ('local', 'remote')),
+        codex_host_id TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'starting', 'started', 'completed', 'expired', 'canceled')),
+        thread_id TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        UNIQUE(project_id, idempotency_key),
+        UNIQUE(project_id, thread_source)
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_coordinator_provisioning_attempts_active
+        ON agent_coordinator_provisioning_attempts(project_id, status, created_at, id);
 
       CREATE TABLE IF NOT EXISTS agent_coordination_domain_receipts (
         id TEXT PRIMARY KEY,
@@ -3309,6 +3387,205 @@ export class TaskboardDatabase {
     return coordinationWindowConfiguration(projectId, row);
   }
 
+  getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey) {
+    const row = this.#prepare(`
+      SELECT * FROM agent_coordinator_provisioning_attempts
+      WHERE project_id = ? AND idempotency_key = ?
+    `).get(projectId, idempotencyKey);
+    if (!row) return null;
+    if (["pending", "starting", "started"].includes(row.status)
+      && Date.parse(row.expires_at) <= Date.now()) {
+      const timestamp = now();
+      this.#prepare(`
+        UPDATE agent_coordinator_provisioning_attempts
+        SET status = 'expired', updated_at = ? WHERE id = ?
+      `).run(timestamp, row.id);
+      return coordinatorProvisioningAttemptFromRow({
+        ...row, status: "expired", updated_at: timestamp,
+      });
+    }
+    return coordinatorProvisioningAttemptFromRow(row);
+  }
+
+  requestAgentLaneCoordinatorProvisioningAttempt(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const fingerprint = coordinatorProvisioningFingerprint(projectId, input);
+      const existing = this.#prepare(`
+        SELECT * FROM agent_coordinator_provisioning_attempts
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(projectId, input.idempotencyKey);
+      if (existing) {
+        if (existing.request_fingerprint !== fingerprint) {
+          throw new ApiError(409, "COORDINATOR_PROVISIONING_IDEMPOTENCY_CONFLICT", "The provisioning key is bound to a different replacement request");
+        }
+        if (["pending", "starting", "started"].includes(existing.status)
+          && Date.parse(existing.expires_at) <= Date.now()) {
+          const timestamp = now();
+          this.#prepare(`
+            UPDATE agent_coordinator_provisioning_attempts
+            SET status = 'expired', updated_at = ? WHERE id = ?
+          `).run(timestamp, existing.id);
+          this.database.exec("COMMIT");
+          return { applied: false, attempt: coordinatorProvisioningAttemptFromRow({
+            ...existing, status: "expired", updated_at: timestamp,
+          }) };
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, attempt: coordinatorProvisioningAttemptFromRow(existing) };
+      }
+
+      const revision = agentLaneConfigRevision(row.config_json);
+      if (revision !== input.expectedRevision) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_REVISION_CONFLICT", "Agent Lane coordination windows changed since provisioning was planned", { actualRevision: revision });
+      }
+      const config = JSON.parse(row.config_json);
+      const tasks = Array.isArray(config.tasks) ? config.tasks : [];
+      const ownerRoot = tasks.find((task) => task?.id === config.ownerRootTaskId) ?? null;
+      const expectedWorkspace = path.resolve(input.workspacePath);
+      if (!ownerRoot
+        || ownerRoot.source !== "codex"
+        || ownerRoot.taskType !== "root_task"
+        || ownerRoot.id !== input.ownerRootTaskId
+        || ownerRoot.threadId !== input.ownerRootThreadId
+        || ownerRoot.codexProjectId !== input.codexProjectId
+        || ownerRoot.codexProjectKind !== input.codexProjectKind
+        || ownerRoot.codexHostId !== input.codexHostId
+        || typeof ownerRoot.workspacePath !== "string"
+        || !path.isAbsolute(ownerRoot.workspacePath)
+        || path.resolve(ownerRoot.workspacePath) !== expectedWorkspace) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_OWNER_ROOT_MISMATCH", "Replacement provisioning requires the exact configured Owner Root host identity");
+      }
+      if (input.taskId === ownerRoot.id) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_OWNER_ROOT_CONFLICT", "A replacement Coordinator must remain separate from Owner Root");
+      }
+      if (tasks.some((task) => task?.source === "codex"
+        && task?.taskType === "root_task" && task.id !== ownerRoot.id)) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_WINDOW_EXISTS", "A registered Coordinator window already exists");
+      }
+      if (this.#exactActiveCoordinatorLease(projectId, config, config.coordinatorLease ?? null)) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_LEASE_ACTIVE", "The Global Coordinator lease is already active");
+      }
+      const lease = config.coordinatorLease ?? null;
+      const leaseHolder = lease
+        ? tasks.find((task) => task?.id === lease.holderTaskId) ?? null
+        : null;
+      if (lease && !lease.releasedAt && !this.#coordinatorLeaseReleasedAt(projectId, lease)
+        && leaseHolder?.source === "codex" && leaseHolder?.taskType === "root_task") {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_LEASE_RECOVERABLE", "The existing Coordinator must recover or release its exact lease before replacement provisioning");
+      }
+      const nonterminal = this.#prepare(`
+        SELECT * FROM agent_coordinator_provisioning_attempts
+        WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
+        ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(projectId);
+      if (nonterminal) {
+        if (Date.parse(nonterminal.expires_at) <= Date.now()) {
+          this.#prepare(`
+            UPDATE agent_coordinator_provisioning_attempts
+            SET status = 'expired', updated_at = ? WHERE id = ?
+          `).run(now(), nonterminal.id);
+        } else {
+          throw new ApiError(409, "COORDINATOR_PROVISIONING_IN_PROGRESS", "Another replacement provisioning attempt is already active");
+        }
+      }
+      const timestamp = now();
+      const attemptRow = {
+        id: randomUUID(), project_id: projectId, idempotency_key: input.idempotencyKey,
+        request_fingerprint: fingerprint, task_id: input.taskId, label: input.label,
+        thread_source: input.threadSource, model: input.model,
+        reasoning_effort: input.reasoningEffort, expected_revision: input.expectedRevision,
+        owner_root_task_id: input.ownerRootTaskId, owner_root_thread_id: input.ownerRootThreadId,
+        codex_project_id: input.codexProjectId, codex_project_kind: input.codexProjectKind,
+        codex_host_id: input.codexHostId, workspace_path: expectedWorkspace,
+        status: "pending", thread_id: null, retry_count: 0,
+        created_at: timestamp, updated_at: timestamp,
+        expires_at: new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString(),
+      };
+      this.#prepare(`
+        INSERT INTO agent_coordinator_provisioning_attempts (
+          id, project_id, idempotency_key, request_fingerprint, task_id, label,
+          thread_source, model, reasoning_effort, expected_revision,
+          owner_root_task_id, owner_root_thread_id,
+          codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+          status, thread_id, retry_count, created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(...Object.values(attemptRow));
+      this.database.exec("COMMIT");
+      return { applied: true, attempt: coordinatorProvisioningAttemptFromRow(attemptRow) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  transitionAgentLaneCoordinatorProvisioningAttempt(attemptId, action, input = {}) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get(attemptId);
+      if (!row) throw new ApiError(404, "COORDINATOR_PROVISIONING_NOT_FOUND", "The replacement provisioning attempt does not exist");
+      if (["completed", "canceled", "expired"].includes(row.status)) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_TERMINAL", "The replacement provisioning attempt is terminal");
+      }
+      if (Date.parse(row.expires_at) <= Date.now()) {
+        this.#prepare(`UPDATE agent_coordinator_provisioning_attempts SET status = 'expired', updated_at = ? WHERE id = ?`)
+          .run(now(), attemptId);
+        this.database.exec("COMMIT");
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_TERMINAL", "The replacement provisioning attempt is terminal");
+      }
+      const project = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(row.project_id);
+      if (!project || agentLaneConfigRevision(project.config_json) !== row.expected_revision) {
+        this.#prepare(`UPDATE agent_coordinator_provisioning_attempts SET status = 'canceled', updated_at = ? WHERE id = ?`)
+          .run(now(), attemptId);
+        this.database.exec("COMMIT");
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_CANCELED", "Agent Lane configuration drift canceled replacement provisioning");
+      }
+      let nextStatus = row.status;
+      let threadId = row.thread_id;
+      let retryCount = row.retry_count;
+      let expiresAt = row.expires_at;
+      if (action === "starting") {
+        if (row.status === "pending") nextStatus = "starting";
+        else if (row.status !== "starting") throw new ApiError(409, "COORDINATOR_PROVISIONING_STATE_CONFLICT", "Only a pending attempt can start a thread");
+      } else if (action === "attach") {
+        if (!["pending", "starting", "started"].includes(row.status)) throw new ApiError(409, "COORDINATOR_PROVISIONING_STATE_CONFLICT", "The attempt cannot attach a thread");
+        if (row.thread_id && row.thread_id !== input.threadId) throw new ApiError(409, "COORDINATOR_PROVISIONING_THREAD_CONFLICT", "The attempt is already bound to another thread");
+        nextStatus = "started";
+        threadId = input.threadId;
+      } else if (action === "reset") {
+        if (row.status !== "starting" || row.thread_id) throw new ApiError(409, "COORDINATOR_PROVISIONING_STATE_CONFLICT", "Only an unbound starting attempt can retry selected-model capacity");
+        nextStatus = "pending";
+        retryCount += 1;
+        expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
+      } else {
+        throw new ApiError(400, "INVALID_FIELD", "Unknown replacement provisioning transition");
+      }
+      const timestamp = now();
+      this.#prepare(`
+        UPDATE agent_coordinator_provisioning_attempts
+        SET status = ?, thread_id = ?, retry_count = ?, updated_at = ?, expires_at = ? WHERE id = ?
+      `).run(nextStatus, threadId, retryCount, timestamp, expiresAt, attemptId);
+      this.database.exec("COMMIT");
+      return { attempt: coordinatorProvisioningAttemptFromRow({
+        ...row, status: nextStatus, thread_id: threadId, retry_count: retryCount,
+        updated_at: timestamp, expires_at: expiresAt,
+      }) };
+    } catch (error) {
+      if (this.database.isTransaction) this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   requestAgentLaneCoordinationIdentityHandshake(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -3674,6 +3951,27 @@ export class TaskboardDatabase {
         codexHostId: threadBinding.codexHostId,
         workspacePath: path.resolve(threadBinding.workspacePath),
       };
+      const provisioningAttempt = this.#prepare(`
+        SELECT * FROM agent_coordinator_provisioning_attempts
+        WHERE project_id = ? AND (task_id = ? OR thread_id = ?)
+        ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(projectId, input.taskId, binding.threadId);
+      if (provisioningAttempt) {
+        const exactProvisionedRegistration = ["started", "completed"].includes(provisioningAttempt.status)
+          && input.role === "coordinator"
+          && input.taskId === provisioningAttempt.task_id
+          && input.label === provisioningAttempt.label
+          && input.threadId === provisioningAttempt.thread_id
+          && input.expectedRevision === provisioningAttempt.expected_revision
+          && input.idempotencyKey === `${provisioningAttempt.idempotency_key}-window`
+          && binding.codexProjectId === provisioningAttempt.codex_project_id
+          && binding.codexProjectKind === provisioningAttempt.codex_project_kind
+          && binding.codexHostId === provisioningAttempt.codex_host_id
+          && binding.workspacePath === path.resolve(provisioningAttempt.workspace_path);
+        if (!exactProvisionedRegistration) {
+          throw new ApiError(409, "COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH", "Window registration must consume the exact durable replacement provisioning attempt");
+        }
+      }
       const identityHandshakeRow = this.#prepare(`
         SELECT * FROM agent_coordination_identity_handshakes
         WHERE project_id = ? AND idempotency_key = ?
@@ -3870,6 +4168,11 @@ export class TaskboardDatabase {
           task_id, thread_id, config_revision, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(...Object.values(receiptRow));
+      this.#prepare(`
+        UPDATE agent_coordinator_provisioning_attempts
+        SET status = 'completed', updated_at = ?
+        WHERE project_id = ? AND task_id = ? AND thread_id = ? AND status = 'started'
+      `).run(timestamp, projectId, input.taskId, binding.threadId);
       if (identityHandshakeRow) {
         this.#prepare(`
           UPDATE agent_coordination_identity_handshakes
