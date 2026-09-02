@@ -294,6 +294,9 @@ test("launch mode opens a dedicated debuggable Codex instance beside the native 
     source,
     /if \(runningCodex\.length > 0\) \{[\s\S]*?if \(debuggingCodexFound\) return false;[\s\S]*?if \(!options\.launch\) \{[\s\S]*?nativeCodexBrowser = true;/,
   );
+  assert.match(source, /startupTimeoutMs: 120_000,[\s\S]*?unhealthyChildGraceMs: 120_000,/);
+  assert.match(source, /Timed out publishing the Taskboard host heartbeat[\s\S]*?30_000/);
+  assert.match(source, /waitForHostHeartbeat\(cdp, startupToken, timeoutMs = 30_000\)/);
 });
 
 test("attach reconciles the renderer against a hashed current injection source", () => {

@@ -4,6 +4,7 @@ import { test } from "node:test";
 
 import {
   classifyOwnerIntentPlanHttpFailure,
+  createSerializedMonitorTick,
   deliverTaskboardCoordination,
   deliverTaskboardCrossDomainHandoff,
   deliverTaskboardOwnerDecision,
@@ -27,6 +28,28 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("background monitor ticks never overlap a still-running cycle", async () => {
+  let releaseFirst;
+  let active = 0;
+  let peakActive = 0;
+  let runs = 0;
+  const tick = createSerializedMonitorTick(async () => {
+    runs += 1;
+    active += 1;
+    peakActive = Math.max(peakActive, active);
+    if (runs === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+    active -= 1;
+  });
+
+  const first = tick();
+  assert.equal(await tick(), false);
+  releaseFirst();
+  assert.equal(await first, true);
+  assert.equal(await tick(), true);
+  assert.equal(runs, 2);
+  assert.equal(peakActive, 1);
+});
 
 test("Owner Intent plan HTTP failures distinguish replan validation from stale state", () => {
   assert.equal(classifyOwnerIntentPlanHttpFailure(400, "PLAN_DEPENDENCY_CYCLE"), "invalid-plan");

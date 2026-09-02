@@ -24,6 +24,20 @@ const CROSS_DOMAIN_HANDOFF_MARKER = "Taskboard cross-domain handoff delivery id:
 const SENSITIVE_COORDINATION_TEXT = /-----BEGIN [^-]+-----|\bAKIA[A-Z0-9]{16}\b|https?:\/\/[^\s/:@]+:[^\s/@]+@|\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*\S+|\bBearer\s+\S+|\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_]{16,}\b/i;
 const SELECTED_MODEL_CAPACITY_ERROR = /selected model is at capacity\.\s*please try a different model\.?/i;
 
+export function createSerializedMonitorTick(run) {
+  let inFlight = false;
+  return async (...args) => {
+    if (inFlight) return false;
+    inFlight = true;
+    try {
+      await run(...args);
+      return true;
+    } finally {
+      inFlight = false;
+    }
+  };
+}
+
 function projectScopedCoordinationKey(projectId) {
   if (!COORDINATION_ID_PATTERN.test(projectId ?? "")) {
     throw new Error("Owner Intent capture requires an exact Taskboard project id");

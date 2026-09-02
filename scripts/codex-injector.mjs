@@ -20,6 +20,7 @@ import {
 } from "../shared/taskboard-automation.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
+  createSerializedMonitorTick,
   deliverTaskboardAdmissionRecovery,
   deliverTaskboardCoordination,
   deliverTaskboardCrossDomainHandoff,
@@ -2521,14 +2522,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
 
   const scheduleBackgroundContinuation = () => {
     if (backgroundContinuationTimer || cdp.closed) return;
-    const tick = async () => {
+    const tick = createSerializedMonitorTick(async () => {
       if (cdp.closed) return;
       try {
         await runBackgroundContinuationMonitor(cdp);
       } catch (error) {
         console.error(`Taskboard background continuation check failed: ${error.message}`);
       }
-    };
+    });
     void tick();
     backgroundContinuationTimer = setInterval(() => void tick(), backgroundContinuationIntervalMs);
     backgroundContinuationTimer.unref?.();
@@ -2784,7 +2785,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
           timeout = setTimeout(() => {
             cdp.close();
             reject(new Error("Timed out publishing the Taskboard host heartbeat"));
-          }, 3_000);
+          }, 30_000);
         }),
       ]);
     } finally {
@@ -2812,7 +2813,7 @@ async function readInjectionStatus(cdp) {
   return status.result.value;
 }
 
-async function waitForHostHeartbeat(cdp, startupToken, timeoutMs = 3_000) {
+async function waitForHostHeartbeat(cdp, startupToken, timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const heartbeat = await cdp.send("Runtime.evaluate", {
@@ -3275,7 +3276,7 @@ async function main() {
       console.error(`Taskboard exited (${signal || code}); it will be restarted automatically.`);
     },
     startupTimeoutMs: 120_000,
-    unhealthyChildGraceMs: 30_000,
+    unhealthyChildGraceMs: 120_000,
   });
 
   const publishRuntime = async () => {

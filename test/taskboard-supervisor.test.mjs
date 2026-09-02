@@ -70,7 +70,7 @@ test("a caller can preserve one slow-starting child with a longer health grace",
       return child;
     },
     startupTimeoutMs: 120_000,
-    unhealthyChildGraceMs: 30_000,
+    unhealthyChildGraceMs: 120_000,
   });
 
   await supervisor.ensure();
@@ -81,7 +81,7 @@ test("a caller can preserve one slow-starting child with a longer health grace",
   assert.deepEqual(events, [
     ["start", "slow-child"],
     ["health", 120_000],
-    ["health", 30_000],
+    ["health", 120_000],
   ]);
   await supervisor.stop();
 });
