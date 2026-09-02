@@ -30,6 +30,7 @@ import {
   deliverTaskboardOwnerIntent,
   findResidentInjectorPids,
   handleHostBindingPayload,
+  loadResidentCoordinatorMonitorProjects,
   reconcileInjectionRuntime,
   restartResidentInjector,
   observeTaskboardOwnerDecision,
@@ -1699,6 +1700,23 @@ async function readTaskboardClientStorageEntries() {
   return payload?.entries && typeof payload.entries === "object" ? payload.entries : {};
 }
 
+async function listResidentCoordinatorMonitorProjects() {
+  const pathname = "/api/local/coordinator-monitor-projects";
+  const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+    headers: coordinatorRenewProofHeaders(pathname, null, "GET"),
+    cache: "no-store",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Taskboard Coordinator monitor projects returned HTTP ${response.status}`);
+  }
+  const result = await response.json();
+  if (!Array.isArray(result?.projectIds)) {
+    throw new Error("Taskboard returned invalid Coordinator monitor projects");
+  }
+  return result.projectIds;
+}
+
 async function readTaskboardAgentLaneSnapshot(projectId) {
   const response = await fetch(
     `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`,
@@ -2507,14 +2525,14 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
 }
 
 async function runBackgroundContinuationMonitor(cdp) {
-  const entries = await readTaskboardClientStorageEntries();
-  const projects = Object.entries(entries)
-    .filter(([key, value]) => key.startsWith(backgroundContinuationPolicyPrefix) && value === "enabled")
-    .map(([key]) => key.slice(backgroundContinuationPolicyPrefix.length))
-    .filter(Boolean)
-    .sort();
-  for (const projectId of projects) {
-    await runTaskboardProjectMonitorSequence([
+  const projects = await loadResidentCoordinatorMonitorProjects({
+    listLifecycleProjects: listResidentCoordinatorMonitorProjects,
+    readContinuationPolicyEntries: readTaskboardClientStorageEntries,
+    continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
+  });
+  for (const { projectId, continuationEnabled } of projects) {
+    const monitors = [];
+    if (continuationEnabled) monitors.push(
       () => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
         projectId,
         listHandshakes: listCoordinatorIdentityHandshakes,
@@ -2528,6 +2546,8 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         confirmIdentity: confirmCoordinatorIdentityHandshake,
       }),
+    );
+    monitors.push(
       () => runCoordinatorLeaseKeepaliveMonitorOnce({
         policy: {
           enabled: true,
@@ -2546,6 +2566,8 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         renewLease: renewCoordinatorLease,
       }),
+    );
+    if (continuationEnabled) monitors.push(
       () => runCoordinatorLeaseRecoveryMonitorOnce({
         policy: {
           enabled: true,
@@ -2711,7 +2733,8 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         recordDecision: recordOwnerDecision,
       }),
-    ]);
+    );
+    await runTaskboardProjectMonitorSequence(monitors);
   }
 }
 

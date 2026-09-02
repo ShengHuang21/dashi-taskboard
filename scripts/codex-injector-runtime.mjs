@@ -38,6 +38,43 @@ export function createSerializedMonitorTick(run) {
   };
 }
 
+export function selectResidentCoordinatorMonitorProjects({
+  lifecycleProjectIds,
+  continuationPolicyEntries,
+  continuationPolicyPrefix = "taskboard:background-continuation:policy:",
+}) {
+  const projects = new Map();
+  for (const projectId of Array.isArray(lifecycleProjectIds) ? lifecycleProjectIds : []) {
+    if (COORDINATION_ID_PATTERN.test(projectId ?? "")) {
+      projects.set(projectId, { projectId, continuationEnabled: false });
+    }
+  }
+  for (const [key, value] of Object.entries(continuationPolicyEntries ?? {})) {
+    if (!key.startsWith(continuationPolicyPrefix) || value !== "enabled") continue;
+    const projectId = key.slice(continuationPolicyPrefix.length);
+    if (!COORDINATION_ID_PATTERN.test(projectId)) continue;
+    projects.set(projectId, { projectId, continuationEnabled: true });
+  }
+  return [...projects.values()].sort((left, right) => left.projectId.localeCompare(right.projectId));
+}
+
+export async function loadResidentCoordinatorMonitorProjects({
+  listLifecycleProjects,
+  readContinuationPolicyEntries,
+  continuationPolicyPrefix,
+}) {
+  const lifecycleProjectIds = await listLifecycleProjects();
+  let continuationPolicyEntries = {};
+  try {
+    continuationPolicyEntries = await readContinuationPolicyEntries();
+  } catch {}
+  return selectResidentCoordinatorMonitorProjects({
+    lifecycleProjectIds,
+    continuationPolicyEntries,
+    continuationPolicyPrefix,
+  });
+}
+
 function projectScopedCoordinationKey(projectId) {
   if (!COORDINATION_ID_PATTERN.test(projectId ?? "")) {
     throw new Error("Owner Intent capture requires an exact Taskboard project id");

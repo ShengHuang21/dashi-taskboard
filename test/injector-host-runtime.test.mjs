@@ -13,6 +13,7 @@ import {
   deliverTaskboardOwnerIntent,
   findResidentInjectorPids,
   handleHostBindingPayload,
+  loadResidentCoordinatorMonitorProjects,
   observeTaskboardOwnerDecision,
   observeTaskboardOwnerIntentCapture,
   observeTaskboardOwnerIntentPlan,
@@ -28,6 +29,7 @@ import {
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
+  selectResidentCoordinatorMonitorProjects,
   selectLaunchCoordinatorRoute,
 } from "../scripts/codex-injector-runtime.mjs";
 
@@ -337,6 +339,90 @@ test("coordinator keepalive renews exact near-expiry Global and domain leases in
   ]);
   assert.equal(result.renewed, 1);
   assert.equal(result.failed, 1);
+});
+
+test("resident Coordinator lifecycle discovery keeps an idle background lease alive across ticks", async () => {
+  assert.deepEqual(selectResidentCoordinatorMonitorProjects({
+    lifecycleProjectIds: ["capstone-dev"],
+    continuationPolicyEntries: {},
+  }), [{ projectId: "capstone-dev", continuationEnabled: false }]);
+
+  let observedAt = Date.parse("2026-09-02T16:40:00.000Z");
+  const originalExpiry = "2026-09-02T16:40:30.000Z";
+  const binding = {
+    holderTaskId: "cap15-execution-coordinator-20260903",
+    holderThreadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+    holderCodexHostId: "local",
+    holderWorkspacePath: "/Users/v-sheng.huang/sbkk",
+  };
+  const lease = {
+    id: "global-lease",
+    status: "active",
+    acquiredAt: "2026-09-02T16:35:00.000Z",
+    expiresAt: originalExpiry,
+  };
+  let busy = true;
+  const receipts = [];
+  const runTick = () => runCoordinatorLeaseKeepaliveMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "capstone-dev",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => observedAt,
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        coordinatorTaskId: binding.holderTaskId,
+        lease,
+        domainCoordinators: [],
+      },
+      taskLanes: [{
+        id: binding.holderTaskId,
+        threadId: binding.holderThreadId,
+        codexHostId: binding.holderCodexHostId,
+        workspacePath: binding.holderWorkspacePath,
+      }],
+    }),
+    readThread: async () => ({
+      thread: {
+        id: binding.holderThreadId,
+        cwd: binding.holderWorkspacePath,
+        turns: busy ? [{ id: "active", status: "inProgress" }] : [],
+      },
+    }),
+    renewLease: async (request) => {
+      assert.equal(request.expectedLeaseId, lease.id);
+      assert.equal(request.holderTaskId, binding.holderTaskId);
+      assert.equal(request.holderThreadId, binding.holderThreadId);
+      assert.equal(request.codexHostId, binding.holderCodexHostId);
+      assert.equal(request.workspacePath, binding.holderWorkspacePath);
+      lease.expiresAt = new Date(observedAt + 120_000).toISOString();
+      receipts.push({ leaseId: lease.id, ...binding });
+      return { lease: { ...lease } };
+    },
+  });
+
+  assert.deepEqual(await runTick(), { renewed: 0, failed: 0, skipped: 1 });
+  busy = false;
+  observedAt += 15_000;
+  assert.deepEqual(await runTick(), { renewed: 1, failed: 0, skipped: 0 });
+  observedAt += 15_000;
+  assert.deepEqual(await runTick(), { renewed: 0, failed: 0, skipped: 1 });
+  assert.ok(Date.parse(lease.expiresAt) > Date.parse(originalExpiry));
+  assert.equal(receipts.length, 1);
+  assert.deepEqual(receipts[0], { leaseId: "global-lease", ...binding });
+});
+
+test("resident keepalive survives an unavailable continuation policy without enabling continuation", async () => {
+  const projects = await loadResidentCoordinatorMonitorProjects({
+    listLifecycleProjects: async () => ["capstone-dev"],
+    readContinuationPolicyEntries: async () => {
+      throw new Error("client storage unavailable");
+    },
+  });
+  assert.deepEqual(projects, [{ projectId: "capstone-dev", continuationEnabled: false }]);
 });
 
 test("coordinator keepalive fails closed for busy, drifted, or non-active holders", async () => {

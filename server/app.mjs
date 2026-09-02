@@ -3378,6 +3378,21 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "PATCH"]);
       }
 
+      if (pathname === "/api/local/coordinator-monitor-projects") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "GET /api/local/coordinator-monitor-projects");
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, null, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, {
+          projectIds: database.listAgentLaneProjectIds().filter((projectId) => {
+            const config = database.getAgentLaneProject(projectId);
+            return Boolean(config?.coordinatorLease)
+              || Object.keys(config?.domainCoordinatorLeases ?? {}).length > 0;
+          }),
+        });
+      }
+
       if (pathname === "/api/local/taskboard-panel-presence") {
         if (request.method === "GET") {
           return sendJson(response, 200, { live: panelPresence.hasLivePanel() });

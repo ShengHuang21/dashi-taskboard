@@ -133,6 +133,43 @@ function signedCoordinatorRenewHeaders(instanceSecret, nonce, pathname, body, is
   };
 }
 
+test("resident Coordinator project discovery requires one request-bound host proof", async () => {
+  const instanceSecret = "7".repeat(64);
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "coordinator",
+      tasks: [{
+        id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex",
+        threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local",
+        workspacePath: process.cwd(),
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "lease", holderTaskId: "coordinator", holderThreadId: "coordinator-thread",
+        holderCodexHostId: "local", holderWorkspacePath: process.cwd(),
+        acquiredAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const pathname = "/api/local/coordinator-monitor-projects";
+  const missingProof = await request(baseUrl, pathname);
+  assert.equal(missingProof.response.status, 403);
+
+  const headers = signedCoordinatorRenewHeaders(
+    instanceSecret, "a".repeat(32), pathname, null, Date.now(), "GET",
+  );
+  const discovered = await request(baseUrl, pathname, { headers });
+  assert.equal(discovered.response.status, 200);
+  assert.deepEqual(discovered.body.projectIds, ["local"]);
+
+  const replay = await request(baseUrl, pathname, { headers });
+  assert.equal(replay.response.status, 403);
+});
+
 test("health and the default local project are available", async () => {
   let skillPath;
   const baseUrl = await startServer(async (directory) => {
