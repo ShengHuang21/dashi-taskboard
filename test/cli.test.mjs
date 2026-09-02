@@ -90,6 +90,54 @@ test("owner-intent list exposes the protected read-only frontier", async () => {
   assert.equal(result.stdout.intents[0].intentId, "intent-1");
 });
 
+test("coordinator status reports an unassigned project when no active Coordinator lane exists", async () => {
+  const calls = [];
+  const result = await run([
+    "coordinator", "status", "capstone-dev", "--json",
+  ], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({
+        error: {
+          code: "AGENT_LANES_NOT_CONFIGURED",
+          message: "Project 'capstone-dev' has no valid Agent Lane mapping",
+        },
+      }, 404);
+    }
+    assert.equal(
+      url.pathname,
+      "/api/local/projects/capstone-dev/coordination-windows",
+    );
+    return response({
+      projectId: "capstone-dev",
+      revision: "a".repeat(64),
+      ownerRootTaskId: "owner-root",
+      coordinatorLease: {
+        id: "released-lease",
+        holderTaskId: "old-coordinator",
+        holderThreadId: "old-thread",
+        releasedAt: "2026-09-02T22:55:28.211Z",
+      },
+      windows: [{ taskId: "owner-root", role: "owner_root", threadId: "owner-thread" }],
+    });
+  });
+
+  assert.equal(result.exitCode, 0, JSON.stringify(result.stderr));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(result.stdout.coordination, {
+    assignment: "unassigned",
+    coordinatorTaskId: null,
+    coordinatorThreadId: null,
+    lease: {
+      id: "released-lease",
+      holderTaskId: "old-coordinator",
+      holderThreadId: "old-thread",
+      releasedAt: "2026-09-02T22:55:28.211Z",
+      status: "expired",
+    },
+  });
+});
+
 test("coordinator window commands inspect and register the current protected window", async () => {
   const calls = [];
   const inspect = await run(["coordinator", "windows", "taskboard-core", "--json"], async (url, init) => {

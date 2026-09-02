@@ -3651,6 +3651,130 @@ test("resident provisioning persists one protected idempotent attempt before rep
   completedInspection.close();
 });
 
+test("resident provisioning atomically retires exact stale Coordinator windows", async () => {
+  let databasePath;
+  const instanceSecret = "e".repeat(64);
+  const staleWindow = {
+    taskId: "root", label: "Execution Coordinator", role: "coordinator",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/sbkk",
+      }, {
+        id: staleWindow.taskId, label: staleWindow.label, owner: "Codex Global Coordinator",
+        source: "codex", connection: "connected", threadId: staleWindow.threadId,
+        taskType: "root_task", codexProjectId: staleWindow.codexProjectId,
+        codexProjectKind: staleWindow.codexProjectKind, codexHostId: staleWindow.codexHostId,
+        workspacePath: staleWindow.workspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "released-lease", holderTaskId: "root", holderThreadId: staleWindow.threadId,
+        holderCodexHostId: "local", holderWorkspacePath: "/tmp/sbkk",
+        acquiredAt: "2026-09-02T20:00:00.000Z", expiresAt: "2026-09-02T20:05:00.000Z",
+        releasedAt: "2026-09-02T20:05:00.000Z",
+      },
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "Ready replacement work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null,
+      recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const before = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "stale-window-replacement", taskId: "coordinator-local-next",
+    label: "Taskboard Execution Coordinator", threadSource: "stale-window-replacement-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: before.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    retireCoordinatorWindows: [staleWindow],
+  };
+  const wrongBody = {
+    ...body, idempotencyKey: "wrong-stale-window",
+    retireCoordinatorWindows: [{ ...staleWindow, threadId: "different-thread" }],
+  };
+  const rejected = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), pathname, wrongBody),
+    body: wrongBody,
+  });
+  assert.equal(rejected.response.status, 409);
+  const zeroMutation = new DatabaseSync(databasePath);
+  assert.equal(zeroMutation.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+  ).get().count, 0);
+  zeroMutation.close();
+
+  const created = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), pathname, body),
+    body,
+  });
+  assert.equal(created.response.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.applied, true);
+  const after = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.deepEqual(after.body.windows.map((window) => window.taskId), ["owner-root"]);
+  assert.equal(after.body.coordinatorLease.id, "released-lease");
+  assert.ok(after.body.coordinatorLease.releasedAt);
+  assert.notEqual(after.body.revision, before.body.revision);
+  assert.equal(created.body.attempt.expectedRevision, after.body.revision);
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(snapshot.response.status, 200, JSON.stringify(snapshot.body));
+  assert.equal(snapshot.body.coordination.assignment, "unassigned");
+  assert.equal(snapshot.body.coordination.lease.status, "expired");
+  assert.ok(snapshot.body.coordination.lease.releasedAt);
+  const activeLookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
+  const activeLookup = await request(baseUrl, activeLookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), activeLookupPath, {}),
+    body: {},
+  });
+  assert.equal(activeLookup.response.status, 200, JSON.stringify(activeLookup.body));
+  assert.equal(activeLookup.body.attempt.id, created.body.attempt.id);
+  const recoveryPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
+  const recovered = await request(baseUrl, recoveryPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), recoveryPath, {}),
+    body: {},
+  });
+  assert.equal(recovered.response.status, 200, JSON.stringify(recovered.body));
+  assert.equal(recovered.body.attempt.status, "starting");
+
+  const replay = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), pathname, body),
+    body,
+  });
+  assert.equal(replay.response.status, 200, JSON.stringify(replay.body));
+  assert.equal(replay.body.applied, false);
+  assert.equal(replay.body.attempt.id, created.body.attempt.id);
+});
+
 test("resident shutdown releases and retires one exact idle Coordinator attempt", async () => {
   let databasePath;
   const instanceSecret = "e".repeat(64);
@@ -3830,6 +3954,8 @@ test("resident shutdown releases and retires one exact idle Coordinator attempt"
   });
   assert.equal(finalWindows.body.windows.some((window) => window.taskId === "coordinator-a"), false);
   assert.equal(finalWindows.body.windows.some((window) => window.taskId === "owner-root"), true);
+  assert.equal(finalWindows.body.coordinatorLease.id, "lease-shutdown-a");
+  assert.ok(finalWindows.body.coordinatorLease.releasedAt);
   const quietProvisioningBody = {
     ...blockedProvisioningBody,
     idempotencyKey: "replacement-without-work",

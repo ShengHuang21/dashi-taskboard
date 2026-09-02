@@ -189,11 +189,17 @@ async function readConfig(configPath, projectId, getLaneConfig) {
       && coordinatorLeaseHolder?.taskType === "root_task"
     )),
   );
+  const coordinatorLeaseReleased = Boolean(
+    coordinatorLease?.releasedAt
+    && !Number.isNaN(Date.parse(coordinatorLease.releasedAt))
+    && !Number.isNaN(Date.parse(coordinatorLease?.acquiredAt ?? ""))
+    && Date.parse(coordinatorLease.releasedAt) >= Date.parse(coordinatorLease.acquiredAt),
+  );
   const hasCoordinatorLease = Boolean(
     coordinatorLease
     && text(coordinatorLease.id)
     && text(coordinatorLease.holderTaskId)
-    && taskIds.includes(coordinatorLease.holderTaskId)
+    && (taskIds.includes(coordinatorLease.holderTaskId) || coordinatorLeaseReleased)
     && text(coordinatorLease.acquiredAt)
     && text(coordinatorLease.expiresAt)
     && !Number.isNaN(Date.parse(coordinatorLease.acquiredAt))

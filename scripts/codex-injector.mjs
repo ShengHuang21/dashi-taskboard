@@ -2012,7 +2012,9 @@ async function requestCoordinatorProvisioningAttempt(request) {
 
 async function getCoordinatorProvisioningAttempt(request) {
   const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-provisioning-attempts/lookup`;
-  return mutateCoordinatorProvisioning(pathname, { idempotencyKey: request.idempotencyKey });
+  return mutateCoordinatorProvisioning(pathname, request.idempotencyKey
+    ? { idempotencyKey: request.idempotencyKey }
+    : {});
 }
 
 async function getCoordinatorShutdownAttempt(request) {
@@ -2047,6 +2049,86 @@ async function findArchivedCoordinatorThread(cdp, attempt) {
   ));
   if (matches.length > 1) throw new Error("Codex returned duplicate archived Coordinator threads");
   return matches[0] ?? null;
+}
+
+async function listCoordinatorWindowThread(cdp, window, archived) {
+  let cursor = null;
+  const matches = [];
+  for (let page = 0; page < 10; page += 1) {
+    const result = await requestCodexAppServerViaCdp(
+      cdp,
+      undefined,
+      window.codexHostId,
+      "thread/list",
+      {
+        cwd: window.workspacePath,
+        archived,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      },
+      10_000,
+    );
+    for (const thread of Array.isArray(result?.data) ? result.data : []) {
+      if (thread?.id === window.threadId) matches.push(thread);
+    }
+    cursor = typeof result?.nextCursor === "string" && result.nextCursor
+      ? result.nextCursor
+      : null;
+    if (!cursor) return matches;
+  }
+  throw new Error("Codex Coordinator window inspection exceeded the bounded thread list");
+}
+
+async function inspectCoordinatorProvisioningWindow(cdp, window) {
+  const protectedWindow = window?.role === "coordinator"
+    && typeof window.taskId === "string" && window.taskId
+    && typeof window.label === "string" && window.label
+    && typeof window.threadId === "string" && window.threadId
+    && typeof window.codexProjectId === "string" && window.codexProjectId
+    && new Set(["local", "remote"]).has(window.codexProjectKind)
+    && typeof window.codexHostId === "string" && window.codexHostId
+    && typeof window.workspacePath === "string" && path.isAbsolute(window.workspacePath)
+    && ((window.codexProjectKind === "local" && window.codexHostId === "local")
+      || (window.codexProjectKind === "remote" && window.codexHostId !== "local"));
+  if (!protectedWindow) return { eligibility: "uncertain", reason: "binding-invalid", window };
+  let thread = null;
+  try {
+    thread = (await requestCodexAppServerViaCdp(
+      cdp, undefined, window.codexHostId, "thread/read",
+      { threadId: window.threadId, includeTurns: true }, 10_000,
+    ))?.thread ?? null;
+  } catch {}
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  if (thread?.id === window.threadId
+    && turns.some((turn) => turn?.status === "inProgress")) {
+    return { eligibility: "eligible", busy: true, reason: "active-turn", window };
+  }
+  try {
+    const active = await listCoordinatorWindowThread(cdp, window, false);
+    if (active.length > 1) {
+      return { eligibility: "uncertain", reason: "duplicate-active-thread", window };
+    }
+    if (active.length === 1) {
+      const exact = thread?.id === window.threadId
+        && typeof thread.cwd === "string"
+        && path.resolve(thread.cwd) === path.resolve(window.workspacePath);
+      return exact
+        ? { eligibility: "eligible", busy: false, reason: "active-thread", window }
+        : { eligibility: "uncertain", reason: "active-thread-binding-unconfirmed", window };
+    }
+    const archived = await listCoordinatorWindowThread(cdp, window, true);
+    if (archived.length > 1) {
+      return { eligibility: "uncertain", reason: "duplicate-archived-thread", window };
+    }
+    if (archived.length === 1) {
+      return { eligibility: "stale", reason: "archived", window };
+    }
+    return thread?.id === window.threadId
+      ? { eligibility: "stale", reason: "inactive-or-drifted", window }
+      : { eligibility: "stale", reason: "missing", window };
+  } catch {
+    return { eligibility: "uncertain", reason: "host-unavailable", window };
+  }
 }
 
 async function transitionCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
@@ -2799,6 +2881,7 @@ async function runBackgroundContinuationMonitor(cdp) {
         readWindows: () => readCoordinatorProvisioningWindows(projectId),
         readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
         getAttempt: getCoordinatorProvisioningAttempt,
+        inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
         requestAttempt: requestCoordinatorProvisioningAttempt,
         findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
         markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(

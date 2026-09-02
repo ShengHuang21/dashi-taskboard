@@ -151,6 +151,16 @@ function coordinatorProvisioningFingerprint(projectId, input) {
     codexProjectKind: input.codexProjectKind,
     codexHostId: input.codexHostId,
     workspacePath: path.resolve(input.workspacePath),
+    retireCoordinatorWindows: (input.retireCoordinatorWindows ?? []).map((window) => ({
+      taskId: window.taskId,
+      label: window.label,
+      role: window.role,
+      threadId: window.threadId,
+      codexProjectId: window.codexProjectId,
+      codexProjectKind: window.codexProjectKind,
+      codexHostId: window.codexHostId,
+      workspacePath: path.resolve(window.workspacePath),
+    })),
   })).digest("hex");
 }
 
@@ -3470,10 +3480,16 @@ export class TaskboardDatabase {
   }
 
   getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey) {
-    const row = this.#prepare(`
-      SELECT * FROM agent_coordinator_provisioning_attempts
-      WHERE project_id = ? AND idempotency_key = ?
-    `).get(projectId, idempotencyKey);
+    const row = idempotencyKey
+      ? this.#prepare(`
+          SELECT * FROM agent_coordinator_provisioning_attempts
+          WHERE project_id = ? AND idempotency_key = ?
+        `).get(projectId, idempotencyKey)
+      : this.#prepare(`
+          SELECT * FROM agent_coordinator_provisioning_attempts
+          WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
+          ORDER BY created_at DESC, id DESC LIMIT 1
+        `).get(projectId);
     if (!row) return null;
     if (["pending", "starting", "started"].includes(row.status)
       && Date.parse(row.expires_at) <= Date.now()) {
@@ -3554,10 +3570,6 @@ export class TaskboardDatabase {
       if (input.taskId === ownerRoot.id) {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_OWNER_ROOT_CONFLICT", "A replacement Coordinator must remain separate from Owner Root");
       }
-      if (tasks.some((task) => task?.source === "codex"
-        && task?.taskType === "root_task" && task.id !== ownerRoot.id)) {
-        throw new ApiError(409, "COORDINATOR_PROVISIONING_WINDOW_EXISTS", "A registered Coordinator window already exists");
-      }
       if (this.#exactActiveCoordinatorLease(projectId, config, config.coordinatorLease ?? null)) {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_LEASE_ACTIVE", "The Global Coordinator lease is already active");
       }
@@ -3568,6 +3580,29 @@ export class TaskboardDatabase {
       if (lease && !lease.releasedAt && !this.#coordinatorLeaseReleasedAt(projectId, lease)
         && leaseHolder?.source === "codex" && leaseHolder?.taskType === "root_task") {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_LEASE_RECOVERABLE", "The existing Coordinator must recover or release its exact lease before replacement provisioning");
+      }
+      const coordinatorTasks = tasks.filter((task) => task?.source === "codex"
+        && task?.taskType === "root_task" && task.id !== ownerRoot.id);
+      const retirements = input.retireCoordinatorWindows ?? [];
+      const retirementTaskIds = new Set();
+      for (const retirement of retirements) {
+        const task = coordinatorTasks.find((candidate) => candidate.id === retirement.taskId) ?? null;
+        const exact = task
+          && task.label === retirement.label
+          && task.threadId === retirement.threadId
+          && task.codexProjectId === retirement.codexProjectId
+          && task.codexProjectKind === retirement.codexProjectKind
+          && task.codexHostId === retirement.codexHostId
+          && typeof task.workspacePath === "string"
+          && path.isAbsolute(task.workspacePath)
+          && path.resolve(task.workspacePath) === path.resolve(retirement.workspacePath);
+        if (!exact || retirementTaskIds.has(retirement.taskId)) {
+          throw new ApiError(409, "COORDINATOR_PROVISIONING_STALE_WINDOW_CONFLICT", "Protected stale Coordinator evidence does not match the current registered window set");
+        }
+        retirementTaskIds.add(retirement.taskId);
+      }
+      if (coordinatorTasks.some((task) => !retirementTaskIds.has(task.id))) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_WINDOW_EXISTS", "A registered eligible Coordinator window already exists");
       }
       const nonterminal = this.#prepare(`
         SELECT * FROM agent_coordinator_provisioning_attempts
@@ -3585,11 +3620,24 @@ export class TaskboardDatabase {
         }
       }
       const timestamp = now();
+      const nextTasks = tasks.filter((task) => !retirementTaskIds.has(task?.id));
+      const nextConfigJson = retirements.length > 0
+        ? JSON.stringify({
+            ...config,
+            tasks: nextTasks,
+          })
+        : row.config_json;
+      const effectiveRevision = agentLaneConfigRevision(nextConfigJson);
+      if (nextConfigJson !== row.config_json) {
+        this.#prepare(`
+          UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
+        `).run(nextConfigJson, timestamp, projectId);
+      }
       const attemptRow = {
         id: randomUUID(), project_id: projectId, idempotency_key: input.idempotencyKey,
         request_fingerprint: fingerprint, task_id: input.taskId, label: input.label,
         thread_source: input.threadSource, model: input.model,
-        reasoning_effort: input.reasoningEffort, expected_revision: input.expectedRevision,
+        reasoning_effort: input.reasoningEffort, expected_revision: effectiveRevision,
         owner_root_task_id: input.ownerRootTaskId, owner_root_thread_id: input.ownerRootThreadId,
         codex_project_id: input.codexProjectId, codex_project_kind: input.codexProjectKind,
         codex_host_id: input.codexHostId, workspace_path: expectedWorkspace,

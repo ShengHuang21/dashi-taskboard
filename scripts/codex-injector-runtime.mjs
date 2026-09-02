@@ -381,8 +381,33 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     return { provisioned: false, reason: "same-holder-recoverable" };
   }
   const coordinatorWindows = windows.windows.filter((window) => window?.role === "coordinator");
-  if (coordinatorWindows.length > 0) {
-    return { provisioned: false, reason: "coordinator-window-exists" };
+  const retireCoordinatorWindows = [];
+  for (const window of coordinatorWindows) {
+    if (typeof options.inspectCoordinatorWindow !== "function") {
+      return { provisioned: false, reason: "coordinator-window-exists" };
+    }
+    let inspection;
+    try {
+      inspection = await options.inspectCoordinatorWindow(window);
+    } catch {
+      return { provisioned: false, reason: "window-inspection-unavailable" };
+    }
+    if (inspection?.eligibility === "eligible" || inspection?.busy === true) {
+      return { provisioned: false, reason: "coordinator-window-exists" };
+    }
+    if (inspection?.eligibility !== "stale"
+      || inspection?.window?.taskId !== window.taskId
+      || inspection.window.label !== window.label
+      || inspection.window.role !== "coordinator"
+      || inspection.window.threadId !== window.threadId
+      || inspection.window.codexProjectId !== window.codexProjectId
+      || inspection.window.codexProjectKind !== window.codexProjectKind
+      || inspection.window.codexHostId !== window.codexHostId
+      || path.resolve(inspection.window.workspacePath ?? "")
+        !== path.resolve(window.workspacePath ?? "")) {
+      return { provisioned: false, reason: "window-inspection-unavailable" };
+    }
+    retireCoordinatorWindows.push(window);
   }
 
   const identity = coordinatorProvisioningIdentity(
@@ -395,6 +420,12 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       })
     : null;
   let attempt = result?.attempt ?? null;
+  let recoveredActiveAttempt = false;
+  if (!attempt && typeof options.getAttempt === "function") {
+    result = await options.getAttempt({ projectId: policy.projectId });
+    attempt = result?.attempt ?? null;
+    recoveredActiveAttempt = Boolean(attempt);
+  }
   if (!attempt) {
     let selectedModel = {
       model: policy.model,
@@ -423,15 +454,16 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       codexProjectKind: ownerLane.codexProjectKind,
       codexHostId: ownerLane.codexHostId,
       workspacePath: ownerRoute.rootWorkspacePath,
+      retireCoordinatorWindows,
     });
     attempt = result?.attempt ?? null;
   }
   if (!attempt?.id) return { provisioned: false, reason: "attempt-unavailable" };
   if (attempt.projectId !== policy.projectId
-    || attempt.idempotencyKey !== identity.idempotencyKey
-    || attempt.taskId !== identity.taskId
-    || attempt.threadSource !== identity.threadSource
-    || attempt.expectedRevision !== windows.revision
+    || (!recoveredActiveAttempt && attempt.idempotencyKey !== identity.idempotencyKey)
+    || (!recoveredActiveAttempt && attempt.taskId !== identity.taskId)
+    || (!recoveredActiveAttempt && attempt.threadSource !== identity.threadSource)
+    || (retireCoordinatorWindows.length === 0 && attempt.expectedRevision !== windows.revision)
     || attempt.ownerRootTaskId !== ownerRootTaskId
     || attempt.ownerRootThreadId !== ownerRoute.rootThreadId
     || attempt.codexProjectId !== ownerLane.codexProjectId

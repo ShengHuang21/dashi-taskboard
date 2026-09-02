@@ -911,6 +911,200 @@ test("Coordinator provisioning performs zero mutation when a lease or Coordinato
   assert.equal(requests, 0);
 });
 
+test("Coordinator provisioning retires only protected stale windows and starts one replacement", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const stale = {
+    taskId: "root", label: "Execution Coordinator", role: "coordinator",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexProjectId: "local-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/taskboard",
+  };
+  let attempt = null;
+  let requests = 0;
+  let starts = 0;
+  const options = {
+    policy: {
+      enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
+    },
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+        ownerRootRoute: {
+          rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+        },
+        lease: { status: "released", releasedAt: "2026-09-02T22:55:28.211Z" },
+      },
+      taskLanes: [{ id: owner.taskId, ...owner }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision: "d".repeat(64), ownerRootTaskId: owner.taskId,
+      windows: [{ ...owner, role: "owner_root" }, stale],
+    }),
+    inspectCoordinatorWindow: async (window) => {
+      assert.deepEqual(window, stale);
+      return { eligibility: "stale", reason: "archived", window };
+    },
+    getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
+    requestAttempt: async (request) => {
+      requests += 1;
+      assert.deepEqual(request.retireCoordinatorWindows, [stale]);
+      attempt ??= { ...request, id: "attempt-stale", status: "pending", threadId: null };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => null,
+    markStarting: async () => {
+      attempt.status = "starting";
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      starts += 1;
+      return { thread: { id: "01a09999-a749-7b53-81e2-af2d477f93ae", cwd: settings.cwd, threadSource: settings.threadSource } };
+    },
+    attachThread: async ({ threadId }) => {
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => ({ delivery: "started", turnId: "turn-1" }),
+  };
+
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: true, reason: "thread-started", attemptId: "attempt-stale",
+  });
+  assert.equal(requests, 1);
+  assert.equal(starts, 1);
+});
+
+test("Coordinator provisioning recovers the same attempt after stale-window retirement response loss", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const stale = {
+    taskId: "root", label: "Execution Coordinator", role: "coordinator",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexProjectId: "local-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/taskboard",
+  };
+  const beforeRevision = "d".repeat(64);
+  const afterRevision = "f".repeat(64);
+  let retired = false;
+  let attempt = null;
+  let requests = 0;
+  let starts = 0;
+  const options = {
+    policy: {
+      enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
+    },
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+        ownerRootRoute: {
+          rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+        },
+        lease: null,
+      },
+      taskLanes: [{ id: owner.taskId, ...owner }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision: retired ? afterRevision : beforeRevision,
+      ownerRootTaskId: owner.taskId,
+      windows: [{ ...owner, role: "owner_root" }, ...(retired ? [] : [stale])],
+    }),
+    inspectCoordinatorWindow: async () => ({ eligibility: "stale", reason: "archived", window: stale }),
+    getAttempt: async ({ idempotencyKey }) => ({
+      attempt: idempotencyKey ? null : attempt ? { ...attempt } : null,
+    }),
+    requestAttempt: async (request) => {
+      requests += 1;
+      retired = true;
+      attempt = {
+        ...request, id: "attempt-response-loss", expectedRevision: afterRevision,
+        status: "pending", threadId: null,
+      };
+      throw new Error("response lost after commit");
+    },
+    findThread: async () => null,
+    markStarting: async () => {
+      attempt.status = "starting";
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      starts += 1;
+      return { thread: {
+        id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+        cwd: settings.cwd, threadSource: attempt.threadSource,
+      } };
+    },
+    attachThread: async ({ threadId }) => {
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => ({ delivery: "started", turnId: "turn-1" }),
+  };
+
+  await assert.rejects(runCoordinatorProvisioningMonitorOnce(options), /response lost/);
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: true, reason: "thread-started", attemptId: "attempt-response-loss",
+  });
+  assert.equal(requests, 1);
+  assert.equal(starts, 1);
+});
+
+test("Coordinator provisioning fails closed for fresh busy or uncertain registered windows", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const coordinator = {
+    taskId: "coordinator-a", label: "Coordinator", role: "coordinator",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexProjectId: "local-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/taskboard",
+  };
+  let requests = 0;
+  for (const inspection of [
+    { eligibility: "eligible", busy: true, window: coordinator },
+    { eligibility: "uncertain", reason: "host-unavailable", window: coordinator },
+  ]) {
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
+      readSnapshot: async () => ({
+        projectId: "capstone-dev",
+        coordination: {
+          assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+          ownerRootRoute: {
+            rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+            codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+          },
+          lease: null,
+        },
+        taskLanes: [{ id: owner.taskId, ...owner }],
+      }),
+      readWindows: async () => ({
+        projectId: "capstone-dev", revision: "e".repeat(64), ownerRootTaskId: owner.taskId,
+        windows: [{ ...owner, role: "owner_root" }, coordinator],
+      }),
+      inspectCoordinatorWindow: async () => inspection,
+      requestAttempt: async () => { requests += 1; },
+      findThread: async () => null,
+      markStarting: async () => null,
+      startThread: async () => null,
+      attachThread: async () => null,
+      deliverInstruction: async () => null,
+    });
+    assert.equal(result.provisioned, false);
+    assert.match(result.reason, /coordinator-window|window-inspection/);
+  }
+  assert.equal(requests, 0);
+});
+
 test("coordinator keepalive fails closed for busy, drifted, or non-active holders", async () => {
   const now = Date.parse("2026-08-31T01:00:00.000Z");
   let renewed = 0;

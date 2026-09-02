@@ -421,7 +421,7 @@ function parseCoordinatorProvisioningRequest(value) {
     "idempotencyKey", "taskId", "label", "threadSource", "model", "reasoningEffort",
     "expectedRevision",
     "ownerRootTaskId", "ownerRootThreadId", "codexProjectId", "codexProjectKind",
-    "codexHostId", "workspacePath",
+    "codexHostId", "workspacePath", "retireCoordinatorWindows",
   ]));
   const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
     required: true, maxLength: 64,
@@ -448,6 +448,43 @@ function parseCoordinatorProvisioningRequest(value) {
     || (codexProjectKind === "remote" && codexHostId === "local")) {
     throw new ApiError(400, "INVALID_FIELD", "Coordinator provisioning project identity is invalid");
   }
+  const retireCoordinatorWindows = value.retireCoordinatorWindows ?? [];
+  if (!Array.isArray(retireCoordinatorWindows) || retireCoordinatorWindows.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'retireCoordinatorWindows' must be an array with at most 32 entries");
+  }
+  const seenRetirements = new Set();
+  const parsedRetirements = retireCoordinatorWindows.map((candidate, index) => {
+    assertPlainObject(candidate);
+    assertAllowedKeys(candidate, new Set([
+      "taskId", "label", "role", "threadId", "codexProjectId", "codexProjectKind",
+      "codexHostId", "workspacePath",
+    ]));
+    if (candidate.role !== "coordinator") {
+      throw new ApiError(400, "INVALID_FIELD", `retireCoordinatorWindows[${index}].role must be coordinator`);
+    }
+    const retirement = {
+      taskId: stringField(candidate.taskId, `retireCoordinatorWindows[${index}].taskId`, { required: true, maxLength: 256 }),
+      label: stringField(candidate.label, `retireCoordinatorWindows[${index}].label`, { required: true, maxLength: 120 }),
+      role: "coordinator",
+      threadId: stringField(candidate.threadId, `retireCoordinatorWindows[${index}].threadId`, { required: true, maxLength: 256 }),
+      codexProjectId: stringField(candidate.codexProjectId, `retireCoordinatorWindows[${index}].codexProjectId`, { required: true, maxLength: 256 }),
+      codexProjectKind: stringField(candidate.codexProjectKind, `retireCoordinatorWindows[${index}].codexProjectKind`, { required: true, maxLength: 16 }),
+      codexHostId: stringField(candidate.codexHostId, `retireCoordinatorWindows[${index}].codexHostId`, { required: true, maxLength: 256 }),
+      workspacePath: path.resolve(stringField(candidate.workspacePath, `retireCoordinatorWindows[${index}].workspacePath`, { required: true, maxLength: 4096 })),
+    };
+    if (!path.isAbsolute(candidate.workspacePath) || candidate.workspacePath.includes("\0")
+      || !new Set(["local", "remote"]).has(retirement.codexProjectKind)
+      || (retirement.codexProjectKind === "local" && retirement.codexHostId !== "local")
+      || (retirement.codexProjectKind === "remote" && retirement.codexHostId === "local")) {
+      throw new ApiError(400, "INVALID_FIELD", `retireCoordinatorWindows[${index}] has an invalid protected identity`);
+    }
+    const key = `${retirement.taskId}\0${retirement.threadId}`;
+    if (seenRetirements.has(key)) {
+      throw new ApiError(400, "INVALID_FIELD", "retireCoordinatorWindows must not contain duplicates");
+    }
+    seenRetirements.add(key);
+    return retirement;
+  });
   return {
     idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
     taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
@@ -464,6 +501,7 @@ function parseCoordinatorProvisioningRequest(value) {
     codexProjectKind,
     codexHostId,
     workspacePath: path.resolve(workspacePath),
+    retireCoordinatorWindows: parsedRetirements,
   };
 }
 
@@ -478,6 +516,7 @@ function parseCoordinatorProvisioningTransition(value, action) {
 function parseCoordinatorProvisioningLookup(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set(["idempotencyKey"]));
+  if (value.idempotencyKey === undefined) return null;
   return stringField(value.idempotencyKey, "idempotencyKey", {
     required: true, maxLength: 256,
   });

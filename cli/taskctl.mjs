@@ -649,8 +649,31 @@ async function execute(parsed, overrides) {
     case "coordinator status": {
       expectOperandCount(parsed, 1);
       const projectId = parsed.operands[0];
-      const snapshot = await api.request("GET", agentLaneProjectPath(projectId));
-      return { projectId, coordination: snapshot.coordination ?? null };
+      try {
+        const snapshot = await api.request("GET", agentLaneProjectPath(projectId));
+        return { projectId, coordination: snapshot.coordination ?? null };
+      } catch (error) {
+        if (!(error instanceof TaskctlError)
+          || error.code !== "AGENT_LANES_NOT_CONFIGURED") throw error;
+        const windows = await api.request("GET", coordinationWindowsPath(projectId));
+        const lease = windows.coordinatorLease ?? null;
+        const active = lease && !lease.releasedAt
+          && typeof lease.expiresAt === "string"
+          && Date.parse(lease.expiresAt) > Date.now();
+        if (active) throw error;
+        return {
+          projectId,
+          coordination: {
+            assignment: "unassigned",
+            coordinatorTaskId: null,
+            coordinatorThreadId: null,
+            lease: lease ? {
+              ...lease,
+              status: "expired",
+            } : null,
+          },
+        };
+      }
     }
     case "coordinator windows":
       expectOperandCount(parsed, 1);
