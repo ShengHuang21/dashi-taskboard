@@ -413,6 +413,7 @@ async function launchCodexWithLaunchServices(appPath, port, shouldStop = () => f
   const launcher = spawn(
     "/usr/bin/open",
     [
+      "-n",
       "-a",
       appPath,
       "--args",
@@ -3273,6 +3274,8 @@ async function main() {
     onUnexpectedExit: (code, signal) => {
       console.error(`Taskboard exited (${signal || code}); it will be restarted automatically.`);
     },
+    startupTimeoutMs: 120_000,
+    unhealthyChildGraceMs: 30_000,
   });
 
   const publishRuntime = async () => {
@@ -3308,8 +3311,10 @@ async function main() {
       }
       if (runningCodex.length > 0) {
         if (debuggingCodexFound) return false;
-        nativeCodexBrowser = true;
-        return false;
+        if (!options.launch) {
+          nativeCodexBrowser = true;
+          return false;
+        }
       }
     }
     if (options.launch) {

@@ -285,6 +285,17 @@ test("the package injection command remains resident for tab-triggered recovery"
   assert.match(source, /__codexTaskboardHostStartupTokenV1/);
 });
 
+test("launch mode opens a dedicated debuggable Codex instance beside the native app", () => {
+  assert.match(
+    source,
+    /spawn\(\s*"\/usr\/bin\/open",\s*\[\s*"-n",\s*"-a",\s*appPath/,
+  );
+  assert.match(
+    source,
+    /if \(runningCodex\.length > 0\) \{[\s\S]*?if \(debuggingCodexFound\) return false;[\s\S]*?if \(!options\.launch\) \{[\s\S]*?nativeCodexBrowser = true;/,
+  );
+});
+
 test("attach reconciles the renderer against a hashed current injection source", () => {
   assert.match(source, /createHash\("sha256"\)/);
   assert.match(source, /__CODEX_TASKBOARD_SOURCE_HASH__/);
