@@ -1142,6 +1142,8 @@ export function createAgentLaneSnapshotProvider({
   listComments = null,
   getPendingOwnerIntent = null,
   getPendingOwnerIntentPlan = null,
+  getCoordinatorDurableWork = null,
+  getCoordinatorShutdownAttempt = null,
   getTaskDomainAssignment = null,
   getCurrentHostIdentity = null,
 }) {
@@ -1513,6 +1515,12 @@ export function createAgentLaneSnapshotProvider({
             targetWorkspacePath: todo.dispatchTarget.rootWorkspacePath,
           },
         }))[0] ?? null;
+      const durableWorkPending = typeof getCoordinatorDurableWork === "function"
+        ? await getCoordinatorDurableWork(projectId)
+        : true;
+      const shutdownAttempt = typeof getCoordinatorShutdownAttempt === "function"
+        ? await getCoordinatorShutdownAttempt(projectId)
+        : null;
       return {
         version: AGENT_LANE_SNAPSHOT_VERSION,
         projectId,
@@ -1542,6 +1550,8 @@ export function createAgentLaneSnapshotProvider({
           pendingOwnerIntentPlan,
           ownerDecisionRequest,
           pendingCrossDomainHandoff,
+          durableWorkPending,
+          shutdownAttempt,
         },
         todos,
         attentionQueue: todos

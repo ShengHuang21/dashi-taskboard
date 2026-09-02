@@ -14,6 +14,8 @@ const crossDomainHandoffMonitorRuns = new Map();
 const coordinatorLeaseKeepaliveMonitorRuns = new Map();
 const coordinatorLeaseRecoveryMonitorRuns = new Map();
 const coordinatorProvisioningMonitorRuns = new Map();
+const coordinatorShutdownMonitorRuns = new Map();
+const coordinatorShutdownIdleObservations = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
 const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
@@ -88,6 +90,251 @@ function coordinatorProvisioningIdentity(projectId, revision, ownerRootTaskId) {
   };
 }
 
+function coordinatorShutdownIdentity(projectId, lease, lane, ownerLane) {
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    projectId,
+    leaseId: lease.id,
+    holderTaskId: lease.holderTaskId,
+    holderThreadId: lane.threadId,
+    codexProjectId: lane.codexProjectId,
+    codexProjectKind: lane.codexProjectKind,
+    codexHostId: lane.codexHostId,
+    workspacePath: path.resolve(lane.workspacePath),
+    ownerRootTaskId: ownerLane.id,
+    ownerRootThreadId: ownerLane.threadId,
+    ownerRootCodexProjectId: ownerLane.codexProjectId,
+    ownerRootCodexProjectKind: ownerLane.codexProjectKind,
+    ownerRootCodexHostId: ownerLane.codexHostId,
+    ownerRootWorkspacePath: path.resolve(ownerLane.workspacePath),
+  })).digest("hex");
+  return {
+    idempotencyKey: `coordinator-shutdown-${fingerprint}`,
+    fingerprint,
+  };
+}
+
+async function continueCoordinatorShutdownAttempt(options, attempt) {
+  if (!attempt?.id) return { shutdown: false, reason: "attempt-unavailable" };
+  if (attempt.status === "completed") {
+    return { shutdown: true, reason: "completed", attemptId: attempt.id };
+  }
+  if (attempt.status === "canceled") {
+    return { shutdown: false, reason: "attempt-canceled", attemptId: attempt.id };
+  }
+  if (attempt.status === "pending") {
+    try {
+      const released = await options.releaseAttempt({ attemptId: attempt.id });
+      attempt = released?.attempt ?? attempt;
+    } catch {
+      return { shutdown: false, reason: "release-unavailable", attemptId: attempt.id };
+    }
+  }
+  if (attempt.status !== "released") {
+    return { shutdown: false, reason: "attempt-state-unavailable", attemptId: attempt.id };
+  }
+  let archivedThread = null;
+  try {
+    archivedThread = await options.findArchivedThread(attempt);
+  } catch {
+    return { shutdown: false, reason: "archive-observation-unavailable", attemptId: attempt.id };
+  }
+  if (!archivedThread) {
+    let thread;
+    try {
+      thread = (await options.readThread({
+        threadId: attempt.holderThreadId,
+        codexHostId: attempt.codexHostId,
+      }))?.thread;
+    } catch {
+      return { shutdown: false, reason: "thread-unavailable", attemptId: attempt.id };
+    }
+    if (thread?.id !== attempt.holderThreadId
+      || typeof thread.cwd !== "string"
+      || path.resolve(thread.cwd) !== path.resolve(attempt.workspacePath)
+      || !Array.isArray(thread.turns)
+      || thread.turns.some((turn) => turn?.status === "inProgress")) {
+      return { shutdown: false, reason: "thread-busy-or-drifted", attemptId: attempt.id };
+    }
+    try {
+      await options.archiveThread({
+        threadId: attempt.holderThreadId,
+        codexHostId: attempt.codexHostId,
+        workspacePath: attempt.workspacePath,
+      });
+    } catch {
+      return { shutdown: false, reason: "archive-uncertain", attemptId: attempt.id };
+    }
+  } else if (archivedThread.id !== attempt.holderThreadId
+    || typeof archivedThread.cwd !== "string"
+    || path.resolve(archivedThread.cwd) !== path.resolve(attempt.workspacePath)) {
+    return { shutdown: false, reason: "archived-thread-drifted", attemptId: attempt.id };
+  }
+  try {
+    const completed = await options.completeAttempt({ attemptId: attempt.id });
+    return completed?.attempt?.status === "completed"
+      ? { shutdown: true, reason: "completed", attemptId: attempt.id }
+      : { shutdown: false, reason: "completion-unavailable", attemptId: attempt.id };
+  } catch {
+    return { shutdown: false, reason: "completion-unavailable", attemptId: attempt.id };
+  }
+}
+
+async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
+  const { policy } = options;
+  const existing = (await options.getAttempt({ projectId: policy.projectId }))?.attempt ?? null;
+  if (existing && existing.status !== "completed" && existing.status !== "canceled") {
+    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    return continueCoordinatorShutdownAttempt(options, existing);
+  }
+  const [snapshot, windows] = await Promise.all([
+    options.readSnapshot(policy.projectId),
+    options.readWindows(policy.projectId),
+  ]);
+  const coordination = snapshot?.coordination;
+  const lease = coordination?.lease;
+  const holderTaskId = lease?.holderTaskId;
+  const lane = Array.isArray(snapshot?.taskLanes)
+    ? snapshot.taskLanes.find((candidate) => candidate?.id === holderTaskId) ?? null
+    : null;
+  const ownerRootTaskId = coordination?.ownerRootTaskId;
+  const ownerLane = Array.isArray(snapshot?.taskLanes)
+    ? snapshot.taskLanes.find((candidate) => candidate?.id === ownerRootTaskId) ?? null
+    : null;
+  const ownerWindow = Array.isArray(windows?.windows)
+    ? windows.windows.find((window) => window?.taskId === ownerRootTaskId) ?? null
+    : null;
+  const holderWindow = Array.isArray(windows?.windows)
+    ? windows.windows.find((window) => window?.taskId === holderTaskId) ?? null
+    : null;
+  const exact = snapshot?.projectId === policy.projectId
+    && windows?.projectId === policy.projectId
+    && RESUME_TOKEN_PATTERN.test(windows?.revision ?? "")
+    && coordination?.assignment === "lease"
+    && coordination?.durableWorkPending === false
+    && lease?.status === "active"
+    && lease?.bindingValid === true
+    && !lease.releasedAt
+    && COORDINATION_ID_PATTERN.test(lease?.id ?? "")
+    && COORDINATION_ID_PATTERN.test(holderTaskId ?? "")
+    && holderTaskId !== ownerRootTaskId
+    && THREAD_ID_PATTERN.test(lane?.threadId ?? "")
+    && COORDINATION_ID_PATTERN.test(lane?.codexHostId ?? "")
+    && typeof lane?.workspacePath === "string"
+    && path.isAbsolute(lane.workspacePath)
+    && holderWindow?.role === "coordinator"
+    && holderWindow.threadId === lane.threadId
+    && holderWindow.codexProjectId === lane.codexProjectId
+    && holderWindow.codexProjectKind === lane.codexProjectKind
+    && holderWindow.codexHostId === lane.codexHostId
+    && path.resolve(holderWindow.workspacePath ?? "") === path.resolve(lane.workspacePath)
+    && ownerWindow?.role === "owner_root"
+    && THREAD_ID_PATTERN.test(ownerLane?.threadId ?? "")
+    && COORDINATION_ID_PATTERN.test(ownerLane?.codexHostId ?? "")
+    && typeof ownerLane?.workspacePath === "string"
+    && path.isAbsolute(ownerLane.workspacePath)
+    && ownerWindow.threadId === ownerLane.threadId
+    && ownerWindow.codexProjectId === ownerLane.codexProjectId
+    && ownerWindow.codexProjectKind === ownerLane.codexProjectKind
+    && ownerWindow.codexHostId === ownerLane.codexHostId
+    && path.resolve(ownerWindow.workspacePath ?? "") === path.resolve(ownerLane.workspacePath)
+    && coordination?.ownerRootRoute?.rootThreadId === ownerLane.threadId
+    && coordination.ownerRootRoute.codexHostId === ownerLane.codexHostId
+    && path.resolve(coordination.ownerRootRoute.rootWorkspacePath ?? "")
+      === path.resolve(ownerLane.workspacePath);
+  if (!exact) {
+    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    return { shutdown: false, reason: "not-idle-or-binding-drift" };
+  }
+  let thread;
+  try {
+    thread = (await options.readThread({
+      threadId: lane.threadId,
+      codexHostId: lane.codexHostId,
+    }))?.thread;
+  } catch {
+    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    return { shutdown: false, reason: "thread-unavailable" };
+  }
+  if (thread?.id !== lane.threadId
+    || typeof thread.cwd !== "string"
+    || path.resolve(thread.cwd) !== path.resolve(lane.workspacePath)
+    || !Array.isArray(thread.turns)
+    || thread.turns.some((turn) => turn?.status === "inProgress")) {
+    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    return { shutdown: false, reason: "thread-busy-or-drifted" };
+  }
+  const identity = coordinatorShutdownIdentity(policy.projectId, lease, lane, ownerLane);
+  const observedAt = options.now();
+  const observation = coordinatorShutdownIdleObservations.get(policy.projectId);
+  if (!observation || observation.fingerprint !== identity.fingerprint) {
+    coordinatorShutdownIdleObservations.set(policy.projectId, {
+      fingerprint: identity.fingerprint,
+      firstObservedAt: observedAt,
+    });
+    return { shutdown: false, reason: "idle-grace" };
+  }
+  if (observedAt - observation.firstObservedAt < policy.idleGraceMs) {
+    return { shutdown: false, reason: "idle-grace" };
+  }
+  let attempt;
+  try {
+    attempt = (await options.requestAttempt({
+      projectId: policy.projectId,
+      idempotencyKey: identity.idempotencyKey,
+      expectedRevision: windows.revision,
+      expectedLeaseId: lease.id,
+      holderTaskId,
+      holderThreadId: lane.threadId,
+      ownerRootTaskId,
+      ownerRootThreadId: ownerLane.threadId,
+      ownerRootCodexProjectId: ownerLane.codexProjectId,
+      ownerRootCodexProjectKind: ownerLane.codexProjectKind,
+      ownerRootCodexHostId: ownerLane.codexHostId,
+      ownerRootWorkspacePath: ownerLane.workspacePath,
+      codexProjectId: lane.codexProjectId,
+      codexProjectKind: lane.codexProjectKind,
+      codexHostId: lane.codexHostId,
+      workspacePath: lane.workspacePath,
+    }))?.attempt ?? null;
+  } catch {
+    return { shutdown: false, reason: "attempt-unavailable" };
+  }
+  coordinatorShutdownIdleObservations.delete(policy.projectId);
+  return continueCoordinatorShutdownAttempt(options, attempt);
+}
+
+export async function runCoordinatorShutdownMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { shutdown: false, reason: "disabled" };
+  if (!COORDINATION_ID_PATTERN.test(policy.projectId ?? "")
+    || !Number.isSafeInteger(policy.idleGraceMs)
+    || policy.idleGraceMs < 1
+    || policy.idleGraceMs > 60 * 60_000
+    || typeof options?.now !== "function"
+    || typeof options?.readSnapshot !== "function"
+    || typeof options?.readWindows !== "function"
+    || typeof options?.readThread !== "function"
+    || typeof options?.getAttempt !== "function"
+    || typeof options?.requestAttempt !== "function"
+    || typeof options?.releaseAttempt !== "function"
+    || typeof options?.findArchivedThread !== "function"
+    || typeof options?.archiveThread !== "function"
+    || typeof options?.completeAttempt !== "function") {
+    return { shutdown: false, reason: "invalid-monitor" };
+  }
+  const current = coordinatorShutdownMonitorRuns.get(policy.projectId);
+  if (current) return current;
+  const run = runCoordinatorShutdownMonitorOnceUnlocked(options);
+  coordinatorShutdownMonitorRuns.set(policy.projectId, run);
+  try {
+    return await run;
+  } finally {
+    if (coordinatorShutdownMonitorRuns.get(policy.projectId) === run) {
+      coordinatorShutdownMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
 async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   const { policy } = options;
   const [snapshot, windows] = await Promise.all([
@@ -98,6 +345,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || windows?.projectId !== policy.projectId
     || !RESUME_TOKEN_PATTERN.test(windows?.revision ?? "")) {
     return { provisioned: false, reason: "invalid-project-state" };
+  }
+  if (snapshot?.coordination?.durableWorkPending !== true) {
+    return { provisioned: false, reason: "no-eligible-work" };
   }
   const ownerRootTaskId = snapshot?.coordination?.ownerRootTaskId;
   const ownerRoute = snapshot?.coordination?.ownerRootRoute;

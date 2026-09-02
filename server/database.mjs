@@ -118,6 +118,10 @@ function coordinatorProvisioningAttemptFromRow(row) {
     expectedRevision: row.expected_revision,
     ownerRootTaskId: row.owner_root_task_id,
     ownerRootThreadId: row.owner_root_thread_id,
+    ownerRootCodexProjectId: row.owner_root_codex_project_id,
+    ownerRootCodexProjectKind: row.owner_root_codex_project_kind,
+    ownerRootCodexHostId: row.owner_root_codex_host_id,
+    ownerRootWorkspacePath: row.owner_root_workspace_path,
     codexProjectId: row.codex_project_id,
     codexProjectKind: row.codex_project_kind,
     codexHostId: row.codex_host_id,
@@ -143,6 +147,54 @@ function coordinatorProvisioningFingerprint(projectId, input) {
     expectedRevision: input.expectedRevision,
     ownerRootTaskId: input.ownerRootTaskId,
     ownerRootThreadId: input.ownerRootThreadId,
+    codexProjectId: input.codexProjectId,
+    codexProjectKind: input.codexProjectKind,
+    codexHostId: input.codexHostId,
+    workspacePath: path.resolve(input.workspacePath),
+  })).digest("hex");
+}
+
+function coordinatorShutdownAttemptFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    idempotencyKey: row.idempotency_key,
+    expectedRevision: row.expected_revision,
+    expectedLeaseId: row.expected_lease_id,
+    holderTaskId: row.holder_task_id,
+    holderThreadId: row.holder_thread_id,
+    ownerRootTaskId: row.owner_root_task_id,
+    ownerRootThreadId: row.owner_root_thread_id,
+    ownerRootCodexProjectId: row.owner_root_codex_project_id,
+    ownerRootCodexProjectKind: row.owner_root_codex_project_kind,
+    ownerRootCodexHostId: row.owner_root_codex_host_id,
+    ownerRootWorkspacePath: row.owner_root_workspace_path,
+    codexProjectId: row.codex_project_id,
+    codexProjectKind: row.codex_project_kind,
+    codexHostId: row.codex_host_id,
+    workspacePath: row.workspace_path,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    releasedAt: row.released_at,
+    completedAt: row.completed_at,
+  };
+}
+
+function coordinatorShutdownFingerprint(projectId, input) {
+  return createHash("sha256").update(JSON.stringify({
+    projectId,
+    idempotencyKey: input.idempotencyKey,
+    expectedRevision: input.expectedRevision,
+    expectedLeaseId: input.expectedLeaseId,
+    holderTaskId: input.holderTaskId,
+    holderThreadId: input.holderThreadId,
+    ownerRootTaskId: input.ownerRootTaskId,
+    ownerRootThreadId: input.ownerRootThreadId,
+    ownerRootCodexProjectId: input.ownerRootCodexProjectId,
+    ownerRootCodexProjectKind: input.ownerRootCodexProjectKind,
+    ownerRootCodexHostId: input.ownerRootCodexHostId,
+    ownerRootWorkspacePath: path.resolve(input.ownerRootWorkspacePath),
     codexProjectId: input.codexProjectId,
     codexProjectKind: input.codexProjectKind,
     codexHostId: input.codexHostId,
@@ -1407,6 +1459,36 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS agent_coordinator_provisioning_attempts_active
         ON agent_coordinator_provisioning_attempts(project_id, status, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS agent_coordinator_shutdown_attempts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        expected_revision TEXT NOT NULL,
+        expected_lease_id TEXT NOT NULL,
+        holder_task_id TEXT NOT NULL,
+        holder_thread_id TEXT NOT NULL,
+        owner_root_task_id TEXT NOT NULL,
+        owner_root_thread_id TEXT NOT NULL,
+        owner_root_codex_project_id TEXT NOT NULL,
+        owner_root_codex_project_kind TEXT NOT NULL CHECK (owner_root_codex_project_kind IN ('local', 'remote')),
+        owner_root_codex_host_id TEXT NOT NULL,
+        owner_root_workspace_path TEXT NOT NULL,
+        codex_project_id TEXT NOT NULL,
+        codex_project_kind TEXT NOT NULL CHECK (codex_project_kind IN ('local', 'remote')),
+        codex_host_id TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'released', 'completed', 'canceled')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        released_at TEXT,
+        completed_at TEXT,
+        UNIQUE(project_id, idempotency_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_coordinator_shutdown_attempts_active
+        ON agent_coordinator_shutdown_attempts(project_id, status, created_at, id);
 
       CREATE TABLE IF NOT EXISTS agent_coordination_domain_receipts (
         id TEXT PRIMARY KEY,
@@ -3441,6 +3523,13 @@ export class TaskboardDatabase {
         return { applied: false, attempt: coordinatorProvisioningAttemptFromRow(existing) };
       }
 
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_IN_PROGRESS", "Replacement provisioning waits until the exact retiring Coordinator is archived");
+      }
+      if (!this.hasAgentLaneCoordinatorDurableWork(projectId)) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_NO_ELIGIBLE_WORK", "Replacement provisioning requires new eligible durable work");
+      }
+
       const revision = agentLaneConfigRevision(row.config_json);
       if (revision !== input.expectedRevision) {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_REVISION_CONFLICT", "Agent Lane coordination windows changed since provisioning was planned", { actualRevision: revision });
@@ -3579,6 +3668,321 @@ export class TaskboardDatabase {
       return { attempt: coordinatorProvisioningAttemptFromRow({
         ...row, status: nextStatus, thread_id: threadId, retry_count: retryCount,
         updated_at: timestamp, expires_at: expiresAt,
+      }) };
+    } catch (error) {
+      if (this.database.isTransaction) this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  hasAgentLaneCoordinatorDurableWork(projectId) {
+    const timestamp = now();
+    const probes = [
+      this.#prepare(`
+        SELECT 1 FROM tasks
+        WHERE project_id = ? AND archived_at IS NULL AND status IN ('todo', 'in_progress') LIMIT 1
+      `).get(projectId),
+      this.#prepare(`
+        SELECT 1 FROM task_agent_runs WHERE project_id = ? AND status = 'active' LIMIT 1
+      `).get(projectId),
+      this.#prepare(`
+        SELECT 1 FROM agent_task_claims WHERE project_id = ? AND status = 'active' LIMIT 1
+      `).get(projectId),
+      this.#prepare(`
+        SELECT 1 FROM task_safe_action_receipts
+        WHERE project_id = ? AND (
+          status IN ('reserved', 'delivering')
+          OR admission_state NOT IN ('none', 'admitted')
+        ) LIMIT 1
+      `).get(projectId),
+      this.#prepare(`
+        SELECT 1 FROM project_owner_intents
+        WHERE project_id = ? AND status IN ('queued', 'adopted', 'needs_decision') LIMIT 1
+      `).get(projectId),
+      this.#prepare(`
+        SELECT 1 FROM owner_intent_adoptions
+        WHERE project_id = ? AND state = 'reserved' LIMIT 1
+      `).get(projectId),
+      this.#prepare(`
+        SELECT 1 FROM owner_decision_deliveries AS delivery
+        LEFT JOIN task_owner_decision_receipts AS receipt ON receipt.delivery_id = delivery.id
+        WHERE delivery.project_id = ? AND receipt.id IS NULL AND (
+          (delivery.state = 'reserved' AND delivery.reservation_expires_at > ?)
+          OR (
+            delivery.state = 'delivered'
+            AND COALESCE(
+              delivery.decision_expires_at,
+              strftime('%Y-%m-%dT%H:%M:%fZ', delivery.delivered_at, '+24 hours')
+            ) > ?
+          )
+        ) LIMIT 1
+      `).get(projectId, timestamp, timestamp),
+      this.#prepare(`
+        SELECT 1 FROM cross_domain_handoff_deliveries
+        WHERE project_id = ? AND state = 'reserved' AND reservation_expires_at > ? LIMIT 1
+      `).get(projectId, timestamp),
+      this.#prepare(`
+        SELECT 1 FROM agent_coordinator_provisioning_attempts
+        WHERE project_id = ? AND status IN ('pending', 'starting', 'started') LIMIT 1
+      `).get(projectId),
+    ];
+    if (probes.some(Boolean)) return true;
+    return this.listTasks({ projectId, archived: "false" }).some((task) => {
+      const capsule = this.getTaskCapsule(task.id);
+      return Boolean(capsule?.readyWork?.ownerDecisionRequest)
+        || (capsule?.dependencyClearances ?? []).some((clearance) => (
+          clearance.status === "awaiting_handoff"
+          && clearance.delivery?.state !== "delivered"
+        ));
+    });
+  }
+
+  getAgentLaneCoordinatorShutdownAttempt(projectId) {
+    const row = this.#prepare(`
+      SELECT * FROM agent_coordinator_shutdown_attempts
+      WHERE project_id = ? AND status IN ('pending', 'released')
+      ORDER BY created_at DESC, id DESC LIMIT 1
+    `).get(projectId);
+    return row ? coordinatorShutdownAttemptFromRow(row) : null;
+  }
+
+  requestAgentLaneCoordinatorShutdownAttempt(projectId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const project = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!project) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const fingerprint = coordinatorShutdownFingerprint(projectId, input);
+      const existing = this.#prepare(`
+        SELECT * FROM agent_coordinator_shutdown_attempts
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(projectId, input.idempotencyKey);
+      if (existing) {
+        if (existing.request_fingerprint !== fingerprint) {
+          throw new ApiError(409, "COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different Coordinator retirement request");
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, attempt: coordinatorShutdownAttemptFromRow(existing) };
+      }
+      const nonterminal = this.#prepare(`
+        SELECT 1 FROM agent_coordinator_shutdown_attempts
+        WHERE project_id = ? AND status IN ('pending', 'released') LIMIT 1
+      `).get(projectId);
+      if (nonterminal) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_IN_PROGRESS", "Another Coordinator shutdown attempt is active");
+      }
+      if (agentLaneConfigRevision(project.config_json) !== input.expectedRevision) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_REVISION_CONFLICT", "Coordinator windows changed during the idle grace period");
+      }
+      const config = JSON.parse(project.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId) ?? null
+        : null;
+      const owner = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === config.ownerRootTaskId) ?? null
+        : null;
+      const lease = config.coordinatorLease ?? null;
+      const exactLease = this.#exactActiveCoordinatorLease(projectId, config, lease);
+      if (!exactLease
+        || lease.id !== input.expectedLeaseId
+        || lease.holderTaskId !== input.holderTaskId
+        || lease.holderThreadId !== input.holderThreadId
+        || !holder
+        || holder.id === config.ownerRootTaskId
+        || holder.source !== "codex"
+        || holder.taskType !== "root_task"
+        || holder.threadId !== input.holderThreadId
+        || holder.codexProjectId !== input.codexProjectId
+        || holder.codexProjectKind !== input.codexProjectKind
+        || holder.codexHostId !== input.codexHostId
+        || path.resolve(holder.workspacePath ?? "") !== path.resolve(input.workspacePath)
+        || !owner
+        || owner.id !== input.ownerRootTaskId
+        || owner.threadId !== input.ownerRootThreadId
+        || owner.codexProjectId !== input.ownerRootCodexProjectId
+        || owner.codexProjectKind !== input.ownerRootCodexProjectKind
+        || owner.codexHostId !== input.ownerRootCodexHostId
+        || path.resolve(owner.workspacePath ?? "") !== path.resolve(input.ownerRootWorkspacePath)
+        || owner.id === holder.id) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_BINDING_MISMATCH", "Shutdown requires the exact active Coordinator and separate Owner Root bindings");
+      }
+      const activeDomainLease = Object.entries(config.domainCoordinatorLeases ?? {}).some(
+        ([domainId, domainLease]) => this.#exactActiveCoordinatorLease(
+          projectId, config, domainLease, Date.now(), domainId,
+        ),
+      );
+      if (activeDomainLease || this.hasAgentLaneCoordinatorDurableWork(projectId)) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_WORK_PENDING", "Coordinator shutdown requires a fully idle durable project frontier");
+      }
+      const timestamp = now();
+      const attemptRow = {
+        id: randomUUID(), project_id: projectId, idempotency_key: input.idempotencyKey,
+        request_fingerprint: fingerprint, expected_revision: input.expectedRevision,
+        expected_lease_id: input.expectedLeaseId, holder_task_id: input.holderTaskId,
+        holder_thread_id: input.holderThreadId, owner_root_task_id: input.ownerRootTaskId,
+        owner_root_thread_id: input.ownerRootThreadId,
+        owner_root_codex_project_id: input.ownerRootCodexProjectId,
+        owner_root_codex_project_kind: input.ownerRootCodexProjectKind,
+        owner_root_codex_host_id: input.ownerRootCodexHostId,
+        owner_root_workspace_path: path.resolve(input.ownerRootWorkspacePath),
+        codex_project_id: input.codexProjectId,
+        codex_project_kind: input.codexProjectKind, codex_host_id: input.codexHostId,
+        workspace_path: path.resolve(input.workspacePath), status: "pending",
+        created_at: timestamp, updated_at: timestamp, released_at: null, completed_at: null,
+      };
+      this.#prepare(`
+        INSERT INTO agent_coordinator_shutdown_attempts (
+          id, project_id, idempotency_key, request_fingerprint, expected_revision,
+          expected_lease_id, holder_task_id, holder_thread_id,
+          owner_root_task_id, owner_root_thread_id,
+          owner_root_codex_project_id, owner_root_codex_project_kind,
+          owner_root_codex_host_id, owner_root_workspace_path,
+          codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+          status, created_at, updated_at, released_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(...Object.values(attemptRow));
+      this.database.exec("COMMIT");
+      return { applied: true, attempt: coordinatorShutdownAttemptFromRow(attemptRow) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  transitionAgentLaneCoordinatorShutdownAttempt(attemptId, action) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT * FROM agent_coordinator_shutdown_attempts WHERE id = ?",
+      ).get(attemptId);
+      if (!row) throw new ApiError(404, "COORDINATOR_SHUTDOWN_NOT_FOUND", "The Coordinator shutdown attempt does not exist");
+      const priorReceipt = this.#prepare(`
+        SELECT id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
+        FROM agent_coordinator_lease_receipts
+        WHERE project_id = ? AND lease_id = ? AND holder_task_id = ?
+          AND holder_thread_id = ? AND action = 'released'
+        ORDER BY created_at DESC, rowid DESC LIMIT 1
+      `).get(row.project_id, row.expected_lease_id, row.holder_task_id, row.holder_thread_id);
+      if (action === "release" && ["released", "completed"].includes(row.status)) {
+        this.database.exec("COMMIT");
+        return {
+          attempt: coordinatorShutdownAttemptFromRow(row),
+          lease: { id: row.expected_lease_id, status: "expired", releasedAt: row.released_at },
+          receipt: priorReceipt ? {
+            id: priorReceipt.id, projectId: priorReceipt.project_id, leaseId: priorReceipt.lease_id,
+            holderTaskId: priorReceipt.holder_task_id, holderThreadId: priorReceipt.holder_thread_id,
+            action: priorReceipt.action, createdAt: priorReceipt.created_at,
+          } : null,
+        };
+      }
+      if (action === "complete" && row.status === "completed") {
+        this.database.exec("COMMIT");
+        return { attempt: coordinatorShutdownAttemptFromRow(row) };
+      }
+      if (row.status === "canceled") {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_CANCELED", "The Coordinator shutdown attempt is terminal");
+      }
+      const project = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(row.project_id);
+      if (!project) throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", "The Coordinator project no longer exists");
+      const config = JSON.parse(project.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === row.holder_task_id) ?? null
+        : null;
+      const owner = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === config.ownerRootTaskId) ?? null
+        : null;
+      const exactBinding = holder
+        && owner
+        && owner.id === row.owner_root_task_id
+        && owner.threadId === row.owner_root_thread_id
+        && owner.codexProjectId === row.owner_root_codex_project_id
+        && owner.codexProjectKind === row.owner_root_codex_project_kind
+        && owner.codexHostId === row.owner_root_codex_host_id
+        && path.resolve(owner.workspacePath ?? "") === path.resolve(row.owner_root_workspace_path)
+        && holder.id !== owner.id
+        && holder.threadId === row.holder_thread_id
+        && holder.codexProjectId === row.codex_project_id
+        && holder.codexProjectKind === row.codex_project_kind
+        && holder.codexHostId === row.codex_host_id
+        && path.resolve(holder.workspacePath ?? "") === path.resolve(row.workspace_path);
+      if (!exactBinding) {
+        this.#prepare(`UPDATE agent_coordinator_shutdown_attempts SET status = 'canceled', updated_at = ? WHERE id = ?`)
+          .run(now(), row.id);
+        this.database.exec("COMMIT");
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_BINDING_MISMATCH", "Coordinator or Owner Root binding drift canceled shutdown");
+      }
+      if (action === "release") {
+        const lease = config.coordinatorLease ?? null;
+        const activeDomainLease = Object.entries(config.domainCoordinatorLeases ?? {}).some(
+          ([domainId, domainLease]) => this.#exactActiveCoordinatorLease(
+            row.project_id, config, domainLease, Date.now(), domainId,
+          ),
+        );
+        if (row.status !== "pending"
+          || agentLaneConfigRevision(project.config_json) !== row.expected_revision
+          || lease?.id !== row.expected_lease_id
+          || lease.holderTaskId !== row.holder_task_id
+          || lease.holderThreadId !== row.holder_thread_id
+          || !this.#exactActiveCoordinatorLease(row.project_id, config, lease)
+          || activeDomainLease
+          || this.hasAgentLaneCoordinatorDurableWork(row.project_id)) {
+          this.#prepare(`UPDATE agent_coordinator_shutdown_attempts SET status = 'canceled', updated_at = ? WHERE id = ?`)
+            .run(now(), row.id);
+          this.database.exec("COMMIT");
+          throw new ApiError(409, "COORDINATOR_SHUTDOWN_RELEASE_CONFLICT", "Work or lease drift canceled Coordinator shutdown before release");
+        }
+        const timestamp = now();
+        const releasedLease = { ...lease, expiresAt: timestamp, releasedAt: timestamp };
+        this.#prepare(`UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?`)
+          .run(JSON.stringify({ ...config, coordinatorLease: releasedLease }), timestamp, row.project_id);
+        const receipt = this.#insertCoordinatorLeaseReceipt({
+          projectId: row.project_id, leaseId: lease.id, holderTaskId: row.holder_task_id,
+          holderThreadId: row.holder_thread_id, action: "released", createdAt: timestamp,
+        });
+        this.#prepare(`
+          UPDATE agent_coordinator_shutdown_attempts
+          SET status = 'released', updated_at = ?, released_at = ? WHERE id = ?
+        `).run(timestamp, timestamp, row.id);
+        this.database.exec("COMMIT");
+        return {
+          attempt: coordinatorShutdownAttemptFromRow({
+            ...row, status: "released", updated_at: timestamp, released_at: timestamp,
+          }),
+          lease: { ...releasedLease, status: "expired" },
+          receipt,
+        };
+      }
+      if (action !== "complete" || row.status !== "released" || !priorReceipt) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_STATE_CONFLICT", "Shutdown completion requires the exact released lease receipt");
+      }
+      const lease = config.coordinatorLease ?? null;
+      if (lease?.id !== row.expected_lease_id
+        || !lease.releasedAt
+        || lease.holderTaskId !== row.holder_task_id
+        || lease.holderThreadId !== row.holder_thread_id) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_COMPLETION_CONFLICT", "The released Coordinator lease changed before thread archival confirmation");
+      }
+      const timestamp = now();
+      const tasks = config.tasks.filter((task) => task?.id !== row.holder_task_id);
+      const nextConfig = {
+        ...config,
+        tasks,
+        ...(config.rootTaskId === row.holder_task_id ? { rootTaskId: config.ownerRootTaskId } : {}),
+      };
+      this.#prepare(`UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?`)
+        .run(JSON.stringify(nextConfig), timestamp, row.project_id);
+      this.#prepare(`
+        UPDATE agent_coordinator_shutdown_attempts
+        SET status = 'completed', updated_at = ?, completed_at = ? WHERE id = ?
+      `).run(timestamp, timestamp, row.id);
+      this.database.exec("COMMIT");
+      return { attempt: coordinatorShutdownAttemptFromRow({
+        ...row, status: "completed", updated_at: timestamp, completed_at: timestamp,
       }) };
     } catch (error) {
       if (this.database.isTransaction) this.database.exec("ROLLBACK");
@@ -3855,6 +4259,13 @@ export class TaskboardDatabase {
           configuration: this.getAgentLaneCoordinationDomains(projectId),
         };
       }
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_SHUTDOWN_IN_PROGRESS",
+          "Coordination domain changes wait until exact thread retirement completes",
+        );
+      }
       const revision = agentLaneConfigRevision(row.config_json);
       if (revision !== input.expectedRevision) {
         throw new ApiError(409, "COORDINATION_DOMAIN_REVISION_CONFLICT", "Coordination domains changed since they were read", { actualRevision: revision });
@@ -4005,6 +4416,14 @@ export class TaskboardDatabase {
           receipt: coordinationWindowReceiptFromRow(existingReceiptRow),
           configuration: coordinationWindowConfiguration(projectId, row),
         };
+      }
+
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_SHUTDOWN_IN_PROGRESS",
+          "Coordination window changes wait until the exact retiring Coordinator is archived",
+        );
       }
 
       if (identityHandshakeRow) {
@@ -4809,6 +5228,13 @@ export class TaskboardDatabase {
       if (!row) {
         throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
       }
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_SHUTDOWN_IN_PROGRESS",
+          "Domain coordinator acquisition waits until exact thread retirement completes",
+        );
+      }
       const config = JSON.parse(row.config_json);
       const domain = normalizeCoordinationDomains(config).find((entry) => entry.id === domainId);
       if (!domain) throw new ApiError(404, "COORDINATION_DOMAIN_NOT_FOUND", `Coordination domain '${domainId}' does not exist`);
@@ -5012,6 +5438,9 @@ export class TaskboardDatabase {
       if (!row) {
         throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
       }
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(409, "COORDINATOR_SHUTDOWN_IN_PROGRESS", "Coordinator lease acquisition and renewal are blocked during exact thread retirement");
+      }
       const config = JSON.parse(row.config_json);
       const holder = Array.isArray(config.tasks)
         ? config.tasks.find((task) => task?.id === input.holderTaskId)
@@ -5204,6 +5633,13 @@ export class TaskboardDatabase {
       if (!row) {
         throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
       }
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_SHUTDOWN_IN_PROGRESS",
+          "Ordinary lease release cannot bypass the durable shutdown attempt",
+        );
+      }
       const config = JSON.parse(row.config_json);
       const holder = Array.isArray(config.tasks)
         ? config.tasks.find((task) => task?.id === input.holderTaskId)
@@ -5274,6 +5710,13 @@ export class TaskboardDatabase {
       ).get(projectId);
       if (!laneRow) {
         throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_SHUTDOWN_IN_PROGRESS",
+          "Coordinator binding repair waits until exact thread retirement completes",
+        );
       }
       const config = JSON.parse(laneRow.config_json);
       const holder = Array.isArray(config.tasks)

@@ -483,6 +483,78 @@ function parseCoordinatorProvisioningLookup(value) {
   });
 }
 
+function parseCoordinatorShutdownRequest(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "idempotencyKey", "expectedRevision", "expectedLeaseId",
+    "holderTaskId", "holderThreadId", "ownerRootTaskId", "ownerRootThreadId",
+    "ownerRootCodexProjectId", "ownerRootCodexProjectKind",
+    "ownerRootCodexHostId", "ownerRootWorkspacePath",
+    "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath",
+  ]));
+  const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
+    required: true, maxLength: 64,
+  });
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+  }
+  const codexProjectKind = stringField(value.codexProjectKind, "codexProjectKind", {
+    required: true, maxLength: 16,
+  });
+  if (!new Set(["local", "remote"]).has(codexProjectKind)) {
+    throw new ApiError(400, "INVALID_FIELD", "'codexProjectKind' must be local or remote");
+  }
+  const codexHostId = stringField(value.codexHostId, "codexHostId", {
+    required: true, maxLength: 256,
+  });
+  if ((codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")) {
+    throw new ApiError(400, "INVALID_FIELD", "Coordinator shutdown project identity is invalid");
+  }
+  const workspacePath = stringField(value.workspacePath, "workspacePath", {
+    required: true, maxLength: 4096,
+  });
+  if (!path.isAbsolute(workspacePath) || workspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be an absolute path");
+  }
+  const ownerRootCodexProjectKind = stringField(
+    value.ownerRootCodexProjectKind, "ownerRootCodexProjectKind", { required: true, maxLength: 16 },
+  );
+  if (!new Set(["local", "remote"]).has(ownerRootCodexProjectKind)) {
+    throw new ApiError(400, "INVALID_FIELD", "'ownerRootCodexProjectKind' must be local or remote");
+  }
+  const ownerRootCodexHostId = stringField(
+    value.ownerRootCodexHostId, "ownerRootCodexHostId", { required: true, maxLength: 256 },
+  );
+  if ((ownerRootCodexProjectKind === "local" && ownerRootCodexHostId !== "local")
+    || (ownerRootCodexProjectKind === "remote" && ownerRootCodexHostId === "local")) {
+    throw new ApiError(400, "INVALID_FIELD", "Owner Root shutdown project identity is invalid");
+  }
+  const ownerRootWorkspacePath = stringField(
+    value.ownerRootWorkspacePath, "ownerRootWorkspacePath", { required: true, maxLength: 4096 },
+  );
+  if (!path.isAbsolute(ownerRootWorkspacePath) || ownerRootWorkspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'ownerRootWorkspacePath' must be an absolute path");
+  }
+  return {
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    expectedRevision,
+    expectedLeaseId: stringField(value.expectedLeaseId, "expectedLeaseId", { required: true, maxLength: 256 }),
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    ownerRootTaskId: stringField(value.ownerRootTaskId, "ownerRootTaskId", { required: true, maxLength: 256 }),
+    ownerRootThreadId: stringField(value.ownerRootThreadId, "ownerRootThreadId", { required: true, maxLength: 256 }),
+    ownerRootCodexProjectId: stringField(value.ownerRootCodexProjectId, "ownerRootCodexProjectId", { required: true, maxLength: 256 }),
+    ownerRootCodexProjectKind,
+    ownerRootCodexHostId,
+    ownerRootWorkspacePath: path.resolve(ownerRootWorkspacePath),
+    codexProjectId: stringField(value.codexProjectId, "codexProjectId", { required: true, maxLength: 256 }),
+    codexProjectKind,
+    codexHostId,
+    workspacePath: path.resolve(workspacePath),
+  };
+}
+
 function parseCoordinatorLeaseRenew(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
@@ -3172,6 +3244,8 @@ export function createTaskboardServer(options = {}) {
     listComments: (taskId) => database.listComments(taskId),
     getPendingOwnerIntent: (projectId) => database.getPendingProjectOwnerIntent(projectId),
     getPendingOwnerIntentPlan: (projectId) => database.getPendingProjectOwnerIntentPlan(projectId),
+    getCoordinatorDurableWork: (projectId) => database.hasAgentLaneCoordinatorDurableWork(projectId),
+    getCoordinatorShutdownAttempt: (projectId) => database.getAgentLaneCoordinatorShutdownAttempt(projectId),
     getCurrentHostIdentity: (threadId) => observedHostThreadIdentity(threadId),
     recordProgress: async (progress) => {
       const candidates = database.listTasks({ projectId: progress.projectId, archived: "false" }).filter((task) => {
@@ -3638,6 +3712,60 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, {
           attempt: database.getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey),
         });
+      }
+
+      const coordinatorShutdownLookupRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-shutdown-attempts\/lookup$/,
+      );
+      if (coordinatorShutdownLookupRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-shutdown-attempts/lookup");
+        const projectId = decodeRouteSegment(coordinatorShutdownLookupRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set());
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, {
+          attempt: database.getAgentLaneCoordinatorShutdownAttempt(projectId),
+        });
+      }
+
+      const coordinatorShutdownRequestRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/coordinator-shutdown-attempts$/,
+      );
+      if (coordinatorShutdownRequestRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/coordinator-shutdown-attempts");
+        const projectId = decodeRouteSegment(coordinatorShutdownRequestRoute[1], "Project id");
+        validateProjectId(projectId);
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.requestAgentLaneCoordinatorShutdownAttempt(
+          projectId, parseCoordinatorShutdownRequest(body),
+        ));
+      }
+
+      const coordinatorShutdownTransitionRoute = pathname.match(
+        /^\/api\/local\/coordinator-shutdown-attempts\/([^/]+)\/(release|complete)$/,
+      );
+      if (coordinatorShutdownTransitionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/coordinator-shutdown-attempts/:id/:action");
+        const attemptId = decodeRouteSegment(coordinatorShutdownTransitionRoute[1], "Attempt id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set());
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.transitionAgentLaneCoordinatorShutdownAttempt(
+          attemptId, coordinatorShutdownTransitionRoute[2],
+        ));
       }
 
       const coordinatorProvisioningRequestRoute = pathname.match(

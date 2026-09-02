@@ -42,6 +42,7 @@ import {
   runOwnerIntentPlanningMonitorOnce,
   runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
   runCoordinatorProvisioningMonitorOnce,
+  runCoordinatorShutdownMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
@@ -126,6 +127,7 @@ const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:po
 const backgroundContinuationIntervalMs = 15_000;
 const coordinatorLeaseRenewWindowMs = 45_000;
 const coordinatorLeaseDurationSeconds = 120;
+const coordinatorShutdownIdleGraceMs = 60_000;
 const configuredMaxActiveAgents = (() => {
   const value = Number(process.env.CODEX_TASKBOARD_MAX_ACTIVE_AGENTS ?? "4");
   return Number.isSafeInteger(value) && value >= 1 && value <= 64 ? value : 4;
@@ -2013,6 +2015,40 @@ async function getCoordinatorProvisioningAttempt(request) {
   return mutateCoordinatorProvisioning(pathname, { idempotencyKey: request.idempotencyKey });
 }
 
+async function getCoordinatorShutdownAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-shutdown-attempts/lookup`;
+  return mutateCoordinatorProvisioning(pathname, {});
+}
+
+async function requestCoordinatorShutdownAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-shutdown-attempts`;
+  const { projectId: _projectId, ...body } = request;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function transitionCoordinatorShutdownAttempt(attemptId, action) {
+  const pathname = `/api/local/coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
+  return mutateCoordinatorProvisioning(pathname, {});
+}
+
+async function findArchivedCoordinatorThread(cdp, attempt) {
+  const result = await requestCodexAppServerViaCdp(
+    cdp,
+    undefined,
+    attempt.codexHostId,
+    "thread/list",
+    { cwd: attempt.workspacePath, archived: true, limit: 100 },
+    10_000,
+  );
+  const matches = (Array.isArray(result?.data) ? result.data : []).filter((thread) => (
+    thread?.id === attempt.holderThreadId
+    && typeof thread.cwd === "string"
+    && path.resolve(thread.cwd) === path.resolve(attempt.workspacePath)
+  ));
+  if (matches.length > 1) throw new Error("Codex returned duplicate archived Coordinator threads");
+  return matches[0] ?? null;
+}
+
 async function transitionCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
   const pathname = `/api/local/coordinator-provisioning-attempts/${encodeURIComponent(attemptId)}/${action}`;
   return mutateCoordinatorProvisioning(pathname, body);
@@ -2682,6 +2718,36 @@ async function runBackgroundContinuationMonitor(cdp) {
           10_000,
         ),
         confirmIdentity: confirmCoordinatorIdentityHandshake,
+      }),
+      () => runCoordinatorShutdownMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          idleGraceMs: coordinatorShutdownIdleGraceMs,
+        },
+        now: Date.now,
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        readWindows: readCoordinatorProvisioningWindows,
+        readThread: (route) => requestCodexAppServerViaCdp(
+          cdp,
+          undefined,
+          route.codexHostId,
+          "thread/read",
+          { threadId: route.threadId, includeTurns: true },
+          10_000,
+        ),
+        getAttempt: getCoordinatorShutdownAttempt,
+        requestAttempt: requestCoordinatorShutdownAttempt,
+        releaseAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "release",
+        ),
+        findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
+        archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
+          cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
+        ),
+        completeAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "complete",
+        ),
       }),
     );
     monitors.push(

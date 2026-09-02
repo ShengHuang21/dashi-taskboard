@@ -26,6 +26,7 @@ import {
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCoordinatorProvisioningMonitorOnce,
+  runCoordinatorShutdownMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
@@ -426,6 +427,240 @@ test("resident keepalive survives an unavailable continuation policy without ena
   assert.deepEqual(projects, [{ projectId: "capstone-dev", continuationEnabled: false }]);
 });
 
+test("resident Coordinator shutdown waits through idle grace and recovers one exact archive", async () => {
+  let observedAt = Date.parse("2026-09-03T00:00:00.000Z");
+  const holder = {
+    taskId: "execution-coordinator",
+    threadId: coordinatorThreadId,
+    codexProjectId: "codex-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const owner = {
+    taskId: "owner-root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "codex-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  let lease = {
+    id: "global-lease", holderTaskId: holder.taskId, status: "active",
+    acquiredAt: "2026-09-02T23:55:00.000Z",
+    expiresAt: "2026-09-03T00:05:00.000Z", releasedAt: null,
+    bindingValid: true,
+  };
+  let attempt = null;
+  let archived = false;
+  let archiveCalls = 0;
+  let releaseCalls = 0;
+  let completionCalls = 0;
+  const snapshot = () => ({
+    projectId: "capstone-dev",
+    coordination: {
+      assignment: lease.releasedAt ? "unassigned" : "lease",
+      coordinatorTaskId: lease.releasedAt ? null : holder.taskId,
+      ownerRootTaskId: owner.taskId,
+      ownerRootRoute: {
+        rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+        codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+      },
+      lease,
+      durableWorkPending: false,
+      shutdownAttempt: attempt,
+      pendingOwnerIntent: null,
+      pendingOwnerIntentPlan: null,
+      ownerDecisionRequest: null,
+      pendingCrossDomainHandoff: null,
+      domainCoordinators: [],
+    },
+    todos: [],
+    taskLanes: [{ id: holder.taskId, ...holder }, { id: owner.taskId, ...owner }],
+  });
+  const runTick = () => runCoordinatorShutdownMonitorOnce({
+    policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 30_000 },
+    now: () => observedAt,
+    readSnapshot: async () => snapshot(),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision: "d".repeat(64), ownerRootTaskId: owner.taskId,
+      windows: [
+        { ...holder, role: "coordinator" },
+        { ...owner, role: "owner_root" },
+      ],
+    }),
+    readThread: async () => ({
+      thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
+    }),
+    getAttempt: async () => ({ attempt }),
+    requestAttempt: async (request) => {
+      assert.equal(request.expectedLeaseId, lease.id);
+      assert.equal(request.ownerRootCodexProjectId, owner.codexProjectId);
+      assert.equal(request.ownerRootCodexProjectKind, owner.codexProjectKind);
+      assert.equal(request.ownerRootCodexHostId, owner.codexHostId);
+      assert.equal(request.ownerRootWorkspacePath, owner.workspacePath);
+      attempt = { ...request, id: "shutdown-1", status: "pending" };
+      return { applied: true, attempt };
+    },
+    releaseAttempt: async ({ attemptId }) => {
+      assert.equal(attemptId, "shutdown-1");
+      releaseCalls += 1;
+      lease = { ...lease, status: "expired", releasedAt: new Date(observedAt).toISOString() };
+      attempt = { ...attempt, status: "released" };
+      return { attempt };
+    },
+    findArchivedThread: async () => archived ? { id: holder.threadId, cwd: holder.workspacePath } : null,
+    archiveThread: async ({ threadId, codexHostId }) => {
+      assert.equal(threadId, holder.threadId);
+      assert.equal(codexHostId, holder.codexHostId);
+      archiveCalls += 1;
+      archived = true;
+      throw new Error("archive response lost");
+    },
+    completeAttempt: async ({ attemptId }) => {
+      assert.equal(attemptId, "shutdown-1");
+      completionCalls += 1;
+      attempt = { ...attempt, status: "completed" };
+      return { attempt };
+    },
+  });
+
+  assert.equal((await runTick()).reason, "idle-grace");
+  observedAt += 29_000;
+  assert.equal((await runTick()).reason, "idle-grace");
+  observedAt += 1_000;
+  assert.deepEqual(await runTick(), {
+    shutdown: false, reason: "archive-uncertain", attemptId: "shutdown-1",
+  });
+  assert.equal(releaseCalls, 1);
+  assert.equal(archiveCalls, 1);
+  assert.equal(completionCalls, 0);
+  observedAt += 15_000;
+  assert.deepEqual(await runTick(), {
+    shutdown: true, reason: "completed", attemptId: "shutdown-1",
+  });
+  assert.equal(releaseCalls, 1);
+  assert.equal(archiveCalls, 1);
+  assert.equal(completionCalls, 1);
+});
+
+test("Coordinator shutdown and replacement provisioning fail closed around work and busy turns", async () => {
+  const holder = {
+    taskId: "execution-coordinator", threadId: coordinatorThreadId,
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/taskboard",
+  };
+  const owner = {
+    id: "owner-root", taskId: "owner-root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/taskboard",
+  };
+  const baseSnapshot = {
+    projectId: "capstone-dev",
+    coordination: {
+      assignment: "lease", coordinatorTaskId: holder.taskId,
+      ownerRootTaskId: "owner-root", ownerRootRoute: {
+        rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+        codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+      },
+      lease: {
+        id: "global-lease", holderTaskId: holder.taskId, status: "active",
+        acquiredAt: "2026-09-02T23:55:00.000Z", expiresAt: "2026-09-03T00:05:00.000Z",
+        bindingValid: true, releasedAt: null,
+      },
+      durableWorkPending: false, shutdownAttempt: null, domainCoordinators: [],
+      pendingOwnerIntent: null, pendingOwnerIntentPlan: null,
+      ownerDecisionRequest: null, pendingCrossDomainHandoff: null,
+    },
+    todos: [],
+    taskLanes: [holder, owner],
+  };
+  let requests = 0;
+  for (const snapshot of [
+    { ...baseSnapshot, coordination: { ...baseSnapshot.coordination, durableWorkPending: true } },
+    baseSnapshot,
+  ]) {
+    const result = await runCoordinatorShutdownMonitorOnce({
+      policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 1 },
+      now: () => Date.parse("2026-09-03T00:00:00.000Z"),
+      readSnapshot: async () => snapshot,
+      readWindows: async () => ({
+        projectId: "capstone-dev", revision: "d".repeat(64), ownerRootTaskId: "owner-root",
+        windows: [
+          { ...holder, role: "coordinator" },
+          { ...owner, role: "owner_root" },
+        ],
+      }),
+      readThread: async () => ({ thread: {
+        id: holder.threadId, cwd: holder.workspacePath,
+        turns: snapshot === baseSnapshot ? [{ id: "busy", status: "inProgress" }] : [],
+      } }),
+      getAttempt: async () => ({ attempt: null }),
+      requestAttempt: async () => { requests += 1; },
+      releaseAttempt: async () => null,
+      findArchivedThread: async () => null,
+      archiveThread: async () => null,
+      completeAttempt: async () => null,
+    });
+    assert.equal(result.shutdown, false);
+  }
+  assert.equal(requests, 0);
+
+  for (const [field, value] of [
+    ["codexProjectId", "other-project"],
+    ["codexProjectKind", "remote"],
+    ["codexHostId", "other-host"],
+    ["workspacePath", "/tmp/other-workspace"],
+  ]) {
+    const result = await runCoordinatorShutdownMonitorOnce({
+      policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 1 },
+      now: () => Date.parse("2026-09-03T00:00:00.000Z"),
+      readSnapshot: async () => baseSnapshot,
+      readWindows: async () => ({
+        projectId: "capstone-dev", revision: "d".repeat(64), ownerRootTaskId: owner.taskId,
+        windows: [
+          { ...holder, role: "coordinator" },
+          { ...owner, role: "owner_root", [field]: value },
+        ],
+      }),
+      readThread: async () => ({
+        thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
+      }),
+      getAttempt: async () => ({ attempt: null }),
+      requestAttempt: async () => { requests += 1; },
+      releaseAttempt: async () => null,
+      findArchivedThread: async () => null,
+      archiveThread: async () => null,
+      completeAttempt: async () => null,
+    });
+    assert.deepEqual(result, { shutdown: false, reason: "not-idle-or-binding-drift" });
+  }
+  assert.equal(requests, 0);
+
+  const unassigned = {
+    ...baseSnapshot,
+    coordination: {
+      ...baseSnapshot.coordination, assignment: "unassigned", coordinatorTaskId: null,
+      lease: { ...baseSnapshot.coordination.lease, status: "expired", releasedAt: "2026-09-03T00:00:00.000Z" },
+      durableWorkPending: false,
+    },
+  };
+  const provisioning = await runCoordinatorProvisioningMonitorOnce({
+    policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
+    readSnapshot: async () => unassigned,
+    readWindows: async () => ({ projectId: "capstone-dev", revision: "a".repeat(64), windows: [] }),
+    requestAttempt: async () => { requests += 1; },
+    findThread: async () => null,
+    markStarting: async () => null,
+    startThread: async () => null,
+    attachThread: async () => null,
+    deliverInstruction: async () => null,
+  });
+  assert.deepEqual(provisioning, { provisioned: false, reason: "no-eligible-work" });
+  assert.equal(requests, 0);
+});
+
 test("resident Coordinator provisioning persists one attempt before starting exactly one replacement thread", async () => {
   const ownerRoot = {
     taskId: "owner-root",
@@ -448,6 +683,7 @@ test("resident Coordinator provisioning persists one attempt before starting exa
       projectId: "capstone-dev",
       coordination: {
         assignment: "unassigned",
+        durableWorkPending: true,
         ownerRootTaskId: ownerRoot.taskId,
         ownerRootRoute: {
           rootTaskId: ownerRoot.taskId,
@@ -537,6 +773,7 @@ test("Coordinator provisioning retries selected-model capacity on the same attem
     projectId: "capstone-dev",
     coordination: {
       assignment: "unassigned",
+      durableWorkPending: true,
       ownerRootTaskId: owner.taskId,
       ownerRootRoute: {
         rootTaskId: owner.taskId,
@@ -635,7 +872,7 @@ test("Coordinator provisioning performs zero mutation when a lease or Coordinato
   const baseSnapshot = {
     projectId: "capstone-dev",
     coordination: {
-      assignment: "unassigned", ownerRootTaskId: owner.taskId,
+      assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
       ownerRootRoute: {
         rootTaskId: owner.taskId, rootThreadId: owner.threadId,
         codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,

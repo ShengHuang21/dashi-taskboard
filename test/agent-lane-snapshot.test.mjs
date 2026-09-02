@@ -146,6 +146,8 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
     pendingOwnerIntentPlan: null,
     ownerDecisionRequest: null,
     pendingCrossDomainHandoff: null,
+    durableWorkPending: true,
+    shutdownAttempt: null,
   });
   assert.deepEqual(snapshot.taskLanes.map((lane) => lane.id), ["root", "visual", "taskboard"]);
   assert.deepEqual(snapshot.adapters.map((lane) => lane.id), ["claude", "pi"]);
@@ -987,6 +989,8 @@ test("assigns project coordination through an active replaceable lease", async (
     pendingOwnerIntentPlan: null,
     ownerDecisionRequest: null,
     pendingCrossDomainHandoff: null,
+    durableWorkPending: true,
+    shutdownAttempt: null,
   });
   assert.deepEqual(snapshot.rootSubagents, []);
 });
