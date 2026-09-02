@@ -73,6 +73,43 @@ async function requestWithHost(baseUrl, host) {
   });
 }
 
+function createRepositoryRefreshTask(database, { title, worktreePath, branch }) {
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  const threadBinding = {
+    threadId: `thread-${title}`,
+    codexProjectId: "local",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: worktreePath,
+  };
+  return database.createTask({
+    projectId: "local",
+    title,
+    description: "",
+    status: "todo",
+    priority: "medium",
+    labels: [],
+    threadId: threadBinding.threadId,
+    threadBinding,
+    actor,
+    assignee: actor,
+    developmentContext: { type: "worktree", path: worktreePath, branch },
+    workingLog: null,
+    startDate: null,
+    dueDate: null,
+    recurrence: null,
+  });
+}
+
+async function createRepositoryRefreshTestServer({ directory, gitProbe }) {
+  const app = createTaskboardServer({
+    dataDirectory: directory,
+    worktreeRepositoryExecFile: gitProbe,
+  });
+  runningApps.push({ app, directory });
+  return app;
+}
+
 function signedInjectorHeaders(instanceSecret, nonce) {
   return {
     "x-codex-taskboard-injector-nonce": nonce,
@@ -124,6 +161,200 @@ test("health and the default local project are available", async () => {
   const agentLaneProjects = await request(baseUrl, "/api/local/agent-lane-projects");
   assert.equal(agentLaneProjects.response.status, 200);
   assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
+});
+
+test("database reuses prepared statements across repeated hot reads", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-statement-cache-test-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"), {
+    statementCacheMax: 3,
+  });
+  try {
+    const nativePrepare = database.database.prepare.bind(database.database);
+    let prepareCalls = 0;
+    database.database.prepare = (...args) => {
+      prepareCalls += 1;
+      return nativePrepare(...args);
+    };
+    database.statementCache.clear();
+    assert.equal(database.getProject("local")?.id, "local");
+    const warmedPrepareCalls = prepareCalls;
+    assert.ok(warmedPrepareCalls > 0);
+    for (let index = 0; index < 20; index += 1) {
+      assert.equal(database.getProject("local")?.id, "local");
+    }
+    assert.equal(prepareCalls, warmedPrepareCalls);
+    database.listProjects();
+    database.listTasks({ projectId: "local", archived: "false" });
+    database.getTask("missing-task");
+    assert.equal(database.statementCache.size, 3);
+    const prepareCallsBeforeEvictedRead = prepareCalls;
+    assert.equal(database.getProject("local")?.id, "local");
+    assert.equal(prepareCalls, prepareCallsBeforeEvictedRead + 1);
+    assert.equal(database.statementCache.size, 3);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("worktree repository refresh coalesces shared task probes and concurrent force", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-refresh-test-"));
+  const worktreePath = path.join(directory, "shared-worktree");
+  const worktreeAlias = path.join(directory, "shared-worktree-alias");
+  await mkdir(worktreePath, { recursive: true });
+  await symlink(worktreePath, worktreeAlias);
+  const probeCalls = [];
+  const gitProbe = async (_executable, args) => {
+    probeCalls.push([...args]);
+    await new Promise((resolve) => setImmediate(resolve));
+    if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+    if (args.includes("get-url")) return { stdout: "git@github.com:Owner/Repo.git\n" };
+    if (args.includes("--show-current")) return { stdout: "codex/shared\n" };
+    throw new Error("unexpected git probe");
+  };
+  const app = await createRepositoryRefreshTestServer({ directory, gitProbe });
+  const tasks = Array.from({ length: 12 }, (_, index) => createRepositoryRefreshTask(
+    app.database,
+    {
+      title: `shared-${index}`,
+      worktreePath: index % 2 === 0 ? worktreePath : worktreeAlias,
+      branch: "codex/shared",
+    },
+  ));
+
+  await Promise.all(tasks.map((task) => app.refreshTaskWorktreeRepository(task.id)));
+  assert.equal(probeCalls.length, 3);
+  const refreshed = tasks.map((task) => app.database.getTask(task.id));
+  assert.ok(refreshed.every((task) => task.developmentContext.repository === "github.com/owner/repo"));
+  assert.ok(refreshed.every((task) => task.developmentContext.repositoryVerifiedAt));
+  assert.equal(new Set(refreshed.map(
+    (task) => task.developmentContext.repositoryVerifiedAt,
+  )).size, 1);
+  const capsules = tasks.map((task) => app.database.getTaskCapsule(task.id));
+  assert.ok(capsules.every(
+    (capsule) => capsule.executionTarget.repository === "github.com/owner/repo",
+  ));
+  assert.equal(new Set(capsules.map(
+    (capsule) => capsule.executionTarget.repositoryVerifiedAt,
+  )).size, 1);
+
+  await Promise.all(tasks.map((task) => app.refreshTaskWorktreeRepository(task.id, { force: true })));
+  assert.equal(probeCalls.length, 6);
+  await app.refreshTaskWorktreeRepository(tasks[0].id, { force: true });
+  assert.equal(probeCalls.length, 9);
+});
+
+test("worktree repository refresh isolates identity and retries a shared failure", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-refresh-test-"));
+  const worktreeA = path.join(directory, "worktree-a");
+  const worktreeB = path.join(directory, "worktree-b");
+  const worktreeFailure = path.join(directory, "worktree-failure");
+  await Promise.all([worktreeA, worktreeB, worktreeFailure].map(
+    (worktreePath) => mkdir(worktreePath, { recursive: true }),
+  ));
+  let failSharedWorktree = true;
+  const probeCalls = [];
+  const gitProbe = async (_executable, args) => {
+    const worktreePath = args[1];
+    probeCalls.push([...args]);
+    await new Promise((resolve) => setImmediate(resolve));
+    if (path.basename(worktreePath) === "worktree-failure" && failSharedWorktree) {
+      throw new Error("temporary git failure");
+    }
+    if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+    if (args.includes("get-url")) return { stdout: "https://github.com/Owner/Repo.git\n" };
+    if (args.includes("--show-current")) return { stdout: "codex/branch-a\n" };
+    throw new Error("unexpected git probe");
+  };
+  const app = await createRepositoryRefreshTestServer({ directory, gitProbe });
+  const isolated = [
+    createRepositoryRefreshTask(app.database, {
+      title: "path-a-branch-a", worktreePath: worktreeA, branch: "codex/branch-a",
+    }),
+    createRepositoryRefreshTask(app.database, {
+      title: "path-a-branch-b", worktreePath: worktreeA, branch: "codex/branch-b",
+    }),
+    createRepositoryRefreshTask(app.database, {
+      title: "path-b-branch-a", worktreePath: worktreeB, branch: "codex/branch-a",
+    }),
+  ];
+  await Promise.all(isolated.map((task) => app.refreshTaskWorktreeRepository(task.id)));
+  assert.equal(probeCalls.length, 9);
+  assert.equal(app.database.getTask(isolated[0].id).developmentContext.repository, "github.com/owner/repo");
+  assert.equal(app.database.getTask(isolated[1].id).developmentContext.repository ?? null, null);
+  assert.equal(app.database.getTask(isolated[2].id).developmentContext.repository, "github.com/owner/repo");
+
+  const failureTasks = Array.from({ length: 8 }, (_, index) => createRepositoryRefreshTask(
+    app.database,
+    { title: `failure-${index}`, worktreePath: worktreeFailure, branch: "codex/branch-a" },
+  ));
+  await Promise.all(failureTasks.map((task) => app.refreshTaskWorktreeRepository(task.id)));
+  assert.equal(probeCalls.length, 12);
+  assert.ok(failureTasks.every(
+    (task) => (app.database.getTask(task.id).developmentContext.repository ?? null) === null,
+  ), JSON.stringify(failureTasks.map(
+    (task) => app.database.getTask(task.id).developmentContext,
+  )));
+
+  failSharedWorktree = false;
+  await Promise.all(failureTasks.map((task) => app.refreshTaskWorktreeRepository(task.id)));
+  assert.equal(probeCalls.length, 15);
+  assert.ok(failureTasks.every(
+    (task) => app.database.getTask(task.id).developmentContext.repository === "github.com/owner/repo",
+  ));
+});
+
+test("worktree repository refresh cannot write a stale branch verification", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-refresh-test-"));
+  const worktreePath = path.join(directory, "branch-drift-worktree");
+  await mkdir(worktreePath, { recursive: true });
+  let probedBranch = "codex/branch-a";
+  let releaseFirstProbe;
+  const firstProbeGate = new Promise((resolve) => { releaseFirstProbe = resolve; });
+  let holdFirstProbe = true;
+  const probeCalls = [];
+  const gitProbe = async (_executable, args) => {
+    probeCalls.push([...args]);
+    if (holdFirstProbe) {
+      await firstProbeGate;
+    }
+    if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+    if (args.includes("get-url")) return { stdout: "git@github.com:Owner/Repo.git\n" };
+    if (args.includes("--show-current")) return { stdout: `${probedBranch}\n` };
+    throw new Error("unexpected git probe");
+  };
+  const app = await createRepositoryRefreshTestServer({ directory, gitProbe });
+  const task = createRepositoryRefreshTask(app.database, {
+    title: "branch-drift", worktreePath, branch: "codex/branch-a",
+  });
+  const staleRefresh = app.refreshTaskWorktreeRepository(task.id, { force: true });
+  while (probeCalls.length < 3) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  app.database.updateTask(
+    task.id,
+    task.version,
+    { developmentContext: { type: "worktree", path: worktreePath, branch: "codex/branch-b" } },
+    task.threadId,
+    task.threadBinding,
+    actor,
+  );
+  holdFirstProbe = false;
+  releaseFirstProbe();
+  await assert.rejects(staleRefresh, (error) => error?.code === "WORKTREE_CHANGED");
+  const afterStaleProbe = app.database.getTask(task.id);
+  assert.equal(afterStaleProbe.developmentContext.branch, "codex/branch-b");
+  assert.equal(afterStaleProbe.developmentContext.repository ?? null, null);
+  assert.equal(afterStaleProbe.developmentContext.repositoryVerifiedAt ?? null, null);
+
+  probedBranch = "codex/branch-b";
+  await app.refreshTaskWorktreeRepository(task.id, { force: true });
+  const refreshed = app.database.getTask(task.id);
+  assert.equal(probeCalls.length, 6);
+  assert.equal(refreshed.developmentContext.branch, "codex/branch-b");
+  assert.equal(refreshed.developmentContext.repository, "github.com/owner/repo");
+  assert.ok(refreshed.developmentContext.repositoryVerifiedAt);
 });
 
 test("protected panel presence reports live and closed Taskboard pages", async () => {
@@ -5218,6 +5449,8 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   let worktreePath;
   let escapedLinkPath;
   let outsideFile;
+  let repositoryProbeCalls = 0;
+  let failRepositoryProbe = false;
   const baseUrl = await startServer(async (directory) => {
     worktreePath = path.join(directory, "standing-authority-worktree");
     await mkdir(worktreePath, { recursive: true });
@@ -5238,7 +5471,14 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
       adapters: [],
     });
     database.close();
-    return {};
+    return {
+      worktreeRepositoryTtlMs: 0,
+      worktreeRepositoryExecFile: async (...args) => {
+        repositoryProbeCalls += 1;
+        if (failRepositoryProbe) throw new Error("temporary repository probe failure");
+        return execFileAsync(...args);
+      },
+    };
   });
   const rootBinding = {
     threadId: rootThreadId,
@@ -5366,6 +5606,10 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   });
   const capsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
   assert.equal(capsule.response.status, 200);
+  assert.equal(repositoryProbeCalls, 3);
+  const repeatedCapsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
+  assert.equal(repeatedCapsule.response.status, 200);
+  assert.equal(repositoryProbeCalls, 3);
   assert.deepEqual(
     capsule.body.capsule.readyWork.safeActions.map((action) => action.id),
     ["push-branch", "delete-link", "edit-link"],
@@ -5552,6 +5796,21 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   assert.equal(changedRemoteDelivery.response.status, 409);
   assert.equal(changedRemoteDelivery.body.error.code, "RESUME_TOKEN_MISMATCH");
 
+  failRepositoryProbe = true;
+  const failedProjection = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
+  assert.equal(failedProjection.response.status, 200);
+  assert.equal(failedProjection.body.capsule.executionTarget.repository ?? null, null);
+  assert.deepEqual(failedProjection.body.capsule.readyWork.safeActions, []);
+  failRepositoryProbe = false;
+  await execFileAsync("git", ["-C", worktreePath, "remote", "set-url", "origin", "git@github.com:Owner/Repo.git"]);
+  const recoveredProjection = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
+  assert.equal(recoveredProjection.response.status, 200);
+  assert.equal(recoveredProjection.body.capsule.standingAuthority.state, "matched");
+  assert.deepEqual(
+    recoveredProjection.body.capsule.readyWork.safeActions.map((action) => action.id),
+    ["push-branch", "delete-link", "edit-link"],
+  );
+
   const authorityId = granted.body.authority.id;
   const revokeBody = { evidence: "Owner revoked standing authority", receipt: "owner-turn:standing-authority:2" };
   const revoked = await request(baseUrl, `/api/projects/local/standing-authorities/${authorityId}/revoke`, {
@@ -5574,8 +5833,14 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   });
   assert.equal(revokeConflict.response.status, 409);
   assert.equal(revokeConflict.body.error.code, "STANDING_AUTHORITY_RECEIPT_CONFLICT");
+  const repositoryProbeCallsBeforeRevokedProjection = repositoryProbeCalls;
   const revokedCapsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
   assert.deepEqual(revokedCapsule.body.capsule.readyWork.safeActions, []);
+  assert.equal(
+    repositoryProbeCalls,
+    repositoryProbeCallsBeforeRevokedProjection,
+    "ordinary Capsule projection must reuse the recorded repository after policy changes",
+  );
 });
 
 test("Codex-hosted user mutations persist the current account identity and avatar", async () => {

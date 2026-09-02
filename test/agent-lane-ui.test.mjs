@@ -134,6 +134,9 @@ test("the lane board keeps the owner view concise while synchronization stays au
   assert.match(boardSource, /snapshot\.taskLanes/);
   assert.match(boardSource, /snapshot\.rootSubagents/);
   assert.match(boardSource, /Root 现在没有启动 Sub-Agent/);
+  assert.match(boardSource, /snapshot\.subagentSummary\.complete/);
+  assert.match(boardSource, /运行状态正在恢复/);
+  assert.match(boardSource, /自动分配保持暂停/);
   assert.doesNotMatch(boardSource, /onRecover|sendMessage|startThread|restartAgent/i);
 });
 

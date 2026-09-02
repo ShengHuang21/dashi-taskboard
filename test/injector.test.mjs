@@ -5,6 +5,8 @@ import { once } from "node:events";
 import { test } from "node:test";
 import vm from "node:vm";
 
+import { coordinatorThreadSelectionConfirmed } from "../scripts/codex-injector-runtime.mjs";
+
 const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
 const runtimeSource = await readFile(
   new URL("../scripts/codex-injector-runtime.mjs", import.meta.url),
@@ -160,6 +162,510 @@ test("the CDP network proxy preserves arbitrary binary attachment bytes", async 
   assert.deepEqual(Buffer.from(await download.arrayBuffer()), expected);
 });
 
+test("a ready injected connection can consume open work before a later renderer finishes", async () => {
+  const start = source.indexOf("async function injectAll");
+  const end = source.indexOf("async function currentInjectionSource", start);
+  assert.notEqual(start, -1, "injectAll must exist");
+  assert.notEqual(end, -1, "injectAll source boundary must exist");
+
+  let releaseLaterRenderer;
+  let laterRendererReleased = false;
+  const injectTarget = async (_runtime, target) => {
+    if (target.id === "later") {
+      await new Promise((resolve) => { releaseLaterRenderer = resolve; });
+    }
+    return {
+      result: { frameReady: true },
+      connection: { id: target.id, closed: false, close() {} },
+    };
+  };
+  const injectAll = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return injectAll; })()`,
+    { injectTarget, Set },
+  );
+  const injectedTargets = new Map();
+  const readyBeforeLaterRenderer = [];
+  const batch = injectAll(
+    { targets: async () => [{ id: "ready" }, { id: "later" }] },
+    "source",
+    "hash",
+    true,
+    null,
+    injectedTargets,
+    true,
+    {},
+    false,
+    "startup-token",
+    async (connection, target, { opened }) => {
+      readyBeforeLaterRenderer.push({
+        id: target.id,
+        laterRendererReleased,
+        retained: injectedTargets.get(target.id) === connection,
+        opened,
+      });
+    },
+  );
+
+  await new Promise((resolve) => setImmediate(resolve));
+  laterRendererReleased = true;
+  releaseLaterRenderer();
+  await batch;
+
+  assert.deepEqual(readyBeforeLaterRenderer[0], {
+    id: "ready",
+    laterRendererReleased: false,
+    retained: true,
+    opened: true,
+  });
+});
+
+test("Coordinator selection delegates to the injected identity-aware API and fails closed", async () => {
+  const start = source.indexOf("async function requestCoordinatorThreadSelection");
+  const end = source.indexOf("\n\nasync function waitForCoordinatorThreadSelection", start);
+  assert.notEqual(start, -1, "Coordinator selection request helper must exist");
+  const requestCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return requestCoordinatorThreadSelection; })()`,
+  );
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+  for (const taskboard of [undefined, {}, { selectNativeThread: () => false }]) {
+    const cdp = {
+      send: async (_method, request) => ({
+        result: {
+          value: await vm.runInNewContext(request.expression, {
+            window: { __codexTaskboardInjection__: taskboard },
+            document: { documentElement: { hasAttribute: () => false } },
+          }),
+        },
+      }),
+    };
+    assert.equal(await requestCoordinatorThreadSelection(cdp, coordinator), false);
+  }
+
+  let selectedThreadId = null;
+  let closeRestoreFocus = null;
+  const cdp = {
+    send: async (_method, request) => ({
+      result: {
+        value: await vm.runInNewContext(request.expression, {
+          window: {
+            __codexTaskboardInjection__: {
+              close(restoreFocus) {
+                closeRestoreFocus = restoreFocus;
+              },
+              selectNativeThread(threadId) {
+                selectedThreadId = threadId;
+                return true;
+              },
+            },
+          },
+          document: { documentElement: { hasAttribute: () => true } },
+        }),
+      },
+    }),
+  };
+  assert.equal(await requestCoordinatorThreadSelection(cdp, coordinator), true);
+  assert.equal(closeRestoreFocus, false);
+  assert.equal(selectedThreadId, coordinator);
+});
+
+test("Coordinator panel preparation rejects stale generations before commit", async () => {
+  const start = source.indexOf("async function prepareInjectedNativeOpen");
+  const end = source.indexOf("\n\nasync function completeSuccessfulTaskboardOpen", start);
+  assert.notEqual(start, -1, "injected panel preparation helper must exist");
+  const requestPreparedTaskboardOpen = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return requestPreparedTaskboardOpen; })()`,
+  );
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let generation = 1;
+  let releaseA;
+  const commits = [];
+  const taskboard = {
+    prepareNativeThreadOpen: (threadId) => threadId === coordinator
+      ? new Promise((resolve) => { releaseA = () => resolve("token-a"); })
+      : "token-b",
+    commitPreparedNativeOpen: (token) => {
+      commits.push(token);
+      return true;
+    },
+  };
+  const cdp = {
+    send: async (_method, request) => ({
+      result: {
+        value: await vm.runInNewContext(request.expression, {
+          window: { __codexTaskboardInjection__: taskboard },
+        }),
+      },
+    }),
+  };
+  const staleA = requestPreparedTaskboardOpen(cdp, coordinator, 1, () => generation);
+  await new Promise((resolve) => setImmediate(resolve));
+  generation = 2;
+  releaseA();
+  assert.equal(await staleA, false);
+  assert.deepEqual(commits, []);
+
+  const coordinatorB = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  assert.equal(await requestPreparedTaskboardOpen(cdp, coordinatorB, 2, () => generation), true);
+  assert.deepEqual(commits, ["token-b"]);
+
+  for (const missing of [undefined, {}, { prepareNativeThreadOpen: () => null }]) {
+    const missingCdp = {
+      send: async (_method, request) => ({
+        result: { value: await vm.runInNewContext(request.expression, {
+          window: { __codexTaskboardInjection__: missing },
+        }) },
+      }),
+    };
+    assert.equal(
+      await requestPreparedTaskboardOpen(missingCdp, coordinatorB, 2, () => generation),
+      false,
+    );
+  }
+});
+
+test("a delayed Coordinator active row keeps the launch panel gate closed", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function renewCoordinatorLease", start);
+  assert.notEqual(start, -1, "Coordinator selection helper must exist");
+  assert.notEqual(end, -1, "Coordinator selection helper boundary must exist");
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date,
+      JSON,
+      setTimeout: (resolve) => setImmediate(resolve),
+      codexThreadIdPattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    },
+  );
+
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const owner = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  let releaseActiveRow;
+  let selectionChecks = 0;
+  let navigationRequests = 0;
+  let coordinatorRowClicks = 0;
+  let routeFallbacks = 0;
+  let panelOpens = 0;
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("native-sidebar-selection-readiness")) {
+        return { result: { value: owner } };
+      }
+      if (request.expression.includes("selectNativeThread")) {
+        assert.match(request.expression, new RegExp(coordinator));
+        navigationRequests += 1;
+        coordinatorRowClicks += 1;
+        return { result: { value: true } };
+      }
+      selectionChecks += 1;
+      if (selectionChecks === 1) {
+        return { result: { value: { activeThreadId: owner, routeThreadId: coordinator } } };
+      }
+      await new Promise((resolve) => { releaseActiveRow = resolve; });
+      return { result: { value: {
+        activeThreadId: coordinator,
+        routeThreadId: coordinator,
+      } } };
+    },
+  };
+
+  const gatedOpen = (async () => {
+    if (await waitForCoordinatorThreadSelection(cdp, coordinator, 1_000, 0, 0)) panelOpens += 1;
+  })();
+  while (!releaseActiveRow) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(panelOpens, 0);
+  assert.equal(navigationRequests, 1);
+  assert.equal(coordinatorRowClicks, 1);
+  assert.equal(routeFallbacks, 0);
+  releaseActiveRow();
+  await gatedOpen;
+  assert.equal(panelOpens, 1);
+  assert.equal(selectionChecks, 2);
+});
+
+test("Coordinator launch falls back to the supported route message when its row is absent", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function completeSuccessfulTaskboardOpen", start);
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date,
+      JSON,
+      setTimeout: (resolve) => setImmediate(resolve),
+      codexThreadIdPattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    },
+  );
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const owner = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  let selectionChecks = 0;
+  let routeFallbacks = 0;
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("native-sidebar-selection-readiness")) {
+        return { result: { value: owner } };
+      }
+      if (request.expression.includes("selectNativeThread")) {
+        routeFallbacks += 1;
+        return { result: { value: true } };
+      }
+      selectionChecks += 1;
+      return { result: { value: selectionChecks === 1
+        ? { activeThreadId: null, routeThreadId: null }
+        : { activeThreadId: coordinator, routeThreadId: coordinator } } };
+    },
+  };
+
+  assert.equal(await waitForCoordinatorThreadSelection(cdp, coordinator, 1_000, 0, 0), true);
+  assert.equal(routeFallbacks, 1);
+  assert.equal(selectionChecks, 2);
+});
+
+test("a newer open generation cancels an older Coordinator selection wait", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function completeSuccessfulTaskboardOpen", start);
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date,
+      JSON,
+      setTimeout: (resolve) => setImmediate(resolve),
+      codexThreadIdPattern: /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    },
+  );
+  const coordinatorA = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const coordinatorB = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  let generation = 1;
+  let releaseAObservation;
+  const selections = [];
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("selectNativeThread")) {
+        const target = request.expression.includes(coordinatorA) ? coordinatorA : coordinatorB;
+        selections.push(target);
+        return { result: { value: true } };
+      }
+      if (selections.at(-1) === coordinatorA) {
+        await new Promise((resolve) => { releaseAObservation = resolve; });
+        return { result: { value: { activeThreadId: coordinatorA, routeThreadId: coordinatorA } } };
+      }
+      return { result: { value: { activeThreadId: coordinatorB, routeThreadId: coordinatorB } } };
+    },
+  };
+  const waitA = waitForCoordinatorThreadSelection(
+    cdp, coordinatorA, 1_000, 0, 0, 0, () => generation === 1,
+  );
+  while (!releaseAObservation) await new Promise((resolve) => setImmediate(resolve));
+  generation = 2;
+  const waitB = waitForCoordinatorThreadSelection(
+    cdp, coordinatorB, 1_000, 0, 0, 0, () => generation === 2,
+  );
+  assert.equal(await waitB, true);
+  releaseAObservation();
+  assert.equal(await waitA, false);
+  assert.deepEqual(selections, [coordinatorA, coordinatorB]);
+});
+
+test("Coordinator launch reselects after hydration override and waits for stable active state", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function completeSuccessfulTaskboardOpen", start);
+  assert.doesNotMatch(source.slice(start, end), /waitForNativeSidebarSelectionReady/);
+  let now = 0;
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date: { now: () => now },
+      JSON,
+      setTimeout: (resolve, delay) => {
+        now += delay;
+        setImmediate(resolve);
+      },
+    },
+  );
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const owner = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  let selectionChecks = 0;
+  let coordinatorRowClicks = 0;
+  let panelOpens = 0;
+  const activeSequence = [null, coordinator, owner, coordinator, coordinator, coordinator, coordinator];
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("selectNativeThread")) {
+        assert.equal(panelOpens, 0);
+        coordinatorRowClicks += 1;
+        return { result: { value: true } };
+      }
+      assert.equal(panelOpens, 0);
+      const activeThreadId = activeSequence[selectionChecks] ?? coordinator;
+      selectionChecks += 1;
+      return { result: { value: {
+        activeThreadId,
+        routeThreadId: activeThreadId,
+      } } };
+    },
+  };
+
+  if (await waitForCoordinatorThreadSelection(cdp, coordinator, 200, 30, 10, 10)) {
+    panelOpens += 1;
+  }
+  assert.equal(coordinatorRowClicks, 2);
+  assert.equal(selectionChecks, 7);
+  assert.equal(panelOpens, 1);
+});
+
+test("Coordinator stability resets across an unknown selection read interval", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function completeSuccessfulTaskboardOpen", start);
+  let now = 0;
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date: { now: () => now },
+      JSON,
+      setTimeout: (resolve, delay) => {
+        now += delay;
+        setImmediate(resolve);
+      },
+    },
+  );
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let navigationRequests = 0;
+  let selectionChecks = 0;
+  let panelOpens = 0;
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("selectNativeThread")) {
+        navigationRequests += 1;
+        return { result: { value: true } };
+      }
+      selectionChecks += 1;
+      if (selectionChecks === 2) {
+        now += 40;
+        throw new Error("selection state unavailable");
+      }
+      return { result: { value: {
+        activeThreadId: coordinator,
+        routeThreadId: coordinator,
+      } } };
+    },
+  };
+
+  if (await waitForCoordinatorThreadSelection(cdp, coordinator, 200, 30, 10, 10)) {
+    panelOpens += 1;
+  }
+  assert.equal(navigationRequests, 2);
+  assert.equal(selectionChecks, 6);
+  assert.equal(panelOpens, 1);
+});
+
+test("continuous selection errors bound re-navigation and leave panel open pending", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function completeSuccessfulTaskboardOpen", start);
+  let now = 0;
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date: { now: () => now },
+      JSON,
+      setTimeout: (resolve, delay) => {
+        now += delay;
+        setImmediate(resolve);
+      },
+    },
+  );
+  let navigationRequests = 0;
+  let panelOpens = 0;
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("selectNativeThread")) {
+        navigationRequests += 1;
+        return { result: { value: true } };
+      }
+      throw new Error("selection state unavailable");
+    },
+  };
+
+  if (await waitForCoordinatorThreadSelection(
+    cdp,
+    "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    90_000,
+    35_000,
+    100,
+    5_000,
+  )) panelOpens += 1;
+  assert.equal(navigationRequests, 18);
+  assert.equal(panelOpens, 0);
+});
+
+test("Coordinator launch times out after proactively navigating from null Home", async () => {
+  const start = source.indexOf("async function coordinatorThreadIsSelected");
+  const end = source.indexOf("async function completeSuccessfulTaskboardOpen", start);
+  const waitForCoordinatorThreadSelection = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return waitForCoordinatorThreadSelection; })()`,
+    {
+      coordinatorThreadSelectionConfirmed,
+      Date,
+      JSON,
+      setTimeout: (resolve) => setImmediate(resolve),
+    },
+  );
+  let navigationRequests = 0;
+  const cdp = {
+    closed: false,
+    async send(_method, request) {
+      if (request.expression.includes("selectNativeThread")) navigationRequests += 1;
+      return { result: { value: null } };
+    },
+  };
+
+  assert.equal(await waitForCoordinatorThreadSelection(
+    cdp,
+    "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    5,
+    2,
+    1,
+  ), false);
+  assert.equal(navigationRequests, 1);
+});
+
+test("a successful panel open consumes its generation despite foreground activation failure", async () => {
+  const start = source.indexOf("async function completeSuccessfulTaskboardOpen");
+  const end = source.indexOf("async function renewCoordinatorLease", start);
+  assert.notEqual(start, -1, "successful open completion helper must exist");
+  assert.notEqual(end, -1, "successful open completion helper boundary must exist");
+  const completeSuccessfulTaskboardOpen = vm.runInNewContext(
+    `(() => { ${source.slice(start, end)}; return completeSuccessfulTaskboardOpen; })()`,
+  );
+
+  const requestedGeneration = 4;
+  let openedGeneration = 3;
+  let panelOpenCalls = 1;
+  const diagnostics = [];
+  assert.equal(await completeSuccessfulTaskboardOpen({
+    markOpened: () => { openedGeneration = requestedGeneration; },
+    bringToFront: async () => { throw new Error("background bring-to-front denied"); },
+    activate: () => { throw new Error("background activation denied"); },
+    report: (message) => diagnostics.push(message),
+  }), true);
+  if (openedGeneration < requestedGeneration) panelOpenCalls += 1;
+
+  assert.equal(openedGeneration, requestedGeneration);
+  assert.equal(panelOpenCalls, 1);
+  assert.equal(diagnostics.length, 2);
+});
+
 test("the CDP bridge exposes only the fixed Taskboard automation operations", () => {
   assert.match(source, /parseTaskboardAutomationHostRequest/);
   assert.match(source, /reconcileTaskboardAutomation/);
@@ -297,6 +803,19 @@ test("launch mode opens a dedicated debuggable Codex instance beside the native 
   assert.match(source, /startupTimeoutMs: 120_000,[\s\S]*?unhealthyChildGraceMs: 120_000,/);
   assert.match(source, /Timed out publishing the Taskboard host heartbeat[\s\S]*?30_000/);
   assert.match(source, /waitForHostHeartbeat\(cdp, startupToken, timeoutMs = 30_000\)/);
+  assert.match(
+    source,
+    /const queueTaskboardOpen = \(\) => \{[\s\S]*?openRequestGeneration \+= 1;[\s\S]*?void requestTaskboardOpen\(\);/,
+  );
+  assert.match(source, /selectLaunchCoordinatorRoute/);
+  assert.match(
+    source,
+    /requestCoordinatorThreadSelection[\s\S]*?selectNativeThread[\s\S]*?waitForCoordinatorThreadSelection[\s\S]*?prepareInjectedNativeOpen[\s\S]*?commitPreparedNativeOpen/,
+  );
+  assert.match(
+    source,
+    /const opened = launchCoordinatorRoute[\s\S]*?requestPreparedTaskboardOpen[\s\S]*?requestInjectedTaskboardOpen[\s\S]*?if \(!opened\)[\s\S]*?completeSuccessfulTaskboardOpen/,
+  );
 });
 
 test("attach reconciles the renderer against a hashed current injection source", () => {

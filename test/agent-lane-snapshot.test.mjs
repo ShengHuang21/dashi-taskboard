@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
@@ -152,6 +152,7 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
   assert.deepEqual(snapshot.rootSubagents.map((agent) => agent.agentPath), ["/root/ui_review", "/root/retrieval_review"]);
   assert.equal(snapshot.subagentSummary.observed, 2);
   assert.equal(snapshot.subagentSummary.active, 1);
+  assert.equal(snapshot.subagentSummary.complete, true);
   assert.deepEqual(snapshot.windowSubagentTrees[0].capacityObservation, {
     source: "list_agents",
     observedAt: "2026-08-23T08:02:40.000Z",
@@ -207,6 +208,394 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
       checkpointReceipt: false,
     },
   });
+});
+
+test("reuses an unchanged Codex task observation and refreshes it after replace or append", async () => {
+  const paths = await fixture();
+  const fixedTime = new Date("2026-08-23T08:04:00.000Z");
+  await utimes(paths.rootPath, fixedTime, fixedTime);
+  const provider = createAgentLaneSnapshotProvider(paths);
+  const initial = await provider.getProjectSnapshot("capstone-dev");
+  assert.match(initial.taskLanes.find((lane) => lane.id === "root").lastActualAction, /Running focused checks/);
+
+  await chmod(paths.rootPath, 0o000);
+  const cached = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(
+    cached.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    initial.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+  );
+
+  await chmod(paths.rootPath, 0o600);
+  const original = await readFile(paths.rootPath, "utf8");
+  const replacementPath = `${paths.rootPath}.replacement`;
+  await writeFile(replacementPath, original.replace("Running focused checks", "Changed focused checks"));
+  await utimes(replacementPath, fixedTime, fixedTime);
+  const beforeReplace = await stat(paths.rootPath);
+  const replacement = await stat(replacementPath);
+  assert.equal(replacement.size, beforeReplace.size);
+  assert.equal(replacement.mtimeMs, beforeReplace.mtimeMs);
+  assert.notEqual(replacement.ino, beforeReplace.ino);
+  await rename(replacementPath, paths.rootPath);
+  const replaced = await provider.getProjectSnapshot("capstone-dev");
+  assert.match(
+    replaced.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    /Changed focused checks/,
+  );
+
+  await appendFile(paths.rootPath, `\n${JSON.stringify({
+    timestamp: "2026-08-23T08:04:30.000Z",
+    type: "event_msg",
+    payload: { type: "agent_message", phase: "commentary", message: "Fresh lane observation after append." },
+  })}`);
+  const refreshed = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(
+    refreshed.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    "Fresh lane observation after append.",
+  );
+
+  const splitSignal = Buffer.from(`\n${JSON.stringify({
+    timestamp: "2026-08-23T08:04:35.000Z",
+    type: "event_msg",
+    payload: { type: "agent_message", phase: "commentary", message: "拆分写入后的新状态。" },
+  })}`);
+  const splitAt = splitSignal.indexOf(Buffer.from("拆")) + 1;
+  await appendFile(paths.rootPath, splitSignal.subarray(0, splitAt));
+  const partial = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(
+    partial.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    "Fresh lane observation after append.",
+  );
+  await appendFile(paths.rootPath, Buffer.concat([splitSignal.subarray(splitAt), Buffer.from("\n")]));
+  const completed = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(
+    completed.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    "拆分写入后的新状态。",
+  );
+
+  const oversizedPrefix = Buffer.from(`\n{"timestamp":"2026-08-23T08:04:36.000Z","type":"event_msg","payload":{"type":"agent_message","message":"`);
+  await appendFile(paths.rootPath, Buffer.concat([oversizedPrefix, Buffer.alloc(200 * 1024, 0x78)]));
+  await provider.getProjectSnapshot("capstone-dev");
+  await appendFile(paths.rootPath, Buffer.alloc(200 * 1024, 0x78));
+  await provider.getProjectSnapshot("capstone-dev");
+  await appendFile(paths.rootPath, Buffer.alloc(200 * 1024, 0x78));
+  const oversizedPartial = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(
+    oversizedPartial.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    "拆分写入后的新状态。",
+  );
+  const afterOversized = JSON.stringify({
+    timestamp: "2026-08-23T08:04:37.000Z",
+    type: "event_msg",
+    payload: { type: "agent_message", phase: "commentary", message: "Oversized record was bounded." },
+  });
+  await appendFile(paths.rootPath, Buffer.from(`"}}\n${afterOversized}\n`));
+  const bounded = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(
+    bounded.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    "Oversized record was bounded.",
+  );
+});
+
+test("accepts task signal JSON fields in any object order", async () => {
+  const paths = await fixture();
+  const source = await readFile(paths.rootPath, "utf8");
+  const reordered = JSON.stringify({
+    timestamp: "2026-08-23T08:04:40.000Z",
+    payload: { message: "Reordered task lane signal.", phase: "commentary", type: "agent_message" },
+    type: "event_msg",
+  });
+  await writeFile(paths.rootPath, `${source}\n${reordered}`);
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+  assert.equal(
+    snapshot.taskLanes.find((lane) => lane.id === "root").lastActualAction,
+    "Reordered task lane signal.",
+  );
+});
+
+test("cold subagent recovery ignores history outside the bounded session tail", async () => {
+  const paths = await fixture();
+  const stale = JSON.stringify({
+    timestamp: "2026-08-01T00:00:00.000Z",
+    type: "event_msg",
+    payload: {
+      type: "sub_agent_activity",
+      agent_thread_id: "stale-thread",
+      agent_path: "/root/stale_agent",
+      kind: "started",
+    },
+  });
+  const padding = JSON.stringify({ padding: "x".repeat(11 * 1024 * 1024) });
+  const recent = JSON.stringify({
+    timestamp: "2026-08-23T08:02:30.000Z",
+    type: "event_msg",
+    payload: {
+      type: "sub_agent_activity",
+      agent_thread_id: "recent-thread",
+      agent_path: "/root/recent_agent",
+      kind: "started",
+    },
+  });
+  await writeFile(paths.rootPath, `${stale}\n${padding}\n${recent}\n`);
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.deepEqual(
+    snapshot.rootSubagents.map((agent) => agent.agentPath),
+    ["/root/recent_agent"],
+  );
+  assert.equal(snapshot.subagentSummary.complete, false);
+});
+
+test("cold subagent recovery anchors a silent active agent from the latest complete registry", async () => {
+  const paths = await fixture();
+  const started = JSON.stringify({
+    timestamp: "2026-08-23T08:00:00.000Z",
+    type: "event_msg",
+    payload: {
+      type: "sub_agent_activity",
+      agent_thread_id: "silent-thread",
+      agent_path: "/root/silent_agent",
+      kind: "started",
+    },
+  });
+  const call = JSON.stringify({
+    timestamp: "2026-08-23T08:00:01.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "list_agents",
+      namespace: "collaboration",
+      call_id: "silent-registry",
+      arguments: "{}",
+    },
+  });
+  const output = JSON.stringify({
+    timestamp: "2026-08-23T08:00:02.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call_output",
+      call_id: "silent-registry",
+      output: JSON.stringify({
+        agents: [
+          { agent_name: "/root", agent_id: "root-thread", agent_status: "running" },
+          { agent_name: "/root/silent_agent", agent_id: "silent-thread", agent_status: "running" },
+        ],
+      }),
+    },
+  });
+  const padding = JSON.stringify({ padding: "x".repeat(3 * 1024 * 1024) });
+  await writeFile(paths.rootPath, `${started}\n${call}\n${output}\n${padding}\n`);
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.equal(snapshot.subagentSummary.complete, true);
+  assert.deepEqual(
+    snapshot.rootSubagents.map((agent) => [agent.agentPath, agent.lifecycleStatus]),
+    [["/root/silent_agent", "running"]],
+  );
+});
+
+test("cold subagent recovery reports incomplete when a registry call is outside bounded lookback", async () => {
+  const paths = await fixture();
+  const call = JSON.stringify({
+    timestamp: "2026-08-23T08:00:01.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "list_agents",
+      namespace: "collaboration",
+      call_id: "outside-lookback",
+      arguments: "{}",
+    },
+  });
+  const padding = JSON.stringify({ padding: "x".repeat(11 * 1024 * 1024) });
+  const output = JSON.stringify({
+    timestamp: "2026-08-23T08:00:02.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call_output",
+      call_id: "outside-lookback",
+      output: JSON.stringify({
+        agents: [{ agent_name: "/root", agent_id: "root-thread", agent_status: "running" }],
+      }),
+    },
+  });
+  await writeFile(paths.rootPath, `${call}\n${padding}\n${output}\n`);
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.equal(snapshot.subagentSummary.complete, false);
+  assert.equal(snapshot.windowSubagentTrees[0].registryObservation, null);
+});
+
+test("cold subagent recovery preserves file order across the registry lookback boundary", async () => {
+  const paths = await fixture();
+  const call = JSON.stringify({
+    timestamp: "2026-08-23T08:00:01.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call",
+      name: "list_agents",
+      namespace: "collaboration",
+      call_id: "split-registry",
+      arguments: "{}",
+    },
+  });
+  const padding = JSON.stringify({ padding: "x".repeat(3 * 1024 * 1024) });
+  const started = JSON.stringify({
+    timestamp: "2026-08-23T08:00:02.000Z",
+    type: "event_msg",
+    payload: {
+      type: "sub_agent_activity",
+      agent_thread_id: "late-thread",
+      agent_path: "/root/late_agent",
+      kind: "started",
+    },
+  });
+  const output = JSON.stringify({
+    timestamp: "2026-08-23T08:00:03.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call_output",
+      call_id: "split-registry",
+      output: JSON.stringify({
+        agents: [{ agent_name: "/root", agent_id: "root-thread", agent_status: "running" }],
+      }),
+    },
+  });
+  await writeFile(paths.rootPath, `${call}\n${padding}\n${started}\n${output}\n`);
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.subagentSummary.complete, true);
+  assert.equal(snapshot.subagentSummary.active, 0);
+  assert.equal(snapshot.rootSubagents.some((agent) => agent.agentPath === "/root/late_agent"), false);
+});
+
+test("cold registry lookback uses the newest complete registry as its anchor", async () => {
+  const paths = await fixture();
+  const registryLines = (callId, agents, second) => [
+    JSON.stringify({
+      timestamp: `2026-08-23T08:00:0${second}.000Z`,
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "list_agents",
+        namespace: "collaboration",
+        call_id: callId,
+        arguments: "{}",
+      },
+    }),
+    JSON.stringify({
+      timestamp: `2026-08-23T08:00:0${second + 1}.000Z`,
+      type: "response_item",
+      payload: { type: "function_call_output", call_id: callId, output: JSON.stringify({ agents }) },
+    }),
+  ];
+  const root = { agent_name: "/root", agent_id: "root-thread", agent_status: "running" };
+  const oldAgent = { agent_name: "/root/old_agent", agent_id: "old-thread", agent_status: { completed: "done" } };
+  const older = registryLines("older-registry", [root, oldAgent], 1);
+  const newer = registryLines("newer-registry", [root], 3);
+  const padding = JSON.stringify({ padding: "x".repeat(3 * 1024 * 1024) });
+  await writeFile(paths.rootPath, `${[...older, padding, ...newer].join("\n")}\n`);
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.equal(snapshot.subagentSummary.complete, true);
+  assert.equal(snapshot.rootSubagents.some((agent) => agent.agentPath === "/root/old_agent"), false);
+});
+
+test("a later valid registry preserves a known agent thread id when the optional id is omitted", async () => {
+  const paths = await fixture();
+  const registry = (callId, agent, second) => [
+    JSON.stringify({
+      timestamp: `2026-08-23T08:00:0${second}.000Z`,
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        name: "list_agents",
+        namespace: "collaboration",
+        call_id: callId,
+        arguments: "{}",
+      },
+    }),
+    JSON.stringify({
+      timestamp: `2026-08-23T08:00:0${second + 1}.000Z`,
+      type: "response_item",
+      payload: {
+        type: "function_call_output",
+        call_id: callId,
+        output: JSON.stringify({
+          agents: [
+            { agent_name: "/root", agent_id: "root-thread", agent_status: "running" },
+            agent,
+          ],
+        }),
+      },
+    }),
+  ];
+  await writeFile(paths.rootPath, `${[
+    ...registry("registry-with-id", {
+      agent_name: "/root/worker",
+      agent_id: "worker-thread",
+      agent_status: "running",
+    }, 1),
+    ...registry("registry-without-id", {
+      agent_name: "/root/worker",
+      agent_status: "running",
+    }, 3),
+  ].join("\n")}\n`);
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+  const worker = snapshot.rootSubagents.find((agent) => agent.agentPath === "/root/worker");
+
+  assert.equal(worker?.agentThreadId, "worker-thread");
+  assert.equal(worker?.stableIdentity, "capstone-dev:subagent:worker-thread");
+});
+
+test("concurrent readers share one in-flight project snapshot", async () => {
+  const paths = await fixture();
+  let capsuleReads = 0;
+  let releaseCapsule;
+  let markCapsuleStarted;
+  const capsuleGate = new Promise((resolve) => { releaseCapsule = resolve; });
+  const capsuleStarted = new Promise((resolve) => { markCapsuleStarted = resolve; });
+  const task = {
+    id: "capsule-task-id",
+    identifier: "CAP-100",
+    title: "Concurrent snapshot task",
+    priority: "medium",
+    status: "todo",
+    labels: ["agent-todo"],
+    archivedAt: null,
+  };
+  const provider = createAgentLaneSnapshotProvider({
+    ...paths,
+    listTasks: () => [task],
+    getTaskCapsule: async () => {
+      capsuleReads += 1;
+      markCapsuleStarted();
+      await capsuleGate;
+      return null;
+    },
+  });
+
+  const snapshots = [
+    provider.getProjectSnapshot("capstone-dev"),
+    provider.getProjectSnapshot("capstone-dev"),
+    provider.getProjectSnapshot("capstone-dev"),
+  ];
+  const startTimeout = new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error("snapshot did not reach Capsule projection")), 2_000);
+    timer.unref?.();
+  });
+  await Promise.race([capsuleStarted, startTimeout]);
+
+  const readsBeforeRelease = capsuleReads;
+  releaseCapsule();
+  const resolved = await Promise.all(snapshots);
+  assert.equal(readsBeforeRelease, 1);
+  assert.equal(resolved[0], resolved[1]);
+  assert.equal(resolved[1], resolved[2]);
 });
 
 test("projects a provider-neutral disabled adapter contract and rejects unimplemented connected adapters", async () => {
@@ -338,6 +727,102 @@ test("a malformed paired collaboration registry fails closed instead of assertin
   const visualTree = snapshot.windowSubagentTrees.find((tree) => tree.rootThreadId === "visual-thread");
   assert.equal(visualTree.capacityObservation, null);
   assert.equal(visualTree.registryObservation, null);
+});
+
+test("a split collaboration registry output fails closed until its UTF-8 tail is complete", async () => {
+  const paths = await fixture();
+  const provider = createAgentLaneSnapshotProvider(paths);
+  const initial = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(initial.windowSubagentTrees[0].summary.complete, true);
+
+  const callId = "split-registry-output";
+  const call = JSON.stringify({
+    timestamp: "2026-08-23T08:04:40.000Z",
+    type: "response_item",
+    payload: { type: "function_call", name: "list_agents", namespace: "collaboration", call_id: callId, arguments: "{}" },
+  });
+  const output = Buffer.from(JSON.stringify({
+    timestamp: "2026-08-23T08:04:41.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call_output",
+      call_id: callId,
+      output: JSON.stringify({
+        note: "恢复容量",
+        agents: [
+          { agent_name: "/root", agent_id: "root-thread", agent_status: "running" },
+          { agent_name: "/root/recovered", agent_id: "recovered-thread", agent_status: "running" },
+        ],
+      }),
+    },
+  }));
+  const splitAt = output.indexOf(Buffer.from("恢")) + 1;
+  await appendFile(paths.rootPath, Buffer.concat([Buffer.from(`\n${call}\n`), output.subarray(0, splitAt)]));
+  const incomplete = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(incomplete.windowSubagentTrees[0].summary.complete, false);
+  assert.equal(incomplete.windowSubagentTrees[0].capacityObservation, null);
+
+  await appendFile(paths.rootPath, Buffer.concat([output.subarray(splitAt), Buffer.from("\n")]));
+  const recovered = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(recovered.windowSubagentTrees[0].summary.complete, true);
+  assert.deepEqual(recovered.windowSubagentTrees[0].capacityObservation, {
+    source: "list_agents",
+    observedAt: "2026-08-23T08:04:41.000Z",
+  });
+  assert.equal(
+    recovered.rootSubagents.find((agent) => agent.agentPath === "/root/recovered")?.agentThreadId,
+    "recovered-thread",
+  );
+});
+
+test("an oversized split registry record stays bounded and fail closed until a later registry", async () => {
+  const paths = await fixture();
+  const provider = createAgentLaneSnapshotProvider(paths);
+  await provider.getProjectSnapshot("capstone-dev");
+  const oversizedCallId = "oversized-registry-output";
+  const oversizedCall = JSON.stringify({
+    timestamp: "2026-08-23T08:04:45.000Z",
+    type: "response_item",
+    payload: { type: "function_call", name: "list_agents", namespace: "collaboration", call_id: oversizedCallId, arguments: "{}" },
+  });
+  const oversizedPrefix = Buffer.from(`\n${oversizedCall}\n{"timestamp":"2026-08-23T08:04:46.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"${oversizedCallId}","output":"`);
+  await appendFile(paths.rootPath, Buffer.concat([oversizedPrefix, Buffer.alloc(200 * 1024, 0x78)]));
+  let snapshot = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.windowSubagentTrees[0].summary.complete, false);
+  assert.equal(snapshot.windowSubagentTrees[0].capacityObservation, null);
+  for (let index = 0; index < 3; index += 1) {
+    await appendFile(paths.rootPath, Buffer.alloc(200 * 1024, 0x78));
+    snapshot = await provider.getProjectSnapshot("capstone-dev");
+    assert.equal(snapshot.windowSubagentTrees[0].summary.complete, false);
+    assert.equal(snapshot.windowSubagentTrees[0].capacityObservation, null);
+  }
+  await appendFile(paths.rootPath, Buffer.from('"}}\n'));
+  snapshot = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.windowSubagentTrees[0].summary.complete, false);
+  assert.equal(snapshot.windowSubagentTrees[0].capacityObservation, null);
+
+  const recoveredCallId = "registry-after-oversized";
+  const recoveredCall = JSON.stringify({
+    timestamp: "2026-08-23T08:04:47.000Z",
+    type: "response_item",
+    payload: { type: "function_call", name: "list_agents", namespace: "collaboration", call_id: recoveredCallId, arguments: "{}" },
+  });
+  const recoveredOutput = JSON.stringify({
+    timestamp: "2026-08-23T08:04:48.000Z",
+    type: "response_item",
+    payload: {
+      type: "function_call_output",
+      call_id: recoveredCallId,
+      output: JSON.stringify({ agents: [
+        { agent_name: "/root", agent_id: "root-thread", agent_status: "running" },
+        { agent_name: "/root/recovered", agent_id: "recovered-thread", agent_status: "running" },
+      ] }),
+    },
+  });
+  await appendFile(paths.rootPath, `\n${recoveredCall}\n${recoveredOutput}\n`);
+  snapshot = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(snapshot.windowSubagentTrees[0].summary.complete, true);
+  assert.equal(snapshot.windowSubagentTrees[0].capacityObservation.observedAt, "2026-08-23T08:04:48.000Z");
 });
 
 test("an unknown collaboration registry status fails closed without idling a known running child", async () => {

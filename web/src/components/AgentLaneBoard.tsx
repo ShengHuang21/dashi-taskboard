@@ -122,6 +122,25 @@ function groupCompletedSubagents(agents: RootSubagentSnapshot[]) {
   return [...groups].map(([category, items]) => ({ category, items }));
 }
 
+export function SubagentRecoveryState({
+  complete,
+  activeCount,
+}: {
+  complete: boolean;
+  activeCount: number;
+}) {
+  if (!complete) {
+    return (
+      <p className="agent-lane-empty">
+        暂时无法确认完整的 Sub-Agent 状态；自动分配保持暂停。
+      </p>
+    );
+  }
+  return activeCount === 0
+    ? <p className="agent-lane-empty">Root 现在没有启动 Sub-Agent。</p>
+    : null;
+}
+
 function TaskLaneCard({
   lane,
   root = false,
@@ -461,13 +480,19 @@ export function AgentLaneBoard({
       <section className="agent-lane-section agent-subagent-section" aria-labelledby="root-subagents-title">
         <div className="agent-lane-section-heading">
           <h3 id="root-subagents-title">Sub-Agent</h3>
-          <p>当前 {snapshot.subagentSummary.active} 个运行中</p>
+          <p>{snapshot.subagentSummary.complete
+            ? `当前 ${snapshot.subagentSummary.active} 个运行中`
+            : "运行状态正在恢复"}</p>
         </div>
-        {activeSubagents.length === 0
-          ? <p className="agent-lane-empty">Root 现在没有启动 Sub-Agent。</p>
-          : <div className="agent-subagent-grid" role="list">
+        <SubagentRecoveryState
+          complete={snapshot.subagentSummary.complete === true}
+          activeCount={activeSubagents.length}
+        />
+        {activeSubagents.length > 0 && (
+          <div className="agent-subagent-grid" role="list">
               {activeSubagents.map((agent) => <SubagentCard key={agent.stableIdentity} agent={agent} />)}
-            </div>}
+          </div>
+        )}
         {completedGroups.length > 0 && (
           <>
             <p className="agent-lane-recent-label">最近完成</p>

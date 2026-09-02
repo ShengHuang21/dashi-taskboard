@@ -15,6 +15,7 @@ const OWNER_INTENT_PLAN_RETRY_LIMIT = 3;
 const CROSS_DOMAIN_HANDOFF_DELIVERY_TTL_MS = 30_000;
 const TASK_SAFE_ACTION_RESERVATION_TTL_MS = 30_000;
 const TASK_SAFE_ACTION_ADMISSION_TTL_MS = 60_000;
+const DATABASE_STATEMENT_CACHE_MAX = 512;
 const MODEL_CAPACITY_RETRY_BASE_MS = 15_000;
 const MODEL_CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 
@@ -994,9 +995,14 @@ export class TaskboardDatabase {
   constructor(filename, {
     admissionTtlMs = TASK_SAFE_ACTION_ADMISSION_TTL_MS,
     isPathCaseSensitive = defaultIsPathCaseSensitive,
+    statementCacheMax = DATABASE_STATEMENT_CACHE_MAX,
   } = {}) {
     mkdirSync(path.dirname(filename), { recursive: true });
     this.database = new DatabaseSync(filename);
+    this.statementCache = new Map();
+    this.statementCacheMax = Number.isSafeInteger(statementCacheMax) && statementCacheMax > 0
+      ? statementCacheMax
+      : DATABASE_STATEMENT_CACHE_MAX;
     this.admissionTtlMs = Number.isSafeInteger(admissionTtlMs) && admissionTtlMs > 0
       ? admissionTtlMs
       : TASK_SAFE_ACTION_ADMISSION_TTL_MS;
@@ -1005,7 +1011,26 @@ export class TaskboardDatabase {
       : defaultIsPathCaseSensitive;
     this.database.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
     this.#migrate();
+    // Migration may change schemas after preparing introspection statements.
+    // Runtime statements are cached from a clean post-migration boundary.
+    this.statementCache.clear();
     this.interruptAbandonedAiChatRuns();
+  }
+
+  #prepare(sql) {
+    let statement = this.statementCache.get(sql);
+    if (statement) {
+      this.statementCache.delete(sql);
+      this.statementCache.set(sql, statement);
+      return statement;
+    }
+    statement = this.database.prepare(sql);
+    if (this.statementCache.size >= this.statementCacheMax) {
+      const oldestSql = this.statementCache.keys().next().value;
+      this.statementCache.delete(oldestSql);
+    }
+    this.statementCache.set(sql, statement);
+    return statement;
   }
 
   #migrate() {
@@ -1669,19 +1694,19 @@ export class TaskboardDatabase {
 
     `);
 
-    const projectColumns = this.database.prepare("PRAGMA table_info(projects)").all();
+    const projectColumns = this.#prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
 
-    const ownerDecisionDeliveryColumns = this.database.prepare(
+    const ownerDecisionDeliveryColumns = this.#prepare(
       "PRAGMA table_info(owner_decision_deliveries)",
     ).all();
     if (!ownerDecisionDeliveryColumns.some((column) => column.name === "decision_expires_at")) {
       this.database.exec("ALTER TABLE owner_decision_deliveries ADD COLUMN decision_expires_at TEXT");
     }
 
-    const ownerIntentColumns = this.database.prepare(
+    const ownerIntentColumns = this.#prepare(
       "PRAGMA table_info(project_owner_intents)",
     ).all();
     if (!ownerIntentColumns.some((column) => column.name === "plan_retry_count")) {
@@ -1694,7 +1719,7 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE project_owner_intents ADD COLUMN plan_last_failure_key TEXT");
     }
 
-    const crossDomainHandoffDeliveryColumns = this.database.prepare(
+    const crossDomainHandoffDeliveryColumns = this.#prepare(
       "PRAGMA table_info(cross_domain_handoff_deliveries)",
     ).all();
     if (!crossDomainHandoffDeliveryColumns.some((column) => column.name === "target_codex_host_id")) {
@@ -1704,7 +1729,7 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE cross_domain_handoff_deliveries ADD COLUMN target_workspace_path TEXT");
     }
 
-    const safeActionReceiptColumns = this.database.prepare(
+    const safeActionReceiptColumns = this.#prepare(
       "PRAGMA table_info(task_safe_action_receipts)",
     ).all();
     const hadSafeActionReceiptStatus = safeActionReceiptColumns.some((column) => column.name === "status");
@@ -1764,7 +1789,7 @@ export class TaskboardDatabase {
       this.database.exec("UPDATE task_safe_action_receipts SET status = 'legacy'");
     }
 
-    const agentClaimColumns = this.database.prepare("PRAGMA table_info(agent_task_claims)").all();
+    const agentClaimColumns = this.#prepare("PRAGMA table_info(agent_task_claims)").all();
     if (!agentClaimColumns.some((column) => column.name === "lease_expires_at")) {
       this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN lease_expires_at TEXT");
     }
@@ -1772,7 +1797,7 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE agent_task_claims ADD COLUMN write_scope_json TEXT NOT NULL DEFAULT '[]'");
     }
 
-    const agentEventReceiptColumns = this.database.prepare("PRAGMA table_info(agent_event_receipts)").all();
+    const agentEventReceiptColumns = this.#prepare("PRAGMA table_info(agent_event_receipts)").all();
     if (!agentEventReceiptColumns.some((column) => column.name === "idempotency_key")) {
       this.database.exec("ALTER TABLE agent_event_receipts ADD COLUMN idempotency_key TEXT");
     }
@@ -1785,7 +1810,7 @@ export class TaskboardDatabase {
       WHERE idempotency_key IS NOT NULL
     `);
 
-    const taskAgentRunColumns = this.database.prepare("PRAGMA table_info(task_agent_runs)").all();
+    const taskAgentRunColumns = this.#prepare("PRAGMA table_info(task_agent_runs)").all();
     if (!taskAgentRunColumns.some((column) => column.name === "project_id")) {
       this.database.exec("ALTER TABLE task_agent_runs ADD COLUMN project_id TEXT");
       this.database.exec(`
@@ -1798,7 +1823,7 @@ export class TaskboardDatabase {
     }
     this.database.exec("DROP INDEX IF EXISTS task_agent_runs_one_active_per_task");
     const taskAgentRunMigrationTimestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE task_agent_runs
       SET status = 'interrupted', version = version + 1, updated_at = ?, finished_at = ?
       WHERE id IN (
@@ -1825,7 +1850,7 @@ export class TaskboardDatabase {
       WHERE status IN ('active', 'blocked')
     `);
 
-    const taskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    const taskColumns = this.#prepare("PRAGMA table_info(tasks)").all();
     const hasWorkflowId = taskColumns.some((column) => column.name === "workflow_id");
     if (hasWorkflowId) {
       this.database.exec("ALTER TABLE tasks DROP COLUMN workflow_id");
@@ -1875,7 +1900,7 @@ export class TaskboardDatabase {
       this.database.exec("ALTER TABLE tasks ADD COLUMN recurrence_unit TEXT");
     }
     this.#migrateTaskStatuses();
-    const migratedTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    const migratedTaskColumns = this.#prepare("PRAGMA table_info(tasks)").all();
     if (!migratedTaskColumns.some((column) => column.name === "worktree_repository")) {
       this.database.exec("ALTER TABLE tasks ADD COLUMN worktree_repository TEXT");
     }
@@ -1891,12 +1916,12 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const detectedAt = now();
-      const insertCandidate = this.database.prepare(`
+      const insertCandidate = this.#prepare(`
         INSERT OR IGNORE INTO task_activation_workflow_profile_candidates (
           task_id, task_version, suggested_profile, observed_labels, detected_at
         ) VALUES (?, ?, 'vibe', ?, ?)
       `);
-      for (const task of this.database.prepare(`
+      for (const task of this.#prepare(`
         SELECT id, version, labels FROM tasks WHERE workflow_profile = 'formal'
       `).all()) {
         const labels = JSON.parse(task.labels);
@@ -1957,7 +1982,7 @@ export class TaskboardDatabase {
       SET creator_type = 'agent', creator_id = 'codex-agent', creator_name = 'Codex Agent'
       WHERE thread_id IS NOT NULL AND version = 1 AND creator_id = 'local-user'
     `);
-    const identityTaskColumns = this.database.prepare("PRAGMA table_info(tasks)").all();
+    const identityTaskColumns = this.#prepare("PRAGMA table_info(tasks)").all();
     const assigneeMigrations = [
       ["assignee_type", "TEXT CHECK (assignee_type IN ('user', 'agent'))", "creator_type"],
       ["assignee_id", "TEXT", "creator_id"],
@@ -1985,11 +2010,11 @@ export class TaskboardDatabase {
           ADD COLUMN labels TEXT NOT NULL DEFAULT '${DEFAULT_PROJECT_LABELS_JSON}'
         `);
         const labelsByProject = new Map(
-          this.database.prepare("SELECT id FROM projects").all().map((project) => (
+          this.#prepare("SELECT id FROM projects").all().map((project) => (
             [project.id, [...DEFAULT_LABEL_NAMES]]
           )),
         );
-        for (const task of this.database.prepare(`
+        for (const task of this.#prepare(`
           SELECT project_id, labels
           FROM tasks
           ORDER BY created_at, id
@@ -2000,7 +2025,7 @@ export class TaskboardDatabase {
             if (!projectLabels.includes(label)) projectLabels.push(label);
           }
         }
-        const updateProjectLabels = this.database.prepare(`
+        const updateProjectLabels = this.#prepare(`
           UPDATE projects SET labels = ? WHERE id = ?
         `);
         for (const [projectId, labels] of labelsByProject) {
@@ -2036,7 +2061,7 @@ export class TaskboardDatabase {
         WHERE relation_type = 'parent';
     `);
 
-    const taskRelationColumns = this.database.prepare("PRAGMA table_info(task_relations)").all();
+    const taskRelationColumns = this.#prepare("PRAGMA table_info(task_relations)").all();
     if (!taskRelationColumns.some((column) => column.name === "origin")) {
       this.database.exec(`
         ALTER TABLE task_relations
@@ -2045,7 +2070,7 @@ export class TaskboardDatabase {
       `);
     }
 
-    const commentColumns = this.database.prepare("PRAGMA table_info(comments)").all();
+    const commentColumns = this.#prepare("PRAGMA table_info(comments)").all();
     if (!commentColumns.some((column) => column.name === "thread_id")) {
       this.database.exec("ALTER TABLE comments ADD COLUMN thread_id TEXT");
     }
@@ -2079,7 +2104,7 @@ export class TaskboardDatabase {
       WHERE author_id = 'local'
     `);
 
-    const hasTaskThreads = this.database.prepare(`
+    const hasTaskThreads = this.#prepare(`
       SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'task_threads'
     `).get();
     if (hasTaskThreads) {
@@ -2103,7 +2128,7 @@ export class TaskboardDatabase {
       this.database.exec("DROP TABLE task_threads");
     }
 
-    const attachmentColumns = this.database.prepare("PRAGMA table_info(attachments)").all();
+    const attachmentColumns = this.#prepare("PRAGMA table_info(attachments)").all();
     if (!attachmentColumns.some((column) => column.name === "comment_id")) {
       this.database.exec("ALTER TABLE attachments ADD COLUMN comment_id TEXT REFERENCES comments(id) ON DELETE CASCADE");
     }
@@ -2140,7 +2165,7 @@ export class TaskboardDatabase {
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_created ON attachments(comment_id, created_at, id)");
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_task_change_revision ON attachments(task_id, change_revision) WHERE comment_id IS NULL");
     this.database.exec("CREATE INDEX IF NOT EXISTS attachments_comment_change_revision ON attachments(comment_id, change_revision) WHERE comment_id IS NOT NULL");
-    const maxChangeRevision = this.database.prepare(`
+    const maxChangeRevision = this.#prepare(`
       SELECT MAX(change_revision) AS value
       FROM (
         SELECT change_revision FROM comments
@@ -2148,19 +2173,19 @@ export class TaskboardDatabase {
         SELECT change_revision FROM attachments
       )
     `).get().value ?? 0;
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO comment_attachment_revision (id, value)
       VALUES (1, ?)
       ON CONFLICT(id) DO UPDATE SET value = MAX(value, excluded.value)
     `).run(maxChangeRevision);
 
     const timestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
       VALUES ('local', '全局', NULL, 1, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `).run(timestamp, timestamp);
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE projects
       SET name = '全局', workspace_path = NULL, updated_at = ?
       WHERE id = 'local' AND (name != '全局' OR workspace_path IS NOT NULL)
@@ -2168,11 +2193,12 @@ export class TaskboardDatabase {
   }
 
   close() {
+    this.statementCache.clear();
     this.database.close();
   }
 
   #migrateTaskStatuses() {
-    const tasksSql = this.database.prepare(`
+    const tasksSql = this.#prepare(`
       SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'tasks'
     `).get()?.sql ?? "";
     if (
@@ -2243,14 +2269,14 @@ export class TaskboardDatabase {
       this.database.exec("PRAGMA foreign_keys = ON");
     }
 
-    const violation = this.database.prepare("PRAGMA foreign_key_check").get();
+    const violation = this.#prepare("PRAGMA foreign_key_check").get();
     if (violation) {
       throw new Error(`Task status migration produced a foreign key violation in '${violation.table}'`);
     }
   }
 
   listProjects() {
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT
         projects.id,
         projects.name,
@@ -2277,7 +2303,7 @@ export class TaskboardDatabase {
   createProject(input) {
     const timestamp = now();
     try {
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO projects (
           id, name, workspace_path, labels, next_task_number, created_at, updated_at
         ) VALUES (?, ?, ?, ?, 1, ?, ?)
@@ -2300,12 +2326,12 @@ export class TaskboardDatabase {
 
   ensureJiraProject(name) {
     const timestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO projects (id, name, workspace_path, next_task_number, created_at, updated_at)
       VALUES (?, ?, NULL, 1, ?, ?)
       ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
     `).run(JIRA_PROJECT_ID, name, timestamp, timestamp);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT
         projects.id,
         projects.name,
@@ -2328,7 +2354,7 @@ export class TaskboardDatabase {
     ]);
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO projects (id, name, workspace_path, labels, next_task_number, created_at, updated_at)
         VALUES (?, ?, NULL, ?, 1, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
@@ -2336,17 +2362,17 @@ export class TaskboardDatabase {
           labels = excluded.labels,
           updated_at = excluded.updated_at
       `).run(JIRA_PROJECT_ID, projectName, projectLabels, timestamp, timestamp);
-      const findExisting = this.database.prepare(`
+      const findExisting = this.#prepare(`
         SELECT * FROM tasks
         WHERE external_source = 'jira' AND external_origin = ? AND external_id = ?
       `);
-      const migrateLegacyIdentity = this.database.prepare(`
+      const migrateLegacyIdentity = this.#prepare(`
         UPDATE tasks SET
           identifier = ?, external_origin = ?, external_id = ?, external_key = ?
         WHERE id = ?
       `);
       if (legacyIdentity) {
-        const legacyTasks = this.database.prepare(`
+        const legacyTasks = this.#prepare(`
           SELECT id, identifier, external_id
           FROM tasks
           WHERE project_id = ?
@@ -2366,7 +2392,7 @@ export class TaskboardDatabase {
           );
         }
       }
-      const insertTask = this.database.prepare(`
+      const insertTask = this.#prepare(`
         INSERT INTO tasks (
           id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
@@ -2388,7 +2414,7 @@ export class TaskboardDatabase {
           NULL, 1, ?, ?
         )
       `);
-      const updateTask = this.database.prepare(`
+      const updateTask = this.#prepare(`
         UPDATE tasks SET
           identifier = ?, title = ?, description = ?, status = ?, priority = ?, labels = ?,
           sort_order = ?, creator_type = ?, creator_id = ?, creator_name = ?, creator_avatar_url = ?,
@@ -2482,11 +2508,11 @@ export class TaskboardDatabase {
       }
 
       if (archiveMissing) {
-        const existingTasks = this.database.prepare(`
+        const existingTasks = this.#prepare(`
           SELECT id FROM tasks
           WHERE project_id = ? AND external_source = 'jira' AND archived_at IS NULL
         `).all(JIRA_PROJECT_ID);
-        const archiveTask = this.database.prepare(`
+        const archiveTask = this.#prepare(`
           UPDATE tasks
           SET archived_at = ?, version = version + 1, updated_at = ?
           WHERE id = ?
@@ -2497,7 +2523,7 @@ export class TaskboardDatabase {
           }
         }
       }
-      this.database.prepare("UPDATE projects SET updated_at = ? WHERE id = ?")
+      this.#prepare("UPDATE projects SET updated_at = ? WHERE id = ?")
         .run(timestamp, JIRA_PROJECT_ID);
       this.database.exec("COMMIT");
     } catch (error) {
@@ -2514,13 +2540,13 @@ export class TaskboardDatabase {
     if (!id.startsWith("temp-")) {
       throw new ApiError(403, "PROJECT_DELETE_FORBIDDEN", "Only manually created projects can be deleted");
     }
-    const result = this.database.prepare(`
+    const result = this.#prepare(`
       DELETE FROM projects
       WHERE id = ?
         AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?)
     `).run(id, id);
     if (result.changes !== 1) {
-      const issueCount = Number(this.database.prepare(`
+      const issueCount = Number(this.#prepare(`
         SELECT COUNT(*) AS issue_count FROM tasks WHERE project_id = ?
       `).get(id).issue_count);
       throw new ApiError(409, "PROJECT_NOT_EMPTY", "Project still contains issues", { issueCount });
@@ -2529,7 +2555,7 @@ export class TaskboardDatabase {
   }
 
   getProject(id) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT
         projects.id,
         projects.name,
@@ -2555,13 +2581,13 @@ export class TaskboardDatabase {
   }
 
   addProjectLabel(projectId, label) {
-    const project = this.database.prepare("SELECT labels FROM projects WHERE id = ?").get(projectId);
+    const project = this.#prepare("SELECT labels FROM projects WHERE id = ?").get(projectId);
     if (!project) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
     const labels = JSON.parse(project.labels);
     if (!labels.includes(label)) {
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?
       `).run(JSON.stringify([...labels, label]), now(), projectId);
     }
@@ -2571,23 +2597,23 @@ export class TaskboardDatabase {
   deleteProjectLabel(projectId, label) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const project = this.database.prepare("SELECT labels FROM projects WHERE id = ?").get(projectId);
+      const project = this.#prepare("SELECT labels FROM projects WHERE id = ?").get(projectId);
       if (!project) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
       }
       const timestamp = now();
       const labels = JSON.parse(project.labels);
       if (labels.includes(label)) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?
         `).run(JSON.stringify(labels.filter((current) => current !== label)), timestamp, projectId);
       }
-      const updateTask = this.database.prepare(`
+      const updateTask = this.#prepare(`
         UPDATE tasks
         SET labels = ?, version = version + 1, updated_at = ?
         WHERE id = ?
       `);
-      for (const task of this.database.prepare(`
+      for (const task of this.#prepare(`
         SELECT id, labels FROM tasks WHERE project_id = ?
       `).all(projectId)) {
         const taskLabels = JSON.parse(task.labels);
@@ -2608,7 +2634,7 @@ export class TaskboardDatabase {
   }
 
   getProjectSummary(projectId) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT project_id, summary, generated_at, attempted_at, error
       FROM project_summaries
       WHERE project_id = ?
@@ -2623,7 +2649,7 @@ export class TaskboardDatabase {
   }
 
   listProjectSummaries() {
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT project_id, summary, generated_at, attempted_at, error
       FROM project_summaries
       ORDER BY project_id
@@ -2632,7 +2658,7 @@ export class TaskboardDatabase {
 
   saveProjectSummary(projectId, summary) {
     const timestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO project_summaries (
         project_id, summary, generated_at, attempted_at, error
       ) VALUES (?, ?, ?, ?, NULL)
@@ -2647,7 +2673,7 @@ export class TaskboardDatabase {
 
   saveProjectSummaryError(projectId, error) {
     const timestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO project_summaries (
         project_id, summary, generated_at, attempted_at, error
       ) VALUES (?, NULL, NULL, ?, ?)
@@ -2659,10 +2685,10 @@ export class TaskboardDatabase {
   }
 
   getProjectReadme(projectId) {
-    if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
+    if (!this.#prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT project_id, content, version, created_at, updated_at
       FROM project_readmes
       WHERE project_id = ?
@@ -2676,10 +2702,10 @@ export class TaskboardDatabase {
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
+      if (!this.#prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
       }
-      const current = this.database.prepare(`
+      const current = this.#prepare(`
         SELECT version FROM project_readmes WHERE project_id = ?
       `).get(projectId);
       if (expectedVersion !== undefined) {
@@ -2696,13 +2722,13 @@ export class TaskboardDatabase {
         const params = expectedVersion !== undefined
           ? [content, timestamp, projectId, expectedVersion]
           : [content, timestamp, projectId];
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE project_readmes
           SET content = ?, version = version + 1, updated_at = ?
           WHERE project_id = ?${versionCondition}
         `).run(...params);
       } else {
-        this.database.prepare(`
+        this.#prepare(`
           INSERT INTO project_readmes (project_id, content, version, created_at, updated_at)
           VALUES (?, ?, 1, ?, ?)
         `).run(projectId, content, timestamp, timestamp);
@@ -2716,10 +2742,10 @@ export class TaskboardDatabase {
   }
 
   createProjectReadmeAttachment(projectId, input) {
-    if (!this.database.prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
+    if (!this.#prepare("SELECT 1 FROM projects WHERE id = ?").get(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO project_readme_attachments (
         id, project_id, filename, content_type, size, created_at
       ) VALUES (?, ?, ?, ?, ?, ?)
@@ -2735,21 +2761,21 @@ export class TaskboardDatabase {
   }
 
   getProjectReadmeAttachment(id) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT * FROM project_readme_attachments WHERE id = ?
     `).get(id);
     return row ? projectReadmeAttachmentFromRow(row) : null;
   }
 
   listAiChatThreads() {
-    const rows = this.database.prepare(`
+    const rows = this.#prepare(`
       SELECT * FROM ai_chat_threads
       ORDER BY updated_at DESC, id
     `).all();
     if (rows.length === 0) return [];
 
     const currentRuns = new Map();
-    for (const row of this.database.prepare(`
+    for (const row of this.#prepare(`
       SELECT * FROM ai_chat_runs
       WHERE status = 'running'
       ORDER BY thread_id, started_at DESC, id DESC
@@ -2758,7 +2784,7 @@ export class TaskboardDatabase {
     }
 
     const latestTodos = new Map();
-    for (const row of this.database.prepare(`
+    for (const row of this.#prepare(`
       SELECT id, thread_id, run_id, data, created_at
       FROM ai_chat_events
       WHERE type = 'todo_list'
@@ -2780,12 +2806,12 @@ export class TaskboardDatabase {
   }
 
   getAiChatThread(id) {
-    const row = this.database.prepare("SELECT * FROM ai_chat_threads WHERE id = ?").get(id);
+    const row = this.#prepare("SELECT * FROM ai_chat_threads WHERE id = ?").get(id);
     return row ? this.#aiChatThreadWithCurrentRun(row) : null;
   }
 
   hasAiChatThreadProjectConflict(issueRef, projectId) {
-    return Boolean(this.database.prepare(`
+    return Boolean(this.#prepare(`
       SELECT 1
       FROM ai_chat_threads
       WHERE (origin_issue_id = ? OR origin_issue_identifier = ?)
@@ -2797,7 +2823,7 @@ export class TaskboardDatabase {
   createAiChatThread(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO ai_chat_threads (
         id, title, status,
         origin_project_id, origin_project_name, origin_workspace_path,
@@ -2847,7 +2873,7 @@ export class TaskboardDatabase {
     if (assignments.length === 0) return current;
     assignments.push("updated_at = ?");
     values.push(changes.updatedAt ?? now(), id);
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE ai_chat_threads SET ${assignments.join(", ")} WHERE id = ?
     `).run(...values);
     return this.getAiChatThread(id);
@@ -2858,12 +2884,12 @@ export class TaskboardDatabase {
     if (!current) {
       throw new ApiError(404, "AI_CHAT_THREAD_NOT_FOUND", `AI chat thread '${id}' does not exist`);
     }
-    this.database.prepare("DELETE FROM ai_chat_threads WHERE id = ?").run(id);
+    this.#prepare("DELETE FROM ai_chat_threads WHERE id = ?").run(id);
     return current;
   }
 
   listAiChatRuns(threadId) {
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM ai_chat_runs
       WHERE thread_id = ?
       ORDER BY started_at, id
@@ -2871,7 +2897,7 @@ export class TaskboardDatabase {
   }
 
   getAiChatRun(id) {
-    const row = this.database.prepare("SELECT * FROM ai_chat_runs WHERE id = ?").get(id);
+    const row = this.#prepare("SELECT * FROM ai_chat_runs WHERE id = ?").get(id);
     return row ? aiChatRunFromRow(row) : null;
   }
 
@@ -2880,7 +2906,7 @@ export class TaskboardDatabase {
     const timestamp = input.startedAt ?? now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO ai_chat_runs (
           id, thread_id, status, exit_code, error, started_at, finished_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2894,7 +2920,7 @@ export class TaskboardDatabase {
         input.finishedAt ?? null,
       );
       if ((input.status ?? "running") === "running") {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE ai_chat_threads
           SET status = 'running', updated_at = ?
           WHERE id = ?
@@ -2931,13 +2957,13 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       values.push(id);
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE ai_chat_runs SET ${assignments.join(", ")} WHERE id = ?
       `).run(...values);
       const status = changes.status ?? current.status;
       if (status !== "running") {
         const threadStatus = status === "failed" ? "failed" : "idle";
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE ai_chat_threads
           SET status = ?, updated_at = ?
           WHERE id = ?
@@ -2958,7 +2984,7 @@ export class TaskboardDatabase {
   insertAiChatEvent(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.createdAt ?? now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO ai_chat_events (
         id, thread_id, run_id, type, role, content, data, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -2972,12 +2998,12 @@ export class TaskboardDatabase {
       input.data === undefined || input.data === null ? null : JSON.stringify(input.data),
       timestamp,
     );
-    const row = this.database.prepare("SELECT * FROM ai_chat_events WHERE id = ?").get(id);
+    const row = this.#prepare("SELECT * FROM ai_chat_events WHERE id = ?").get(id);
     return aiChatEventFromRow(row);
   }
 
   listAiChatEvents(threadId) {
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM ai_chat_events
       WHERE thread_id = ?
       ORDER BY created_at, rowid
@@ -2988,7 +3014,7 @@ export class TaskboardDatabase {
     const timestamp = now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE ai_chat_runs
         SET
           status = 'interrupted',
@@ -2997,7 +3023,7 @@ export class TaskboardDatabase {
         WHERE status = 'running'
       `).run(timestamp);
       if (result.changes > 0) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE ai_chat_threads
           SET status = 'idle', updated_at = ?
           WHERE status = 'running'
@@ -3017,7 +3043,7 @@ export class TaskboardDatabase {
   }
 
   getActivationReadiness() {
-    const workflowProfileCandidates = this.database.prepare(`
+    const workflowProfileCandidates = this.#prepare(`
       SELECT
         candidate.*,
         tasks.identifier,
@@ -3026,7 +3052,7 @@ export class TaskboardDatabase {
       JOIN tasks ON tasks.id = candidate.task_id
       ORDER BY candidate.detected_at, tasks.identifier
     `).all().map(activationWorkflowProfileCandidate);
-    const legacyRootBindings = this.database.prepare(`
+    const legacyRootBindings = this.#prepare(`
       SELECT id, identifier, project_id, version, thread_id
       FROM tasks
       WHERE thread_id IS NOT NULL
@@ -3052,7 +3078,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
-      const candidate = this.database.prepare(`
+      const candidate = this.#prepare(`
         SELECT * FROM task_activation_workflow_profile_candidates WHERE task_id = ?
       `).get(task.id);
       if (!candidate) {
@@ -3096,12 +3122,12 @@ export class TaskboardDatabase {
       }
       const timestamp = now();
       const nextVersion = version + 1;
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE tasks
         SET workflow_profile = 'vibe', version = ?, updated_at = ?
         WHERE id = ? AND version = ? AND workflow_profile = 'formal'
       `).run(nextVersion, timestamp, task.id, version);
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE task_activation_workflow_profile_candidates
         SET status = 'applied', applied_at = ?, applied_by_type = ?, applied_by_id = ?,
           applied_by_name = ?, task_version_after = ?
@@ -3112,7 +3138,7 @@ export class TaskboardDatabase {
         before: "formal",
         after: "vibe",
       }], timestamp);
-      const appliedCandidate = this.database.prepare(`
+      const appliedCandidate = this.#prepare(`
         SELECT * FROM task_activation_workflow_profile_candidates WHERE task_id = ?
       `).get(task.id);
       this.database.exec("COMMIT");
@@ -3170,7 +3196,7 @@ export class TaskboardDatabase {
         created_at,
         id
     `;
-    const rows = this.database.prepare(sql).all(...values);
+    const rows = this.#prepare(sql).all(...values);
     const commentsByTask = this.#commentsForTaskActivity(rows.map((row) => row.id));
     const activitiesByTask = this.#activitiesForTasks(rows.map((row) => row.id));
     const previewImagesByTask = this.#taskPreviewImages(rows.map((row) => row.id));
@@ -3183,7 +3209,7 @@ export class TaskboardDatabase {
   }
 
   getAgentLaneProject(projectId) {
-    const row = this.database.prepare(
+    const row = this.#prepare(
       "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
     ).get(projectId);
     if (!row) return null;
@@ -3211,7 +3237,7 @@ export class TaskboardDatabase {
     if (!this.getProject(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
-    const row = this.database.prepare(
+    const row = this.#prepare(
       "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
     ).get(projectId);
     if (!row) {
@@ -3221,7 +3247,7 @@ export class TaskboardDatabase {
   }
 
   getAgentLaneCoordinationDomains(projectId) {
-    const row = this.database.prepare(
+    const row = this.#prepare(
       "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
     ).get(projectId);
     if (!row) {
@@ -3238,7 +3264,7 @@ export class TaskboardDatabase {
   configureAgentLaneCoordinationDomain(projectId, domainId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) {
@@ -3249,7 +3275,7 @@ export class TaskboardDatabase {
         holderTaskId: input.holderTaskId, holderThreadId: input.holderThreadId,
         expectedCoordinatorLeaseId: input.expectedCoordinatorLeaseId,
       })).digest("hex");
-      const existingReceiptRow = this.database.prepare(`
+      const existingReceiptRow = this.#prepare(`
         SELECT * FROM agent_coordination_domain_receipts
         WHERE project_id = ? AND idempotency_key = ?
       `).get(projectId, input.idempotencyKey);
@@ -3291,7 +3317,7 @@ export class TaskboardDatabase {
         && !sameCoordinationDomainConfiguration(currentDomain, nextDomain);
       const removes = currentDomain && !nextDomain;
       if (creates || domainChanges || removes) {
-        const assigned = this.database.prepare(`
+        const assigned = this.#prepare(`
           SELECT 1 FROM agent_task_domain_assignments WHERE project_id = ? AND domain_id = ? LIMIT 1
         `).get(projectId, domainId);
         if (assigned) {
@@ -3315,7 +3341,7 @@ export class TaskboardDatabase {
       const configRevision = agentLaneConfigRevision(configJson);
       const timestamp = now();
       if (!same) {
-        this.database.prepare("UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?")
+        this.#prepare("UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?")
           .run(configJson, timestamp, projectId);
       }
       const receiptRow = {
@@ -3324,7 +3350,7 @@ export class TaskboardDatabase {
         action: input.domain === null ? "removed" : "configured",
         config_revision: configRevision, created_at: timestamp,
       };
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_coordination_domain_receipts (
           id, project_id, domain_id, idempotency_key, fingerprint, action, config_revision, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -3347,7 +3373,7 @@ export class TaskboardDatabase {
       if (!this.getProject(projectId)) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
       }
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) {
@@ -3366,7 +3392,7 @@ export class TaskboardDatabase {
         label: input.label,
         binding,
       })).digest("hex");
-      const existingReceiptRow = this.database.prepare(`
+      const existingReceiptRow = this.#prepare(`
         SELECT * FROM agent_coordination_window_receipts
         WHERE project_id = ? AND idempotency_key = ?
       `).get(projectId, input.idempotencyKey);
@@ -3516,7 +3542,7 @@ export class TaskboardDatabase {
       const configJson = JSON.stringify(nextConfig);
       const configRevision = agentLaneConfigRevision(configJson);
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
       `).run(configJson, timestamp, projectId);
       const receiptRow = {
@@ -3530,7 +3556,7 @@ export class TaskboardDatabase {
         config_revision: configRevision,
         created_at: timestamp,
       };
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_coordination_window_receipts (
           id, project_id, idempotency_key, fingerprint, role,
           task_id, thread_id, config_revision, created_at
@@ -3621,7 +3647,7 @@ export class TaskboardDatabase {
   getAgentTaskDomainAssignment(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
-    return agentTaskDomainAssignmentFromRow(this.database.prepare(`
+    return agentTaskDomainAssignmentFromRow(this.#prepare(`
       SELECT * FROM agent_task_domain_assignments WHERE task_id = ?
     `).get(task.id));
   }
@@ -3631,7 +3657,7 @@ export class TaskboardDatabase {
     if (assignment) return assignment;
     const task = this.getTask(taskId);
     if (!task) return null;
-    const provenance = agentTaskDomainAssignmentFromRow(this.database.prepare(`
+    const provenance = agentTaskDomainAssignmentFromRow(this.#prepare(`
       SELECT * FROM agent_task_domain_provenance WHERE task_id = ?
     `).get(task.id));
     if (provenance && provenance.projectId !== task.projectId) {
@@ -3687,7 +3713,7 @@ export class TaskboardDatabase {
         throw new ApiError(409, "DOMAIN_TODO_PROJECT_MISMATCH", "Domain Todo assignment must stay inside one project");
       }
       this.#requireVersion(task, input.taskVersion);
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
@@ -3711,13 +3737,13 @@ export class TaskboardDatabase {
       }
       const existing = this.getAgentTaskDomainAssignment(task.id);
       if (input.domainId === null) {
-        const activeClaim = this.database.prepare(`
+        const activeClaim = this.#prepare(`
           SELECT 1 FROM agent_task_claims WHERE task_id = ? AND status = 'active' LIMIT 1
         `).get(task.id);
         if (activeClaim || this.getOpenTaskAgentRun(task.id)) {
           throw new ApiError(409, "DOMAIN_TODO_ACTIVE", "An active Todo claim or run cannot be reassigned");
         }
-        const activeAdmission = this.database.prepare(`
+        const activeAdmission = this.#prepare(`
           SELECT 1 FROM task_safe_action_receipts
           WHERE task_id = ? AND status = 'delivering'
             AND admission_state IN ('awaiting_admission', 'prepared', 'admission_uncertain', 'recovery_confirmed')
@@ -3727,7 +3753,7 @@ export class TaskboardDatabase {
           throw new ApiError(409, "DOMAIN_TODO_ADMISSION_ACTIVE", "A non-terminal admission must finish before clearing its domain assignment");
         }
         if (["in_review", "done"].includes(task.status)) {
-          const outboundDependency = this.database.prepare(`
+          const outboundDependency = this.#prepare(`
             SELECT 1 FROM task_relations
             WHERE relation_type = 'blocks' AND source_task_id = ? LIMIT 1
           `).get(task.id);
@@ -3739,7 +3765,7 @@ export class TaskboardDatabase {
           this.database.exec("COMMIT");
           return { assignment: null, task };
         }
-        this.database.prepare(`
+        this.#prepare(`
           INSERT INTO agent_task_domain_provenance (
             task_id, project_id, domain_id, assigned_by_lease_id, assigned_by_task_id,
             assigned_by_thread_id, assigned_at, updated_at, cleared_at
@@ -3758,8 +3784,8 @@ export class TaskboardDatabase {
           existing.assignedByTaskId, existing.assignedByThreadId, existing.assignedAt,
           existing.updatedAt, timestamp,
         );
-        this.database.prepare("DELETE FROM agent_task_domain_assignments WHERE task_id = ?").run(task.id);
-        this.database.prepare(`
+        this.#prepare("DELETE FROM agent_task_domain_assignments WHERE task_id = ?").run(task.id);
+        this.#prepare(`
           UPDATE tasks SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?
         `).run(timestamp, task.id, task.version);
         this.database.exec("COMMIT");
@@ -3777,7 +3803,7 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return { assignment: existing, task };
       }
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_task_domain_assignments (
           task_id, project_id, domain_id, assigned_by_lease_id, assigned_by_task_id,
           assigned_by_thread_id, assigned_at, updated_at
@@ -3792,7 +3818,7 @@ export class TaskboardDatabase {
         task.id, projectId, domain.id, coordinatorLease.id, input.holderTaskId,
         input.holderThreadId, existing?.assignedAt ?? timestamp, timestamp,
       );
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE tasks SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?
       `).run(timestamp, task.id, task.version);
       this.database.exec("COMMIT");
@@ -3809,7 +3835,7 @@ export class TaskboardDatabase {
     const targetAssignment = this.getAgentTaskDomainAssignment(target.id);
     if (!targetAssignment) return [];
     const route = this.getAgentTaskDomainRoute(target.id);
-    const dependencies = this.database.prepare(`
+    const dependencies = this.#prepare(`
       SELECT task_relations.created_at AS edge_created_at, tasks.id AS source_task_id
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.source_task_id
@@ -3843,7 +3869,7 @@ export class TaskboardDatabase {
         targetHolderThreadId: route?.holderThreadId ?? null,
       };
       const fingerprint = createHash("sha256").update(JSON.stringify(binding)).digest("hex");
-      const receipt = this.database.prepare(`
+      const receipt = this.#prepare(`
         SELECT * FROM cross_domain_dependency_clearances
         WHERE target_task_id = ? AND source_task_id = ?
         ORDER BY accepted_at DESC, id DESC LIMIT 1
@@ -3855,7 +3881,7 @@ export class TaskboardDatabase {
         && target.labels.includes("agent-todo")
         && !this.getAgentTaskClaim(target.id)
         && !this.getOpenTaskAgentRun(target.id);
-      const delivery = this.database.prepare(`
+      const delivery = this.#prepare(`
         SELECT id, state, reservation_expires_at, delivered_at, delivery_turn_id
         FROM cross_domain_handoff_deliveries WHERE fingerprint = ?
       `).get(fingerprint);
@@ -3901,7 +3927,7 @@ export class TaskboardDatabase {
         || path.resolve(route.workspacePath ?? "") !== path.resolve(input.route.targetWorkspacePath)) {
         throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_DELIVERY_STALE", "Cross-domain handoff host or workspace route changed before delivery");
       }
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM cross_domain_handoff_deliveries WHERE fingerprint = ?
       `).get(frontier.fingerprint);
       if (existing?.state === "delivered") {
@@ -3924,7 +3950,7 @@ export class TaskboardDatabase {
       const reservationExpiresAt = new Date(Date.now() + CROSS_DOMAIN_HANDOFF_DELIVERY_TTL_MS).toISOString();
       const id = existing?.id ?? randomUUID();
       if (existing) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE cross_domain_handoff_deliveries SET
             target_holder_thread_id = ?, target_codex_host_id = ?, target_workspace_path = ?,
             state = 'reserved', reservation_expires_at = ?,
@@ -3935,7 +3961,7 @@ export class TaskboardDatabase {
           reservationExpiresAt, timestamp, id,
         );
       } else {
-        this.database.prepare(`
+        this.#prepare(`
           INSERT INTO cross_domain_handoff_deliveries (
             id, fingerprint, project_id, source_task_id, target_task_id,
             target_holder_thread_id, target_codex_host_id, target_workspace_path,
@@ -3958,7 +3984,7 @@ export class TaskboardDatabase {
   confirmCrossDomainHandoffDelivery(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM cross_domain_handoff_deliveries WHERE id = ? AND project_id = ?
       `).get(input.deliveryId, projectId);
       if (!row) throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_DELIVERY_MISMATCH", "Cross-domain handoff delivery does not exist");
@@ -3990,7 +4016,7 @@ export class TaskboardDatabase {
         return { confirmed: true, reused: true, deliveryId: row.id };
       }
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE cross_domain_handoff_deliveries
         SET state = 'delivered', delivered_at = ?, delivery_turn_id = ?
         WHERE id = ? AND state = 'reserved'
@@ -4011,7 +4037,7 @@ export class TaskboardDatabase {
       if (source.projectId !== target.projectId) {
         throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_PROJECT_MISMATCH", "Dependency clearance must stay inside one project");
       }
-      const edge = this.database.prepare(`
+      const edge = this.#prepare(`
         SELECT created_at FROM task_relations
         WHERE relation_type = 'blocks' AND source_task_id = ? AND target_task_id = ?
       `).get(source.id, target.id);
@@ -4063,7 +4089,7 @@ export class TaskboardDatabase {
         targetHolderThreadId: route.holderThreadId,
       };
       const fingerprint = createHash("sha256").update(JSON.stringify(binding)).digest("hex");
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM cross_domain_dependency_clearances
         WHERE project_id = ? AND idempotency_key = ?
       `).get(target.projectId, input.idempotencyKey);
@@ -4080,7 +4106,7 @@ export class TaskboardDatabase {
       }
       const id = randomUUID();
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO cross_domain_dependency_clearances (
           id, idempotency_key, fingerprint, project_id,
           source_task_id, source_task_version, target_task_id, target_task_version,
@@ -4108,7 +4134,7 @@ export class TaskboardDatabase {
   }
 
   listAgentLaneProjectIds() {
-    return this.database.prepare("SELECT project_id FROM agent_lane_projects ORDER BY project_id")
+    return this.#prepare("SELECT project_id FROM agent_lane_projects ORDER BY project_id")
       .all().map((row) => row.project_id);
   }
 
@@ -4124,10 +4150,10 @@ export class TaskboardDatabase {
       : { ...config, coordinationDomains };
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const currentRow = this.database.prepare(
+      const currentRow = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
-      const assignedDomainIds = this.database.prepare(`
+      const assignedDomainIds = this.#prepare(`
         SELECT DISTINCT domain_id FROM agent_task_domain_assignments WHERE project_id = ?
       `).all(projectId).map((row) => row.domain_id);
       if (currentRow && assignedDomainIds.length > 0) {
@@ -4144,7 +4170,7 @@ export class TaskboardDatabase {
           }
         }
       }
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_lane_projects (project_id, config_json, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(project_id) DO UPDATE SET config_json = excluded.config_json, updated_at = excluded.updated_at
@@ -4160,7 +4186,7 @@ export class TaskboardDatabase {
   claimAgentLaneDomainCoordinator(projectId, domainId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) {
@@ -4285,7 +4311,7 @@ export class TaskboardDatabase {
         expiresAt: new Date(Date.parse(timestamp) + input.leaseDurationSeconds * 1000).toISOString(),
         writeScope: domain.writeScope,
       };
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
       `).run(JSON.stringify({
         ...config,
@@ -4309,7 +4335,7 @@ export class TaskboardDatabase {
   releaseAgentLaneDomainCoordinator(projectId, domainId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
@@ -4344,7 +4370,7 @@ export class TaskboardDatabase {
         throw new ApiError(409, "DOMAIN_COORDINATOR_LEASE_ACTIVE", "Another peer window holds the active domain coordinator lease");
       }
       const lease = { ...existing, expiresAt: timestamp, releasedAt: timestamp };
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
       `).run(JSON.stringify({ ...config, domainCoordinatorLeases: { ...leases, [domainId]: lease } }), timestamp, projectId);
       const receipt = this.#insertDomainCoordinatorLeaseReceipt({
@@ -4363,7 +4389,7 @@ export class TaskboardDatabase {
   claimAgentLaneCoordinator(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) {
@@ -4531,7 +4557,7 @@ export class TaskboardDatabase {
             : "Global Coordinator acquisition requires an exact configured window binding",
         );
       }
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE agent_lane_projects
         SET config_json = ?, updated_at = ?
         WHERE project_id = ?
@@ -4555,7 +4581,7 @@ export class TaskboardDatabase {
   releaseAgentLaneCoordinator(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(
+      const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!row) {
@@ -4602,7 +4628,7 @@ export class TaskboardDatabase {
       this.#assertNoActiveOwnerDecisionDelivery(projectId);
 
       const lease = { ...existing, expiresAt: timestamp, releasedAt: timestamp };
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE agent_lane_projects
         SET config_json = ?, updated_at = ?
         WHERE project_id = ?
@@ -4626,7 +4652,7 @@ export class TaskboardDatabase {
   repairLegacyTaskRootBinding(projectId, input, threadBinding, actor) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const laneRow = this.database.prepare(
+      const laneRow = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!laneRow) {
@@ -4688,7 +4714,7 @@ export class TaskboardDatabase {
       const activityId = randomUUID();
       const previousThreadId = task.legacyLocalThreadId;
       const storedBinding = storedThreadBinding(threadBinding, threadBinding.threadId);
-      const updated = this.database.prepare(`
+      const updated = this.#prepare(`
         UPDATE tasks SET
           thread_id = ?,
           thread_codex_project_id = ?,
@@ -4705,7 +4731,7 @@ export class TaskboardDatabase {
         { field: "legacyLocalThreadId", before: previousThreadId, after: null },
         { field: "coordinatorLeaseId", before: null, after: lease.id },
       ];
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO task_activities (
           id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -4744,7 +4770,7 @@ export class TaskboardDatabase {
     if (!this.getAgentLaneProject(projectId)) {
       throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
     }
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
       FROM agent_coordinator_lease_receipts
       WHERE project_id = ?
@@ -4763,7 +4789,7 @@ export class TaskboardDatabase {
 
   #insertCoordinatorLeaseReceipt(input) {
     const receipt = { id: randomUUID(), ...input };
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO agent_coordinator_lease_receipts (
         id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -4781,7 +4807,7 @@ export class TaskboardDatabase {
 
   #coordinatorLeaseReleasedAt(projectId, lease) {
     if (!lease?.id || !lease?.holderTaskId || !lease?.holderThreadId) return null;
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT created_at FROM agent_coordinator_lease_receipts
       WHERE project_id = ? AND lease_id = ?
         AND holder_task_id = ? AND holder_thread_id = ? AND action = 'released'
@@ -4799,7 +4825,7 @@ export class TaskboardDatabase {
     if (!normalizeCoordinationDomains(config).some((domain) => domain.id === domainId)) {
       throw new ApiError(404, "COORDINATION_DOMAIN_NOT_FOUND", `Coordination domain '${domainId}' does not exist`);
     }
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT id, project_id, domain_id, lease_id, holder_task_id, holder_thread_id, action, created_at
       FROM agent_domain_coordinator_lease_receipts
       WHERE project_id = ? AND domain_id = ?
@@ -4819,7 +4845,7 @@ export class TaskboardDatabase {
 
   #insertDomainCoordinatorLeaseReceipt(input) {
     const receipt = { id: randomUUID(), ...input };
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO agent_domain_coordinator_lease_receipts (
         id, project_id, domain_id, lease_id, holder_task_id, holder_thread_id, action, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -4832,7 +4858,7 @@ export class TaskboardDatabase {
 
   #domainCoordinatorLeaseReleasedAt(projectId, domainId, lease) {
     if (!lease?.id || !lease?.holderTaskId || !lease?.holderThreadId) return null;
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT created_at FROM agent_domain_coordinator_lease_receipts
       WHERE project_id = ? AND domain_id = ? AND lease_id = ?
         AND holder_task_id = ? AND holder_thread_id = ? AND action = 'released'
@@ -4843,7 +4869,7 @@ export class TaskboardDatabase {
   }
 
   #assertNoActiveOwnerDecisionDelivery(projectId) {
-    const active = this.database.prepare(`
+    const active = this.#prepare(`
       SELECT delivery.id FROM owner_decision_deliveries AS delivery
       WHERE delivery.project_id = ? AND (
         (delivery.state = 'reserved' AND delivery.reservation_expires_at > ?)
@@ -4871,7 +4897,7 @@ export class TaskboardDatabase {
   }
 
   #activeOwnerDecisionProtectionExpiresAt(projectId) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT MAX(
         CASE
           WHEN delivery.state = 'reserved' THEN delivery.reservation_expires_at
@@ -4904,7 +4930,7 @@ export class TaskboardDatabase {
   getAgentTaskClaim(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
-    const row = this.database.prepare(
+    const row = this.#prepare(
       "SELECT * FROM agent_task_claims WHERE task_id = ?",
     ).get(task.id);
     return row ? {
@@ -4923,7 +4949,7 @@ export class TaskboardDatabase {
   }
 
   getTaskAgentRun(id) {
-    const row = this.database.prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(id);
+    const row = this.#prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(id);
     return row ? taskAgentRunFromRow(row) : null;
   }
 
@@ -4979,7 +5005,7 @@ export class TaskboardDatabase {
       const currentOpenRun = current.status === "in_progress" && currentClaim?.status === "active"
         ? this.getOpenTaskAgentRun(current.id)
         : null;
-      const awaitingReceipt = this.database.prepare(`
+      const awaitingReceipt = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE task_id = ? AND status = 'delivering'
           AND admission_state IN ('awaiting_admission', 'prepared', 'admission_uncertain', 'recovery_confirmed')
@@ -4989,7 +5015,7 @@ export class TaskboardDatabase {
         throw new ApiError(400, "INVALID_ADMISSION_BINDING", "Admission receipt and attempt ids must be supplied together");
       }
       if (admissionReceiptId === null && currentOpenRun) {
-        const admittedReceipt = this.database.prepare(`
+        const admittedReceipt = this.#prepare(`
           SELECT * FROM task_safe_action_receipts
           WHERE task_id = ? AND status = 'delivered' AND admission_state = 'admitted'
             AND admitted_run_id = ? AND admitted_agent_thread_id = ?
@@ -5005,7 +5031,7 @@ export class TaskboardDatabase {
       }
       let admissionReceipt = null;
       if (admissionReceiptId !== null) {
-        admissionReceipt = this.database.prepare(`
+        admissionReceipt = this.#prepare(`
           SELECT * FROM task_safe_action_receipts WHERE id = ?
         `).get(admissionReceiptId);
         const awaitingAdmission = admissionReceipt?.status === "delivering"
@@ -5063,7 +5089,7 @@ export class TaskboardDatabase {
           throw new ApiError(409, "CLAIM_CONFLICT", "The task is already claimed by another Sub-Agent");
         }
         const timestamp = now();
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE agent_task_claims SET lease_expires_at = ?, write_scope_json = ?
           WHERE task_id = ? AND status = 'active'
         `).run(leaseExpiresAt, JSON.stringify(normalizedWriteScope), current.id);
@@ -5075,7 +5101,7 @@ export class TaskboardDatabase {
         }
         if (openRun) {
           this.#assertTaskAgentRunBinding(openRun, current, rootRun);
-          this.database.prepare(`
+          this.#prepare(`
             UPDATE task_agent_runs
             SET status = 'active', version = version + 1, updated_at = ?,
               write_scope_json = ?, finished_at = NULL
@@ -5097,7 +5123,7 @@ export class TaskboardDatabase {
       if (this.getOpenTaskAgentRun(current.id)) {
         throw new ApiError(409, "RUN_CONFLICT", "The task has an unresolved durable Agent Run");
       }
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT task_id FROM agent_task_claims
         WHERE project_id = ? AND agent_thread_id = ? AND status = 'active' AND task_id <> ?
       `).get(current.projectId, agentThreadId, current.id);
@@ -5109,12 +5135,12 @@ export class TaskboardDatabase {
         );
       }
       const timestamp = now();
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE tasks SET status = 'in_progress', version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
       `).run(timestamp, current.id, version);
       if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_task_claims (
           task_id, project_id, agent_path, agent_thread_id, status, claimed_at,
           lease_expires_at, write_scope_json, completed_at
@@ -5129,7 +5155,7 @@ export class TaskboardDatabase {
       this.#createTaskAgentRun(current, rootRun, agentPath, agentThreadId, normalizedWriteScope, timestamp);
       const admittedRun = this.getActiveTaskAgentRun(current.id);
       if (admissionReceipt) {
-        const admitted = this.database.prepare(`
+        const admitted = this.#prepare(`
           UPDATE task_safe_action_receipts
           SET status = 'delivered', admission_state = 'admitted', admitted_run_id = ?,
             admitted_agent_thread_id = ?, admitted_at = ?, delivered_at = ?
@@ -5174,7 +5200,7 @@ export class TaskboardDatabase {
       }
       this.#requireAgentRunVersion(current, version);
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE task_agent_runs
         SET status = ?, version = version + 1, updated_at = ?, summary = ?, next_action = ?
         WHERE id = ? AND version = ?
@@ -5202,18 +5228,18 @@ export class TaskboardDatabase {
       this.#requireAgentRunVersion(current, version);
       const task = this.#requireTask(current.taskId);
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE task_agent_runs
         SET status = ?, version = version + 1, updated_at = ?, finished_at = ?, summary = ?, next_action = ?
         WHERE id = ? AND version = ?
       `).run(status, timestamp, timestamp, summary, nextAction, current.id, version);
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE agent_task_claims
         SET status = ?, completed_at = ?
         WHERE task_id = ? AND status = 'active' AND agent_thread_id = ?
       `).run(status === "completed" ? "completed" : "interrupted", timestamp, task.id, agentThreadId);
       if (status === "completed") {
-        const result = this.database.prepare(`
+        const result = this.#prepare(`
           UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ?
           WHERE id = ? AND status = 'in_progress'
         `).run(timestamp, task.id);
@@ -5250,14 +5276,14 @@ export class TaskboardDatabase {
         this.database.exec("ROLLBACK");
         return { applied: false, reason: "claim_mismatch" };
       }
-      if (this.database.prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
+      if (this.#prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
         this.database.exec("ROLLBACK");
         return { applied: false, reason: "duplicate" };
       }
       const timestamp = now();
       const commentId = randomUUID();
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO comments (
           id, task_id, body, thread_id, author_type, author_id, author_name,
           author_avatar_url, version, created_at, updated_at, change_revision
@@ -5266,7 +5292,7 @@ export class TaskboardDatabase {
         commentId, current.id, `Sub-Agent 进展：${summary}`, agentThreadId,
         actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp, changeRevision,
       );
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(eventId, current.projectId, current.id, commentId, timestamp);
@@ -5301,12 +5327,12 @@ export class TaskboardDatabase {
       }
       const timestamp = now();
       const commentId = randomUUID();
-      if (this.database.prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
+      if (this.#prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) {
         this.database.exec("ROLLBACK");
         return { applied: false, reason: "duplicate" };
       }
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO comments (
           id, task_id, body, thread_id, author_type, author_id, author_name,
           author_avatar_url, version, created_at, updated_at, change_revision
@@ -5315,21 +5341,21 @@ export class TaskboardDatabase {
         commentId, current.id, `Sub-Agent 完成：${summary}`, agentThreadId,
         actor.type, actor.id, actor.name, actor.avatarUrl, timestamp, timestamp, changeRevision,
       );
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, created_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(eventId, current.projectId, current.id, commentId, timestamp);
-      const transitioned = this.database.prepare(`
+      const transitioned = this.#prepare(`
         UPDATE agent_task_claims SET status = 'completed', completed_at = ?
         WHERE task_id = ? AND status = 'active' AND agent_thread_id = ?
       `).run(timestamp, current.id, agentThreadId);
       if (transitioned.changes !== 1) throw new ApiError(409, "CLAIM_CONFLICT", "Agent claim changed during completion");
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE task_agent_runs
         SET status = 'completed', version = version + 1, updated_at = ?, finished_at = ?, summary = ?
         WHERE task_id = ? AND status IN ('active', 'blocked') AND agent_thread_id = ?
       `).run(timestamp, timestamp, summary, current.id, agentThreadId);
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ? WHERE id = ?
       `).run(timestamp, current.id);
       this.database.exec("COMMIT");
@@ -5341,7 +5367,7 @@ export class TaskboardDatabase {
   }
 
   getTask(id) {
-    const row = this.database.prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
+    const row = this.#prepare("SELECT * FROM tasks WHERE id = ? OR identifier = ?").get(id, id);
     if (!row) return null;
     const task = this.#taskWithRelations(row);
     const comments = this.#commentsForTaskActivity([task.id]).get(task.id) ?? [];
@@ -5350,16 +5376,26 @@ export class TaskboardDatabase {
     return attachTaskActivity(task, comments, activities, previewImage);
   }
 
-  recordTaskWorktreeRepository(taskId, { worktreePath, repository, verifiedAt }) {
+  recordTaskWorktreeRepository(taskId, {
+    worktreePath,
+    expectedBranch,
+    repository,
+    verifiedAt,
+  }) {
     const task = this.#requireTask(taskId);
-    if (task.developmentContext?.type !== "worktree" || task.developmentContext.path !== worktreePath) {
-      throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree changed during repository verification");
+    if (task.developmentContext?.type !== "worktree"
+      || task.developmentContext.path !== worktreePath
+      || task.developmentContext.branch !== expectedBranch) {
+      throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree or branch changed during repository verification");
     }
-    this.database.prepare(`
+    const result = this.#prepare(`
       UPDATE tasks
       SET worktree_repository = ?, worktree_repository_verified_at = ?
-      WHERE id = ? AND worktree_path = ?
-    `).run(repository, verifiedAt, task.id, worktreePath);
+      WHERE id = ? AND worktree_path = ? AND worktree_branch = ?
+    `).run(repository, verifiedAt, task.id, worktreePath, expectedBranch);
+    if (result.changes !== 1) {
+      throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree or branch changed during repository verification");
+    }
     return this.getTask(task.id);
   }
 
@@ -5367,7 +5403,7 @@ export class TaskboardDatabase {
     if (!this.getProject(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM project_standing_authorities
       WHERE project_id = ?
       ORDER BY created_at, id
@@ -5394,7 +5430,7 @@ export class TaskboardDatabase {
     if (!sourceTask.threadBinding || sourceTask.threadBinding.threadId !== input.sourceThreadId) {
       throw new ApiError(409, "STANDING_AUTHORITY_ROOT_MISMATCH", "Source thread must be the task's confirmed Root");
     }
-    const existing = this.database.prepare(`
+    const existing = this.#prepare(`
       SELECT * FROM project_standing_authorities WHERE receipt = ?
     `).get(input.receipt);
     if (existing) {
@@ -5413,7 +5449,7 @@ export class TaskboardDatabase {
     }
     const id = randomUUID();
     const timestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO project_standing_authorities (
         id, project_id, repository, actions_json, source_task_id, source_thread_id,
         evidence, receipt, recorded_by_type, recorded_by_id, recorded_by_name,
@@ -5424,17 +5460,17 @@ export class TaskboardDatabase {
       input.evidence, input.receipt, actor.type, actor.id, actor.name,
       input.grantedAt, input.expiresAt, timestamp, timestamp,
     );
-    return { created: true, authority: standingAuthorityFromRow(this.database.prepare(`
+    return { created: true, authority: standingAuthorityFromRow(this.#prepare(`
       SELECT * FROM project_standing_authorities WHERE id = ?
     `).get(id)) };
   }
 
   revokeProjectStandingAuthority(projectId, authorityId, input, actor) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT * FROM project_standing_authorities WHERE id = ? AND project_id = ?
     `).get(authorityId, projectId);
     if (!row) throw new ApiError(404, "STANDING_AUTHORITY_NOT_FOUND", "Standing authority does not exist");
-    const receiptOwner = this.database.prepare(`
+    const receiptOwner = this.#prepare(`
       SELECT * FROM project_standing_authorities WHERE revocation_receipt = ?
     `).get(input.receipt);
     if (receiptOwner) {
@@ -5448,21 +5484,21 @@ export class TaskboardDatabase {
       throw new ApiError(409, "STANDING_AUTHORITY_ALREADY_REVOKED", "Standing authority is already revoked");
     }
     const timestamp = now();
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE project_standing_authorities SET
         revoked_at = ?, revocation_evidence = ?, revocation_receipt = ?,
         revoked_by_type = ?, revoked_by_id = ?, revoked_by_name = ?,
         version = version + 1, updated_at = ?
       WHERE id = ? AND revoked_at IS NULL
     `).run(timestamp, input.evidence, input.receipt, actor.type, actor.id, actor.name, timestamp, authorityId);
-    return { changed: true, authority: standingAuthorityFromRow(this.database.prepare(`
+    return { changed: true, authority: standingAuthorityFromRow(this.#prepare(`
       SELECT * FROM project_standing_authorities WHERE id = ?
     `).get(authorityId)) };
   }
 
   listTaskOwnerDecisionReceipts(taskId) {
     const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM task_owner_decision_receipts
       WHERE task_id = ?
       ORDER BY created_at, id
@@ -5502,7 +5538,7 @@ export class TaskboardDatabase {
         input.route.codexHostId,
         input.route.rootWorkspacePath,
       ])).digest("hex");
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM owner_decision_deliveries WHERE route_key = ?
       `).get(routeKey);
       const observedAt = now();
@@ -5510,7 +5546,7 @@ export class TaskboardDatabase {
         if (!existing.decision_expires_at) {
           const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
           this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, decisionExpiresAt);
-          this.database.prepare(`
+          this.#prepare(`
             UPDATE owner_decision_deliveries
             SET decision_expires_at = ?
             WHERE id = ? AND decision_expires_at IS NULL
@@ -5535,14 +5571,14 @@ export class TaskboardDatabase {
       this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, reservationExpiresAt);
       const id = existing?.id ?? randomUUID();
       if (existing) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE owner_decision_deliveries SET
             state = 'reserved', reservation_expires_at = ?, claimed_at = ?,
             delivered_at = NULL, delivery_turn_id = NULL
           WHERE id = ?
         `).run(reservationExpiresAt, observedAt, id);
       } else {
-        this.database.prepare(`
+        this.#prepare(`
           INSERT INTO owner_decision_deliveries (
             id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
             root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
@@ -5569,7 +5605,7 @@ export class TaskboardDatabase {
   confirmOwnerDecisionDelivery(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM owner_decision_deliveries WHERE id = ? AND project_id = ?
       `).get(input.deliveryId, projectId);
       if (!row) throw new ApiError(409, "OWNER_DECISION_DELIVERY_MISMATCH", "Owner decision delivery does not exist");
@@ -5588,7 +5624,7 @@ export class TaskboardDatabase {
           }
           const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
           this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, decisionExpiresAt);
-          this.database.prepare(`
+          this.#prepare(`
             UPDATE owner_decision_deliveries SET decision_expires_at = ? WHERE id = ?
           `).run(decisionExpiresAt, row.id);
         }
@@ -5609,7 +5645,7 @@ export class TaskboardDatabase {
       const timestamp = now();
       const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
       this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, decisionExpiresAt);
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE owner_decision_deliveries
         SET state = 'delivered', delivered_at = ?, delivery_turn_id = ?, decision_expires_at = ?
         WHERE id = ? AND state = 'reserved'
@@ -5673,7 +5709,7 @@ export class TaskboardDatabase {
     if (Date.parse(lease.expiresAt) >= Date.parse(leaseProtectedUntil)) return;
     const timestamp = now();
     const extendedLease = { ...lease, expiresAt: leaseProtectedUntil };
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?
     `).run(JSON.stringify({ ...config, coordinatorLease: extendedLease }), timestamp, projectId);
     this.#insertCoordinatorLeaseReceipt({
@@ -5693,7 +5729,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);
-      const delivery = this.database.prepare(`
+      const delivery = this.#prepare(`
         SELECT * FROM owner_decision_deliveries WHERE id = ?
       `).get(input.deliveryId);
       if (!delivery
@@ -5704,7 +5740,7 @@ export class TaskboardDatabase {
         || delivery.root_thread_id !== input.rootThreadId) {
         throw new ApiError(409, "OWNER_DECISION_DELIVERY_REQUIRED", "Decision requires a host-observed exact Root delivery and Owner turn");
       }
-      const existingRow = this.database.prepare(`
+      const existingRow = this.#prepare(`
         SELECT * FROM task_owner_decision_receipts WHERE request_id = ? OR receipt = ?
       `).get(input.requestId, input.receipt);
       if (existingRow) {
@@ -5750,7 +5786,7 @@ export class TaskboardDatabase {
       }
       const id = randomUUID();
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO task_owner_decision_receipts (
           id, request_id, task_id, project_id, action_id, gate_id, expected_resume_token,
           outcome, root_task_id, root_thread_id, coordinator_epoch, owner_turn_id, root_decision_turn_id,
@@ -5766,7 +5802,7 @@ export class TaskboardDatabase {
         capsule.authorization.source.commentId, capsule.authorization.source.commentVersion,
         actor.type, actor.id, actor.name, timestamp,
       );
-      const recorded = ownerDecisionReceiptFromRow(this.database.prepare(`
+      const recorded = ownerDecisionReceiptFromRow(this.#prepare(`
         SELECT * FROM task_owner_decision_receipts WHERE id = ?
       `).get(id));
       this.database.exec("COMMIT");
@@ -5829,7 +5865,7 @@ export class TaskboardDatabase {
         throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap claim must match the first authorized safe action");
       }
 
-      const durableDelivery = this.database.prepare(`
+      const durableDelivery = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE task_id = ? AND safe_action_id = ? AND status IN ('delivering', 'delivered', 'legacy')
         ORDER BY claimed_at DESC, id DESC
@@ -5865,12 +5901,12 @@ export class TaskboardDatabase {
           const recoveryLeaseExpiresAt = new Date(
             observedAt + TASK_SAFE_ACTION_RESERVATION_TTL_MS,
           ).toISOString();
-          this.database.prepare(`
+          this.#prepare(`
             UPDATE task_safe_action_receipts
             SET recovery_lease_id = ?, recovery_lease_expires_at = ?
             WHERE id = ? AND status = 'delivering'
           `).run(reservationLeaseId, recoveryLeaseExpiresAt, durableDelivery.id);
-          const recovering = this.database.prepare(`
+          const recovering = this.#prepare(`
             SELECT * FROM task_safe_action_receipts WHERE id = ?
           `).get(durableDelivery.id);
           const observeOnly = recovering.root_thread_id !== rootRun.rootThreadId
@@ -5901,7 +5937,7 @@ export class TaskboardDatabase {
         };
       }
 
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE task_id = ? AND resume_token = ?
       `).get(task.id, expectedResumeToken);
@@ -5938,7 +5974,7 @@ export class TaskboardDatabase {
           ? randomUUID()
           : existing.admission_attempt_id ?? randomUUID();
         const admissionAgentName = deterministicAdmissionAgentName(task, admissionAttemptId);
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE task_safe_action_receipts
           SET reservation_lease_id = ?, lease_expires_at = ?, admission_attempt_id = ?,
             admission_state = 'reserved', recovery_lease_id = NULL,
@@ -5969,7 +6005,7 @@ export class TaskboardDatabase {
           rootRun.domainCoordinatorLeaseId ? rootRun.rootThreadId : null,
           existing.id,
         );
-        const resumed = this.database.prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(existing.id);
+        const resumed = this.#prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(existing.id);
         this.database.exec("COMMIT");
         return {
           receipt: this.#taskSafeActionReceipt(resumed), reused: true,
@@ -6004,7 +6040,7 @@ export class TaskboardDatabase {
       };
       receipt.admissionAgentName = deterministicAdmissionAgentName(task, receipt.admissionAttemptId);
       receipt.admissionAgentPath = `/root/${receipt.admissionAgentName}`;
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO task_safe_action_receipts (
           id, task_id, project_id, resume_token, safe_action_id, root_thread_id,
           global_coordinator_lease_id, global_coordinator_task_id, global_coordinator_thread_id,
@@ -6052,7 +6088,7 @@ export class TaskboardDatabase {
   getTaskSafeActionAdmission(id) {
     const task = this.getTask(id);
     if (!task) return null;
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT * FROM task_safe_action_receipts
       WHERE task_id = ? AND (
         (
@@ -6095,7 +6131,7 @@ export class TaskboardDatabase {
       if (capsule.readyWork.eligible !== true || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
         throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap delivery must match the current first safe action");
       }
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE task_id = ? AND resume_token = ? AND safe_action_id = ? AND root_thread_id = ?
           AND status = 'reserved' AND reservation_lease_id = ? AND lease_expires_at > ?
@@ -6104,7 +6140,7 @@ export class TaskboardDatabase {
         throw new ApiError(409, "SAFE_ACTION_RECEIPT_MISSING", "Bootstrap delivery requires an existing reservation receipt");
       }
       this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE task_safe_action_receipts
         SET status = 'delivering', admission_state = 'awaiting_admission',
           recovery_lease_id = ?, recovery_lease_expires_at = ?, admission_deadline_at = ?
@@ -6115,7 +6151,7 @@ export class TaskboardDatabase {
         new Date(Date.now() + this.admissionTtlMs).toISOString(),
         row.id,
       );
-      const delivering = this.database.prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(row.id);
+      const delivering = this.#prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(row.id);
       this.database.exec("COMMIT");
       return { confirmed: true, receipt: this.#taskSafeActionReceipt(delivering) };
     } catch (error) {
@@ -6131,7 +6167,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE task_id = ? AND resume_token = ? AND safe_action_id = ? AND root_thread_id = ?
       `).get(task.id, expectedResumeToken, safeActionId, rootThreadId);
@@ -6141,7 +6177,7 @@ export class TaskboardDatabase {
       this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
       if (row.status === "delivered") {
         if (row.delivery_turn_id === null && row.admission_state === "admitted") {
-          const recorded = this.database.prepare(`
+          const recorded = this.#prepare(`
             UPDATE task_safe_action_receipts SET delivery_turn_id = ?
             WHERE id = ? AND status = 'delivered' AND admission_state = 'admitted'
               AND delivery_turn_id IS NULL AND reservation_lease_id = ?
@@ -6149,7 +6185,7 @@ export class TaskboardDatabase {
           if (recorded.changes !== 1) {
             throw new ApiError(409, "SAFE_ACTION_DELIVERY_MISMATCH", "Bootstrap admission was finalized by another Root delivery");
           }
-          const recordedRow = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+          const recordedRow = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
           this.database.exec("COMMIT");
           return { completed: true, reused: false, receipt: this.#taskSafeActionReceipt(recordedRow) };
         }
@@ -6176,15 +6212,15 @@ export class TaskboardDatabase {
         || Date.parse(row.recovery_lease_expires_at) <= Date.now()) {
         throw new ApiError(409, "SAFE_ACTION_RECOVERY_LEASE_REQUIRED", "Bootstrap completion requires the active recovery lease");
       }
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE task_safe_action_receipts
         SET delivery_turn_id = ?
         WHERE id = ? AND status = 'delivering' AND reservation_lease_id = ? AND recovery_lease_id = ?
       `).run(deliveryTurnId, row.id, reservationLeaseId, recoveryLeaseId);
-      if (this.database.prepare("SELECT changes() AS count").get().count !== 1) {
+      if (this.#prepare("SELECT changes() AS count").get().count !== 1) {
         throw new ApiError(409, "SAFE_ACTION_DELIVERY_NOT_CONFIRMED", "Bootstrap delivery was not confirmed before completion");
       }
-      const completed = this.database.prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(row.id);
+      const completed = this.#prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(row.id);
       this.database.exec("COMMIT");
       return {
         completed: false, awaitingAdmission: true, reused: false,
@@ -6202,7 +6238,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
           AND root_thread_id = ?
@@ -6276,7 +6312,7 @@ export class TaskboardDatabase {
             ));
         if (matchingDomains.length === 1) {
           const domain = matchingDomains[0];
-          this.database.prepare(`
+          this.#prepare(`
             INSERT INTO agent_task_domain_assignments (
               task_id, project_id, domain_id, assigned_by_lease_id, assigned_by_task_id,
               assigned_by_thread_id, assigned_at, updated_at
@@ -6285,10 +6321,10 @@ export class TaskboardDatabase {
             task.id, task.projectId, domain.id, rootRun.globalCoordinatorLeaseId,
             rootRun.globalCoordinatorTaskId, rootRun.rootThreadId, timestamp, timestamp,
           );
-          const taskUpdate = this.database.prepare(`
+          const taskUpdate = this.#prepare(`
             UPDATE tasks SET version = version + 1, updated_at = ? WHERE id = ? AND version = ?
           `).run(timestamp, task.id, task.version);
-          const receiptUpdate = this.database.prepare(`
+          const receiptUpdate = this.#prepare(`
             UPDATE task_safe_action_receipts
             SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
               lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
@@ -6301,7 +6337,7 @@ export class TaskboardDatabase {
             throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Global arbitration frontier changed before domain routing");
           }
           const assignment = this.getAgentTaskDomainAssignment(task.id);
-          const deferred = this.database.prepare(
+          const deferred = this.#prepare(
             "SELECT * FROM task_safe_action_receipts WHERE id = ?",
           ).get(row.id);
           this.database.exec("COMMIT");
@@ -6316,7 +6352,7 @@ export class TaskboardDatabase {
       const agentName = row.admission_agent_name ?? deterministicAdmissionAgentName(task, admissionAttemptId);
       const agentPath = row.admission_agent_path ?? `/root/${agentName}`;
       const deadlineAt = new Date(Date.parse(timestamp) + this.admissionTtlMs).toISOString();
-      const updated = this.database.prepare(`
+      const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
         SET admission_state = 'prepared', admission_agent_name = ?, admission_agent_path = ?,
           admission_write_scope_json = ?, admission_prepared_at = ?, admission_deadline_at = ?
@@ -6326,7 +6362,7 @@ export class TaskboardDatabase {
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission attempt changed before preparation was persisted");
       }
-      const prepared = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      const prepared = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
       return { applied: true, receipt: this.#taskSafeActionReceipt(prepared) };
     } catch (error) {
@@ -6342,7 +6378,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
           AND root_thread_id = ?
@@ -6364,7 +6400,7 @@ export class TaskboardDatabase {
       if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
         throw new ApiError(409, "ADMISSION_ALREADY_CLAIMED", "An admitted or open Agent run cannot become uncertain");
       }
-      const updated = this.database.prepare(`
+      const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
         SET admission_state = 'admission_uncertain', admission_uncertain_at = ?
         WHERE id = ? AND status = 'delivering' AND admission_state IN ('awaiting_admission', 'prepared')
@@ -6373,7 +6409,7 @@ export class TaskboardDatabase {
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission attempt changed before timeout was persisted");
       }
-      const uncertain = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      const uncertain = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
       return { applied: true, receipt: this.#taskSafeActionReceipt(uncertain) };
     } catch (error) {
@@ -6389,7 +6425,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
           AND root_thread_id = ?
@@ -6407,7 +6443,7 @@ export class TaskboardDatabase {
       }
       const probeId = randomUUID();
       const requestedAt = now();
-      const updated = this.database.prepare(`
+      const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
         SET admission_probe_id = ?, admission_probe_requested_at = ?
         WHERE id = ? AND status = 'delivering' AND admission_state = 'admission_uncertain'
@@ -6416,7 +6452,7 @@ export class TaskboardDatabase {
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_PROBE_CONFLICT", "Admission probe changed before it was persisted");
       }
-      const probed = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      const probed = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
       return { applied: true, receipt: this.#taskSafeActionReceipt(probed) };
     } catch (error) {
@@ -6433,7 +6469,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
           AND root_thread_id = ?
@@ -6472,7 +6508,7 @@ export class TaskboardDatabase {
         if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
           throw new ApiError(409, "ADMISSION_ALREADY_CLAIMED", "An admitted or open Agent run cannot be reconciled as absent");
         }
-        const updated = this.database.prepare(`
+        const updated = this.#prepare(`
           UPDATE task_safe_action_receipts
           SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
             lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
@@ -6482,7 +6518,7 @@ export class TaskboardDatabase {
             AND admission_attempt_id = ?
         `).run(registryObservation.observedAt, row.id, admissionAttemptId);
         if (updated.changes !== 1) throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission changed during absence reconciliation");
-        const deferred = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+        const deferred = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
         this.database.exec("COMMIT");
         return { applied: true, outcome: "absent", receipt: this.#taskSafeActionReceipt(deferred) };
       }
@@ -6493,7 +6529,7 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return { applied: false, outcome: "unresolved", receipt: this.#taskSafeActionReceipt(row) };
       }
-      const updated = this.database.prepare(`
+      const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
         SET admission_state = 'recovery_confirmed', admission_registry_observed_at = ?,
           admission_recovered_agent_thread_id = ?
@@ -6501,7 +6537,7 @@ export class TaskboardDatabase {
           AND admission_attempt_id = ?
       `).run(registryObservation.observedAt, observed.agentThreadId, row.id, admissionAttemptId);
       if (updated.changes !== 1) throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission changed during child reconciliation");
-      const confirmed = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      const confirmed = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
       return { applied: true, outcome: "present", receipt: this.#taskSafeActionReceipt(confirmed) };
     } catch (error) {
@@ -6517,7 +6553,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
           AND root_thread_id = ?
@@ -6538,7 +6574,7 @@ export class TaskboardDatabase {
       }
       const retryCount = Math.max(0, Number(row.admission_retry_count) || 0) + 1;
       const retryAfter = new Date(Date.now() + modelCapacityRetryDelay(retryCount)).toISOString();
-      const updated = this.database.prepare(`
+      const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
         SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
           lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
@@ -6550,7 +6586,7 @@ export class TaskboardDatabase {
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission attempt changed before capacity deferral");
       }
-      const deferred = this.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      const deferred = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
       return { applied: true, receipt: this.#taskSafeActionReceipt(deferred) };
     } catch (error) {
@@ -6658,7 +6694,7 @@ export class TaskboardDatabase {
   createTask(input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const project = this.database.prepare(`
+      const project = this.#prepare(`
         SELECT
           projects.id,
           projects.name,
@@ -6679,7 +6715,7 @@ export class TaskboardDatabase {
       }
 
       const prefix = projectPrefix(project);
-      const maximum = this.database.prepare(`
+      const maximum = this.#prepare(`
         SELECT MAX(CAST(substr(identifier, ?) AS INTEGER)) AS number
         FROM tasks
         WHERE identifier GLOB ?
@@ -6691,7 +6727,7 @@ export class TaskboardDatabase {
       const workingLog = normalizeWorkingLog(input.workingLog, input.developmentContext);
       let sortOrder = input.sortOrder;
       if (sortOrder === undefined) {
-        const row = this.database.prepare(`
+        const row = this.#prepare(`
           SELECT MIN(sort_order) AS minimum
           FROM tasks
           WHERE project_id = ? AND status = ? AND archived_at IS NULL
@@ -6699,7 +6735,7 @@ export class TaskboardDatabase {
         sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
       }
 
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE projects SET next_task_number = ?, labels = ?, updated_at = ? WHERE id = ?
       `).run(
         number + 1,
@@ -6707,7 +6743,7 @@ export class TaskboardDatabase {
         timestamp,
         input.projectId,
       );
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO tasks (
           id, identifier, project_id, title, description, status, priority, labels, workflow_profile,
           sort_order, thread_id, thread_codex_project_id, thread_codex_project_kind,
@@ -6777,14 +6813,14 @@ export class TaskboardDatabase {
     }
     const activityChanges = taskFieldChanges(current, changes);
     const targetProject = Object.hasOwn(changes, "projectId")
-      ? this.database.prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
+      ? this.#prepare("SELECT id, name, workspace_path, labels FROM projects WHERE id = ?").get(changes.projectId)
       : null;
     if (Object.hasOwn(changes, "projectId") && !targetProject) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${changes.projectId}' does not exist`);
     }
     const projectChanged = Boolean(targetProject && targetProject.id !== current.projectId);
     if (projectChanged) {
-      const relation = this.database.prepare(`
+      const relation = this.#prepare(`
         SELECT 1
         FROM task_relations
         WHERE source_task_id = ? OR target_task_id = ?
@@ -6872,7 +6908,7 @@ export class TaskboardDatabase {
     }
     if (Object.hasOwn(changes, "status") && changes.status !== current.status) {
       const placementProjectId = projectChanged ? targetProject.id : current.projectId;
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT MIN(sort_order) AS minimum
         FROM tasks
         WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
@@ -6906,7 +6942,7 @@ export class TaskboardDatabase {
           "Domain-assigned work and its durable provenance cannot move across projects",
         );
       }
-      if (projectChanged && this.database.prepare(`
+      if (projectChanged && this.#prepare(`
         SELECT 1 FROM owner_intent_plan_items WHERE task_id = ? LIMIT 1
       `).get(current.id)) {
         throw new ApiError(
@@ -6915,26 +6951,26 @@ export class TaskboardDatabase {
           "Owner-Intent-planned work and its durable provenance cannot move across projects",
         );
       }
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE tasks SET ${assignments.join(", ")} WHERE id = ? AND version = ?
       `).run(...values);
       if (result.changes !== 1) {
         this.#throwMissingOrConflict(id, version);
       }
       if (projectChanged) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE projects SET updated_at = ? WHERE id IN (?, ?)
         `).run(timestamp, current.projectId, targetProject.id);
       }
       const destinationProjectId = projectChanged ? targetProject.id : current.projectId;
-      const destinationProject = this.database.prepare(`
+      const destinationProject = this.#prepare(`
         SELECT labels FROM projects WHERE id = ?
       `).get(destinationProjectId);
       const taskLabels = Object.hasOwn(changes, "labels") ? changes.labels : current.labels;
       const projectLabels = JSON.parse(destinationProject.labels);
       const mergedLabels = [...new Set([...projectLabels, ...taskLabels])];
       if (mergedLabels.length !== projectLabels.length) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE projects SET labels = ?, updated_at = ? WHERE id = ?
         `).run(JSON.stringify(mergedLabels), timestamp, destinationProjectId);
       }
@@ -6957,14 +6993,14 @@ export class TaskboardDatabase {
       throw new ApiError(409, "TASK_ARCHIVED", "Archived tasks cannot be moved");
     }
     if (status !== current.status && sortOrder === undefined) {
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT MIN(sort_order) AS minimum
         FROM tasks
         WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
       `).get(current.projectId, status, current.id);
       sortOrder = row.minimum === null ? 1000 : row.minimum - 1000;
     } else if (sortOrder === undefined) {
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT COALESCE(MAX(sort_order), 0) AS maximum
         FROM tasks
         WHERE project_id = ? AND status = ? AND archived_at IS NULL AND id != ?
@@ -6983,7 +7019,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE tasks
         SET status = ?, sort_order = ?, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
@@ -7022,7 +7058,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE tasks
         SET archived_at = ?, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
@@ -7062,7 +7098,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       this.#assertNoOpenTaskAgentRunRebinding(current, {}, threadBinding);
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE tasks
         SET archived_at = NULL, ${threadAssignment} version = version + 1, updated_at = ?
         WHERE id = ? AND version = ?
@@ -7092,10 +7128,10 @@ export class TaskboardDatabase {
       if (current.archivedAt === null) {
         throw new ApiError(409, "TASK_NOT_ARCHIVED", "Only archived tasks can be deleted");
       }
-      const attachmentIds = this.database.prepare(
+      const attachmentIds = this.#prepare(
         "SELECT id FROM attachments WHERE task_id = ? ORDER BY created_at, id",
       ).all(current.id).map((attachment) => attachment.id);
-      const result = this.database.prepare(
+      const result = this.#prepare(
         "DELETE FROM tasks WHERE id = ? AND version = ? AND archived_at IS NOT NULL",
       ).run(current.id, version);
       if (result.changes !== 1) this.#throwMissingOrConflict(id, version);
@@ -7122,7 +7158,7 @@ export class TaskboardDatabase {
       );
       if (relationType === "parent") {
         this.#assertNoParentCycle(task.id, relatedTask.id);
-        const existing = this.database.prepare(`
+        const existing = this.#prepare(`
           SELECT source_task_id
           FROM task_relations
           WHERE relation_type = 'parent' AND target_task_id = ?
@@ -7131,7 +7167,7 @@ export class TaskboardDatabase {
           throw new ApiError(409, "RELATION_EXISTS", "This parent relation already exists");
         }
         if (existing) {
-          this.database.prepare(`
+          this.#prepare(`
             DELETE FROM task_relations
             WHERE relation_type = 'parent' AND target_task_id = ?
           `).run(task.id);
@@ -7140,7 +7176,7 @@ export class TaskboardDatabase {
         if (relationType === "blocks") {
           this.#assertNoDependencyCycle(sourceTaskId, targetTaskId);
         }
-        const existing = this.database.prepare(`
+        const existing = this.#prepare(`
           SELECT 1
           FROM task_relations
           WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
@@ -7154,7 +7190,7 @@ export class TaskboardDatabase {
       const previousRelation = type === "parent" && task.relations.parent
         ? relationActivityValue(type, task.relations.parent)
         : null;
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO task_relations (
           relation_type, source_task_id, target_task_id, origin, created_at
         ) VALUES (?, ?, ?, ?, ?)
@@ -7188,7 +7224,7 @@ export class TaskboardDatabase {
         task.id,
         relatedTask.id,
       );
-      const relation = this.database.prepare(`
+      const relation = this.#prepare(`
         SELECT origin
         FROM task_relations
         WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
@@ -7213,7 +7249,7 @@ export class TaskboardDatabase {
           project: task.projectId,
           issue: task.identifier,
         })})`;
-        deleted = this.database.prepare(`
+        deleted = this.#prepare(`
           DELETE FROM task_relations
           WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
             AND origin = 'mention'
@@ -7243,7 +7279,7 @@ export class TaskboardDatabase {
           relatedTaskReference,
         );
       } else {
-        deleted = this.database.prepare(`
+        deleted = this.#prepare(`
           DELETE FROM task_relations
           WHERE relation_type = ? AND source_task_id = ? AND target_task_id = ?
         `).run(relationType, sourceTaskId, targetTaskId);
@@ -7256,7 +7292,7 @@ export class TaskboardDatabase {
         };
       }
       if (relationType === "blocks" && deleted.changes > 0) {
-        this.database.prepare(`
+        this.#prepare(`
           DELETE FROM owner_intent_plan_dependencies
           WHERE project_id = ? AND source_task_id = ? AND target_task_id = ?
         `).run(task.projectId, sourceTaskId, targetTaskId);
@@ -7281,7 +7317,7 @@ export class TaskboardDatabase {
 
   listTaskActivities(taskId) {
     const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM task_activities
       WHERE task_id = ?
       ORDER BY created_at, id
@@ -7290,7 +7326,7 @@ export class TaskboardDatabase {
 
   listComments(taskId) {
     const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
       ORDER BY created_at, id
@@ -7299,7 +7335,7 @@ export class TaskboardDatabase {
 
   listCommentsAfter(taskId, after) {
     const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM comments
       WHERE task_id = ?
         AND change_revision > ?
@@ -7315,7 +7351,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(taskId);
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO comments (
           id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
@@ -7347,7 +7383,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM task_inbox_delivery_receipts
         WHERE task_id = ? AND delivery_id = ?
       `).get(task.id, input.deliveryId);
@@ -7388,7 +7424,7 @@ export class TaskboardDatabase {
       const commentId = randomUUID();
       const receiptId = randomUUID();
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO comments (
           id, task_id, body, thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
@@ -7408,7 +7444,7 @@ export class TaskboardDatabase {
         timestamp,
         changeRevision,
       );
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO task_inbox_delivery_receipts (
           id, delivery_id, task_id, project_id, comment_id, source_thread_id, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -7434,7 +7470,7 @@ export class TaskboardDatabase {
   }
 
   getTaskInboxDeliveryReceipt(id) {
-    const row = this.database.prepare(
+    const row = this.#prepare(
       "SELECT * FROM task_inbox_delivery_receipts WHERE id = ?",
     ).get(id);
     return row ? taskInboxDeliveryReceiptFromRow(row) : null;
@@ -7442,7 +7478,7 @@ export class TaskboardDatabase {
 
   listTaskInboxDeliveryReceipts(taskId) {
     const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM task_inbox_delivery_receipts
       WHERE task_id = ?
       ORDER BY created_at DESC, rowid DESC
@@ -7476,7 +7512,7 @@ export class TaskboardDatabase {
         );
       }
 
-      const existing = this.database.prepare(
+      const existing = this.#prepare(
         "SELECT * FROM project_owner_intents WHERE delivery_id = ? OR id = ?",
       ).get(input.deliveryId, input.intentId);
       if (existing) {
@@ -7508,7 +7544,7 @@ export class TaskboardDatabase {
         return { applied: false, intent };
       }
 
-      const existingTurn = this.database.prepare(`
+      const existingTurn = this.#prepare(`
         SELECT id FROM project_owner_intents
         WHERE project_id = ? AND (
           (owner_root_thread_id = ? AND owner_turn_id = ?)
@@ -7528,7 +7564,7 @@ export class TaskboardDatabase {
       }
       if (input.kind !== "append") {
         const target = input.targetIntentId
-          ? this.database.prepare(
+          ? this.#prepare(
             "SELECT project_id FROM project_owner_intents WHERE id = ?",
           ).get(input.targetIntentId)
           : null;
@@ -7542,7 +7578,7 @@ export class TaskboardDatabase {
       }
 
       const timestamp = now();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO project_owner_intents (
           id, delivery_id, project_id, kind, goal, constraints_json, target_intent_id,
           owner_root_task_id, owner_root_thread_id,
@@ -7574,7 +7610,7 @@ export class TaskboardDatabase {
         timestamp,
         timestamp,
       );
-      const intent = projectOwnerIntentFromRow(this.database.prepare(
+      const intent = projectOwnerIntentFromRow(this.#prepare(
         "SELECT * FROM project_owner_intents WHERE id = ?",
       ).get(input.intentId));
       this.database.exec("COMMIT");
@@ -7589,7 +7625,7 @@ export class TaskboardDatabase {
     if (!this.getProject(projectId)) {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
     }
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM project_owner_intents
       WHERE project_id = ?
       ORDER BY created_at, id
@@ -7597,7 +7633,7 @@ export class TaskboardDatabase {
   }
 
   getPendingProjectOwnerIntent(projectId) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT intent.*, adoption.coordinator_epoch AS adoption_epoch
       FROM project_owner_intents AS intent
       LEFT JOIN owner_intent_adoptions AS adoption ON adoption.intent_id = intent.id
@@ -7624,7 +7660,7 @@ export class TaskboardDatabase {
   }
 
   getPendingProjectOwnerIntentPlan(projectId) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT intent.*, adoption.id AS adoption_id, adoption.coordinator_task_id,
         adoption.coordinator_thread_id, adoption.coordinator_epoch,
         adoption.delivery_turn_id, adoption.adopted_at
@@ -7679,10 +7715,10 @@ export class TaskboardDatabase {
   claimProjectOwnerIntentAdoption(projectId, intentId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const readExecutionIntent = () => ownerIntentExecutionFromRow(this.database.prepare(
+      const readExecutionIntent = () => ownerIntentExecutionFromRow(this.#prepare(
         "SELECT * FROM project_owner_intents WHERE id = ? AND project_id = ?",
       ).get(intentId, projectId));
-      const intentRow = this.database.prepare(
+      const intentRow = this.#prepare(
         "SELECT * FROM project_owner_intents WHERE id = ? AND project_id = ?",
       ).get(intentId, projectId);
       if (!intentRow) {
@@ -7696,7 +7732,7 @@ export class TaskboardDatabase {
       ) {
         throw new ApiError(409, "COORDINATOR_ROUTE_STALE", "Coordinator identity or epoch changed before adoption");
       }
-      const existing = this.database.prepare(
+      const existing = this.#prepare(
         "SELECT * FROM owner_intent_adoptions WHERE intent_id = ?",
       ).get(intentId);
       if (existing) {
@@ -7724,21 +7760,21 @@ export class TaskboardDatabase {
           };
         }
         if (adoption.state === "adopted" && !sameCoordinator) {
-          const planned = this.database.prepare(
+          const planned = this.#prepare(
             "SELECT 1 FROM owner_intent_plan_revisions WHERE intent_id = ?",
           ).get(intentId);
           if (planned) {
             throw new ApiError(409, "OWNER_INTENT_ADOPTION_CONFLICT", "A planned intent cannot move to another coordinator epoch");
           }
-          this.database.prepare(`
+          this.#prepare(`
             UPDATE project_owner_intents
             SET status = 'queued', version = version + 1, updated_at = ?
             WHERE id = ? AND project_id = ? AND status = 'adopted'
           `).run(now(), intentId, projectId);
         }
-        this.database.prepare("DELETE FROM owner_intent_adoptions WHERE id = ?").run(adoption.id);
+        this.#prepare("DELETE FROM owner_intent_adoptions WHERE id = ?").run(adoption.id);
       }
-      const currentIntent = this.database.prepare(
+      const currentIntent = this.#prepare(
         "SELECT status FROM project_owner_intents WHERE id = ? AND project_id = ?",
       ).get(intentId, projectId);
       if (currentIntent?.status !== "queued") {
@@ -7747,7 +7783,7 @@ export class TaskboardDatabase {
       const claimedAt = now();
       const adoptionId = randomUUID();
       const reservationExpiresAt = new Date(Date.now() + OWNER_INTENT_ADOPTION_TTL_MS).toISOString();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO owner_intent_adoptions (
           id, intent_id, project_id, coordinator_task_id, coordinator_thread_id,
           coordinator_epoch, state, reservation_expires_at, claimed_at
@@ -7762,7 +7798,7 @@ export class TaskboardDatabase {
         reservationExpiresAt,
         claimedAt,
       );
-      const receipt = ownerIntentAdoptionFromRow(this.database.prepare(
+      const receipt = ownerIntentAdoptionFromRow(this.#prepare(
         "SELECT * FROM owner_intent_adoptions WHERE id = ?",
       ).get(adoptionId));
       this.database.exec("COMMIT");
@@ -7776,7 +7812,7 @@ export class TaskboardDatabase {
   confirmProjectOwnerIntentAdoption(projectId, intentId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM owner_intent_adoptions
         WHERE id = ? AND intent_id = ? AND project_id = ?
       `).get(input.adoptionId, intentId, projectId);
@@ -7803,12 +7839,12 @@ export class TaskboardDatabase {
         throw new ApiError(409, "OWNER_INTENT_ADOPTION_STALE", "Intent adoption reservation expired");
       }
       const adoptedAt = now();
-      this.database.prepare(`
+      this.#prepare(`
         UPDATE owner_intent_adoptions
         SET state = 'adopted', delivery_turn_id = ?, adopted_at = ?
         WHERE id = ? AND state = 'reserved'
       `).run(input.deliveryTurnId, adoptedAt, adoption.id);
-      const updatedIntent = this.database.prepare(`
+      const updatedIntent = this.#prepare(`
         UPDATE project_owner_intents
         SET status = 'adopted', version = version + 1, updated_at = ?
         WHERE id = ? AND project_id = ? AND status = 'queued'
@@ -7816,7 +7852,7 @@ export class TaskboardDatabase {
       if (updatedIntent.changes !== 1) {
         throw new ApiError(409, "OWNER_INTENT_NOT_QUEUED", "Owner Intent changed before adoption confirmation");
       }
-      const receipt = ownerIntentAdoptionFromRow(this.database.prepare(
+      const receipt = ownerIntentAdoptionFromRow(this.#prepare(
         "SELECT * FROM owner_intent_adoptions WHERE id = ?",
       ).get(adoption.id));
       this.database.exec("COMMIT");
@@ -7830,7 +7866,7 @@ export class TaskboardDatabase {
   retryProjectOwnerIntentPlan(projectId, intentId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const intentRow = this.database.prepare(`
+      const intentRow = this.#prepare(`
         SELECT * FROM project_owner_intents WHERE id = ? AND project_id = ?
       `).get(intentId, projectId);
       if (!intentRow) {
@@ -7844,7 +7880,7 @@ export class TaskboardDatabase {
           intent: projectOwnerIntentFromRow(intentRow),
         };
       }
-      const adoption = this.database.prepare(`
+      const adoption = this.#prepare(`
         SELECT * FROM owner_intent_adoptions
         WHERE id = ? AND intent_id = ? AND project_id = ? AND state = 'adopted'
       `).get(input.adoptionId, intentId, projectId);
@@ -7858,7 +7894,7 @@ export class TaskboardDatabase {
         || adoption.coordinator_epoch !== coordinator.epoch) {
         throw new ApiError(409, "COORDINATOR_ROUTE_STALE", "Plan retry coordinator identity or epoch changed");
       }
-      if (this.database.prepare(
+      if (this.#prepare(
         "SELECT 1 FROM owner_intent_plan_revisions WHERE intent_id = ?",
       ).get(intentId)) {
         throw new ApiError(409, "OWNER_INTENT_PLAN_RETRY_STALE", "A recorded plan cannot be retried");
@@ -7866,8 +7902,8 @@ export class TaskboardDatabase {
       const timestamp = now();
       const retryCount = Number(intentRow.plan_retry_count ?? 0) + 1;
       const exhausted = retryCount >= OWNER_INTENT_PLAN_RETRY_LIMIT;
-      this.database.prepare("DELETE FROM owner_intent_adoptions WHERE id = ?").run(adoption.id);
-      this.database.prepare(`
+      this.#prepare("DELETE FROM owner_intent_adoptions WHERE id = ?").run(adoption.id);
+      this.#prepare(`
         UPDATE project_owner_intents
         SET status = ?, version = version + 1,
           plan_retry_count = ?, plan_retry_after = ?, plan_last_failure_key = ?, updated_at = ?
@@ -7881,7 +7917,7 @@ export class TaskboardDatabase {
         intentId,
         projectId,
       );
-      const intent = projectOwnerIntentFromRow(this.database.prepare(
+      const intent = projectOwnerIntentFromRow(this.#prepare(
         "SELECT * FROM project_owner_intents WHERE id = ?",
       ).get(intentId));
       this.database.exec("COMMIT");
@@ -7893,11 +7929,11 @@ export class TaskboardDatabase {
   }
 
   listProjectOwnerIntentPlan(projectId) {
-    const rows = this.database.prepare(`
+    const rows = this.#prepare(`
       SELECT * FROM owner_intent_plan_revisions
       WHERE project_id = ? ORDER BY created_at, id
     `).all(projectId);
-    const itemStatement = this.database.prepare(`
+    const itemStatement = this.#prepare(`
       SELECT plan_items.*, tasks.identifier, tasks.title, tasks.status, tasks.priority, tasks.version
       FROM owner_intent_plan_items AS plan_items
       JOIN tasks ON tasks.id = plan_items.task_id
@@ -7923,7 +7959,7 @@ export class TaskboardDatabase {
     const serializedRequest = JSON.stringify(input);
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const existing = this.database.prepare(
+      const existing = this.#prepare(
         "SELECT * FROM owner_intent_plan_revisions WHERE id = ? OR intent_id = ?",
       ).get(input.revisionId, intentId);
       if (existing) {
@@ -7938,7 +7974,7 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return { applied: false, revision: result };
       }
-      const intent = this.database.prepare(`
+      const intent = this.#prepare(`
         SELECT * FROM project_owner_intents WHERE id = ? AND project_id = ?
       `).get(intentId, projectId);
       if (!intent) throw new ApiError(404, "OWNER_INTENT_NOT_FOUND", `Owner Intent '${intentId}' does not exist`);
@@ -7952,7 +7988,7 @@ export class TaskboardDatabase {
           "A cancel Owner Intent plan cannot create or update executable Todos",
         );
       }
-      const adoption = this.database.prepare(`
+      const adoption = this.#prepare(`
         SELECT * FROM owner_intent_adoptions
         WHERE id = ? AND intent_id = ? AND project_id = ? AND state = 'adopted'
       `).get(input.adoptionId, intentId, projectId);
@@ -7980,7 +8016,7 @@ export class TaskboardDatabase {
       const timestamp = now();
       const needsDecision = input.classification !== "bounded_delivery";
       const revisionStatus = needsDecision ? "needs_decision" : "applied";
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO owner_intent_plan_revisions (
           id, project_id, intent_id, intent_version, adoption_id,
           coordinator_task_id, coordinator_thread_id, coordinator_epoch,
@@ -7992,7 +8028,7 @@ export class TaskboardDatabase {
         input.classification, revisionStatus, input.summary, serializedRequest, timestamp, timestamp,
       );
       if (needsDecision) {
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE project_owner_intents SET status = 'needs_decision', version = version + 1, updated_at = ?
           WHERE id = ? AND project_id = ? AND status = 'adopted'
         `).run(timestamp, intentId, projectId);
@@ -8005,7 +8041,7 @@ export class TaskboardDatabase {
       const targetIntentId = intent.target_intent_id;
       const reconciledTaskIds = new Set();
       if (["supersede", "cancel"].includes(intent.kind) && targetIntentId) {
-        const priorItems = this.database.prepare(`
+        const priorItems = this.#prepare(`
           SELECT plan_items.*, tasks.project_id AS task_project_id, tasks.status,
             EXISTS(SELECT 1 FROM agent_task_claims WHERE task_id = tasks.id AND status = 'active') AS active_claim,
             EXISTS(SELECT 1 FROM task_agent_runs WHERE task_id = tasks.id AND status IN ('active','blocked')) AS open_run
@@ -8023,12 +8059,12 @@ export class TaskboardDatabase {
           }
           reconciledTaskIds.add(prior.task_id);
           if (["backlog", "todo"].includes(prior.status) && !prior.active_claim && !prior.open_run) {
-            this.database.prepare(`
+            this.#prepare(`
               UPDATE tasks SET status = 'canceled', version = version + 1, updated_at = ? WHERE id = ?
             `).run(timestamp, prior.task_id);
           }
         }
-        this.database.prepare(`
+        this.#prepare(`
           UPDATE project_owner_intents SET status = ?, version = version + 1, updated_at = ?
           WHERE id = ? AND project_id = ? AND status IN ('adopted','needs_decision')
         `).run(intent.kind === "cancel" ? "canceled" : "superseded", timestamp, targetIntentId, projectId);
@@ -8036,7 +8072,7 @@ export class TaskboardDatabase {
 
       const plannedTaskIds = new Map();
       for (const item of input.items) {
-        const prior = this.database.prepare(`
+        const prior = this.#prepare(`
           SELECT plan_items.task_id, tasks.*
           FROM owner_intent_plan_items AS plan_items
           JOIN tasks ON tasks.id = plan_items.task_id
@@ -8056,7 +8092,7 @@ export class TaskboardDatabase {
         if (prior) {
           taskId = prior.task_id;
           const active = ["in_progress", "in_review", "done"].includes(prior.status)
-            || this.database.prepare(`
+            || this.#prepare(`
               SELECT 1 FROM agent_task_claims WHERE task_id = ? AND status = 'active'
               UNION ALL SELECT 1 FROM task_agent_runs WHERE task_id = ? AND status IN ('active','blocked')
               LIMIT 1
@@ -8064,7 +8100,7 @@ export class TaskboardDatabase {
           if (active) {
             disposition = "preserved_active";
           } else {
-            this.database.prepare(`
+            this.#prepare(`
               UPDATE tasks SET title = ?, description = ?, priority = ?, status = 'todo',
                 version = version + 1, updated_at = ?
               WHERE id = ?
@@ -8075,7 +8111,7 @@ export class TaskboardDatabase {
               && prior.priority === item.priority ? "reused" : "updated";
           }
         } else {
-          const project = this.database.prepare(`
+          const project = this.#prepare(`
             SELECT projects.*, (
               SELECT tasks.identifier FROM tasks WHERE tasks.project_id = projects.id
               ORDER BY tasks.created_at, tasks.id LIMIT 1
@@ -8083,19 +8119,19 @@ export class TaskboardDatabase {
             FROM projects WHERE id = ?
           `).get(projectId);
           const prefix = projectPrefix(project);
-          const maximum = this.database.prepare(`
+          const maximum = this.#prepare(`
             SELECT MAX(CAST(substr(identifier, ?) AS INTEGER)) AS number
             FROM tasks WHERE identifier GLOB ?
           `).get(prefix.length + 2, `${prefix}-[0-9]*`).number;
           const number = Math.max(project.next_task_number, maximum === null ? 1 : maximum + 1);
           taskId = randomUUID();
-          const sort = this.database.prepare(`
+          const sort = this.#prepare(`
             SELECT MIN(sort_order) AS minimum FROM tasks
             WHERE project_id = ? AND status = 'todo' AND archived_at IS NULL
           `).get(projectId).minimum;
-          this.database.prepare("UPDATE projects SET next_task_number = ?, updated_at = ? WHERE id = ?")
+          this.#prepare("UPDATE projects SET next_task_number = ?, updated_at = ? WHERE id = ?")
             .run(number + 1, timestamp, projectId);
-          this.database.prepare(`
+          this.#prepare(`
             INSERT INTO tasks (
               id, identifier, project_id, title, description, status, priority, labels,
               workflow_profile, sort_order, thread_id,
@@ -8116,17 +8152,17 @@ export class TaskboardDatabase {
         }
         plannedTaskIds.set(item.outcomeKey, taskId);
         reconciledTaskIds.add(taskId);
-        this.database.prepare(`
+        this.#prepare(`
           INSERT INTO owner_intent_plan_items (
             id, revision_id, project_id, intent_id, outcome_key, task_id, disposition, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).run(randomUUID(), input.revisionId, projectId, intentId, item.outcomeKey, taskId, disposition, timestamp);
         if (input.parentTaskId) {
-          const parent = this.database.prepare("SELECT project_id FROM tasks WHERE id = ?").get(input.parentTaskId);
+          const parent = this.#prepare("SELECT project_id FROM tasks WHERE id = ?").get(input.parentTaskId);
           if (!parent || parent.project_id !== projectId) {
             throw new ApiError(400, "CROSS_PROJECT_RELATION", "Plan parent must be in the same project");
           }
-          this.database.prepare(`
+          this.#prepare(`
             INSERT INTO task_relations (relation_type, source_task_id, target_task_id, origin, created_at)
             VALUES ('parent', ?, ?, 'manual', ?)
             ON CONFLICT DO NOTHING
@@ -8145,19 +8181,19 @@ export class TaskboardDatabase {
       }
       if (reconciledTaskIds.size > 0) {
         const taskIds = [...reconciledTaskIds];
-        const priorDependencies = this.database.prepare(`
+        const priorDependencies = this.#prepare(`
           SELECT * FROM owner_intent_plan_dependencies
           WHERE project_id = ? AND target_task_id IN (${taskIds.map(() => "?").join(", ")})
         `).all(projectId, ...taskIds);
         for (const dependency of priorDependencies) {
           const key = `${dependency.source_task_id}\0${dependency.target_task_id}`;
           if (desiredDependencies.has(key)) continue;
-          this.database.prepare(`
+          this.#prepare(`
             DELETE FROM owner_intent_plan_dependencies
             WHERE project_id = ? AND source_task_id = ? AND target_task_id = ?
           `).run(projectId, dependency.source_task_id, dependency.target_task_id);
           if (dependency.owns_relation === 1) {
-            this.database.prepare(`
+            this.#prepare(`
               DELETE FROM task_relations
               WHERE relation_type = 'blocks' AND source_task_id = ? AND target_task_id = ?
             `).run(dependency.source_task_id, dependency.target_task_id);
@@ -8165,22 +8201,22 @@ export class TaskboardDatabase {
         }
       }
       for (const { sourceTaskId, targetTaskId } of desiredDependencies.values()) {
-        const relation = this.database.prepare(`
+        const relation = this.#prepare(`
           SELECT 1 FROM task_relations
           WHERE relation_type = 'blocks' AND source_task_id = ? AND target_task_id = ?
         `).get(sourceTaskId, targetTaskId);
-        const ownership = this.database.prepare(`
+        const ownership = this.#prepare(`
           SELECT owns_relation FROM owner_intent_plan_dependencies
           WHERE project_id = ? AND source_task_id = ? AND target_task_id = ?
         `).get(projectId, sourceTaskId, targetTaskId);
         const ownsRelation = relation ? ownership?.owns_relation ?? 0 : 1;
         if (!relation) {
-          this.database.prepare(`
+          this.#prepare(`
             INSERT INTO task_relations (relation_type, source_task_id, target_task_id, origin, created_at)
             VALUES ('blocks', ?, ?, 'manual', ?) ON CONFLICT DO NOTHING
           `).run(sourceTaskId, targetTaskId, timestamp);
         }
-        this.database.prepare(`
+        this.#prepare(`
           INSERT INTO owner_intent_plan_dependencies (
             project_id, source_task_id, target_task_id, revision_id, intent_id,
             owns_relation, created_at, updated_at
@@ -8195,7 +8231,7 @@ export class TaskboardDatabase {
           ownsRelation, timestamp, timestamp,
         );
       }
-      const dependencyCycle = this.database.prepare(`
+      const dependencyCycle = this.#prepare(`
         WITH RECURSIVE dependency_paths(start_task_id, current_task_id) AS (
           SELECT relations.source_task_id, relations.target_task_id
           FROM task_relations AS relations
@@ -8229,7 +8265,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(taskId);
       const serializedEnvelope = JSON.stringify(envelope);
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM agent_event_receipts
         WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
         LIMIT 1
@@ -8275,7 +8311,7 @@ export class TaskboardDatabase {
           "The handoff sender must match the active execution claim",
         );
       }
-      const previous = this.database.prepare(`
+      const previous = this.#prepare(`
         SELECT envelope_json FROM agent_event_receipts
         WHERE task_id = ? AND envelope_json IS NOT NULL
         ORDER BY created_at DESC, rowid DESC
@@ -8294,7 +8330,7 @@ export class TaskboardDatabase {
       const timestamp = now();
       const commentId = randomUUID();
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO comments (
           id, task_id, body, thread_id, author_type, author_id, author_name,
           author_avatar_url, version, created_at, updated_at, change_revision
@@ -8312,7 +8348,7 @@ export class TaskboardDatabase {
         timestamp,
         changeRevision,
       );
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_event_receipts (
           event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -8338,12 +8374,12 @@ export class TaskboardDatabase {
   }
 
   getTaskCoordinationEvent(eventId) {
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT * FROM agent_event_receipts
       WHERE event_id = ? AND envelope_json IS NOT NULL
     `).get(eventId);
     if (!row) return null;
-    const acknowledgements = this.database.prepare(`
+    const acknowledgements = this.#prepare(`
       SELECT * FROM agent_event_acknowledgements
       WHERE event_id = ?
       ORDER BY created_at, rowid
@@ -8353,7 +8389,7 @@ export class TaskboardDatabase {
 
   listTaskCoordinationEvents(taskId) {
     const task = this.#requireTask(taskId);
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM agent_event_receipts
       WHERE task_id = ? AND envelope_json IS NOT NULL
       ORDER BY created_at, rowid
@@ -8363,7 +8399,7 @@ export class TaskboardDatabase {
   acknowledgeTaskCoordinationEvent(eventId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const row = this.database.prepare(`
+      const row = this.#prepare(`
         SELECT * FROM agent_event_receipts
         WHERE event_id = ? AND envelope_json IS NOT NULL
       `).get(eventId);
@@ -8386,7 +8422,7 @@ export class TaskboardDatabase {
           "Acknowledgement must come from the task's exactly bound Root",
         );
       }
-      const existing = this.database.prepare(`
+      const existing = this.#prepare(`
         SELECT * FROM agent_event_acknowledgements WHERE event_id = ?
       `).get(eventId);
       if (existing) {
@@ -8413,7 +8449,7 @@ export class TaskboardDatabase {
         senderAgentPath: input.senderAgentPath,
         createdAt: now(),
       };
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO agent_event_acknowledgements (
           id, acknowledgement_id, event_id, sender_thread_id, sender_agent_path, created_at
         ) VALUES (?, ?, ?, ?, ?, ?)
@@ -8434,7 +8470,7 @@ export class TaskboardDatabase {
   }
 
   getComment(id) {
-    const row = this.database.prepare("SELECT * FROM comments WHERE id = ?").get(id);
+    const row = this.#prepare("SELECT * FROM comments WHERE id = ?").get(id);
     return row ? this.#commentWithAttachments(row) : null;
   }
 
@@ -8449,7 +8485,7 @@ export class TaskboardDatabase {
       const current = this.#requireComment(id);
       this.#requireCommentVersion(current, version);
       const changeRevision = this.#nextCommentAttachmentRevision();
-      const result = this.database.prepare(`
+      const result = this.#prepare(`
         UPDATE comments
         SET body = ?, ${threadAssignment} version = version + 1, updated_at = ?,
           change_revision = ?
@@ -8469,7 +8505,7 @@ export class TaskboardDatabase {
   deleteComment(id, version) {
     const current = this.#requireComment(id);
     this.#requireCommentVersion(current, version);
-    const result = this.database.prepare(`
+    const result = this.#prepare(`
       DELETE FROM comments WHERE id = ? AND version = ?
     `).run(id, version);
     if (result.changes !== 1) {
@@ -8481,14 +8517,14 @@ export class TaskboardDatabase {
   listAttachments(taskId, after = null) {
     const task = this.#requireTask(taskId);
     if (after) {
-      return this.database.prepare(`
+      return this.#prepare(`
         SELECT * FROM attachments
         WHERE task_id = ? AND comment_id IS NULL
           AND change_revision > ?
         ORDER BY change_revision
       `).all(task.id, after.revision).map(attachmentFromRow);
     }
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM attachments
       WHERE task_id = ? AND comment_id IS NULL
       ORDER BY created_at, id
@@ -8500,7 +8536,7 @@ export class TaskboardDatabase {
     try {
       const task = this.#requireTask(taskId);
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO attachments (
           id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision
         ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
@@ -8523,7 +8559,7 @@ export class TaskboardDatabase {
   }
 
   listCommentAttachments(commentId, after = null) {
-    const comment = this.database.prepare("SELECT id FROM comments WHERE id = ?").get(commentId);
+    const comment = this.#prepare("SELECT id FROM comments WHERE id = ?").get(commentId);
     if (!comment) {
       throw new ApiError(404, "COMMENT_NOT_FOUND", `Comment '${commentId}' does not exist`);
     }
@@ -8535,7 +8571,7 @@ export class TaskboardDatabase {
     try {
       const comment = this.#requireComment(commentId);
       const changeRevision = this.#nextCommentAttachmentRevision();
-      this.database.prepare(`
+      this.#prepare(`
         INSERT INTO attachments (
           id, task_id, comment_id, kind, filename, content_type, size, created_at, change_revision
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -8559,7 +8595,7 @@ export class TaskboardDatabase {
   }
 
   getAttachment(id) {
-    const row = this.database.prepare("SELECT * FROM attachments WHERE id = ?").get(id);
+    const row = this.#prepare("SELECT * FROM attachments WHERE id = ?").get(id);
     return row ? attachmentFromRow(row) : null;
   }
 
@@ -8568,7 +8604,7 @@ export class TaskboardDatabase {
     if (!attachment) {
       throw new ApiError(404, "ATTACHMENT_NOT_FOUND", `Attachment '${id}' does not exist`);
     }
-    this.database.prepare("DELETE FROM attachments WHERE id = ?").run(id);
+    this.#prepare("DELETE FROM attachments WHERE id = ?").run(id);
     return attachment;
   }
 
@@ -8580,14 +8616,14 @@ export class TaskboardDatabase {
 
   #aiChatThreadWithCurrentRun(row) {
     const thread = aiChatThreadFromRow(row);
-    const currentRun = this.database.prepare(`
+    const currentRun = this.#prepare(`
       SELECT * FROM ai_chat_runs
       WHERE thread_id = ? AND status = 'running'
       ORDER BY started_at DESC, id DESC
       LIMIT 1
     `).get(thread.id);
     thread.currentRun = currentRun ? aiChatRunFromRow(currentRun) : null;
-    const todoRows = this.database.prepare(`
+    const todoRows = this.#prepare(`
       SELECT id, thread_id, run_id, data, created_at
       FROM ai_chat_events
       WHERE thread_id = ? AND type = 'todo_list'
@@ -8606,7 +8642,7 @@ export class TaskboardDatabase {
       const chunk = taskIds.slice(offset, offset + 400);
       if (chunk.length === 0) continue;
       const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.database.prepare(`
+      const rows = this.#prepare(`
         SELECT
           id, task_id,
           CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
@@ -8629,7 +8665,7 @@ export class TaskboardDatabase {
       const chunk = taskIds.slice(offset, offset + 400);
       if (chunk.length === 0) continue;
       const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.database.prepare(`
+      const rows = this.#prepare(`
         SELECT
           id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, created_at
         FROM task_activities
@@ -8647,7 +8683,7 @@ export class TaskboardDatabase {
       const chunk = taskIds.slice(offset, offset + 400);
       if (chunk.length === 0) continue;
       const placeholders = chunk.map(() => "?").join(", ");
-      const rows = this.database.prepare(`
+      const rows = this.#prepare(`
         SELECT attachments.*
         FROM attachments
         JOIN tasks ON tasks.id = attachments.task_id
@@ -8666,14 +8702,14 @@ export class TaskboardDatabase {
 
   #attachmentsForComment(commentId, after = null) {
     if (after) {
-      return this.database.prepare(`
+      return this.#prepare(`
         SELECT * FROM attachments
         WHERE comment_id = ?
           AND change_revision > ?
         ORDER BY change_revision
       `).all(commentId, after.revision).map(attachmentFromRow);
     }
-    return this.database.prepare(`
+    return this.#prepare(`
       SELECT * FROM attachments
       WHERE comment_id = ?
       ORDER BY created_at, id
@@ -8681,7 +8717,7 @@ export class TaskboardDatabase {
   }
 
   #nextCommentAttachmentRevision() {
-    return this.database.prepare(`
+    return this.#prepare(`
       UPDATE comment_attachment_revision
       SET value = value + 1
       WHERE id = 1
@@ -8691,14 +8727,14 @@ export class TaskboardDatabase {
 
   #taskWithRelations(row) {
     const task = taskFromRow(row);
-    const parent = this.database.prepare(`
+    const parent = this.#prepare(`
       SELECT tasks.*
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.source_task_id
       WHERE task_relations.relation_type = 'parent'
         AND task_relations.target_task_id = ?
     `).get(task.id);
-    const subIssues = this.database.prepare(`
+    const subIssues = this.#prepare(`
       SELECT tasks.*
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.target_task_id
@@ -8706,7 +8742,7 @@ export class TaskboardDatabase {
         AND task_relations.source_task_id = ?
       ORDER BY tasks.sort_order, tasks.created_at, tasks.id
     `).all(task.id);
-    const blockedBy = this.database.prepare(`
+    const blockedBy = this.#prepare(`
       SELECT tasks.*
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.source_task_id
@@ -8714,7 +8750,7 @@ export class TaskboardDatabase {
         AND task_relations.target_task_id = ?
       ORDER BY tasks.sort_order, tasks.created_at, tasks.id
     `).all(task.id);
-    const blocks = this.database.prepare(`
+    const blocks = this.#prepare(`
       SELECT tasks.*
       FROM task_relations
       JOIN tasks ON tasks.id = task_relations.target_task_id
@@ -8722,7 +8758,7 @@ export class TaskboardDatabase {
         AND task_relations.source_task_id = ?
       ORDER BY tasks.sort_order, tasks.created_at, tasks.id
     `).all(task.id);
-    const related = this.database.prepare(`
+    const related = this.#prepare(`
       SELECT tasks.*
       FROM task_relations
       JOIN tasks ON tasks.id = CASE
@@ -8782,7 +8818,7 @@ export class TaskboardDatabase {
   }
 
   #assertNoParentCycle(childId, parentId) {
-    const cycle = this.database.prepare(`
+    const cycle = this.#prepare(`
       WITH RECURSIVE ancestors(id) AS (
         SELECT source_task_id
         FROM task_relations
@@ -8801,7 +8837,7 @@ export class TaskboardDatabase {
   }
 
   #assertNoDependencyCycle(sourceTaskId, targetTaskId) {
-    const cycle = this.database.prepare(`
+    const cycle = this.#prepare(`
       WITH RECURSIVE descendants(id) AS (
         SELECT target_task_id
         FROM task_relations
@@ -8821,7 +8857,7 @@ export class TaskboardDatabase {
 
   #recordTaskActivity(taskId, actor, changes, timestamp) {
     if (changes.length === 0) return;
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO task_activities (
         id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -8848,7 +8884,7 @@ export class TaskboardDatabase {
       ? `thread_id = ?, thread_codex_project_id = ?, thread_codex_project_kind = ?,
         thread_codex_host_id = ?, thread_workspace_path = ?,`
       : "";
-    const result = this.database.prepare(`
+    const result = this.#prepare(`
       UPDATE tasks
       SET ${threadAssignment} version = version + 1, updated_at = ?
       WHERE id = ? AND version = ?
@@ -8955,7 +8991,7 @@ export class TaskboardDatabase {
   }
 
   #createTaskAgentRun(task, rootRun, agentPath, agentThreadId, writeScope, timestamp) {
-    this.database.prepare(`
+    this.#prepare(`
       INSERT INTO task_agent_runs (
         id, task_id, project_id, role, status, version, root_thread_id, agent_path, agent_thread_id,
         worktree_path, worktree_branch, write_scope_json, started_at, updated_at,
@@ -8978,7 +9014,7 @@ export class TaskboardDatabase {
 
   #taskAgentRunForTask(taskId, statuses = null) {
     const statusClause = statuses ? ` AND status IN (${statuses.map(() => "?").join(", ")})` : "";
-    const row = this.database.prepare(`
+    const row = this.#prepare(`
       SELECT * FROM task_agent_runs
       WHERE task_id = ?${statusClause}
       ORDER BY updated_at DESC, id DESC
@@ -9021,11 +9057,11 @@ export class TaskboardDatabase {
   }
 
   #interruptTaskAgentExecution(taskId, timestamp) {
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE agent_task_claims SET status = 'interrupted', completed_at = ?
       WHERE task_id = ? AND status = 'active'
     `).run(timestamp, taskId);
-    this.database.prepare(`
+    this.#prepare(`
       UPDATE task_agent_runs
       SET status = 'interrupted', version = version + 1, updated_at = ?, finished_at = ?
       WHERE task_id = ? AND status IN ('active', 'blocked')

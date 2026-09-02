@@ -159,6 +159,51 @@ function ownerIntentCaptureRoute(snapshot) {
   };
 }
 
+export function selectLaunchCoordinatorRoute(snapshots) {
+  if (!Array.isArray(snapshots)) return null;
+  const routes = [];
+  for (const snapshot of snapshots) {
+    const projectId = snapshot?.projectId;
+    const coordinatorTaskId = snapshot?.coordination?.coordinatorTaskId;
+    const ownerRootTaskId = snapshot?.coordination?.ownerRootTaskId;
+    if (!COORDINATION_ID_PATTERN.test(projectId ?? "")
+      || !COORDINATION_ID_PATTERN.test(coordinatorTaskId ?? "")
+      || coordinatorTaskId === ownerRootTaskId) continue;
+    const lane = Array.isArray(snapshot?.taskLanes)
+      ? snapshot.taskLanes.find((candidate) => candidate?.id === coordinatorTaskId)
+      : null;
+    if (lane?.taskType !== "root_task"
+      || !THREAD_ID_PATTERN.test(lane?.threadId ?? "")
+      || !COORDINATION_ID_PATTERN.test(lane?.codexHostId ?? "")
+      || typeof lane?.workspacePath !== "string"
+      || !path.isAbsolute(lane.workspacePath)) continue;
+    routes.push({
+      projectId,
+      taskId: coordinatorTaskId,
+      threadId: lane.threadId,
+      codexHostId: lane.codexHostId,
+      workspacePath: lane.workspacePath,
+    });
+  }
+  const uniqueRoutes = new Map(routes.map((route) => [
+    [route.threadId, route.codexHostId, path.resolve(route.workspacePath)].join("\0"),
+    route,
+  ]));
+  return uniqueRoutes.size === 1 ? uniqueRoutes.values().next().value : null;
+}
+
+export function coordinatorThreadSelectionConfirmed({
+  expectedThreadId,
+  activeThreadId,
+  routeThreadId,
+}) {
+  if (!THREAD_ID_PATTERN.test(expectedThreadId ?? "")) return false;
+  if (THREAD_ID_PATTERN.test(activeThreadId ?? "")) {
+    return activeThreadId === expectedThreadId;
+  }
+  return routeThreadId === expectedThreadId;
+}
+
 function isCodexControlEnvelope(value) {
   const input = value.trim();
   return /^(?:<\/?(?:heartbeat|environment_context|codex_delegation|app-context|skills_instructions|permissions\s+instructions|collaboration_mode|apps_instructions|plugins_instructions|multi_agent_mode)\b|#\s*AGENTS\.md\s+instructions\b|<INSTRUCTIONS>(?:\s|$)|Message Type:\s*|taskctl\s+issue\s+bootstrap\b)/i.test(input);
@@ -1884,6 +1929,30 @@ export async function reconcileInjectionRuntime({
   const shouldRemainOpen = currentStatus.pageVisible === true;
   if (replaced && shouldRemainOpen) await reopen();
   return { replaced, scriptIdentifier, shouldRemainOpen };
+}
+
+export function createOpenGenerationRouteResolver(resolveRoute) {
+  let resolvedGeneration = -1;
+  let resolvedRoute = null;
+  const inFlight = new Map();
+
+  return async function resolveOpenGenerationRoute(generation) {
+    if (generation === resolvedGeneration) return resolvedRoute;
+    const pending = inFlight.get(generation);
+    if (pending) return pending;
+    const resolution = (async () => {
+      const route = await resolveRoute();
+      if (generation >= resolvedGeneration) {
+        resolvedGeneration = generation;
+        resolvedRoute = route;
+      }
+      return route;
+    })().finally(() => {
+      if (inFlight.get(generation) === resolution) inFlight.delete(generation);
+    });
+    inFlight.set(generation, resolution);
+    return resolution;
+  };
 }
 
 export function findResidentInjectorPids({

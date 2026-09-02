@@ -4,6 +4,8 @@ import { test } from "node:test";
 
 import {
   classifyOwnerIntentPlanHttpFailure,
+  coordinatorThreadSelectionConfirmed,
+  createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
   deliverTaskboardCoordination,
   deliverTaskboardCrossDomainHandoff,
@@ -25,9 +27,153 @@ import {
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
+  selectLaunchCoordinatorRoute,
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("each open generation resolves one fresh Coordinator route and coalesces retries", async () => {
+  const coordinatorB = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const routes = [
+    { taskId: "coordinator-a", threadId: coordinatorThreadId },
+    { taskId: "coordinator-b", threadId: coordinatorB },
+  ];
+  let calls = 0;
+  let releaseFirst;
+  const resolver = createOpenGenerationRouteResolver(async () => {
+    const route = routes[calls];
+    calls += 1;
+    if (calls === 1) await new Promise((resolve) => { releaseFirst = resolve; });
+    return route;
+  });
+  const selected = [];
+  const pinned = [];
+  const openGeneration = async (generation) => {
+    const route = await resolver(generation);
+    selected.push(route.threadId);
+    pinned.push(route.threadId);
+  };
+
+  const first = resolver(1);
+  const duplicate = resolver(1);
+  assert.equal(calls, 1);
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, duplicate]), [routes[0], routes[0]]);
+  assert.equal(await resolver(1), routes[0]);
+  assert.equal(calls, 1);
+  await openGeneration(1);
+  assert.equal(await resolver(2), routes[1]);
+  assert.equal(await resolver(2), routes[1]);
+  assert.equal(calls, 2);
+  await openGeneration(2);
+  assert.deepEqual(selected, [coordinatorThreadId, coordinatorB]);
+  assert.deepEqual(pinned, [coordinatorThreadId, coordinatorB]);
+  assert.equal(calls, 2);
+});
+
+test("a failed open generation route resolution remains retryable", async () => {
+  let calls = 0;
+  const route = { taskId: "coordinator-a", threadId: coordinatorThreadId };
+  const resolver = createOpenGenerationRouteResolver(async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("temporary snapshot failure");
+    return route;
+  });
+  await assert.rejects(resolver(1), /temporary snapshot failure/);
+  assert.equal(await resolver(1), route);
+  assert.equal(calls, 2);
+});
+
+test("Coordinator selection waits for a delayed active row instead of trusting the pathname", () => {
+  assert.equal(coordinatorThreadSelectionConfirmed({
+    expectedThreadId: coordinatorThreadId,
+    activeThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    routeThreadId: coordinatorThreadId,
+  }), false);
+  assert.equal(coordinatorThreadSelectionConfirmed({
+    expectedThreadId: coordinatorThreadId,
+    activeThreadId: coordinatorThreadId,
+    routeThreadId: coordinatorThreadId,
+  }), true);
+  assert.equal(coordinatorThreadSelectionConfirmed({
+    expectedThreadId: coordinatorThreadId,
+    activeThreadId: null,
+    routeThreadId: coordinatorThreadId,
+  }), true);
+});
+
+test("launch route selects the unique registered Execution Coordinator instead of Owner Root", () => {
+  const route = selectLaunchCoordinatorRoute([{
+    projectId: "capstone-dev",
+    coordination: {
+      coordinatorTaskId: "execution-root",
+      ownerRootTaskId: "owner-root",
+    },
+    taskLanes: [
+      {
+        id: "owner-root",
+        taskType: "root_task",
+        threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        codexHostId: "host-owner",
+        workspacePath: "/tmp/capstone",
+      },
+      {
+        id: "execution-root",
+        taskType: "root_task",
+        threadId: coordinatorThreadId,
+        codexHostId: "host-coordinator",
+        workspacePath: "/tmp/capstone",
+      },
+    ],
+  }]);
+
+  assert.deepEqual(route, {
+    projectId: "capstone-dev",
+    taskId: "execution-root",
+    threadId: coordinatorThreadId,
+    codexHostId: "host-coordinator",
+    workspacePath: "/tmp/capstone",
+  });
+});
+
+test("launch route fails closed when registered coordinator routes are missing or ambiguous", () => {
+  const ownerOnly = {
+    projectId: "capstone-dev",
+    coordination: { coordinatorTaskId: null, ownerRootTaskId: "owner-root" },
+    taskLanes: [{
+      id: "owner-root",
+      taskType: "root_task",
+      threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      codexHostId: "host-owner",
+      workspacePath: "/tmp/capstone",
+    }],
+  };
+  assert.equal(selectLaunchCoordinatorRoute([ownerOnly]), null);
+
+  const coordinator = {
+    id: "execution-root",
+    taskType: "root_task",
+    threadId: coordinatorThreadId,
+    codexHostId: "host-coordinator",
+    workspacePath: "/tmp/capstone",
+  };
+  const first = {
+    ...ownerOnly,
+    coordination: { coordinatorTaskId: coordinator.id, ownerRootTaskId: "owner-root" },
+    taskLanes: [...ownerOnly.taskLanes, coordinator],
+  };
+  const second = {
+    ...first,
+    projectId: "taskboard-core",
+    coordination: { coordinatorTaskId: "another-root", ownerRootTaskId: "owner-root" },
+    taskLanes: [...ownerOnly.taskLanes, {
+      ...coordinator,
+      id: "another-root",
+      threadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
+    }],
+  };
+  assert.equal(selectLaunchCoordinatorRoute([first, second]), null);
+});
 
 test("background monitor ticks never overlap a still-running cycle", async () => {
   let releaseFirst;

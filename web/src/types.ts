@@ -646,6 +646,7 @@ export interface WindowSubagentTreeSnapshot {
     observed: number;
     active: number;
     shown: number;
+    complete?: boolean;
   };
 }
 
@@ -979,5 +980,6 @@ export interface AgentLaneSnapshot {
     observed: number;
     active: number;
     shown: number;
+    complete?: boolean;
   };
 }

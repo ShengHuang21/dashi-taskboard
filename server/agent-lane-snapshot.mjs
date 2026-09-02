@@ -1,11 +1,12 @@
-import { createReadStream } from "node:fs";
 import { open, readFile, readdir, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { createInterface } from "node:readline";
 
 export const AGENT_LANE_SNAPSHOT_VERSION = 7;
 const MAX_TAIL_BYTES = 512 * 1024;
+const MAX_PARTIAL_JSON_LINE_BYTES = MAX_TAIL_BYTES;
+const MAX_SUBAGENT_RECOVERY_BYTES = 2 * 1024 * 1024;
+const MAX_SUBAGENT_REGISTRY_LOOKBACK_BYTES = 8 * 1024 * 1024;
 const MAX_VISIBLE_SUBAGENTS = 12;
 const CONNECTED_SOURCES = new Set(["codex"]);
 const CONNECTIONS = new Set(["connected", "not_connected"]);
@@ -603,18 +604,73 @@ async function findSessionFile(directory, threadId) {
   return null;
 }
 
-async function readTailLines(filename) {
-  const details = await stat(filename);
-  const length = Math.min(details.size, MAX_TAIL_BYTES);
+async function readByteRange(filename, start, end) {
+  if (end <= start) return Buffer.alloc(0);
   const handle = await open(filename, "r");
   try {
-    const buffer = Buffer.alloc(length);
-    await handle.read(buffer, 0, length, details.size - length);
-    let value = buffer.toString("utf8");
-    if (details.size > length) value = value.slice(value.indexOf("\n") + 1);
-    return value.split("\n").filter(Boolean);
+    const buffer = Buffer.alloc(end - start);
+    let total = 0;
+    while (total < buffer.length) {
+      const { bytesRead } = await handle.read(
+        buffer,
+        total,
+        buffer.length - total,
+        start + total,
+      );
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    return buffer.subarray(0, total);
   } finally {
     await handle.close();
+  }
+}
+
+function splitCompleteJsonLines(buffer, { discardLeadingPartial = false, startOffset = 0 } = {}) {
+  let cursor = 0;
+  if (discardLeadingPartial) {
+    const firstNewline = buffer.indexOf(0x0a);
+    if (firstNewline < 0) {
+      return {
+        records: [],
+        trailing: Buffer.alloc(0),
+        trailingOffset: startOffset + buffer.length,
+        discardingLeadingPartial: true,
+      };
+    }
+    cursor = firstNewline + 1;
+  }
+  const records = [];
+  while (cursor < buffer.length) {
+    const newline = buffer.indexOf(0x0a, cursor);
+    if (newline < 0) break;
+    if (newline > cursor) {
+      records.push({
+        line: buffer.subarray(cursor, newline).toString("utf8"),
+        endOffset: startOffset + newline + 1,
+      });
+    }
+    cursor = newline + 1;
+  }
+  return {
+    records,
+    trailing: buffer.subarray(cursor),
+    trailingOffset: startOffset + cursor,
+    discardingLeadingPartial: false,
+  };
+}
+
+function consumeCompleteTrailingJson(records, trailing, endOffset) {
+  if (trailing.length === 0) return { records, trailing };
+  const line = trailing.toString("utf8");
+  try {
+    JSON.parse(line);
+    return {
+      records: [...records, { line, endOffset }],
+      trailing: Buffer.alloc(0),
+    };
+  } catch {
+    return { records, trailing: Buffer.from(trailing) };
   }
 }
 
@@ -663,7 +719,22 @@ function freshness(lastActivityAt, now) {
   return "stale";
 }
 
-async function readCodexTask(taskLane, resolveSessionFile, now) {
+const CODEX_TASK_SIGNAL_TYPES = ["turn_context", "event_msg", "task_complete", "agent_message", "user_message"];
+const CODEX_TASK_SIGNAL_TYPE_PATTERNS = new Map(CODEX_TASK_SIGNAL_TYPES.map((value) => [
+  value,
+  new RegExp(`"type"\\s*:\\s*"${value}"`),
+]));
+
+function codexTaskSignalLine(line) {
+  const hasType = (value) => line.includes(`"type":"${value}"`)
+    || CODEX_TASK_SIGNAL_TYPE_PATTERNS.get(value).test(line);
+  return hasType("turn_context") || (
+    hasType("event_msg")
+    && ["task_complete", "agent_message", "user_message"].some(hasType)
+  );
+}
+
+async function readCodexTask(taskLane, resolveSessionFile, now, sessionStates) {
   const sessionFile = await resolveSessionFile(taskLane.threadId);
   if (!sessionFile) {
     return {
@@ -679,17 +750,66 @@ async function readCodexTask(taskLane, resolveSessionFile, now) {
       provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
     };
   }
-  const entries = [];
-  for (const line of await readTailLines(sessionFile)) {
-    try {
-      entries.push(JSON.parse(line));
-    } catch {}
+  const details = await stat(sessionFile);
+  const cached = sessionStates.get(sessionFile);
+  if (cached?.dev === details.dev
+    && cached.ino === details.ino
+    && cached.observedSize === details.size
+    && cached.mtimeMs === details.mtimeMs) {
+    return {
+      ...taskLane,
+      status: cached.observation.status,
+      lastActivityAt: cached.observation.lastActivityAt,
+      lastActualAction: cached.observation.lastActualAction,
+      ...cached.observation.evidence,
+      freshness: freshness(cached.observation.lastActivityAt, now),
+      provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
+    };
   }
-  let status = "idle";
-  let lastActualAction = null;
-  let lastActivityAt = null;
-  let evidence = { branch: null, sha: null, checks: [], blocker: null };
-  for (const entry of entries) {
+  const canAdvance = cached?.dev === details.dev
+    && cached.ino === details.ino
+    && cached.observedSize < details.size
+    && details.size - cached.observedSize <= MAX_TAIL_BYTES;
+  const start = canAdvance ? cached.observedSize : Math.max(0, details.size - MAX_TAIL_BYTES);
+  const added = await readByteRange(sessionFile, start, details.size);
+  const capturedSize = start + added.length;
+  let discardingOversizedLine = canAdvance && cached.discardingOversizedLine === true;
+  let input = canAdvance ? Buffer.concat([cached.trailing, added]) : added;
+  let inputStart = canAdvance ? start - cached.trailing.length : start;
+  if (discardingOversizedLine) {
+    const newline = added.indexOf(0x0a);
+    if (newline < 0) {
+      input = Buffer.alloc(0);
+      inputStart = capturedSize;
+    } else {
+      input = added.subarray(newline + 1);
+      inputStart = start + newline + 1;
+      discardingOversizedLine = false;
+    }
+  }
+  const split = splitCompleteJsonLines(input, {
+    discardLeadingPartial: !canAdvance && start > 0,
+    startOffset: inputStart,
+  });
+  discardingOversizedLine ||= split.discardingLeadingPartial === true;
+  const complete = split.trailing.length > MAX_PARTIAL_JSON_LINE_BYTES
+    ? { records: split.records, trailing: Buffer.alloc(0) }
+    : consumeCompleteTrailingJson(split.records, split.trailing, capturedSize);
+  if (split.trailing.length > MAX_PARTIAL_JSON_LINE_BYTES) discardingOversizedLine = true;
+  const lines = complete.records.map((record) => record.line);
+  let status = canAdvance ? cached.observation.status : "idle";
+  let lastActualAction = canAdvance ? cached.observation.lastActualAction : null;
+  let lastActivityAt = canAdvance ? cached.observation.lastActivityAt : null;
+  let evidence = canAdvance
+    ? cached.observation.evidence
+    : { branch: null, sha: null, checks: [], blocker: null };
+  for (const line of lines) {
+    if (!codexTaskSignalLine(line)) continue;
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {}
+    if (!entry) continue;
     const signal = eventSignal(entry);
     if (!signal) continue;
     status = signal.status;
@@ -699,13 +819,28 @@ async function readCodexTask(taskLane, resolveSessionFile, now) {
     }
     if (typeof entry.timestamp === "string") lastActivityAt = entry.timestamp;
   }
-  return {
-    ...taskLane,
+  const observation = {
     status,
-    freshness: freshness(lastActivityAt, now),
     lastActivityAt,
     lastActualAction,
-    ...evidence,
+    evidence,
+  };
+  sessionStates.set(sessionFile, {
+    dev: details.dev,
+    ino: details.ino,
+    observedSize: capturedSize,
+    mtimeMs: details.mtimeMs,
+    trailing: complete.trailing,
+    discardingOversizedLine,
+    observation,
+  });
+  return {
+    ...taskLane,
+    status: observation.status,
+    lastActivityAt: observation.lastActivityAt,
+    lastActualAction: observation.lastActualAction,
+    ...observation.evidence,
+    freshness: freshness(lastActivityAt, now),
     provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
   };
 }
@@ -734,12 +869,15 @@ function normalizedListAgentStatus(value) {
   return entries[0][0];
 }
 
-function applySubagentLine(state, line) {
+function applySubagentLine(state, line, { registryOnly = false } = {}) {
+  const registryOutput = line.includes('"type":"function_call_output"');
+  if (registryOutput && ![...state.pendingListAgentCalls].some((callId) => line.includes(callId))) {
+    return;
+  }
   if (!line.includes("sub_agent_activity")
     && !line.includes('"author":"/root/')
     && !line.includes('"name":"list_agents"')
-    && !line.includes("function_call_output")
-    && !line.includes("agent_status")) return;
+    && !registryOutput) return;
   let entry;
   try {
     entry = JSON.parse(line);
@@ -756,6 +894,7 @@ function applySubagentLine(state, line) {
     state.pendingListAgentCalls.add(entry.payload.call_id);
     return;
   }
+  if (registryOnly && entry.payload?.type !== "function_call_output") return;
   if (entry.type === "event_msg" && entry.payload?.type === "sub_agent_activity") {
     const agentPath = text(entry.payload.agent_path);
     if (!agentPath || agentPath === "/root") return;
@@ -785,6 +924,7 @@ function applySubagentLine(state, line) {
       }
     }
     state.agents.set(agentPath, current);
+    state.eventAgents.set(agentPath, { ...current });
     return;
   }
   if (entry.type === "response_item") {
@@ -808,6 +948,7 @@ function applySubagentLine(state, line) {
         }
       }
       state.agents.set(action.agentPath, current);
+      state.eventAgents.set(action.agentPath, { ...current });
       return;
     }
     if (entry.payload?.type === "function_call_output" && typeof entry.payload.output === "string") {
@@ -816,10 +957,13 @@ function applySubagentLine(state, line) {
       state.registryAgents = null;
       state.registrySnapshotObservedAt = null;
       state.registryObservedAt = null;
+      state.recoveryComplete = false;
+      const previousAgents = state.agents;
+      let normalizedRegistry = null;
       try {
         const output = JSON.parse(entry.payload.output);
         if (Array.isArray(output?.agents)) {
-          const normalizedRegistry = output.agents.map((agent) => {
+          const candidateRegistry = output.agents.map((agent) => {
             if (!agent || typeof agent !== "object" || Array.isArray(agent)
               || typeof agent.agent_name !== "string"
               || !/^\/root(?:\/[a-z0-9_]+)*$/i.test(agent.agent_name)
@@ -829,49 +973,148 @@ function applySubagentLine(state, line) {
             if (!status) return null;
             return { ...agent, normalizedStatus: status };
           });
-          if (normalizedRegistry.some((agent) => agent === null)) return;
-          state.registryAgents = normalizedRegistry
-            .filter((agent) => agent.agent_name !== "/root")
-            .map((agent) => ({
-              agentPath: agent.agent_name,
-              agentThreadId: typeof agent.agent_id === "string" && agent.agent_id
-                ? agent.agent_id
-                : typeof agent.agent_thread_id === "string" && agent.agent_thread_id
-                  ? agent.agent_thread_id
-                  : state.agents.get(agent.agent_name)?.agentThreadId ?? null,
-              status: agent.normalizedStatus,
-            }));
-          state.activeRegistry = new Set(normalizedRegistry
-            .filter((agent) => agent.normalizedStatus === "running" && agent.agent_name !== "/root")
-            .map((agent) => agent.agent_name));
-          state.registryObservedAt = at;
-          state.registrySnapshotObservedAt = at;
+          if (!candidateRegistry.some((agent) => agent === null)) {
+            normalizedRegistry = candidateRegistry;
+          }
         }
       } catch {}
+      if (normalizedRegistry) {
+        const registryAgents = normalizedRegistry
+          .filter((agent) => agent.agent_name !== "/root")
+          .map((agent) => ({
+            agentPath: agent.agent_name,
+            agentThreadId: typeof agent.agent_id === "string" && agent.agent_id
+              ? agent.agent_id
+              : typeof agent.agent_thread_id === "string" && agent.agent_thread_id
+                ? agent.agent_thread_id
+                : previousAgents.get(agent.agent_name)?.agentThreadId ?? null,
+            status: agent.normalizedStatus,
+          }));
+        state.agents = new Map();
+        state.registryAgents = registryAgents;
+        state.activeRegistry = new Set(normalizedRegistry
+          .filter((agent) => agent.normalizedStatus === "running" && agent.agent_name !== "/root")
+          .map((agent) => agent.agent_name));
+        for (const agent of state.registryAgents) {
+          const current = previousAgents.get(agent.agentPath) ?? {
+            agentPath: agent.agentPath,
+            agentThreadId: null,
+            lifecycleStatus: "idle",
+            startedAt: null,
+            lastActivityAt: null,
+            lastActualAction: null,
+          };
+          current.agentThreadId = agent.agentThreadId ?? current.agentThreadId;
+          current.lifecycleStatus = agent.status === "running"
+            ? "running"
+            : agent.status === "completed"
+              ? "completed"
+              : agent.status === "interrupted" ? "interrupted" : "idle";
+          current.lastActivityAt = current.lastActivityAt ?? at;
+          state.agents.set(agent.agentPath, current);
+        }
+        state.registryObservedAt = at;
+        state.registrySnapshotObservedAt = at;
+        state.recoveryComplete = true;
+        return;
+      }
+      state.agents = new Map(
+        [...state.eventAgents].map(([agentPath, agent]) => [agentPath, { ...agent }]),
+      );
     }
   }
 }
 
 async function scanSubagents(filename, cached = null) {
   const details = await stat(filename);
-  const reset = !cached || details.size < cached.offset;
+  const previousSize = cached?.observedSize ?? cached?.offset ?? 0;
+  const reset = !cached
+    || cached.dev !== details.dev
+    || cached.ino !== details.ino
+    || details.size < previousSize
+    || details.size - previousSize > MAX_SUBAGENT_RECOVERY_BYTES + MAX_SUBAGENT_REGISTRY_LOOKBACK_BYTES
+    || details.size === previousSize && cached.mtimeMs !== details.mtimeMs;
   const state = reset ? {
     offset: 0,
+    observedSize: 0,
+    dev: details.dev,
+    ino: details.ino,
+    mtimeMs: details.mtimeMs,
+    trailing: Buffer.alloc(0),
     agents: new Map(),
+    eventAgents: new Map(),
     activeRegistry: null,
     registryAgents: null,
     registrySnapshotObservedAt: null,
     registryObservedAt: null,
     pendingListAgentCalls: new Set(),
+    recoveryComplete: details.size <= MAX_SUBAGENT_RECOVERY_BYTES,
   } : cached;
   state.pendingListAgentCalls ??= new Set();
+  state.eventAgents ??= new Map();
   state.registryAgents ??= null;
   state.registrySnapshotObservedAt ??= null;
-  if (details.size > state.offset) {
-    const input = createReadStream(filename, { start: state.offset, end: details.size - 1, encoding: "utf8" });
-    const lines = createInterface({ input, crlfDelay: Infinity });
-    for await (const line of lines) applySubagentLine(state, line);
-    state.offset = details.size;
+  state.recoveryComplete ??= false;
+  state.trailing = Buffer.isBuffer(state.trailing) ? state.trailing : Buffer.alloc(0);
+  state.discardingOversizedLine ??= false;
+  const invalidateRegistryObservation = () => {
+    state.activeRegistry = null;
+    state.registryAgents = null;
+    state.registrySnapshotObservedAt = null;
+    state.registryObservedAt = null;
+    state.recoveryComplete = false;
+  };
+  const hasNewBytes = details.size > previousSize;
+  if (reset || hasNewBytes) {
+    const start = reset
+      ? Math.max(0, details.size - MAX_SUBAGENT_RECOVERY_BYTES - MAX_SUBAGENT_REGISTRY_LOOKBACK_BYTES)
+      : previousSize;
+    const added = await readByteRange(filename, start, details.size);
+    const capturedSize = start + added.length;
+    let discardingOversizedLine = !reset && state.discardingOversizedLine === true;
+    let input = reset ? added : Buffer.concat([state.trailing, added]);
+    let inputStart = reset ? start : start - state.trailing.length;
+    if (discardingOversizedLine) {
+      const newline = added.indexOf(0x0a);
+      if (newline < 0) {
+        input = Buffer.alloc(0);
+        inputStart = capturedSize;
+      } else {
+        input = added.subarray(newline + 1);
+        inputStart = start + newline + 1;
+        discardingOversizedLine = false;
+      }
+    }
+    const split = splitCompleteJsonLines(input, {
+      discardLeadingPartial: reset && start > 0,
+      startOffset: inputStart,
+    });
+    discardingOversizedLine ||= split.discardingLeadingPartial === true;
+    const complete = split.trailing.length > MAX_PARTIAL_JSON_LINE_BYTES
+      ? { records: split.records, trailing: Buffer.alloc(0) }
+      : consumeCompleteTrailingJson(split.records, split.trailing, capturedSize);
+    if (split.trailing.length > MAX_PARTIAL_JSON_LINE_BYTES) discardingOversizedLine = true;
+    const recoveryStart = Math.max(0, capturedSize - MAX_SUBAGENT_RECOVERY_BYTES);
+    for (const record of complete.records) {
+      applySubagentLine(state, record.line, {
+        registryOnly: reset && record.endOffset <= recoveryStart,
+      });
+    }
+    state.trailing = complete.trailing;
+    state.discardingOversizedLine = discardingOversizedLine;
+    if (state.discardingOversizedLine && state.pendingListAgentCalls.size > 0) {
+      invalidateRegistryObservation();
+    } else if (state.trailing.length > 0) {
+      const partial = state.trailing.toString("utf8");
+      const pendingRegistryOutput = partial.includes('"type":"function_call_output"')
+        && [...state.pendingListAgentCalls].some((callId) => partial.includes(callId));
+      if (pendingRegistryOutput) invalidateRegistryObservation();
+    }
+    state.observedSize = capturedSize;
+    state.offset = capturedSize - state.trailing.length;
+    state.dev = details.dev;
+    state.ino = details.ino;
+    state.mtimeMs = details.mtimeMs;
   }
   if (state.activeRegistry) {
     for (const agent of state.agents.values()) {
@@ -900,8 +1143,10 @@ export function createAgentLaneSnapshotProvider({
   getTaskDomainAssignment = null,
 }) {
   const sessionFilePromises = new Map();
+  const taskSessionStates = new Map();
   const subagentStates = new Map();
   const allSubagentsByProject = new Map();
+  const projectSnapshotInFlight = new Map();
   const resolveSessionFile = (threadId) => {
     let pending = sessionFilePromises.get(threadId);
     if (!pending) {
@@ -913,13 +1158,13 @@ export function createAgentLaneSnapshotProvider({
     }
     return pending;
   };
-  return {
+  const provider = {
     async getProjectSnapshot(projectId) {
       const configured = await readConfig(configPath, projectId, getLaneConfig);
       const generatedAt = now();
       const observedTasks = await Promise.all(configured.tasks.map((taskLane) => (
         taskLane.connection === "connected" && taskLane.source === "codex"
-          ? readCodexTask(taskLane, resolveSessionFile, generatedAt)
+          ? readCodexTask(taskLane, resolveSessionFile, generatedAt, taskSessionStates)
           : {
               ...taskLane,
               status: "unavailable",
@@ -993,9 +1238,11 @@ export function createAgentLaneSnapshotProvider({
         let allSubagents = [];
         let capacityObservation = null;
         let registryObservation = null;
+        let recoveryComplete = false;
         if (sessionFile) {
           const state = await scanSubagents(sessionFile, subagentStates.get(sessionFile));
           subagentStates.set(sessionFile, state);
+          recoveryComplete = state.recoveryComplete === true;
           capacityObservation = state.registryObservedAt ? {
             source: "list_agents",
             observedAt: state.registryObservedAt,
@@ -1030,10 +1277,12 @@ export function createAgentLaneSnapshotProvider({
             observed: allSubagents.length,
             active: allSubagents.filter((agent) => agent.lifecycleStatus === "running").length,
             shown: subagents.length,
+            complete: recoveryComplete,
           },
         });
       }
       const allRootSubagents = allSubagentsByWindow.get(coordinatorTaskId) ?? [];
+      const rootSubagentTree = windowSubagentTrees.find((tree) => tree.windowTaskId === coordinatorTaskId);
       allSubagentsByProject.set(projectId, [...allSubagentsByWindow.values()].flat());
       const rootSubagents = allRootSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
       const observedSubagentCount = allRootSubagents.length;
@@ -1288,6 +1537,7 @@ export function createAgentLaneSnapshotProvider({
           observed: observedSubagentCount,
           active: rootSubagents.filter((agent) => agent.lifecycleStatus === "running").length,
           shown: rootSubagents.length,
+          complete: rootSubagentTree?.summary.complete === true,
         },
       };
     },
@@ -1337,4 +1587,19 @@ export function createAgentLaneSnapshotProvider({
       return { applied };
     },
   };
+  const buildProjectSnapshot = provider.getProjectSnapshot.bind(provider);
+  provider.getProjectSnapshot = async (projectId) => {
+    const active = projectSnapshotInFlight.get(projectId);
+    if (active) return active;
+    const pending = buildProjectSnapshot(projectId);
+    projectSnapshotInFlight.set(projectId, pending);
+    try {
+      return await pending;
+    } finally {
+      if (projectSnapshotInFlight.get(projectId) === pending) {
+        projectSnapshotInFlight.delete(projectId);
+      }
+    }
+  };
+  return provider;
 }

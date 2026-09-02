@@ -20,6 +20,8 @@ import {
 } from "../shared/taskboard-automation.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
+  coordinatorThreadSelectionConfirmed,
+  createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
   deliverTaskboardAdmissionRecovery,
   deliverTaskboardCoordination,
@@ -42,6 +44,7 @@ import {
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
+  selectLaunchCoordinatorRoute,
 } from "./codex-injector-runtime.mjs";
 import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
 import { readCodexQuotaStatus } from "./codex-rate-limits.mjs";
@@ -1704,6 +1707,180 @@ async function readTaskboardAgentLaneSnapshot(projectId) {
   return response.json();
 }
 
+async function readLaunchCoordinatorRoute() {
+  const entries = await readTaskboardClientStorageEntries();
+  const projectIds = Object.entries(entries)
+    .filter(([key, value]) => key.startsWith(backgroundContinuationPolicyPrefix) && value === "enabled")
+    .map(([key]) => key.slice(backgroundContinuationPolicyPrefix.length))
+    .filter(Boolean)
+    .sort();
+  const snapshots = [];
+  for (const projectId of projectIds) {
+    snapshots.push(await readTaskboardAgentLaneSnapshot(projectId));
+  }
+  return selectLaunchCoordinatorRoute(snapshots);
+}
+
+async function coordinatorThreadIsSelected(cdp, threadId) {
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const normalize = (value) => String(value || "").trim().replace(/^(?:local|cloud):/i, "");
+      const rows = Array.from(document.querySelectorAll("[data-app-action-sidebar-thread-id]"));
+      const active = rows.find((row) => (
+        row.getAttribute("data-app-action-sidebar-thread-active") === "true"
+        || ["page", "true"].includes(row.getAttribute("aria-current"))
+      ));
+      const routeThreadId = window.location.pathname.match(
+        /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/|$)/i,
+      )?.[1];
+      return {
+        activeThreadId: normalize(active?.getAttribute("data-app-action-sidebar-thread-id")) || null,
+        routeThreadId: normalize(routeThreadId) || null,
+      };
+    })()`,
+    returnByValue: true,
+  });
+  const selection = evaluation.result.value;
+  return selection?.activeThreadId === threadId && coordinatorThreadSelectionConfirmed({
+    expectedThreadId: threadId,
+    ...selection,
+  });
+}
+
+async function requestCoordinatorThreadSelection(cdp, threadId) {
+  const navigation = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const expected = ${JSON.stringify(threadId)};
+      const taskboard = window.__codexTaskboardInjection__;
+      if (typeof taskboard?.selectNativeThread !== "function") return false;
+      if (
+        document.documentElement.hasAttribute("data-codex-taskboard-open")
+        && typeof taskboard.close === "function"
+      ) {
+        taskboard.close(false);
+      }
+      return taskboard.selectNativeThread(expected) === true;
+    })()`,
+    returnByValue: true,
+  });
+  return navigation.result.value === true;
+}
+
+async function waitForCoordinatorThreadSelection(
+  cdp,
+  threadId,
+  timeoutMs = 90_000,
+  stabilityMs = 35_000,
+  pollMs = 100,
+  renavigationIntervalMs = 5_000,
+  isCurrent = () => true,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let stableSince = null;
+  let navigationRequired = true;
+  let nextNavigationAt = 0;
+  while (Date.now() < deadline) {
+    if (cdp.closed || !isCurrent()) return false;
+    if (navigationRequired && Date.now() >= nextNavigationAt) {
+      if (!(await requestCoordinatorThreadSelection(cdp, threadId))) return false;
+      if (!isCurrent()) return false;
+      navigationRequired = false;
+      nextNavigationAt = Date.now() + renavigationIntervalMs;
+    }
+    try {
+      const selected = await coordinatorThreadIsSelected(cdp, threadId);
+      if (!isCurrent()) return false;
+      if (selected) {
+        const observedAt = Date.now();
+        navigationRequired = false;
+        if (stableSince === null) stableSince = observedAt;
+        if (observedAt - stableSince >= stabilityMs) return true;
+      } else if (stableSince !== null) {
+        stableSince = null;
+        navigationRequired = true;
+      }
+    } catch (_) {
+      stableSince = null;
+      navigationRequired = true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    if (!isCurrent()) return false;
+  }
+  return false;
+}
+
+async function requestInjectedTaskboardOpen(cdp) {
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const taskboard = window.__codexTaskboardInjection__;
+      if (typeof taskboard?.open !== "function") return false;
+      taskboard.open();
+      return true;
+    })()`,
+    returnByValue: true,
+  });
+  return evaluation.result.value === true;
+}
+
+async function prepareInjectedNativeOpen(cdp, threadId) {
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const taskboard = window.__codexTaskboardInjection__;
+      if (typeof taskboard?.prepareNativeThreadOpen !== "function") return null;
+      return await taskboard.prepareNativeThreadOpen(${JSON.stringify(threadId)});
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  return typeof evaluation.result.value === "string" && evaluation.result.value
+    ? evaluation.result.value
+    : null;
+}
+
+async function commitInjectedNativeOpen(cdp, token) {
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const taskboard = window.__codexTaskboardInjection__;
+      if (typeof taskboard?.commitPreparedNativeOpen !== "function") return false;
+      return taskboard.commitPreparedNativeOpen(${JSON.stringify(token)}) === true;
+    })()`,
+    returnByValue: true,
+  });
+  return evaluation.result.value === true;
+}
+
+async function requestPreparedTaskboardOpen(
+  cdp,
+  threadId,
+  generation,
+  currentGeneration,
+) {
+  if (generation !== currentGeneration()) return false;
+  const token = await prepareInjectedNativeOpen(cdp, threadId);
+  if (!token || generation !== currentGeneration()) return false;
+  return commitInjectedNativeOpen(cdp, token);
+}
+
+async function completeSuccessfulTaskboardOpen({
+  markOpened,
+  bringToFront,
+  activate,
+  report = (message) => console.error(message),
+}) {
+  markOpened();
+  try {
+    await bringToFront();
+  } catch (error) {
+    report(`Taskboard opened; foreground request was unavailable: ${error.message}`);
+  }
+  try {
+    activate();
+  } catch (error) {
+    report(`Taskboard opened; app activation was unavailable: ${error.message}`);
+  }
+  return true;
+}
+
 async function renewCoordinatorLease(request) {
   const suffix = request.scope === "domain"
     ? `/domain-coordinator-leases/${encodeURIComponent(request.domainId)}/renew`
@@ -3057,6 +3234,7 @@ async function injectAll(
   supervisor,
   attachExisting,
   startupToken,
+  onConnectionReady = async () => {},
 ) {
   const targets = await runtime.targets();
   if (targets.length === 0) {
@@ -3089,7 +3267,12 @@ async function injectAll(
       attachExisting,
       startupToken,
     );
-    if (connection) injectedTargets.set(target.id, connection);
+    if (connection) {
+      injectedTargets.set(target.id, connection);
+      await onConnectionReady(connection, target, {
+        opened: shouldOpen && firstTarget,
+      });
+    }
     results.push({ targetId: target.id, title: target.title, url: target.url, ...result });
   }
   return results;
@@ -3194,17 +3377,53 @@ async function main() {
     focusApp: () => activateCodexApp(codexAppPid),
   });
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
+  const resolveLaunchCoordinatorRouteForGeneration = createOpenGenerationRouteResolver(
+    async () => {
+      const route = await readLaunchCoordinatorRoute();
+      if (route) {
+        console.log(JSON.stringify({
+          selectedCoordinatorTaskId: route.taskId,
+          selectedCoordinatorThreadId: route.threadId,
+        }));
+      }
+      return route;
+    },
+  );
   const queueTaskboardOpen = () => {
     openRequestGeneration += 1;
     console.log(JSON.stringify({ openTaskboardSignalQueued: true }));
+    void requestTaskboardOpen();
   };
   let openControl = null;
-  const requestTaskboardOpen = async () => {
+  const requestTaskboardOpen = async (preferredConnection = null) => {
     const generation = openRequestGeneration;
     if (generation <= openedRequestGeneration) return true;
-    const connection = injectedTargets.values().next().value;
+    let launchCoordinatorRoute;
+    try {
+      launchCoordinatorRoute = await resolveLaunchCoordinatorRouteForGeneration(generation);
+    } catch (error) {
+      console.error(`Waiting for registered Execution Coordinator route: ${error.message}`);
+      return false;
+    }
+    if (generation !== openRequestGeneration) return false;
+    const connection = preferredConnection && !preferredConnection.closed
+      ? preferredConnection
+      : injectedTargets.values().next().value;
     if (!nativeCodexBrowser && !connection) return false;
     try {
+      if (launchCoordinatorRoute) {
+        if (nativeCodexBrowser) return false;
+        if (!(await waitForCoordinatorThreadSelection(
+          connection,
+          launchCoordinatorRoute.threadId,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          () => generation === openRequestGeneration,
+        ))) return false;
+        if (generation !== openRequestGeneration) return false;
+      }
       if (nativeCodexBrowser) {
         const result = await nativeTaskboardPanelOpener.openOrFocus();
         openedRequestGeneration = Math.max(openedRequestGeneration, generation);
@@ -3217,22 +3436,24 @@ async function main() {
         ));
         return true;
       }
-      const evaluation = await connection.send("Runtime.evaluate", {
-        expression: `(() => {
-          const taskboard = window.__codexTaskboardInjection__;
-          if (typeof taskboard?.open !== "function") return false;
-          taskboard.open();
-          return true;
-        })()`,
-        returnByValue: true,
-      });
-      if (evaluation.result.value !== true) {
+      const opened = launchCoordinatorRoute
+        ? await requestPreparedTaskboardOpen(
+            connection,
+            launchCoordinatorRoute.threadId,
+            generation,
+            () => openRequestGeneration,
+          )
+        : await requestInjectedTaskboardOpen(connection);
+      if (!opened) {
         throw new Error("Taskboard injection is not ready");
       }
-      await connection.send("Page.bringToFront");
-      activateCodexApp(codexAppPid);
-      openedRequestGeneration = Math.max(openedRequestGeneration, generation);
-      return true;
+      return completeSuccessfulTaskboardOpen({
+        markOpened: () => {
+          openedRequestGeneration = Math.max(openedRequestGeneration, generation);
+        },
+        bringToFront: () => connection.send("Page.bringToFront"),
+        activate: () => activateCodexApp(codexAppPid),
+      });
     } catch (error) {
       console.error(`Waiting to open Taskboard: ${error.message}`);
       return false;
@@ -3453,6 +3674,19 @@ async function main() {
     if (stopping) return;
     await publishRuntime();
     if (stopping) return;
+    let initialLaunchCoordinatorRoute = null;
+    let initialLaunchCoordinatorRouteResolved = !hasOpenPending();
+    if (hasOpenPending()) {
+      try {
+        initialLaunchCoordinatorRoute = await resolveLaunchCoordinatorRouteForGeneration(
+          openRequestGeneration,
+        );
+        initialLaunchCoordinatorRouteResolved = true;
+      } catch (error) {
+        console.error(`Waiting for registered Execution Coordinator route: ${error.message}`);
+      }
+      if (stopping) return;
+    }
 
     if (options.cdpPipe || !cdpReachable) {
       idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
@@ -3482,7 +3716,9 @@ async function main() {
     if (stopping) return;
     let firstResults = [];
     const firstOpenGeneration = openRequestGeneration;
-    const shouldOpenFirstTarget = firstOpenGeneration > openedRequestGeneration;
+    const shouldOpenFirstTarget = firstOpenGeneration > openedRequestGeneration
+      && initialLaunchCoordinatorRouteResolved
+      && !initialLaunchCoordinatorRoute;
     if (!idleAfterNormalExit && !nativeCodexBrowser) {
       try {
         firstResults = await injectAll(
@@ -3496,6 +3732,16 @@ async function main() {
           supervisor,
           options.attachExisting,
           options.startupToken,
+          async (connection, _target, { opened }) => {
+            if (opened) {
+              openedRequestGeneration = Math.max(
+                openedRequestGeneration,
+                firstOpenGeneration,
+              );
+              activateCodexApp(codexAppPid);
+            }
+            if (hasOpenPending()) await requestTaskboardOpen(connection);
+          },
         );
       } catch (error) {
         if (!options.watch) throw error;
@@ -3504,7 +3750,7 @@ async function main() {
     }
     if (stopping) return;
     if (firstResults.length > 0) {
-      if (shouldOpenFirstTarget) {
+      if (shouldOpenFirstTarget && !options.watch) {
         openedRequestGeneration = Math.max(openedRequestGeneration, firstOpenGeneration);
         activateCodexApp(codexAppPid);
       }
@@ -3562,17 +3808,29 @@ async function main() {
         }
       }
       try {
+        const pendingOpenGeneration = openRequestGeneration;
+        const shouldOpenNewConnection = false;
         const results = await injectAll(
           cdpRuntime,
           source,
           sourceHash,
-          false,
+          shouldOpenNewConnection,
           null,
           injectedTargets,
           true,
           supervisor,
           options.attachExisting,
           options.startupToken,
+          async (connection, _target, { opened }) => {
+            if (opened) {
+              openedRequestGeneration = Math.max(
+                openedRequestGeneration,
+                pendingOpenGeneration,
+              );
+              activateCodexApp(codexAppPid);
+            }
+            if (hasOpenPending()) await requestTaskboardOpen(connection);
+          },
         );
         if (results.length > 0) {
           console.log(JSON.stringify({ injected: results }, null, 2));

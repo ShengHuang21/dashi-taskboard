@@ -34,6 +34,7 @@ import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import {
+  STANDING_AUTHORITY_ACTIONS,
   normalizeRepository,
   normalizeStandingActions,
 } from "./standing-authority.mjs";
@@ -48,7 +49,8 @@ const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_ATTACHMENT_LIMIT = 10;
 const AI_CHAT_SKILL_MARKER = "\uFFFC";
 const HOST_RUNTIME_TTL_MS = 3_000;
-const WORKTREE_REPOSITORY_TTL_MS = 2_000;
+const WORKTREE_REPOSITORY_TTL_MS = 30_000;
+const STANDING_AUTHORITY_ACTION_SET = new Set(STANDING_AUTHORITY_ACTIONS);
 const STANDING_AUTHORITY_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 const CODEX_PLAN_TAIL_BYTES = 16 * 1024 * 1024;
 const INLINE_ATTACHMENT_TYPES = new Set([
@@ -2609,7 +2611,11 @@ export function createTaskboardServer(options = {}) {
   const database = new TaskboardDatabase(resolved.databasePath, {
     admissionTtlMs: options.admissionTtlMs,
   });
+  const worktreeRepositoryExecFile = options.worktreeRepositoryExecFile ?? execFileAsync;
+  const worktreeRepositoryTtlMs = options.worktreeRepositoryTtlMs ?? WORKTREE_REPOSITORY_TTL_MS;
   const worktreeRepositoryCache = new Map();
+  const worktreeRepositoryInFlight = new Map();
+  const worktreeRealpathInFlight = new Map();
   const events = new EventHub();
   const panelPresence = options.panelPresence ?? createTaskboardPanelPresence();
   const coordinatorRenewNonces = new Map();
@@ -2619,58 +2625,128 @@ export function createTaskboardServer(options = {}) {
     const task = database.getTask(taskId);
     if (!task || task.developmentContext?.type !== "worktree") return task;
     const worktreePath = task.developmentContext.path;
-    const cacheKey = `${task.id}:${worktreePath}`;
-    const cachedAt = worktreeRepositoryCache.get(cacheKey) ?? 0;
-    if (!force && Date.now() - cachedAt < WORKTREE_REPOSITORY_TTL_MS) return task;
-
-    let repository = null;
+    const expectedBranch = task.developmentContext.branch;
+    let resolvedPath = null;
     try {
-      const [resolvedPath, topLevelResult, remoteResult, branchResult] = await Promise.all([
-        realpath(worktreePath),
-        execFileAsync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
-          env: codexProcessEnvironment,
-          timeout: 5_000,
-          windowsHide: true,
-        }),
-        execFileAsync("git", ["-C", worktreePath, "remote", "get-url", "origin"], {
-          env: codexProcessEnvironment,
-          timeout: 5_000,
-          windowsHide: true,
-        }),
-        execFileAsync("git", ["-C", worktreePath, "branch", "--show-current"], {
-          env: codexProcessEnvironment,
-          timeout: 5_000,
-          windowsHide: true,
-        }),
-      ]);
-      const resolvedTopLevel = await realpath(topLevelResult.stdout.trim());
-      const actualBranch = branchResult.stdout.trim();
-      if (resolvedTopLevel === resolvedPath
-        && actualBranch
-        && actualBranch === task.developmentContext.branch) {
-        repository = normalizeRepository(remoteResult.stdout.trim());
+      const realpathKey = `${path.resolve(worktreePath)}\0${expectedBranch}`;
+      let pendingRealpath = worktreeRealpathInFlight.get(realpathKey);
+      if (!pendingRealpath) {
+        pendingRealpath = realpath(worktreePath);
+        worktreeRealpathInFlight.set(realpathKey, pendingRealpath);
+      }
+      try {
+        resolvedPath = await pendingRealpath;
+      } finally {
+        if (worktreeRealpathInFlight.get(realpathKey) === pendingRealpath) {
+          worktreeRealpathInFlight.delete(realpathKey);
+        }
       }
     } catch {
-      repository = null;
+      resolvedPath = null;
     }
-    const verifiedAt = new Date().toISOString();
+    let resolution = null;
+    if (resolvedPath) {
+      const cacheKey = `${resolvedPath}\0${expectedBranch}`;
+      const activeResolution = worktreeRepositoryInFlight.get(cacheKey);
+      if (activeResolution) {
+        resolution = await activeResolution;
+      } else {
+        const cached = worktreeRepositoryCache.get(cacheKey);
+        if (!force && cached && Date.now() - cached.cachedAt < worktreeRepositoryTtlMs) {
+          resolution = cached;
+        } else {
+          const pendingResolution = (async () => {
+            let repository = null;
+            let cacheable = false;
+            try {
+              const [topLevelResult, remoteResult, branchResult] = await Promise.all([
+                worktreeRepositoryExecFile(
+                  "git",
+                  ["-C", resolvedPath, "rev-parse", "--show-toplevel"],
+                  { env: codexProcessEnvironment, timeout: 5_000, windowsHide: true },
+                ),
+                worktreeRepositoryExecFile(
+                  "git",
+                  ["-C", resolvedPath, "remote", "get-url", "origin"],
+                  { env: codexProcessEnvironment, timeout: 5_000, windowsHide: true },
+                ),
+                worktreeRepositoryExecFile(
+                  "git",
+                  ["-C", resolvedPath, "branch", "--show-current"],
+                  { env: codexProcessEnvironment, timeout: 5_000, windowsHide: true },
+                ),
+              ]);
+              const resolvedTopLevel = await realpath(topLevelResult.stdout.trim());
+              const actualBranch = branchResult.stdout.trim();
+              if (resolvedTopLevel === resolvedPath
+                && actualBranch
+                && actualBranch === expectedBranch) {
+                repository = normalizeRepository(remoteResult.stdout.trim());
+              }
+              cacheable = true;
+            } catch {
+              repository = null;
+            }
+            return {
+              repository,
+              verifiedAt: new Date().toISOString(),
+              cachedAt: Date.now(),
+              cacheable,
+            };
+          })();
+          worktreeRepositoryInFlight.set(cacheKey, pendingResolution);
+          try {
+            resolution = await pendingResolution;
+            if (resolution.cacheable) worktreeRepositoryCache.set(cacheKey, resolution);
+            else worktreeRepositoryCache.delete(cacheKey);
+          } finally {
+            if (worktreeRepositoryInFlight.get(cacheKey) === pendingResolution) {
+              worktreeRepositoryInFlight.delete(cacheKey);
+            }
+          }
+        }
+      }
+    }
+    const repository = resolution?.repository ?? null;
+    const verifiedAt = resolution?.verifiedAt ?? new Date().toISOString();
     const updated = database.recordTaskWorktreeRepository(task.id, {
       worktreePath,
+      expectedBranch,
       repository,
       verifiedAt,
     });
-    worktreeRepositoryCache.set(cacheKey, Date.now());
     return updated;
   }
 
   async function verifiedTaskCapsule(taskId, options) {
-    await refreshTaskWorktreeRepository(taskId, options);
-    let capsule = database.getTaskCapsule(taskId);
-    if (!options?.force && capsule?.standingAuthority.state === "matched") {
-      await refreshTaskWorktreeRepository(taskId, { force: true });
-      capsule = database.getTaskCapsule(taskId);
+    const current = database.getTaskCapsule(taskId);
+    if (!options?.force) {
+      const envelope = current?.authorization?.state === "valid"
+        ? current.authorization.envelope
+        : null;
+      const approvalKinds = new Map((envelope?.gates ?? []).map((gate) => [gate.id, gate]));
+      const hasStandingCandidate = envelope?.useStandingAuthority === true
+        && envelope.actions.some((action) => {
+          const gate = approvalKinds.get(action.gate);
+          return action.status === "pending"
+            && gate?.state === "approval_required"
+            && STANDING_AUTHORITY_ACTION_SET.has(gate.kind);
+        });
+      const repository = hasStandingCandidate ? normalizeRepository(envelope.repository) : null;
+      const timestamp = Date.now();
+      const hasActivePolicy = repository !== null
+        && database.listProjectStandingAuthorities(current.task.projectId).some((authority) => (
+          authority.repository === repository
+          && authority.revokedAt === null
+          && Date.parse(authority.grantedAt) <= timestamp
+          && (authority.expiresAt === null || Date.parse(authority.expiresAt) > timestamp)
+        ));
+      // Projection only needs repository discovery while an active policy could
+      // unlock pending work. Execution endpoints still force a fresh probe.
+      if (!hasActivePolicy || current.standingAuthority.state === "matched") return current;
     }
-    return capsule;
+    await refreshTaskWorktreeRepository(taskId, options);
+    return database.getTaskCapsule(taskId);
   }
 
   function assertInsideWorktree(worktreePath, targetPath, message) {
@@ -5304,6 +5380,7 @@ export function createTaskboardServer(options = {}) {
   let listening = false;
   return {
     database,
+    refreshTaskWorktreeRepository,
     aiChat,
     agentLanes,
     reconcileAgentLanes,
