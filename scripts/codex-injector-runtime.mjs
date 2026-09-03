@@ -179,6 +179,25 @@ export async function resumeCoordinatorProvisioningDeliveryThread(thread, resume
   return true;
 }
 
+export function classifyCoordinatorProvisioningDeliveryTurns(turns, marker) {
+  if (!Array.isArray(turns) || typeof marker !== "string" || !marker) {
+    throw new Error("Codex did not return exact Coordinator delivery turns");
+  }
+  const matching = turns.filter((turn) => JSON.stringify(turn).includes(marker));
+  const completed = matching.find((turn) => turn?.status === "completed");
+  if (typeof completed?.id === "string" && completed.id) {
+    return { delivery: "observed", turnId: completed.id };
+  }
+  const active = turns.find((turn) => turn?.status === "inProgress");
+  if (active) {
+    return {
+      delivery: "busy",
+      turnId: typeof active.id === "string" && active.id ? active.id : null,
+    };
+  }
+  return { delivery: "retry", turnId: null };
+}
+
 const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [
   "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
   "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",

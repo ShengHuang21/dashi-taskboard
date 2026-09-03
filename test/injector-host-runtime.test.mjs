@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
+  classifyCoordinatorProvisioningDeliveryTurns,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadReadData,
   coordinatorProvisioningThreadListData,
@@ -261,6 +262,32 @@ test("Coordinator provisioning materializes one exact empty thread before first 
       },
     }),
     /did not confirm the exact provisioned Coordinator thread/,
+  );
+});
+
+test("Coordinator provisioning retries terminal delivery turns on the same thread", () => {
+  const marker = "TASKBOARD_COORDINATOR_PROVISIONING_V1:attempt-1";
+  const marked = (status, id) => ({ id, status, input: marker });
+  assert.deepEqual(
+    classifyCoordinatorProvisioningDeliveryTurns([marked("completed", "turn-complete")], marker),
+    { delivery: "observed", turnId: "turn-complete" },
+  );
+  assert.deepEqual(
+    classifyCoordinatorProvisioningDeliveryTurns([marked("inProgress", "turn-active")], marker),
+    { delivery: "busy", turnId: "turn-active" },
+  );
+  for (const status of ["interrupted", "failed", "canceled"]) {
+    assert.deepEqual(
+      classifyCoordinatorProvisioningDeliveryTurns([marked(status, `turn-${status}`)], marker),
+      { delivery: "retry", turnId: null },
+    );
+  }
+  assert.deepEqual(
+    classifyCoordinatorProvisioningDeliveryTurns([
+      marked("interrupted", "old-marker"),
+      { id: "unrelated-active", status: "inProgress", input: "other work" },
+    ], marker),
+    { delivery: "busy", turnId: "unrelated-active" },
   );
 });
 

@@ -21,6 +21,7 @@ import {
 import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
+  classifyCoordinatorProvisioningDeliveryTurns,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadReadData,
   coordinatorProvisioningThreadListData,
@@ -2216,11 +2217,8 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   });
   const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  const observed = turns.find((turn) => JSON.stringify(turn).includes(marker));
-  if (observed?.id) return { delivery: "observed", turnId: observed.id };
-  if (turns.some((turn) => turn?.status === "inProgress")) {
-    return { delivery: "busy", turnId: null };
-  }
+  const priorDelivery = classifyCoordinatorProvisioningDeliveryTurns(turns, marker);
+  if (priorDelivery.delivery !== "retry") return priorDelivery;
   await resumeCoordinatorProvisioningDeliveryThread(
     thread,
     () => rpc("thread/resume", { threadId }),
