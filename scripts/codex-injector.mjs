@@ -20,6 +20,8 @@ import {
 } from "../shared/taskboard-automation.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
+  classifyCoordinatorProvisioningActiveThread,
+  coordinatorProvisioningThreadListData,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
@@ -85,6 +87,22 @@ if (taskboardListenFd !== null && (
   || taskboardListenFd > 255
 )) {
   throw new Error("CODEX_TASKBOARD_LISTEN_FD must be an inherited file descriptor");
+}
+const coordinatorProvisioningDiagnosticReasons = new Map();
+
+function reportCoordinatorProvisioningDiagnostic(projectId, result) {
+  const reason = typeof result?.reason === "string" && result.reason
+    ? result.reason
+    : "unknown";
+  if (coordinatorProvisioningDiagnosticReasons.get(projectId) === reason) return;
+  coordinatorProvisioningDiagnosticReasons.set(projectId, reason);
+  console.error(JSON.stringify({
+    event: "taskboard.coordinator.provisioning",
+    projectId,
+    provisioned: result?.provisioned === true,
+    reason,
+    attemptPresent: typeof result?.attemptId === "string" && result.attemptId.length > 0,
+  }));
 }
 const automationPoliciesPath = path.join(
   taskboardDataDirectory,
@@ -2081,7 +2099,7 @@ async function listCoordinatorWindowThread(cdp, window, archived) {
       },
       10_000,
     );
-    for (const thread of Array.isArray(result?.data) ? result.data : []) {
+    for (const thread of coordinatorProvisioningThreadListData(result)) {
       if (thread?.id === window.threadId) matches.push(thread);
     }
     cursor = typeof result?.nextCursor === "string" && result.nextCursor
@@ -2118,17 +2136,10 @@ async function inspectCoordinatorProvisioningWindow(cdp, window) {
   }
   try {
     const active = await listCoordinatorWindowThread(cdp, window, false);
-    if (active.length > 1) {
-      return { eligibility: "uncertain", reason: "duplicate-active-thread", window };
-    }
-    if (active.length === 1) {
-      const exact = thread?.id === window.threadId
-        && typeof thread.cwd === "string"
-        && path.resolve(thread.cwd) === path.resolve(window.workspacePath);
-      return exact
-        ? { eligibility: "eligible", busy: false, reason: "active-thread", window }
-        : { eligibility: "uncertain", reason: "active-thread-binding-unconfirmed", window };
-    }
+    const activeInspection = classifyCoordinatorProvisioningActiveThread({
+      window, thread, activeThreads: active,
+    });
+    if (activeInspection) return activeInspection;
     const archived = await listCoordinatorWindowThread(cdp, window, true);
     if (archived.length > 1) {
       return { eligibility: "uncertain", reason: "duplicate-archived-thread", window };
@@ -2798,6 +2809,12 @@ async function runBackgroundContinuationMonitor(cdp) {
     continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
   });
   for (const { projectId, continuationEnabled } of projects) {
+    if (!continuationEnabled) {
+      reportCoordinatorProvisioningDiagnostic(projectId, {
+        provisioned: false,
+        reason: "continuation-disabled",
+      });
+    }
     const automationPolicy = quotaPolicyRecords.get(projectId)?.request ?? null;
     const monitors = [];
     if (continuationEnabled) monitors.push(
@@ -2883,36 +2900,40 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         recoverLease: recoverCoordinatorLease,
       }),
-      () => runCoordinatorProvisioningMonitorOnce({
-        policy: {
-          enabled: true,
-          projectId,
-          model: automationPolicy?.model,
-          reasoningEffort: automationPolicy?.reasoningEffort,
-        },
-        readPreflight: () => readCoordinatorProvisioningPreflight(projectId),
-        readWindows: () => readCoordinatorProvisioningWindows(projectId),
-        readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
-        getAttempt: getCoordinatorProvisioningAttempt,
-        inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
-        requestAttempt: requestCoordinatorProvisioningAttempt,
-        findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
-        markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-          attemptId, "starting",
-        ),
-        startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
-          cdp, undefined, codexHostId, "thread/start", params, 10_000,
-        ),
-        attachThread: ({ attemptId, threadId }) => transitionCoordinatorProvisioningAttempt(
-          attemptId, "attach", { threadId },
-        ),
-        resetAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-          attemptId, "reset",
-        ),
-        deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
-          cdp, attempt, threadId, projectId,
-        ),
-      }),
+      async () => {
+        const result = await runCoordinatorProvisioningMonitorOnce({
+          policy: {
+            enabled: true,
+            projectId,
+            model: automationPolicy?.model,
+            reasoningEffort: automationPolicy?.reasoningEffort,
+          },
+          readPreflight: () => readCoordinatorProvisioningPreflight(projectId),
+          readWindows: () => readCoordinatorProvisioningWindows(projectId),
+          readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
+          getAttempt: getCoordinatorProvisioningAttempt,
+          inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
+          requestAttempt: requestCoordinatorProvisioningAttempt,
+          findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
+          markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "starting",
+          ),
+          startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
+            cdp, undefined, codexHostId, "thread/start", params, 10_000,
+          ),
+          attachThread: ({ attemptId, threadId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "attach", { threadId },
+          ),
+          resetAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "reset",
+          ),
+          deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
+            cdp, attempt, threadId, projectId,
+          ),
+        });
+        reportCoordinatorProvisioningDiagnostic(projectId, result);
+        return result;
+      },
       () => runOwnerIntentCaptureMonitorOnce({
         policy: { enabled: true, projectId },
         readSnapshot: readTaskboardAgentLaneSnapshot,

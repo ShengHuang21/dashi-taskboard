@@ -41,6 +41,39 @@ export function createSerializedMonitorTick(run) {
   };
 }
 
+export function classifyCoordinatorProvisioningActiveThread({ window, thread, activeThreads }) {
+  if (!Array.isArray(activeThreads)) {
+    return { eligibility: "uncertain", reason: "active-thread-list-invalid", window };
+  }
+  if (activeThreads.length > 1) {
+    return { eligibility: "uncertain", reason: "duplicate-active-thread", window };
+  }
+  if (activeThreads.length === 0) return null;
+  if (thread?.id === window?.threadId && !Array.isArray(thread.turns)) {
+    return { eligibility: "uncertain", reason: "thread-state-unconfirmed", window };
+  }
+  const exact = thread?.id === window?.threadId
+    && typeof thread.cwd === "string"
+    && path.resolve(thread.cwd) === path.resolve(window?.workspacePath ?? "");
+  if (exact) return { eligibility: "eligible", busy: false, reason: "active-thread", window };
+  if (thread?.id === window?.threadId
+    && typeof thread.cwd === "string"
+    && path.isAbsolute(thread.cwd)
+    && typeof window?.workspacePath === "string"
+    && path.isAbsolute(window.workspacePath)
+    && path.resolve(thread.cwd) !== path.resolve(window.workspacePath)) {
+    return { eligibility: "stale", reason: "active-thread-binding-drift", window };
+  }
+  return { eligibility: "uncertain", reason: "active-thread-binding-unconfirmed", window };
+}
+
+export function coordinatorProvisioningThreadListData(result) {
+  if (!Array.isArray(result?.data)) {
+    throw new Error("Codex did not return one exact thread list array");
+  }
+  return result.data;
+}
+
 export function selectResidentCoordinatorMonitorProjects({
   lifecycleProjectIds,
   continuationPolicyEntries,

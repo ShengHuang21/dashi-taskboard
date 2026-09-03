@@ -4,6 +4,8 @@ import { test } from "node:test";
 
 import {
   classifyOwnerIntentPlanHttpFailure,
+  classifyCoordinatorProvisioningActiveThread,
+  coordinatorProvisioningThreadListData,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
@@ -36,6 +38,66 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("an idle unarchived Coordinator with a protected workspace drift is stale", () => {
+  const window = {
+    taskId: "root",
+    label: "Execution Coordinator",
+    role: "coordinator",
+    threadId: coordinatorThreadId,
+    workspacePath: "/Users/v-sheng.huang/sbkk",
+  };
+  assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
+    window,
+    thread: { id: coordinatorThreadId, cwd: "/Users/v-sheng.huang/sboai", turns: [] },
+    activeThreads: [{ id: coordinatorThreadId }],
+  }), {
+    eligibility: "stale",
+    reason: "active-thread-binding-drift",
+    window,
+  });
+  assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
+    window,
+    thread: null,
+    activeThreads: [{ id: coordinatorThreadId }],
+  }), {
+    eligibility: "uncertain",
+    reason: "active-thread-binding-unconfirmed",
+    window,
+  });
+  for (const turns of [undefined, null]) {
+    assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
+      window,
+      thread: { id: coordinatorThreadId, cwd: "/Users/v-sheng.huang/sboai", turns },
+      activeThreads: [{ id: coordinatorThreadId }],
+    }), {
+      eligibility: "uncertain",
+      reason: "thread-state-unconfirmed",
+      window,
+    });
+  }
+  assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
+    window,
+    thread: { id: coordinatorThreadId, cwd: window.workspacePath, turns: [] },
+    activeThreads: [{ id: coordinatorThreadId }],
+  }), {
+    eligibility: "eligible",
+    busy: false,
+    reason: "active-thread",
+    window,
+  });
+});
+
+test("Coordinator provisioning rejects an unauthenticated thread list shape", () => {
+  for (const result of [{}, { data: null }, { data: {} }]) {
+    assert.throws(
+      () => coordinatorProvisioningThreadListData(result),
+      /exact thread list array/,
+    );
+  }
+  const threads = [{ id: coordinatorThreadId }];
+  assert.equal(coordinatorProvisioningThreadListData({ data: threads }), threads);
+});
 
 test("background Coordinator identity handshake verifies the exact host thread without changing foreground focus", async () => {
   const confirmations = [];
