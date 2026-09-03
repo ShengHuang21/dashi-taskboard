@@ -37,6 +37,7 @@ import {
   handleHostBindingPayload,
   isExactCoordinatorThreadNotLoadedError,
   readCoordinatorProvisioningDeliveryThread,
+  resumeCoordinatorProvisioningDeliveryThread,
   loadResidentCoordinatorMonitorProjects,
   reconcileInjectionRuntime,
   restartResidentInjector,
@@ -2220,7 +2221,10 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   if (turns.some((turn) => turn?.status === "inProgress")) {
     return { delivery: "busy", turnId: null };
   }
-  await rpc("thread/resume", { threadId });
+  await resumeCoordinatorProvisioningDeliveryThread(
+    thread,
+    () => rpc("thread/resume", { threadId }),
+  );
   const registrationKey = `${attempt.idempotencyKey}-window`;
   const instruction = [
     marker,

@@ -27,6 +27,7 @@ import {
   observeTaskboardOwnerIntentPlan,
   reconcileInjectionRuntime,
   readCoordinatorProvisioningDeliveryThread,
+  resumeCoordinatorProvisioningDeliveryThread,
   runOwnerDecisionMonitorOnce,
   runOwnerIntentAdoptionMonitorOnce,
   runOwnerIntentCaptureMonitorOnce,
@@ -209,6 +210,32 @@ test("Coordinator provisioning materializes one exact empty thread before first 
   });
   assert.deepEqual(calls, [true, false]);
   assert.deepEqual(thread.turns, []);
+  assert.equal(thread.deliveryMaterialized, false);
+
+  const materialized = await readCoordinatorProvisioningDeliveryThread({
+    attempt,
+    threadId,
+    readThread: async (includeTurns) => ({
+      thread: {
+        id: threadId,
+        threadSource: attempt.threadSource,
+        cwd: attempt.workspacePath,
+        turns: includeTurns ? [] : null,
+      },
+    }),
+  });
+  assert.equal(materialized.deliveryMaterialized, true);
+  assert.deepEqual(materialized.turns, []);
+
+  let resumeCalls = 0;
+  assert.equal(await resumeCoordinatorProvisioningDeliveryThread(thread, async () => {
+    resumeCalls += 1;
+  }), false);
+  assert.equal(resumeCalls, 0);
+  assert.equal(await resumeCoordinatorProvisioningDeliveryThread(materialized, async () => {
+    resumeCalls += 1;
+  }), true);
+  assert.equal(resumeCalls, 1);
 
   const transientCalls = [];
   await assert.rejects(

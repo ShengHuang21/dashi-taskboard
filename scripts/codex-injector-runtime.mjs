@@ -169,7 +169,14 @@ export async function readCoordinatorProvisioningDeliveryThread({
   return {
     ...thread,
     turns: materialized ? thread.turns : [],
+    deliveryMaterialized: materialized,
   };
+}
+
+export async function resumeCoordinatorProvisioningDeliveryThread(thread, resumeThread) {
+  if (thread?.deliveryMaterialized !== true) return false;
+  await resumeThread();
+  return true;
 }
 
 const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [
