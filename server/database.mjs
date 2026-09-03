@@ -3772,10 +3772,15 @@ export class TaskboardDatabase {
         SELECT 1 FROM agent_task_claims WHERE project_id = ? AND status = 'active' LIMIT 1
       `).get(projectId),
       this.#prepare(`
-        SELECT 1 FROM task_safe_action_receipts
-        WHERE project_id = ? AND (
-          status IN ('reserved', 'delivering')
-          OR admission_state NOT IN ('none', 'admitted')
+        SELECT 1 FROM task_safe_action_receipts AS receipt
+        JOIN tasks AS task
+          ON task.id = receipt.task_id AND task.project_id = receipt.project_id
+        WHERE receipt.project_id = ?
+          AND task.archived_at IS NULL
+          AND task.status IN ('todo', 'in_progress')
+          AND (
+            receipt.status IN ('reserved', 'delivering')
+            OR receipt.admission_state NOT IN ('none', 'admitted')
         ) LIMIT 1
       `).get(projectId),
       this.#prepare(`

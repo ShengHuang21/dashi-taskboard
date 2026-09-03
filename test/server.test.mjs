@@ -3929,7 +3929,7 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
   assert.equal(lookup.body.attempt.id, created.body.attempt.id);
 });
 
-test("resident shutdown releases and retires one exact idle Coordinator attempt", async () => {
+test("resident shutdown ignores a stale deferred receipt for reviewed work", async () => {
   let databasePath;
   const instanceSecret = "e".repeat(64);
   const holderThreadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
@@ -3965,13 +3965,22 @@ test("resident shutdown releases and retires one exact idle Coordinator attempt"
       },
     });
     const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
-    database.createTask({
+    const reviewedTask = database.createTask({
       projectId: "local", title: "Reviewed work", description: "", status: "in_review",
       priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
       threadId: null, threadBinding: null, actor, assignee: actor,
       developmentContext: null, workingLog: null, startDate: null, dueDate: null,
       recurrence: null,
     });
+    database.database.prepare(`
+      INSERT INTO task_safe_action_receipts (
+        id, task_id, project_id, resume_token, safe_action_id, root_thread_id,
+        claimed_at, status, admission_state
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', 'deferred')
+    `).run(
+      "stale-reviewed-admission", reviewedTask.id, "local", "stale-resume",
+      "execute-safe-action", ownerThreadId, new Date(current - 120_000).toISOString(),
+    );
     database.close();
     return { instanceSecret };
   });
