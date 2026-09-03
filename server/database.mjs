@@ -3817,8 +3817,9 @@ export class TaskboardDatabase {
       `).get(projectId, timestamp)],
       ["coordinator-provisioning", this.#prepare(`
         SELECT 1 FROM agent_coordinator_provisioning_attempts
-        WHERE project_id = ? AND status IN ('pending', 'starting', 'started') LIMIT 1
-      `).get(projectId)],
+        WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
+          AND expires_at > ? LIMIT 1
+      `).get(projectId, timestamp)],
     ];
     const matchedProbe = probes.find(([, value]) => Boolean(value));
     if (matchedProbe) return matchedProbe[0];

@@ -3981,6 +3981,21 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
       "stale-reviewed-admission", reviewedTask.id, "local", "stale-resume",
       "execute-safe-action", ownerThreadId, new Date(current - 120_000).toISOString(),
     );
+    database.database.prepare(`
+      INSERT INTO agent_coordinator_provisioning_attempts (
+        id, project_id, idempotency_key, request_fingerprint, task_id, label,
+        thread_source, model, reasoning_effort, expected_revision,
+        owner_root_task_id, owner_root_thread_id,
+        codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+        status, thread_id, retry_count, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, 0, ?, ?, ?)
+    `).run(
+      "stale-provisioning", "local", "stale-provisioning-key", "stale-fingerprint",
+      "coordinator-a", "Execution Coordinator", "stale-thread-source", "gpt-5", "high",
+      "stale-revision", "owner-root", ownerThreadId, "codex-project", "local", "local",
+      "/tmp/sbkk", holderThreadId, new Date(current - 180_000).toISOString(),
+      new Date(current - 120_000).toISOString(), new Date(current - 60_000).toISOString(),
+    );
     database.close();
     return { instanceSecret };
   });
@@ -3991,6 +4006,19 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
   assert.equal(idleSnapshot.response.status, 200, JSON.stringify(idleSnapshot.body));
   assert.equal(idleSnapshot.body.coordination.durableWorkPending, false);
   assert.equal(idleSnapshot.body.coordination.durableWorkReason, null);
+  const liveProvisioning = new DatabaseSync(databasePath);
+  liveProvisioning.prepare(`
+    UPDATE agent_coordinator_provisioning_attempts SET expires_at = ? WHERE id = ?
+  `).run(new Date(Date.now() + 60_000).toISOString(), "stale-provisioning");
+  liveProvisioning.close();
+  const blockedSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(blockedSnapshot.body.coordination.durableWorkPending, true);
+  assert.equal(blockedSnapshot.body.coordination.durableWorkReason, "coordinator-provisioning");
+  const expiredProvisioning = new DatabaseSync(databasePath);
+  expiredProvisioning.prepare(`
+    UPDATE agent_coordinator_provisioning_attempts SET expires_at = ? WHERE id = ?
+  `).run(new Date(Date.now() - 60_000).toISOString(), "stale-provisioning");
+  expiredProvisioning.close();
   const pathname = "/api/local/projects/local/coordinator-shutdown-attempts";
   const body = {
     idempotencyKey: "coordinator-shutdown-a",
