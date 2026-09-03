@@ -28,7 +28,9 @@ import {
   observeTaskboardOwnerIntentPlan,
   reconcileInjectionRuntime,
   readCoordinatorProvisioningDeliveryThread,
+  readCoordinatorProvisioningAttemptThread,
   resumeCoordinatorProvisioningDeliveryThread,
+  normalizeCoordinatorProvisioningPersistedThread,
   runOwnerDecisionMonitorOnce,
   runOwnerIntentAdoptionMonitorOnce,
   runOwnerIntentCaptureMonitorOnce,
@@ -288,6 +290,104 @@ test("Coordinator provisioning retries terminal delivery turns on the same threa
       { id: "unrelated-active", status: "inProgress", input: "other work" },
     ], marker),
     { delivery: "busy", turnId: "unrelated-active" },
+  );
+});
+
+test("Coordinator provisioning recovers a persisted null source only from its exact marker", async () => {
+  const attempt = {
+    id: "attempt-persisted",
+    threadId: "01a067b2-4a8f-72c2-9c3d-85a89017233c",
+    threadSource: "taskboard-coordinator-provision-stable",
+    workspacePath: "/tmp/taskboard",
+  };
+  const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const persisted = {
+    id: attempt.threadId,
+    threadSource: null,
+    cwd: attempt.workspacePath,
+    turns: [{ id: "turn-1", status: "interrupted", input: marker }],
+  };
+  assert.equal(
+    normalizeCoordinatorProvisioningPersistedThread(attempt, persisted).threadSource,
+    attempt.threadSource,
+  );
+  assert.equal(
+    normalizeCoordinatorProvisioningPersistedThread(attempt, { ...persisted, turns: [] }).threadSource,
+    null,
+  );
+  assert.equal(
+    normalizeCoordinatorProvisioningPersistedThread(attempt, { ...persisted, cwd: "/tmp/other" }).threadSource,
+    null,
+  );
+  assert.equal(
+    normalizeCoordinatorProvisioningPersistedThread(attempt, {
+      ...persisted, threadSource: "conflicting-source",
+    }).threadSource,
+    "conflicting-source",
+  );
+
+  const calls = [];
+  const recovered = await readCoordinatorProvisioningAttemptThread({
+    attempt,
+    readThread: async (includeTurns) => {
+      calls.push(includeTurns);
+      return { thread: persisted };
+    },
+  });
+  assert.deepEqual(calls, [true]);
+  assert.equal(recovered.threadSource, attempt.threadSource);
+
+  const deliveryThread = await readCoordinatorProvisioningDeliveryThread({
+    attempt,
+    threadId: attempt.threadId,
+    readThread: async () => ({ thread: persisted }),
+  });
+  assert.equal(deliveryThread.threadSource, attempt.threadSource);
+  assert.deepEqual(
+    classifyCoordinatorProvisioningDeliveryTurns(deliveryThread.turns, marker),
+    { delivery: "retry", turnId: null },
+  );
+  for (const rejected of [
+    { ...persisted, turns: [] },
+    { ...persisted, threadSource: "conflicting-source" },
+  ]) {
+    await assert.rejects(
+      readCoordinatorProvisioningDeliveryThread({
+        attempt,
+        threadId: attempt.threadId,
+        readThread: async () => ({ thread: rejected }),
+      }),
+      /did not confirm the exact provisioned Coordinator thread/,
+    );
+  }
+
+  const unmaterialized = new Error(
+    `thread ${attempt.threadId} is not materialized yet; includeTurns is unavailable before first user message`,
+  );
+  const freshCalls = [];
+  const fresh = await readCoordinatorProvisioningAttemptThread({
+    attempt,
+    readThread: async (includeTurns) => {
+      freshCalls.push(includeTurns);
+      if (includeTurns) throw unmaterialized;
+      return { thread: { ...persisted, threadSource: attempt.threadSource, turns: undefined } };
+    },
+  });
+  assert.deepEqual(freshCalls, [true, false]);
+  assert.equal(fresh.threadSource, attempt.threadSource);
+
+  assert.equal(await readCoordinatorProvisioningAttemptThread({
+    attempt,
+    readThread: async () => {
+      throw new Error(`thread not loaded: ${attempt.threadId}`);
+    },
+  }), null);
+  await assert.rejects(
+    readCoordinatorProvisioningAttemptThread({
+      attempt,
+      readThread: async () => { throw new Error("Codex App Server request timed out"); },
+    }),
+    /timed out/,
   );
 });
 

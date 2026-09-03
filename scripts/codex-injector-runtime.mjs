@@ -157,6 +157,9 @@ export async function readCoordinatorProvisioningDeliveryThread({
     materialized = false;
     thread = coordinatorProvisioningThreadReadData(await readThread(false));
   }
+  if (materialized) {
+    thread = normalizeCoordinatorProvisioningPersistedThread(attempt, thread);
+  }
   if (thread.id !== threadId
     || thread.threadSource !== attempt.threadSource
     || typeof thread.cwd !== "string"
@@ -196,6 +199,36 @@ export function classifyCoordinatorProvisioningDeliveryTurns(turns, marker) {
     };
   }
   return { delivery: "retry", turnId: null };
+}
+
+export function normalizeCoordinatorProvisioningPersistedThread(attempt, thread) {
+  if (thread?.threadSource !== null) return thread;
+  const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const exactMarker = Array.isArray(thread?.turns)
+    && thread.turns.some((turn) => JSON.stringify(turn).includes(marker));
+  if (thread?.id === attempt.threadId
+    && typeof thread.cwd === "string"
+    && path.resolve(thread.cwd) === path.resolve(attempt.workspacePath)
+    && exactMarker) {
+    return { ...thread, threadSource: attempt.threadSource };
+  }
+  return thread;
+}
+
+export async function readCoordinatorProvisioningAttemptThread({ attempt, readThread }) {
+  try {
+    const thread = coordinatorProvisioningThreadReadData(await readThread(true));
+    return normalizeCoordinatorProvisioningPersistedThread(attempt, thread);
+  } catch (error) {
+    if (isExactCoordinatorThreadNotLoadedError(error, attempt.threadId)) return null;
+    if (!isExactCoordinatorThreadNotMaterializedError(error, attempt.threadId)) throw error;
+  }
+  try {
+    return coordinatorProvisioningThreadReadData(await readThread(false));
+  } catch (error) {
+    if (isExactCoordinatorThreadNotLoadedError(error, attempt.threadId)) return null;
+    throw error;
+  }
 }
 
 const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [
