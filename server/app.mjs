@@ -3284,6 +3284,9 @@ export function createTaskboardServer(options = {}) {
     getPendingOwnerIntent: (projectId) => database.getPendingProjectOwnerIntent(projectId),
     getPendingOwnerIntentPlan: (projectId) => database.getPendingProjectOwnerIntentPlan(projectId),
     getCoordinatorDurableWork: (projectId) => database.hasAgentLaneCoordinatorDurableWork(projectId),
+    getCoordinatorDurableWorkReason: (projectId) => (
+      database.getAgentLaneCoordinatorDurableWorkReason(projectId)
+    ),
     getCoordinatorShutdownAttempt: (projectId) => database.getAgentLaneCoordinatorShutdownAttempt(projectId),
     getCurrentHostIdentity: (threadId) => observedHostThreadIdentity(threadId),
     recordProgress: async (progress) => {

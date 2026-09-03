@@ -3987,6 +3987,10 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
   const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
     headers: { "x-taskboard-client": "taskctl" },
   });
+  const idleSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(idleSnapshot.response.status, 200, JSON.stringify(idleSnapshot.body));
+  assert.equal(idleSnapshot.body.coordination.durableWorkPending, false);
+  assert.equal(idleSnapshot.body.coordination.durableWorkReason, null);
   const pathname = "/api/local/projects/local/coordinator-shutdown-attempts";
   const body = {
     idempotencyKey: "coordinator-shutdown-a",

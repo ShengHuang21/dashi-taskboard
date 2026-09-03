@@ -3504,6 +3504,7 @@ export class TaskboardDatabase {
   getAgentLaneCoordinatorProvisioningPreflight(projectId) {
     const configuration = this.getAgentLaneCoordinationWindows(projectId);
     const normalized = this.getAgentLaneProject(projectId);
+    const durableWorkReason = this.getAgentLaneCoordinatorDurableWorkReason(projectId);
     const ownerRoot = normalized?.tasks?.find(
       (task) => task?.id === normalized.ownerRootTaskId,
     ) ?? null;
@@ -3511,7 +3512,8 @@ export class TaskboardDatabase {
       ...configuration,
       coordinatorLease: normalized?.coordinatorLease ?? null,
       ownerRootValid: isValidCoordinatorProvisioningOwnerRoot(ownerRoot),
-      durableWorkPending: this.hasAgentLaneCoordinatorDurableWork(projectId),
+      durableWorkPending: durableWorkReason !== null,
+      durableWorkReason,
       shutdownAttempt: this.getAgentLaneCoordinatorShutdownAttempt(projectId),
     };
   }
@@ -3759,19 +3761,23 @@ export class TaskboardDatabase {
   }
 
   hasAgentLaneCoordinatorDurableWork(projectId) {
+    return this.getAgentLaneCoordinatorDurableWorkReason(projectId) !== null;
+  }
+
+  getAgentLaneCoordinatorDurableWorkReason(projectId) {
     const timestamp = now();
     const probes = [
-      this.#prepare(`
+      ["eligible-task", this.#prepare(`
         SELECT 1 FROM tasks
         WHERE project_id = ? AND archived_at IS NULL AND status IN ('todo', 'in_progress') LIMIT 1
-      `).get(projectId),
-      this.#prepare(`
+      `).get(projectId)],
+      ["active-run", this.#prepare(`
         SELECT 1 FROM task_agent_runs WHERE project_id = ? AND status = 'active' LIMIT 1
-      `).get(projectId),
-      this.#prepare(`
+      `).get(projectId)],
+      ["active-claim", this.#prepare(`
         SELECT 1 FROM agent_task_claims WHERE project_id = ? AND status = 'active' LIMIT 1
-      `).get(projectId),
-      this.#prepare(`
+      `).get(projectId)],
+      ["active-safe-action", this.#prepare(`
         SELECT 1 FROM task_safe_action_receipts AS receipt
         JOIN tasks AS task
           ON task.id = receipt.task_id AND task.project_id = receipt.project_id
@@ -3782,16 +3788,16 @@ export class TaskboardDatabase {
             receipt.status IN ('reserved', 'delivering')
             OR receipt.admission_state NOT IN ('none', 'admitted')
         ) LIMIT 1
-      `).get(projectId),
-      this.#prepare(`
+      `).get(projectId)],
+      ["owner-intent", this.#prepare(`
         SELECT 1 FROM project_owner_intents
         WHERE project_id = ? AND status IN ('queued', 'adopted', 'needs_decision') LIMIT 1
-      `).get(projectId),
-      this.#prepare(`
+      `).get(projectId)],
+      ["owner-intent-adoption", this.#prepare(`
         SELECT 1 FROM owner_intent_adoptions
         WHERE project_id = ? AND state = 'reserved' LIMIT 1
-      `).get(projectId),
-      this.#prepare(`
+      `).get(projectId)],
+      ["owner-decision-delivery", this.#prepare(`
         SELECT 1 FROM owner_decision_deliveries AS delivery
         LEFT JOIN task_owner_decision_receipts AS receipt ON receipt.delivery_id = delivery.id
         WHERE delivery.project_id = ? AND receipt.id IS NULL AND (
@@ -3804,25 +3810,27 @@ export class TaskboardDatabase {
             ) > ?
           )
         ) LIMIT 1
-      `).get(projectId, timestamp, timestamp),
-      this.#prepare(`
+      `).get(projectId, timestamp, timestamp)],
+      ["cross-domain-handoff", this.#prepare(`
         SELECT 1 FROM cross_domain_handoff_deliveries
         WHERE project_id = ? AND state = 'reserved' AND reservation_expires_at > ? LIMIT 1
-      `).get(projectId, timestamp),
-      this.#prepare(`
+      `).get(projectId, timestamp)],
+      ["coordinator-provisioning", this.#prepare(`
         SELECT 1 FROM agent_coordinator_provisioning_attempts
         WHERE project_id = ? AND status IN ('pending', 'starting', 'started') LIMIT 1
-      `).get(projectId),
+      `).get(projectId)],
     ];
-    if (probes.some(Boolean)) return true;
-    return this.listTasks({ projectId, archived: "false" }).some((task) => {
+    const matchedProbe = probes.find(([, value]) => Boolean(value));
+    if (matchedProbe) return matchedProbe[0];
+    for (const task of this.listTasks({ projectId, archived: "false" })) {
       const capsule = this.getTaskCapsule(task.id);
-      return Boolean(capsule?.readyWork?.ownerDecisionRequest)
-        || (capsule?.dependencyClearances ?? []).some((clearance) => (
-          clearance.status === "awaiting_handoff"
-          && clearance.delivery?.state !== "delivered"
-        ));
-    });
+      if (capsule?.readyWork?.ownerDecisionRequest) return "capsule-owner-decision";
+      if ((capsule?.dependencyClearances ?? []).some((clearance) => (
+        clearance.status === "awaiting_handoff"
+        && clearance.delivery?.state !== "delivered"
+      ))) return "capsule-handoff";
+    }
+    return null;
   }
 
   getAgentLaneCoordinatorShutdownAttempt(projectId) {

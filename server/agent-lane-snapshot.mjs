@@ -1190,6 +1190,7 @@ export function createAgentLaneSnapshotProvider({
   getPendingOwnerIntent = null,
   getPendingOwnerIntentPlan = null,
   getCoordinatorDurableWork = null,
+  getCoordinatorDurableWorkReason = null,
   getCoordinatorShutdownAttempt = null,
   getTaskDomainAssignment = null,
   getCurrentHostIdentity = null,
@@ -1588,9 +1589,14 @@ export function createAgentLaneSnapshotProvider({
             targetWorkspacePath: todo.dispatchTarget.rootWorkspacePath,
           },
         }))[0] ?? null;
-      const durableWorkPending = typeof getCoordinatorDurableWork === "function"
-        ? await getCoordinatorDurableWork(projectId)
-        : true;
+      const durableWorkReason = typeof getCoordinatorDurableWorkReason === "function"
+        ? await getCoordinatorDurableWorkReason(projectId)
+        : null;
+      const durableWorkPending = typeof getCoordinatorDurableWorkReason === "function"
+        ? durableWorkReason !== null
+        : typeof getCoordinatorDurableWork === "function"
+          ? await getCoordinatorDurableWork(projectId)
+          : true;
       const shutdownAttempt = typeof getCoordinatorShutdownAttempt === "function"
         ? await getCoordinatorShutdownAttempt(projectId)
         : null;
@@ -1624,6 +1630,9 @@ export function createAgentLaneSnapshotProvider({
           ownerDecisionRequest,
           pendingCrossDomainHandoff,
           durableWorkPending,
+          ...(typeof getCoordinatorDurableWorkReason === "function"
+            ? { durableWorkReason }
+            : {}),
           shutdownAttempt,
         },
         todos,
