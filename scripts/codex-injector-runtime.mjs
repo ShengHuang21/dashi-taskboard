@@ -688,12 +688,14 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || typeof attempt.reasoningEffort !== "string" || !attempt.reasoningEffort) {
     return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
   }
-  if (["completed", "canceled", "expired"].includes(attempt.status)) {
+  const recoverableExpiredThread = attempt.status === "expired" && Boolean(attempt.threadId);
+  if (["completed", "canceled"].includes(attempt.status)
+    || (attempt.status === "expired" && !recoverableExpiredThread)) {
     return { provisioned: attempt.status === "completed", reason: `attempt-${attempt.status}`, attemptId: attempt.id };
   }
 
   let thread = await options.findThread(attempt);
-  if (!thread && attempt.status === "started") {
+  if (!thread && (attempt.status === "started" || recoverableExpiredThread)) {
     if (typeof options.findArchivedThread === "function") {
       await options.findArchivedThread(attempt);
     }
@@ -749,7 +751,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || path.resolve(thread?.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
     return { provisioned: false, reason: "thread-binding-mismatch", attemptId: attempt.id };
   }
-  if (attempt.status === "started" && attempt.missingSince) {
+  if (["started", "expired"].includes(attempt.status) && attempt.missingSince) {
     if (typeof options.clearMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
@@ -758,6 +760,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     if (attempt.missingSince) {
       return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
     }
+  }
+  if (attempt.status === "expired") {
+    return { provisioned: false, reason: "attempt-expired-thread-active", attemptId: attempt.id };
   }
   if (attempt.threadId !== thread.id || attempt.status !== "started") {
     result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });

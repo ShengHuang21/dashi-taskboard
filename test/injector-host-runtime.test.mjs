@@ -1315,6 +1315,24 @@ test("Coordinator provisioning safely resets a confirmed missing started thread 
   assert.equal(missingResets, 1);
   assert.equal(starts, 1);
   assert.equal(missingClears, 0);
+
+  attempt = {
+    ...attempt,
+    status: "expired",
+    threadId: "01a07777-a749-7b53-81e2-af2d477f93ae",
+    missingSince: null,
+  };
+  currentTime += 1_000;
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: false, reason: "started-thread-missing", attemptId: attempt.id,
+  });
+  assert.equal(missingObservations, 3);
+  assert.equal(missingResets, 1);
+  currentTime += 60_000;
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: false, reason: "missing-thread-reset", attemptId: attempt.id,
+  });
+  assert.equal(missingResets, 2);
 });
 
 test("Coordinator provisioning clears a transient missing observation when the old thread reappears", async () => {

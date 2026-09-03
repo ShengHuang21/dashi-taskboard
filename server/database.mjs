@@ -3716,10 +3716,14 @@ export class TaskboardDatabase {
         "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
       ).get(attemptId);
       if (!row) throw new ApiError(404, "COORDINATOR_PROVISIONING_NOT_FOUND", "The replacement provisioning attempt does not exist");
-      if (["completed", "canceled", "expired"].includes(row.status)) {
+      const recoverableExpiredMissing = row.status === "expired"
+        && Boolean(row.thread_id)
+        && ["observe-missing", "clear-missing", "reset-missing"].includes(action);
+      if (["completed", "canceled", "expired"].includes(row.status)
+        && !recoverableExpiredMissing) {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_TERMINAL", "The replacement provisioning attempt is terminal");
       }
-      if (Date.parse(row.expires_at) <= Date.now()) {
+      if (!recoverableExpiredMissing && Date.parse(row.expires_at) <= Date.now()) {
         this.#prepare(`UPDATE agent_coordinator_provisioning_attempts SET status = 'expired', updated_at = ? WHERE id = ?`)
           .run(now(), attemptId);
         this.database.exec("COMMIT");
@@ -3802,7 +3806,7 @@ export class TaskboardDatabase {
           && ownerRoot.codexProjectKind === row.codex_project_kind
           && ownerRoot.codexHostId === row.codex_host_id
           && path.resolve(ownerRoot.workspacePath) === path.resolve(row.workspace_path);
-        if (row.status !== "started"
+        if (!["started", "expired"].includes(row.status)
           || !row.thread_id
           || !exactOwner
           || coordinatorTasks.length > 0
@@ -3846,7 +3850,7 @@ export class TaskboardDatabase {
         retryCount += 1;
         expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
       } else if (action === "clear-missing") {
-        if (row.status !== "started" || !row.thread_id) {
+        if (!["started", "expired"].includes(row.status) || !row.thread_id) {
           throw new ApiError(409, "COORDINATOR_PROVISIONING_STATE_CONFLICT", "Only a started attempt can clear missing-thread evidence");
         }
         const timestamp = now();

@@ -3695,6 +3695,25 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(missingReattach.body.attempt.status, "started");
   assert.equal(missingReattach.body.attempt.threadId, attachBody.threadId);
 
+  const expiredMissingInspection = new DatabaseSync(databasePath);
+  expiredMissingInspection.prepare(`
+    UPDATE agent_coordinator_provisioning_attempts
+    SET status = 'expired', missing_since = NULL, expires_at = ? WHERE id = ?
+  `).run(new Date(Date.now() - 1_000).toISOString(), created.body.attempt.id);
+  expiredMissingInspection.close();
+  const observedExpiredMissing = await request(baseUrl, observeMissingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b6".repeat(16), observeMissingPath, {}),
+    body: {},
+  });
+  assert.equal(
+    observedExpiredMissing.response.status,
+    200,
+    JSON.stringify(observedExpiredMissing.body),
+  );
+  assert.equal(observedExpiredMissing.body.attempt.status, "expired");
+  assert.ok(Date.parse(observedExpiredMissing.body.attempt.missingSince));
+
   await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
