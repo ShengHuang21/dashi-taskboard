@@ -130,12 +130,46 @@ export function isExactCoordinatorThreadNotLoadedError(error, threadId) {
     && (error instanceof Error ? error.message : String(error)) === `thread not loaded: ${threadId}`;
 }
 
+export function isExactCoordinatorThreadNotMaterializedError(error, threadId) {
+  return typeof threadId === "string"
+    && threadId.length > 0
+    && (error instanceof Error ? error.message : String(error))
+      === `thread ${threadId} is not materialized yet; includeTurns is unavailable before first user message`;
+}
+
 export function coordinatorProvisioningThreadReadData(result) {
   if (!result || typeof result !== "object"
     || !result.thread || typeof result.thread !== "object" || Array.isArray(result.thread)) {
     throw new Error("Codex did not return one exact thread object");
   }
   return result.thread;
+}
+
+export async function readCoordinatorProvisioningDeliveryThread({
+  attempt, threadId, readThread,
+}) {
+  let thread;
+  let materialized = true;
+  try {
+    thread = coordinatorProvisioningThreadReadData(await readThread(true));
+  } catch (error) {
+    if (!isExactCoordinatorThreadNotMaterializedError(error, threadId)) throw error;
+    materialized = false;
+    thread = coordinatorProvisioningThreadReadData(await readThread(false));
+  }
+  if (thread.id !== threadId
+    || thread.threadSource !== attempt.threadSource
+    || typeof thread.cwd !== "string"
+    || path.resolve(thread.cwd) !== path.resolve(attempt.workspacePath)) {
+    throw new Error("Codex did not confirm the exact provisioned Coordinator thread");
+  }
+  if (materialized && !Array.isArray(thread.turns)) {
+    throw new Error("Codex did not return the exact provisioned Coordinator turns");
+  }
+  return {
+    ...thread,
+    turns: materialized ? thread.turns : [],
+  };
 }
 
 const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [

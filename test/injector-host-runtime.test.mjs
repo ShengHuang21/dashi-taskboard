@@ -20,11 +20,13 @@ import {
   findResidentInjectorPids,
   handleHostBindingPayload,
   isExactCoordinatorThreadNotLoadedError,
+  isExactCoordinatorThreadNotMaterializedError,
   loadResidentCoordinatorMonitorProjects,
   observeTaskboardOwnerDecision,
   observeTaskboardOwnerIntentCapture,
   observeTaskboardOwnerIntentPlan,
   reconcileInjectionRuntime,
+  readCoordinatorProvisioningDeliveryThread,
   runOwnerDecisionMonitorOnce,
   runOwnerIntentAdoptionMonitorOnce,
   runOwnerIntentCaptureMonitorOnce,
@@ -167,6 +169,71 @@ test("Coordinator provisioning recognizes only its exact thread-not-loaded error
   assert.throws(
     () => coordinatorProvisioningThreadReadData({ thread: [] }),
     /did not return one exact thread object/,
+  );
+});
+
+test("Coordinator provisioning materializes one exact empty thread before first delivery", async () => {
+  const threadId = "01a067a2-41dc-7400-9515-19625a1c55ed";
+  const attempt = {
+    threadSource: "taskboard-coordinator-provision-stable",
+    workspacePath: "/tmp/taskboard",
+  };
+  const unmaterialized = new Error(
+    `thread ${threadId} is not materialized yet; includeTurns is unavailable before first user message`,
+  );
+  assert.equal(isExactCoordinatorThreadNotMaterializedError(unmaterialized, threadId), true);
+  assert.equal(
+    isExactCoordinatorThreadNotMaterializedError(unmaterialized, coordinatorThreadId),
+    false,
+  );
+  assert.equal(
+    isExactCoordinatorThreadNotMaterializedError(new Error("Codex App Server request timed out"), threadId),
+    false,
+  );
+
+  const calls = [];
+  const thread = await readCoordinatorProvisioningDeliveryThread({
+    attempt,
+    threadId,
+    readThread: async (includeTurns) => {
+      calls.push(includeTurns);
+      if (includeTurns) throw unmaterialized;
+      return {
+        thread: {
+          id: threadId,
+          threadSource: attempt.threadSource,
+          cwd: attempt.workspacePath,
+        },
+      };
+    },
+  });
+  assert.deepEqual(calls, [true, false]);
+  assert.deepEqual(thread.turns, []);
+
+  const transientCalls = [];
+  await assert.rejects(
+    readCoordinatorProvisioningDeliveryThread({
+      attempt,
+      threadId,
+      readThread: async (includeTurns) => {
+        transientCalls.push(includeTurns);
+        throw new Error("Codex App Server request timed out");
+      },
+    }),
+    /timed out/,
+  );
+  assert.deepEqual(transientCalls, [true]);
+
+  await assert.rejects(
+    readCoordinatorProvisioningDeliveryThread({
+      attempt,
+      threadId,
+      readThread: async (includeTurns) => {
+        if (includeTurns) throw unmaterialized;
+        return { thread: {} };
+      },
+    }),
+    /did not confirm the exact provisioned Coordinator thread/,
   );
 });
 

@@ -36,6 +36,7 @@ import {
   findResidentInjectorPids,
   handleHostBindingPayload,
   isExactCoordinatorThreadNotLoadedError,
+  readCoordinatorProvisioningDeliveryThread,
   loadResidentCoordinatorMonitorProjects,
   reconcileInjectionRuntime,
   restartResidentInjector,
@@ -2207,14 +2208,11 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   const rpc = (method, params) => requestCodexAppServerViaCdp(
     cdp, undefined, attempt.codexHostId, method, params, 10_000,
   );
-  const threadResult = await rpc("thread/read", { threadId, includeTurns: true });
-  const thread = threadResult?.thread;
-  if (thread?.id !== threadId
-    || thread.threadSource !== attempt.threadSource
-    || typeof thread.cwd !== "string"
-    || path.resolve(thread.cwd) !== path.resolve(attempt.workspacePath)) {
-    throw new Error("Codex did not confirm the exact provisioned Coordinator thread");
-  }
+  const thread = await readCoordinatorProvisioningDeliveryThread({
+    attempt,
+    threadId,
+    readThread: (includeTurns) => rpc("thread/read", { threadId, includeTurns }),
+  });
   const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
   const observed = turns.find((turn) => JSON.stringify(turn).includes(marker));
