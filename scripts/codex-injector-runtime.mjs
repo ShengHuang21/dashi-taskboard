@@ -41,6 +41,9 @@ export function createSerializedMonitorTick(run) {
   };
 }
 
+const ACTIVE_COORDINATOR_THREAD_STATUSES = new Set(["active", "running", "busy", "inProgress"]);
+const NON_RUNNING_COORDINATOR_THREAD_STATUSES = new Set(["notLoaded", "idle", "archived"]);
+
 export function classifyCoordinatorProvisioningActiveThread({ window, thread, activeThreads }) {
   if (!Array.isArray(activeThreads)) {
     return { eligibility: "uncertain", reason: "active-thread-list-invalid", window };
@@ -48,23 +51,70 @@ export function classifyCoordinatorProvisioningActiveThread({ window, thread, ac
   if (activeThreads.length > 1) {
     return { eligibility: "uncertain", reason: "duplicate-active-thread", window };
   }
-  if (activeThreads.length === 0) return null;
-  if (thread?.id === window?.threadId && !Array.isArray(thread.turns)) {
+  const listedThread = activeThreads[0] ?? null;
+  if (listedThread && listedThread?.id !== window?.threadId) {
+    return { eligibility: "uncertain", reason: "active-thread-binding-unconfirmed", window };
+  }
+  if (thread?.id !== window?.threadId) {
+    return listedThread
+      ? { eligibility: "uncertain", reason: "active-thread-binding-unconfirmed", window }
+      : null;
+  }
+  if (!Array.isArray(thread.turns)) {
     return { eligibility: "uncertain", reason: "thread-state-unconfirmed", window };
+  }
+  if (thread.turns.some((turn) => turn?.status === "inProgress")) {
+    return { eligibility: "eligible", busy: true, reason: "active-turn", window };
   }
   const exact = thread?.id === window?.threadId
     && typeof thread.cwd === "string"
     && path.resolve(thread.cwd) === path.resolve(window?.workspacePath ?? "");
   if (exact) return { eligibility: "eligible", busy: false, reason: "active-thread", window };
-  if (thread?.id === window?.threadId
-    && typeof thread.cwd === "string"
+  const status = typeof thread.status === "string"
+    ? thread.status
+    : thread.status?.type;
+  if (ACTIVE_COORDINATOR_THREAD_STATUSES.has(status)) {
+    return { eligibility: "uncertain", reason: "thread-status-active", window };
+  }
+  if (!NON_RUNNING_COORDINATOR_THREAD_STATUSES.has(status)) {
+    return { eligibility: "uncertain", reason: "thread-status-unconfirmed", window };
+  }
+  if (typeof thread.cwd === "string"
     && path.isAbsolute(thread.cwd)
     && typeof window?.workspacePath === "string"
     && path.isAbsolute(window.workspacePath)
     && path.resolve(thread.cwd) !== path.resolve(window.workspacePath)) {
-    return { eligibility: "stale", reason: "active-thread-binding-drift", window };
+    return {
+      eligibility: "stale",
+      reason: listedThread
+        ? "active-thread-binding-drift"
+        : "inactive-thread-binding-drift",
+      window,
+    };
   }
   return { eligibility: "uncertain", reason: "active-thread-binding-unconfirmed", window };
+}
+
+const COORDINATOR_INSPECTION_DIAGNOSTIC_REASONS = new Set([
+  "active-thread-binding-drift",
+  "active-thread-binding-unconfirmed",
+  "active-thread-list-invalid",
+  "active-turn",
+  "archived",
+  "binding-invalid",
+  "duplicate-active-thread",
+  "duplicate-archived-thread",
+  "host-unavailable",
+  "inactive-thread-binding-drift",
+  "inspection-binding-mismatch",
+  "inspection-threw",
+  "thread-state-unconfirmed",
+  "thread-status-active",
+  "thread-status-unconfirmed",
+]);
+
+export function coordinatorProvisioningInspectionDiagnosticReason(value) {
+  return COORDINATOR_INSPECTION_DIAGNOSTIC_REASONS.has(value) ? value : "unknown";
 }
 
 export function coordinatorProvisioningThreadListData(result) {
@@ -461,13 +511,23 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     try {
       inspection = await options.inspectCoordinatorWindow(window);
     } catch {
-      return { provisioned: false, reason: "window-inspection-unavailable" };
+      return {
+        provisioned: false,
+        reason: "window-inspection-unavailable",
+        inspectionReason: "inspection-threw",
+      };
     }
     if (inspection?.eligibility === "eligible" || inspection?.busy === true) {
       return { provisioned: false, reason: "coordinator-window-exists" };
     }
-    if (inspection?.eligibility !== "stale"
-      || inspection?.window?.taskId !== window.taskId
+    if (inspection?.eligibility !== "stale") {
+      return {
+        provisioned: false,
+        reason: "window-inspection-unavailable",
+        inspectionReason: coordinatorProvisioningInspectionDiagnosticReason(inspection?.reason),
+      };
+    }
+    if (inspection?.window?.taskId !== window.taskId
       || inspection.window.label !== window.label
       || inspection.window.role !== "coordinator"
       || inspection.window.threadId !== window.threadId
@@ -476,7 +536,11 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       || inspection.window.codexHostId !== window.codexHostId
       || path.resolve(inspection.window.workspacePath ?? "")
         !== path.resolve(window.workspacePath ?? "")) {
-      return { provisioned: false, reason: "window-inspection-unavailable" };
+      return {
+        provisioned: false,
+        reason: "window-inspection-unavailable",
+        inspectionReason: "inspection-binding-mismatch",
+      };
     }
     retireCoordinatorWindows.push(window);
   }

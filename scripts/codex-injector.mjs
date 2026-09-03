@@ -21,6 +21,7 @@ import {
 import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
+  coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadListData,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
@@ -94,14 +95,19 @@ function reportCoordinatorProvisioningDiagnostic(projectId, result) {
   const reason = typeof result?.reason === "string" && result.reason
     ? result.reason
     : "unknown";
-  if (coordinatorProvisioningDiagnosticReasons.get(projectId) === reason) return;
-  coordinatorProvisioningDiagnosticReasons.set(projectId, reason);
+  const inspectionReason = coordinatorProvisioningInspectionDiagnosticReason(
+    result?.inspectionReason,
+  );
+  const diagnosticKey = `${reason}:${inspectionReason}`;
+  if (coordinatorProvisioningDiagnosticReasons.get(projectId) === diagnosticKey) return;
+  coordinatorProvisioningDiagnosticReasons.set(projectId, diagnosticKey);
   console.error(JSON.stringify({
     event: "taskboard.coordinator.provisioning",
     projectId,
     provisioned: result?.provisioned === true,
     reason,
     attemptPresent: typeof result?.attemptId === "string" && result.attemptId.length > 0,
+    ...(reason === "window-inspection-unavailable" ? { inspectionReason } : {}),
   }));
 }
 const automationPoliciesPath = path.join(

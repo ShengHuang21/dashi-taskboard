@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
+  coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadListData,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
@@ -49,13 +50,50 @@ test("an idle unarchived Coordinator with a protected workspace drift is stale",
   };
   assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
     window,
-    thread: { id: coordinatorThreadId, cwd: "/Users/v-sheng.huang/sboai", turns: [] },
+    thread: {
+      id: coordinatorThreadId,
+      cwd: "/Users/v-sheng.huang/sboai",
+      status: { type: "notLoaded" },
+      turns: [{ status: "completed" }, { status: "interrupted" }],
+    },
     activeThreads: [{ id: coordinatorThreadId }],
   }), {
     eligibility: "stale",
     reason: "active-thread-binding-drift",
     window,
   });
+  assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
+    window,
+    thread: {
+      id: coordinatorThreadId,
+      cwd: "/Users/v-sheng.huang/sboai",
+      status: { type: "notLoaded" },
+      turns: [{ status: "completed" }],
+    },
+    activeThreads: [],
+  }), {
+    eligibility: "stale",
+    reason: "inactive-thread-binding-drift",
+    window,
+  });
+  for (const status of [{ type: "active" }, { type: "running" }, { type: "mystery" }, null]) {
+    assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
+      window,
+      thread: {
+        id: coordinatorThreadId,
+        cwd: "/Users/v-sheng.huang/sboai",
+        status,
+        turns: [{ status: "completed" }],
+      },
+      activeThreads: [{ id: coordinatorThreadId }],
+    }), {
+      eligibility: "uncertain",
+      reason: status?.type === "active" || status?.type === "running"
+        ? "thread-status-active"
+        : "thread-status-unconfirmed",
+      window,
+    });
+  }
   assert.deepEqual(classifyCoordinatorProvisioningActiveThread({
     window,
     thread: null,
@@ -97,6 +135,18 @@ test("Coordinator provisioning rejects an unauthenticated thread list shape", ()
   }
   const threads = [{ id: coordinatorThreadId }];
   assert.equal(coordinatorProvisioningThreadListData({ data: threads }), threads);
+});
+
+test("Coordinator provisioning inspection diagnostics allow only finite reasons", () => {
+  assert.equal(
+    coordinatorProvisioningInspectionDiagnosticReason("thread-status-unconfirmed"),
+    "thread-status-unconfirmed",
+  );
+  assert.equal(
+    coordinatorProvisioningInspectionDiagnosticReason("thread=secret cwd=/private token=value"),
+    "unknown",
+  );
+  assert.equal(coordinatorProvisioningInspectionDiagnosticReason(null), "unknown");
 });
 
 test("background Coordinator identity handshake verifies the exact host thread without changing foreground focus", async () => {
@@ -1279,6 +1329,9 @@ test("Coordinator provisioning fails closed for fresh busy or uncertain register
     });
     assert.equal(result.provisioned, false);
     assert.match(result.reason, /coordinator-window|window-inspection/);
+    if (inspection.eligibility === "uncertain") {
+      assert.equal(result.inspectionReason, "host-unavailable");
+    }
   }
   assert.equal(requests, 0);
 });
