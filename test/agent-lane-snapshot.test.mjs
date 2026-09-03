@@ -1298,6 +1298,151 @@ test("marks a configured Codex lane disconnected when its session evidence disap
   assert.match(visual.continuity.reason, /session was not found/);
 });
 
+test("keeps a registered Coordinator snapshot recoverable when its cached rollout disappears", async () => {
+  const paths = await fixture({
+    rootTaskId: "visual",
+    ownerRootTaskId: "visual",
+    coordinatorLease: {
+      id: "coordinator-lease",
+      holderTaskId: "root",
+      bindingValid: true,
+      holderThreadId: "root-thread",
+      holderCodexHostId: "local",
+      holderWorkspacePath: "/tmp/coordinator-workspace",
+      acquiredAt: "2026-08-23T08:00:00.000Z",
+      expiresAt: "2026-08-23T08:10:00.000Z",
+    },
+    tasks: [
+      {
+        id: "visual", label: "Owner Root", owner: "Codex", source: "codex",
+        threadId: "visual-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+        workspacePath: "/tmp/owner-workspace",
+      },
+      {
+        id: "root", label: "Coordinator", owner: "Codex", source: "codex",
+        threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+        workspacePath: "/tmp/coordinator-workspace",
+      },
+    ],
+    adapters: [],
+  });
+  let racePath = null;
+  let removeAfterStat = false;
+  let removeBeforeStatCall = null;
+  let raceStatCalls = 0;
+  const provider = createAgentLaneSnapshotProvider({
+    ...paths,
+    getCurrentHostIdentity: (threadId) => threadId === "root-thread" ? {
+      threadId,
+      threadRunning: false,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/coordinator-workspace",
+    } : null,
+    recordProgress: async () => ({ applied: false }),
+    statSessionFile: async (filename) => {
+      if (filename !== racePath) return stat(filename);
+      raceStatCalls += 1;
+      if (raceStatCalls === removeBeforeStatCall) await rm(filename);
+      const details = await stat(filename);
+      if (removeAfterStat && raceStatCalls === 1) await rm(filename);
+      return details;
+    },
+  });
+
+  const initial = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(initial.coordination.lease.bindingValid, true);
+  assert.equal(initial.taskLanes.find((lane) => lane.id === "root").status, "running");
+
+  await rm(paths.rootPath);
+
+  const recovered = await provider.getProjectSnapshot("capstone-dev");
+  const coordinator = recovered.taskLanes.find((lane) => lane.id === "root");
+  assert.equal(recovered.coordination.lease.bindingValid, true);
+  assert.equal(coordinator.status, "unavailable");
+  assert.equal(coordinator.continuity.state, "disconnected");
+  assert.match(coordinator.blocker, /session was not found/);
+  assert.deepEqual(await provider.reconcileProject("capstone-dev"), { applied: 0 });
+
+  const replacementContents = [
+    JSON.stringify({
+      timestamp: "2026-08-23T08:04:30.000Z",
+      type: "session_meta",
+      payload: { session_id: "root-thread" },
+    }),
+    JSON.stringify({
+      timestamp: "2026-08-23T08:04:40.000Z",
+      type: "event_msg",
+      payload: { type: "task_complete", last_agent_message: "Recovered after rollout relocation." },
+    }),
+  ].join("\n");
+  const replacementPath = path.join(path.dirname(paths.rootPath), "rollout-moved-root-thread.jsonl");
+  await writeFile(replacementPath, replacementContents);
+  const relocated = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(relocated.taskLanes.find((lane) => lane.id === "root").status, "idle");
+
+  await appendFile(replacementPath, `\n${JSON.stringify({
+    timestamp: "2026-08-23T08:04:50.000Z",
+    type: "event_msg",
+    payload: { type: "agent_message", phase: "commentary", message: "Race before read." },
+  })}`);
+  racePath = replacementPath;
+  removeAfterStat = true;
+  raceStatCalls = 0;
+  const readRace = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(readRace.taskLanes.find((lane) => lane.id === "root").status, "unavailable");
+
+  const secondReplacementPath = path.join(
+    path.dirname(paths.rootPath),
+    "rollout-relocated-root-thread.jsonl",
+  );
+  await writeFile(secondReplacementPath, replacementContents);
+  removeAfterStat = false;
+  racePath = secondReplacementPath;
+  raceStatCalls = 0;
+  const secondRelocation = await provider.getProjectSnapshot("capstone-dev");
+  assert.equal(secondRelocation.taskLanes.find((lane) => lane.id === "root").status, "idle");
+
+  removeBeforeStatCall = 2;
+  raceStatCalls = 0;
+  const subagentRace = await provider.getProjectSnapshot("capstone-dev");
+  const coordinatorTree = subagentRace.windowSubagentTrees.find(
+    (tree) => tree.windowTaskId === "root",
+  );
+  assert.equal(coordinatorTree.observed, false);
+  assert.equal(coordinatorTree.summary.complete, false);
+});
+
+test("does not hide non-ENOENT Codex session read failures", async () => {
+  const paths = await fixture();
+  const failure = Object.assign(new Error("session access denied"), { code: "EACCES" });
+  const provider = createAgentLaneSnapshotProvider({
+    ...paths,
+    statSessionFile: async (filename) => {
+      if (filename === paths.rootPath) throw failure;
+      return stat(filename);
+    },
+  });
+
+  await assert.rejects(provider.getProjectSnapshot("capstone-dev"), (error) => error === failure);
+});
+
+test("does not hide non-ENOENT Codex session discovery failures", async () => {
+  const paths = await fixture();
+  const failure = Object.assign(new Error("session directory access denied"), { code: "EACCES" });
+  const provider = createAgentLaneSnapshotProvider({
+    ...paths,
+    readSessionDirectory: async () => {
+      throw failure;
+    },
+  });
+
+  await assert.rejects(provider.getProjectSnapshot("capstone-dev"), (error) => error === failure);
+});
+
 test("rejects projects that have no configured lane mapping", async () => {
   const paths = await fixture();
   const provider = createAgentLaneSnapshotProvider(paths);

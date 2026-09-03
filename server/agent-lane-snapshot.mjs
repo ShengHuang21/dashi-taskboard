@@ -593,17 +593,18 @@ async function workItemFor(taskLane, getTask, listComments) {
   };
 }
 
-async function findSessionFile(directory, threadId) {
+async function findSessionFile(directory, threadId, readSessionDirectory = readdir) {
   let entries;
   try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch {
+    entries = await readSessionDirectory(directory, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
     return null;
   }
   for (const entry of entries) {
     const target = path.join(directory, entry.name);
     if (entry.isDirectory()) {
-      const nested = await findSessionFile(target, threadId);
+      const nested = await findSessionFile(target, threadId, readSessionDirectory);
       if (nested) return nested;
     } else if (entry.isFile() && entry.name.endsWith(`-${threadId}.jsonl`)) {
       return target;
@@ -742,23 +743,58 @@ function codexTaskSignalLine(line) {
   );
 }
 
-async function readCodexTask(taskLane, resolveSessionFile, now, sessionStates) {
+function unavailableCodexTask(taskLane) {
+  return {
+    ...taskLane,
+    status: "unavailable",
+    freshness: "unknown",
+    lastActivityAt: null,
+    lastActualAction: null,
+    branch: null,
+    sha: null,
+    checks: [],
+    blocker: "Configured Codex task session was not found.",
+    provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
+  };
+}
+
+async function readCodexTask(
+  taskLane,
+  resolveSessionFile,
+  forgetSessionFile,
+  now,
+  sessionStates,
+  statSessionFile,
+  readSessionByteRange,
+) {
   const sessionFile = await resolveSessionFile(taskLane.threadId);
-  if (!sessionFile) {
-    return {
-      ...taskLane,
-      status: "unavailable",
-      freshness: "unknown",
-      lastActivityAt: null,
-      lastActualAction: null,
-      branch: null,
-      sha: null,
-      checks: [],
-      blocker: "Configured Codex task session was not found.",
-      provenance: { kind: "codex-local-session", threadId: taskLane.threadId },
-    };
+  if (!sessionFile) return unavailableCodexTask(taskLane);
+  try {
+    return await readCodexTaskFromSession(
+      taskLane,
+      sessionFile,
+      now,
+      sessionStates,
+      statSessionFile,
+      readSessionByteRange,
+    );
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+    forgetSessionFile(taskLane.threadId);
+    sessionStates.delete(sessionFile);
+    return unavailableCodexTask(taskLane);
   }
-  const details = await stat(sessionFile);
+}
+
+async function readCodexTaskFromSession(
+  taskLane,
+  sessionFile,
+  now,
+  sessionStates,
+  statSessionFile,
+  readSessionByteRange,
+) {
+  const details = await statSessionFile(sessionFile);
   const cached = sessionStates.get(sessionFile);
   if (cached?.dev === details.dev
     && cached.ino === details.ino
@@ -779,7 +815,7 @@ async function readCodexTask(taskLane, resolveSessionFile, now, sessionStates) {
     && cached.observedSize < details.size
     && details.size - cached.observedSize <= MAX_TAIL_BYTES;
   const start = canAdvance ? cached.observedSize : Math.max(0, details.size - MAX_TAIL_BYTES);
-  const added = await readByteRange(sessionFile, start, details.size);
+  const added = await readSessionByteRange(sessionFile, start, details.size);
   const capturedSize = start + added.length;
   let discardingOversizedLine = canAdvance && cached.discardingOversizedLine === true;
   let input = canAdvance ? Buffer.concat([cached.trailing, added]) : added;
@@ -1033,8 +1069,13 @@ function applySubagentLine(state, line, { registryOnly = false } = {}) {
   }
 }
 
-async function scanSubagents(filename, cached = null) {
-  const details = await stat(filename);
+async function scanSubagents(
+  filename,
+  cached = null,
+  statSessionFile = stat,
+  readSessionByteRange = readByteRange,
+) {
+  const details = await statSessionFile(filename);
   const previousSize = cached?.observedSize ?? cached?.offset ?? 0;
   const reset = !cached
     || cached.dev !== details.dev
@@ -1077,7 +1118,7 @@ async function scanSubagents(filename, cached = null) {
     const start = reset
       ? Math.max(0, details.size - MAX_SUBAGENT_RECOVERY_BYTES - MAX_SUBAGENT_REGISTRY_LOOKBACK_BYTES)
       : previousSize;
-    const added = await readByteRange(filename, start, details.size);
+    const added = await readSessionByteRange(filename, start, details.size);
     const capturedSize = start + added.length;
     let discardingOversizedLine = !reset && state.discardingOversizedLine === true;
     let input = reset ? added : Buffer.concat([state.trailing, added]);
@@ -1152,6 +1193,9 @@ export function createAgentLaneSnapshotProvider({
   getCoordinatorShutdownAttempt = null,
   getTaskDomainAssignment = null,
   getCurrentHostIdentity = null,
+  readSessionDirectory = readdir,
+  statSessionFile = stat,
+  readSessionByteRange = readByteRange,
 }) {
   const sessionFilePromises = new Map();
   const taskSessionStates = new Map();
@@ -1161,13 +1205,16 @@ export function createAgentLaneSnapshotProvider({
   const resolveSessionFile = (threadId) => {
     let pending = sessionFilePromises.get(threadId);
     if (!pending) {
-      pending = findSessionFile(sessionsDirectory, threadId).then((filename) => {
+      pending = findSessionFile(sessionsDirectory, threadId, readSessionDirectory).then((filename) => {
         if (!filename) sessionFilePromises.delete(threadId);
         return filename;
       });
       sessionFilePromises.set(threadId, pending);
     }
     return pending;
+  };
+  const forgetSessionFile = (threadId) => {
+    sessionFilePromises.delete(threadId);
   };
   const provider = {
     async getProjectSnapshot(projectId) {
@@ -1194,7 +1241,15 @@ export function createAgentLaneSnapshotProvider({
       const generatedAt = now();
       const observedTasks = await Promise.all(configured.tasks.map((taskLane) => (
         taskLane.connection === "connected" && taskLane.source === "codex"
-          ? readCodexTask(taskLane, resolveSessionFile, generatedAt, taskSessionStates)
+          ? readCodexTask(
+            taskLane,
+            resolveSessionFile,
+            forgetSessionFile,
+            generatedAt,
+            taskSessionStates,
+            statSessionFile,
+            readSessionByteRange,
+          )
           : {
               ...taskLane,
               status: "unavailable",
@@ -1264,34 +1319,46 @@ export function createAgentLaneSnapshotProvider({
       const allSubagentsByWindow = new Map();
       const windowSubagentTrees = [];
       for (const windowTask of configured.tasks.filter((task) => task.source === "codex")) {
-        const sessionFile = await resolveSessionFile(windowTask.threadId);
+        let sessionFile = await resolveSessionFile(windowTask.threadId);
         let allSubagents = [];
         let capacityObservation = null;
         let registryObservation = null;
         let recoveryComplete = false;
         if (sessionFile) {
-          const state = await scanSubagents(sessionFile, subagentStates.get(sessionFile));
-          subagentStates.set(sessionFile, state);
-          recoveryComplete = state.recoveryComplete === true;
-          capacityObservation = state.registryObservedAt ? {
-            source: "list_agents",
-            observedAt: state.registryObservedAt,
-          } : null;
-          registryObservation = state.registrySnapshotObservedAt && Array.isArray(state.registryAgents) ? {
-            source: "list_agents",
-            observedAt: state.registrySnapshotObservedAt,
-            complete: true,
-            agents: state.registryAgents.map((agent) => ({ ...agent })),
-          } : null;
-          allSubagents = [...state.agents.values()].map((agent) => ({
-            ...agent,
-            label: agent.agentPath.split("/").at(-1),
-            parentTaskId: windowTask.id,
-            stableIdentity: `${projectId}:subagent:${agent.agentThreadId ?? agent.agentPath}`,
-            provenance: { kind: "codex-collaboration-event", threadId: windowTask.threadId },
-          })).sort((left, right) => (
-            (right.lastActivityAt ?? "").localeCompare(left.lastActivityAt ?? "")
-          ));
+          try {
+            const state = await scanSubagents(
+              sessionFile,
+              subagentStates.get(sessionFile),
+              statSessionFile,
+              readSessionByteRange,
+            );
+            subagentStates.set(sessionFile, state);
+            recoveryComplete = state.recoveryComplete === true;
+            capacityObservation = state.registryObservedAt ? {
+              source: "list_agents",
+              observedAt: state.registryObservedAt,
+            } : null;
+            registryObservation = state.registrySnapshotObservedAt && Array.isArray(state.registryAgents) ? {
+              source: "list_agents",
+              observedAt: state.registrySnapshotObservedAt,
+              complete: true,
+              agents: state.registryAgents.map((agent) => ({ ...agent })),
+            } : null;
+            allSubagents = [...state.agents.values()].map((agent) => ({
+              ...agent,
+              label: agent.agentPath.split("/").at(-1),
+              parentTaskId: windowTask.id,
+              stableIdentity: `${projectId}:subagent:${agent.agentThreadId ?? agent.agentPath}`,
+              provenance: { kind: "codex-collaboration-event", threadId: windowTask.threadId },
+            })).sort((left, right) => (
+              (right.lastActivityAt ?? "").localeCompare(left.lastActivityAt ?? "")
+            ));
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+            forgetSessionFile(windowTask.threadId);
+            subagentStates.delete(sessionFile);
+            sessionFile = null;
+          }
         }
         allSubagentsByWindow.set(windowTask.id, allSubagents);
         const subagents = allSubagents.slice(0, MAX_VISIBLE_SUBAGENTS);
