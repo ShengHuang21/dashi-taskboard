@@ -1691,6 +1691,19 @@ test("Coordinator provisioning clears a transient missing observation when the o
   directReadable = true;
   assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "thread-started");
   assert.equal(attempt.missingSince, null);
+  attempt = { ...attempt, status: "expired" };
+  activeThread.turns = [{
+    id: "failed-delivery",
+    status: "failed",
+    input: `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+  }];
+  assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "thread-started");
+  activeThread.turns = [];
+  assert.equal(
+    (await runCoordinatorProvisioningMonitorOnce(options)).reason,
+    "attempt-expired-thread-active",
+  );
+  attempt = { ...attempt, status: "started" };
   directReadable = false;
   assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "started-thread-missing");
   assert.equal(attempt.missingSince, "2026-09-03T00:02:00.000Z");
