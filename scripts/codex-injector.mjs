@@ -22,6 +22,7 @@ import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
   coordinatorProvisioningInspectionDiagnosticReason,
+  coordinatorProvisioningThreadReadData,
   coordinatorProvisioningThreadListData,
   findCoordinatorProvisioningThreadAcrossPages,
   coordinatorThreadSelectionConfirmed,
@@ -34,6 +35,7 @@ import {
   deliverTaskboardOwnerIntent,
   findResidentInjectorPids,
   handleHostBindingPayload,
+  isExactCoordinatorThreadNotLoadedError,
   loadResidentCoordinatorMonitorProjects,
   reconcileInjectionRuntime,
   restartResidentInjector,
@@ -2906,6 +2908,17 @@ async function runBackgroundContinuationMonitor(cdp) {
           ),
           inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
           requestAttempt: requestCoordinatorProvisioningAttempt,
+          readThread: async (attempt) => {
+            try {
+              return coordinatorProvisioningThreadReadData(await requestCodexAppServerViaCdp(
+                cdp, undefined, attempt.codexHostId, "thread/read",
+                { threadId: attempt.threadId, includeTurns: false }, 10_000,
+              ));
+            } catch (error) {
+              if (isExactCoordinatorThreadNotLoadedError(error, attempt.threadId)) return null;
+              throw error;
+            }
+          },
           findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
           findArchivedThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt, true),
           markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(

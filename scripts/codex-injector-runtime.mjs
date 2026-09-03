@@ -124,6 +124,20 @@ export function coordinatorProvisioningThreadListData(result) {
   return result.data;
 }
 
+export function isExactCoordinatorThreadNotLoadedError(error, threadId) {
+  return typeof threadId === "string"
+    && threadId.length > 0
+    && (error instanceof Error ? error.message : String(error)) === `thread not loaded: ${threadId}`;
+}
+
+export function coordinatorProvisioningThreadReadData(result) {
+  if (!result || typeof result !== "object"
+    || !result.thread || typeof result.thread !== "object" || Array.isArray(result.thread)) {
+    throw new Error("Codex did not return one exact thread object");
+  }
+  return result.thread;
+}
+
 const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [
   "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
   "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
@@ -694,9 +708,28 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     return { provisioned: attempt.status === "completed", reason: `attempt-${attempt.status}`, attemptId: attempt.id };
   }
 
-  let thread = await options.findThread(attempt);
+  let thread = null;
+  let archivedThreadChecked = false;
+  let exactThreadArchived = false;
+  if (attempt.threadId && typeof options.readThread === "function") {
+    const directThread = await options.readThread(attempt);
+    if (directThread) {
+      if (directThread.id !== attempt.threadId
+        || directThread.threadSource !== attempt.threadSource
+        || path.resolve(directThread.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
+        return { provisioned: false, reason: "thread-binding-mismatch", attemptId: attempt.id };
+      }
+      if (typeof options.findArchivedThread === "function") {
+        const archivedThread = await options.findArchivedThread(attempt);
+        archivedThreadChecked = true;
+        exactThreadArchived = archivedThread?.id === attempt.threadId;
+      }
+      if (!exactThreadArchived) thread = directThread;
+    }
+  }
+  if (!thread && !exactThreadArchived) thread = await options.findThread(attempt);
   if (!thread && (attempt.status === "started" || recoverableExpiredThread)) {
-    if (typeof options.findArchivedThread === "function") {
+    if (!archivedThreadChecked && typeof options.findArchivedThread === "function") {
       await options.findArchivedThread(attempt);
     }
     if (typeof options.observeMissingAttempt !== "function") {

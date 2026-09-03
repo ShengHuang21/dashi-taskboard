@@ -6,6 +6,7 @@ import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
   coordinatorProvisioningInspectionDiagnosticReason,
+  coordinatorProvisioningThreadReadData,
   coordinatorProvisioningThreadListData,
   coordinatorProvisioningThreadListParams,
   coordinatorThreadSelectionConfirmed,
@@ -18,6 +19,7 @@ import {
   findCoordinatorProvisioningThreadAcrossPages,
   findResidentInjectorPids,
   handleHostBindingPayload,
+  isExactCoordinatorThreadNotLoadedError,
   loadResidentCoordinatorMonitorProjects,
   observeTaskboardOwnerDecision,
   observeTaskboardOwnerIntentCapture,
@@ -138,6 +140,34 @@ test("Coordinator provisioning rejects an unauthenticated thread list shape", ()
   }
   const threads = [{ id: coordinatorThreadId }];
   assert.equal(coordinatorProvisioningThreadListData({ data: threads }), threads);
+});
+
+test("Coordinator provisioning recognizes only its exact thread-not-loaded error", () => {
+  const threadId = "01a06791-4dc0-7373-bbee-d7582187ea28";
+  assert.equal(
+    isExactCoordinatorThreadNotLoadedError(new Error(`thread not loaded: ${threadId}`), threadId),
+    true,
+  );
+  assert.equal(
+    isExactCoordinatorThreadNotLoadedError(new Error("Codex App Server request timed out"), threadId),
+    false,
+  );
+  assert.equal(
+    isExactCoordinatorThreadNotLoadedError(
+      new Error("thread not loaded: 01a00000-0000-7000-8000-000000000000"), threadId,
+    ),
+    false,
+  );
+  const thread = { id: threadId };
+  assert.equal(coordinatorProvisioningThreadReadData({ thread }), thread);
+  assert.throws(
+    () => coordinatorProvisioningThreadReadData({}),
+    /did not return one exact thread object/,
+  );
+  assert.throws(
+    () => coordinatorProvisioningThreadReadData({ thread: [] }),
+    /did not return one exact thread object/,
+  );
 });
 
 test("Coordinator provisioning searches every authenticated app-server thread source", () => {
@@ -1360,6 +1390,9 @@ test("Coordinator provisioning clears a transient missing observation when the o
   };
   let currentTime = Date.parse("2026-09-03T00:00:00.000Z");
   let active = false;
+  let directReadable = false;
+  let directError = new Error("Codex App Server request timed out");
+  let listReads = 0;
   let starts = 0;
   let resets = 0;
   const options = {
@@ -1385,7 +1418,14 @@ test("Coordinator provisioning clears a transient missing observation when the o
       idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
     ),
     requestAttempt: async () => assert.fail("the same durable attempt must be reused"),
-    findThread: async () => (active ? activeThread : null),
+    readThread: async () => {
+      if (directError) throw directError;
+      return directReadable ? activeThread : null;
+    },
+    findThread: async () => {
+      listReads += 1;
+      return active ? activeThread : null;
+    },
     findArchivedThread: async () => null,
     observeMissingAttempt: async () => {
       attempt = { ...attempt, missingSince: attempt.missingSince ?? new Date(currentTime).toISOString() };
@@ -1405,13 +1445,32 @@ test("Coordinator provisioning clears a transient missing observation when the o
     startThread: async () => { starts += 1; return { thread: activeThread }; },
   };
 
+  await assert.rejects(() => runCoordinatorProvisioningMonitorOnce(options), /timed out/);
+  assert.equal(listReads, 0);
+  assert.equal(attempt.missingSince, null);
+  assert.equal(resets, 0);
+  assert.equal(starts, 0);
+  try {
+    coordinatorProvisioningThreadReadData({});
+  } catch (error) {
+    directError = error;
+  }
+  await assert.rejects(
+    () => runCoordinatorProvisioningMonitorOnce(options),
+    /did not return one exact thread object/,
+  );
+  assert.equal(listReads, 0);
+  assert.equal(attempt.missingSince, null);
+  assert.equal(resets, 0);
+  assert.equal(starts, 0);
+  directError = null;
   assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "started-thread-missing");
   assert.equal(attempt.missingSince, "2026-09-03T00:00:00.000Z");
   currentTime += 120_000;
-  active = true;
+  directReadable = true;
   assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "thread-started");
   assert.equal(attempt.missingSince, null);
-  active = false;
+  directReadable = false;
   assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "started-thread-missing");
   assert.equal(attempt.missingSince, "2026-09-03T00:02:00.000Z");
   assert.equal(resets, 0);
