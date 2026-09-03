@@ -20,6 +20,7 @@ const MODEL_CAPACITY_RETRY_BASE_MS = 15_000;
 const MODEL_CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 const COORDINATION_IDENTITY_HANDSHAKE_TTL_MS = 2 * 60_000;
 const COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS = 10 * 60_000;
+const COORDINATOR_PROVISIONING_MISSING_THREAD_GRACE_MS = 60_000;
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -129,6 +130,7 @@ function coordinatorProvisioningAttemptFromRow(row) {
     status: row.status,
     threadId: row.thread_id,
     retryCount: row.retry_count,
+    missingSince: row.missing_since ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     expiresAt: row.expires_at,
@@ -1482,6 +1484,7 @@ export class TaskboardDatabase {
         status TEXT NOT NULL CHECK (status IN ('pending', 'starting', 'started', 'completed', 'expired', 'canceled')),
         thread_id TEXT,
         retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+        missing_since TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         expires_at TEXT NOT NULL,
@@ -1952,6 +1955,13 @@ export class TaskboardDatabase {
     const projectColumns = this.#prepare("PRAGMA table_info(projects)").all();
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
+    }
+
+    const coordinatorProvisioningColumns = this.#prepare(
+      "PRAGMA table_info(agent_coordinator_provisioning_attempts)",
+    ).all();
+    if (!coordinatorProvisioningColumns.some((column) => column.name === "missing_since")) {
+      this.database.exec("ALTER TABLE agent_coordinator_provisioning_attempts ADD COLUMN missing_since TEXT");
     }
 
     const ownerDecisionDeliveryColumns = this.#prepare(
@@ -3779,17 +3789,90 @@ export class TaskboardDatabase {
         nextStatus = "pending";
         retryCount += 1;
         expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
+      } else if (["observe-missing", "reset-missing"].includes(action)) {
+        const config = JSON.parse(project.config_json);
+        const tasks = Array.isArray(config?.tasks) ? config.tasks : [];
+        const ownerRoot = tasks.find((task) => task?.id === config?.ownerRootTaskId) ?? null;
+        const coordinatorTasks = tasks.filter((task) => task?.source === "codex"
+          && task?.taskType === "root_task" && task.id !== ownerRoot?.id);
+        const exactOwner = isValidCoordinatorProvisioningOwnerRoot(ownerRoot)
+          && ownerRoot.id === row.owner_root_task_id
+          && ownerRoot.threadId === row.owner_root_thread_id
+          && ownerRoot.codexProjectId === row.codex_project_id
+          && ownerRoot.codexProjectKind === row.codex_project_kind
+          && ownerRoot.codexHostId === row.codex_host_id
+          && path.resolve(ownerRoot.workspacePath) === path.resolve(row.workspace_path);
+        if (row.status !== "started"
+          || !row.thread_id
+          || !exactOwner
+          || coordinatorTasks.length > 0
+          || this.#exactActiveCoordinatorLease(row.project_id, config, config?.coordinatorLease ?? null)
+          || this.getAgentLaneCoordinatorShutdownAttempt(row.project_id)
+          || !this.hasAgentLaneCoordinatorDurableWork(row.project_id, {
+            includeCoordinatorProvisioning: false,
+          })) {
+          throw new ApiError(
+            409,
+            "COORDINATOR_PROVISIONING_MISSING_RESET_CONFLICT",
+            "Missing-thread retry requires the exact unassigned safe preflight",
+          );
+        }
+        if (action === "observe-missing") {
+          const timestamp = now();
+          if (!row.missing_since) {
+            this.#prepare(`
+              UPDATE agent_coordinator_provisioning_attempts
+              SET missing_since = ?, updated_at = ? WHERE id = ?
+            `).run(timestamp, timestamp, attemptId);
+          }
+          this.database.exec("COMMIT");
+          return { attempt: coordinatorProvisioningAttemptFromRow({
+            ...row,
+            missing_since: row.missing_since ?? timestamp,
+            updated_at: row.missing_since ? row.updated_at : timestamp,
+          }) };
+        }
+        const missingSince = Date.parse(row.missing_since ?? "");
+        if (!Number.isFinite(missingSince)
+          || Date.now() - missingSince < COORDINATOR_PROVISIONING_MISSING_THREAD_GRACE_MS) {
+          throw new ApiError(
+            409,
+            "COORDINATOR_PROVISIONING_MISSING_GRACE_ACTIVE",
+            "Missing-thread retry requires a continuous missing observation through the grace period",
+          );
+        }
+        nextStatus = "pending";
+        threadId = null;
+        retryCount += 1;
+        expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
+      } else if (action === "clear-missing") {
+        if (row.status !== "started" || !row.thread_id) {
+          throw new ApiError(409, "COORDINATOR_PROVISIONING_STATE_CONFLICT", "Only a started attempt can clear missing-thread evidence");
+        }
+        const timestamp = now();
+        if (row.missing_since) {
+          this.#prepare(`
+            UPDATE agent_coordinator_provisioning_attempts
+            SET missing_since = NULL, updated_at = ? WHERE id = ?
+          `).run(timestamp, attemptId);
+        }
+        this.database.exec("COMMIT");
+        return { attempt: coordinatorProvisioningAttemptFromRow({
+          ...row, missing_since: null, updated_at: row.missing_since ? timestamp : row.updated_at,
+        }) };
       } else {
         throw new ApiError(400, "INVALID_FIELD", "Unknown replacement provisioning transition");
       }
       const timestamp = now();
       this.#prepare(`
         UPDATE agent_coordinator_provisioning_attempts
-        SET status = ?, thread_id = ?, retry_count = ?, updated_at = ?, expires_at = ? WHERE id = ?
+        SET status = ?, thread_id = ?, retry_count = ?, missing_since = NULL,
+            updated_at = ?, expires_at = ? WHERE id = ?
       `).run(nextStatus, threadId, retryCount, timestamp, expiresAt, attemptId);
       this.database.exec("COMMIT");
       return { attempt: coordinatorProvisioningAttemptFromRow({
         ...row, status: nextStatus, thread_id: threadId, retry_count: retryCount,
+        missing_since: null,
         updated_at: timestamp, expires_at: expiresAt,
       }) };
     } catch (error) {

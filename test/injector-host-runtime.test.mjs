@@ -15,6 +15,7 @@ import {
   deliverTaskboardCrossDomainHandoff,
   deliverTaskboardOwnerDecision,
   deliverTaskboardOwnerIntent,
+  findCoordinatorProvisioningThreadAcrossPages,
   findResidentInjectorPids,
   handleHostBindingPayload,
   loadResidentCoordinatorMonitorProjects,
@@ -995,6 +996,8 @@ test("Coordinator provisioning rebinds the same active attempt after safe window
     },
     startThread: async (settings) => {
       starts += 1;
+      assert.equal(settings.approvalPolicy, "never");
+      assert.equal(settings.approvalsReviewer, undefined);
       return { thread: {
         id: "01a09999-a749-7b53-81e2-af2d477f93ae",
         cwd: settings.cwd,
@@ -1202,6 +1205,219 @@ test("Coordinator provisioning retries selected-model capacity on the same attem
   assert.equal(uncertain.starts, 1);
   assert.equal(uncertain.resets, 0);
   assert.equal(uncertain.attempt.status, "starting");
+});
+
+test("Coordinator provisioning safely resets a confirmed missing started thread and starts one replacement", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const revision = "9".repeat(64);
+  let attempt = {
+    id: "attempt-missing-thread", projectId: "capstone-dev",
+    idempotencyKey: "older-revision-key", taskId: "coordinator-capstone-dev-stable",
+    label: "Taskboard Execution Coordinator",
+    threadSource: "taskboard-coordinator-provision-stable",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+    ownerRootTaskId: owner.taskId, ownerRootThreadId: owner.threadId,
+    codexProjectId: owner.codexProjectId, codexProjectKind: owner.codexProjectKind,
+    codexHostId: owner.codexHostId, workspacePath: owner.workspacePath,
+    status: "started", threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+    updatedAt: "2026-09-02T00:00:00.000Z", missingSince: null,
+  };
+  let missingResets = 0;
+  let missingObservations = 0;
+  let missingClears = 0;
+  let starts = 0;
+  let currentTime = Date.parse("2026-09-03T00:00:30.000Z");
+  const options = {
+    policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
+    now: () => currentTime,
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+        ownerRootRoute: {
+          rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+        },
+        lease: null,
+      },
+      taskLanes: [{ id: owner.taskId, ...owner }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision, ownerRootTaskId: owner.taskId,
+      coordinatorLease: null, windows: [{ ...owner, role: "owner_root" }],
+    }),
+    getAttempt: async ({ idempotencyKey }) => (
+      idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
+    ),
+    requestAttempt: async () => assert.fail("the same durable attempt must be reused"),
+    findThread: async () => null,
+    findArchivedThread: async () => null,
+    observeMissingAttempt: async ({ attemptId }) => {
+      assert.equal(attemptId, attempt.id);
+      missingObservations += 1;
+      attempt = {
+        ...attempt,
+        missingSince: attempt.missingSince
+          ?? new Date(currentTime).toISOString(),
+      };
+      return { attempt: { ...attempt } };
+    },
+    clearMissingAttempt: async ({ attemptId }) => {
+      assert.equal(attemptId, attempt.id);
+      missingClears += 1;
+      attempt = { ...attempt, missingSince: null };
+      return { attempt: { ...attempt } };
+    },
+    resetMissingAttempt: async ({ attemptId }) => {
+      assert.equal(attemptId, attempt.id);
+      missingResets += 1;
+      attempt = { ...attempt, status: "pending", threadId: null, retryCount: 1 };
+      return { attempt: { ...attempt } };
+    },
+    markStarting: async () => {
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      starts += 1;
+      return { thread: {
+        id: "01a08888-a749-7b53-81e2-af2d477f93ae",
+        cwd: settings.cwd, threadSource: settings.threadSource,
+      } };
+    },
+    attachThread: async ({ threadId }) => {
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => ({ delivery: "started", turnId: "turn-1" }),
+  };
+
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: false, reason: "started-thread-missing", attemptId: attempt.id,
+  });
+  assert.equal(missingResets, 0);
+  assert.equal(starts, 0);
+  assert.equal(missingObservations, 1);
+  assert.equal(attempt.missingSince, "2026-09-03T00:00:30.000Z");
+  currentTime = Date.parse("2026-09-03T00:02:00.000Z");
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: false, reason: "missing-thread-reset", attemptId: attempt.id,
+  });
+  assert.equal(missingResets, 1);
+  assert.equal(starts, 0);
+  assert.deepEqual(await runCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: true, reason: "thread-started", attemptId: attempt.id,
+  });
+  assert.equal(missingResets, 1);
+  assert.equal(starts, 1);
+  assert.equal(missingClears, 0);
+});
+
+test("Coordinator provisioning clears a transient missing observation when the old thread reappears", async () => {
+  const owner = {
+    taskId: "owner-root", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const revision = "9".repeat(64);
+  const activeThread = {
+    id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+    cwd: owner.workspacePath,
+    threadSource: "taskboard-coordinator-provision-stable",
+  };
+  let attempt = {
+    id: "attempt-transient-missing", projectId: "capstone-dev",
+    idempotencyKey: "older-revision-key", taskId: "coordinator-capstone-dev-stable",
+    label: "Taskboard Execution Coordinator", threadSource: activeThread.threadSource,
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+    ownerRootTaskId: owner.taskId, ownerRootThreadId: owner.threadId,
+    codexProjectId: owner.codexProjectId, codexProjectKind: owner.codexProjectKind,
+    codexHostId: owner.codexHostId, workspacePath: owner.workspacePath,
+    status: "started", threadId: activeThread.id,
+    updatedAt: "2026-09-02T00:00:00.000Z", missingSince: null,
+  };
+  let currentTime = Date.parse("2026-09-03T00:00:00.000Z");
+  let active = false;
+  let starts = 0;
+  let resets = 0;
+  const options = {
+    policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
+    now: () => currentTime,
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+        ownerRootRoute: {
+          rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+        },
+        lease: null,
+      },
+      taskLanes: [{ id: owner.taskId, ...owner }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision, ownerRootTaskId: owner.taskId,
+      coordinatorLease: null, windows: [{ ...owner, role: "owner_root" }],
+    }),
+    getAttempt: async ({ idempotencyKey }) => (
+      idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
+    ),
+    requestAttempt: async () => assert.fail("the same durable attempt must be reused"),
+    findThread: async () => (active ? activeThread : null),
+    findArchivedThread: async () => null,
+    observeMissingAttempt: async () => {
+      attempt = { ...attempt, missingSince: attempt.missingSince ?? new Date(currentTime).toISOString() };
+      return { attempt: { ...attempt } };
+    },
+    clearMissingAttempt: async () => {
+      attempt = { ...attempt, missingSince: null };
+      return { attempt: { ...attempt } };
+    },
+    resetMissingAttempt: async () => {
+      resets += 1;
+      return { attempt: { ...attempt } };
+    },
+    markStarting: async () => assert.fail("an attached thread must not start again"),
+    attachThread: async () => ({ attempt: { ...attempt } }),
+    deliverInstruction: async () => ({ delivery: "already-delivered", turnId: "turn-1" }),
+    startThread: async () => { starts += 1; return { thread: activeThread }; },
+  };
+
+  assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "started-thread-missing");
+  assert.equal(attempt.missingSince, "2026-09-03T00:00:00.000Z");
+  currentTime += 120_000;
+  active = true;
+  assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "thread-started");
+  assert.equal(attempt.missingSince, null);
+  active = false;
+  assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "started-thread-missing");
+  assert.equal(attempt.missingSince, "2026-09-03T00:02:00.000Z");
+  assert.equal(resets, 0);
+  assert.equal(starts, 0);
+});
+
+test("Coordinator provisioning thread lookup fails closed when pagination is not exhausted", async () => {
+  let pages = 0;
+  await assert.rejects(
+    () => findCoordinatorProvisioningThreadAcrossPages({
+      attempt: {
+        threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+        threadSource: "taskboard-coordinator-provision-stable",
+        workspacePath: "/tmp/taskboard",
+      },
+      archived: false,
+      listPage: async () => {
+        pages += 1;
+        return { data: [], nextCursor: `page-${pages + 1}` };
+      },
+    }),
+    /pagination was not exhausted/,
+  );
+  assert.equal(pages, 10);
 });
 
 test("Coordinator provisioning performs zero mutation when a lease or Coordinator window exists", async () => {

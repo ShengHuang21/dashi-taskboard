@@ -23,7 +23,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadListData,
-  coordinatorProvisioningThreadListParams,
+  findCoordinatorProvisioningThreadAcrossPages,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
@@ -37,7 +37,6 @@ import {
   loadResidentCoordinatorMonitorProjects,
   reconcileInjectionRuntime,
   restartResidentInjector,
-  selectCoordinatorProvisioningThread,
   observeTaskboardOwnerDecision,
   observeTaskboardOwnerIntentCapture,
   observeTaskboardOwnerIntentPlan,
@@ -2168,25 +2167,19 @@ async function transitionCoordinatorProvisioningAttempt(attemptId, action, body 
   return mutateCoordinatorProvisioning(pathname, body);
 }
 
-async function findCoordinatorProvisioningThread(cdp, attempt) {
-  let cursor = null;
-  const threads = [];
-  for (let page = 0; page < 10; page += 1) {
-    const result = await requestCodexAppServerViaCdp(
+async function findCoordinatorProvisioningThread(cdp, attempt, archived = false) {
+  return findCoordinatorProvisioningThreadAcrossPages({
+    attempt,
+    archived,
+    listPage: (params) => requestCodexAppServerViaCdp(
       cdp,
       undefined,
       attempt.codexHostId,
       "thread/list",
-      coordinatorProvisioningThreadListParams(attempt, false, cursor),
+      params,
       10_000,
-    );
-    threads.push(...coordinatorProvisioningThreadListData(result));
-    cursor = typeof result?.nextCursor === "string" && result.nextCursor
-      ? result.nextCursor
-      : null;
-    if (!cursor) break;
-  }
-  return selectCoordinatorProvisioningThread(attempt, threads);
+    ),
+  });
 }
 
 async function readDefaultCoordinatorModel(cdp, route) {
@@ -2914,6 +2907,7 @@ async function runBackgroundContinuationMonitor(cdp) {
           inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
           requestAttempt: requestCoordinatorProvisioningAttempt,
           findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
+          findArchivedThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt, true),
           markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
             attemptId, "starting",
           ),
@@ -2925,6 +2919,15 @@ async function runBackgroundContinuationMonitor(cdp) {
           ),
           resetAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
             attemptId, "reset",
+          ),
+          resetMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "reset-missing",
+          ),
+          observeMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "observe-missing",
+          ),
+          clearMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "clear-missing",
           ),
           deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
             cdp, attempt, threadId, projectId,

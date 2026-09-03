@@ -128,6 +128,7 @@ const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [
   "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
   "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
 ];
+const COORDINATOR_PROVISIONING_MISSING_THREAD_GRACE_MS = 60_000;
 
 export function coordinatorProvisioningThreadListParams(attempt, archived, cursor = null) {
   return {
@@ -157,6 +158,24 @@ export function selectCoordinatorProvisioningThread(attempt, threads) {
     throw new Error("Codex returned duplicate threads for one Coordinator provisioning marker");
   }
   return candidates[0] ?? null;
+}
+
+export async function findCoordinatorProvisioningThreadAcrossPages({
+  attempt, archived = false, listPage, maxPages = 10,
+}) {
+  let cursor = null;
+  const threads = [];
+  for (let page = 0; page < maxPages; page += 1) {
+    const result = await listPage(coordinatorProvisioningThreadListParams(
+      attempt, archived, cursor,
+    ));
+    threads.push(...coordinatorProvisioningThreadListData(result));
+    cursor = typeof result?.nextCursor === "string" && result.nextCursor
+      ? result.nextCursor
+      : null;
+    if (!cursor) return selectCoordinatorProvisioningThread(attempt, threads);
+  }
+  throw new Error("Codex thread list pagination was not exhausted");
 }
 
 export function selectResidentCoordinatorMonitorProjects({
@@ -675,7 +694,29 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
 
   let thread = await options.findThread(attempt);
   if (!thread && attempt.status === "started") {
-    return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
+    if (typeof options.findArchivedThread === "function") {
+      await options.findArchivedThread(attempt);
+    }
+    if (typeof options.observeMissingAttempt !== "function") {
+      return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
+    }
+    const observed = await options.observeMissingAttempt({ attemptId: attempt.id });
+    attempt = observed?.attempt ?? attempt;
+    const missingSince = Date.parse(attempt.missingSince ?? "");
+    const currentTime = typeof options.now === "function" ? options.now() : Date.now();
+    if (!Number.isFinite(missingSince)
+      || currentTime - missingSince < COORDINATOR_PROVISIONING_MISSING_THREAD_GRACE_MS
+      || typeof options.resetMissingAttempt !== "function") {
+      return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
+    }
+    const reset = await options.resetMissingAttempt({ attemptId: attempt.id });
+    const resetAttempt = reset?.attempt ?? null;
+    if (resetAttempt?.id !== attempt.id
+      || resetAttempt.status !== "pending"
+      || resetAttempt.threadId !== null) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
+    return { provisioned: false, reason: "missing-thread-reset", attemptId: attempt.id };
   }
   if (!thread && attempt.status === "starting") {
     return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
@@ -690,8 +731,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
         runtimeWorkspaceRoots: [attempt.workspacePath],
         model: attempt.model,
         config: { model_reasoning_effort: attempt.reasoningEffort },
-        approvalPolicy: "on-request",
-        approvalsReviewer: "auto_review",
+        approvalPolicy: "never",
         sandbox: "workspace-write",
         threadSource: attempt.threadSource,
       });
@@ -708,6 +748,16 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || thread.threadSource !== attempt.threadSource
     || path.resolve(thread?.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
     return { provisioned: false, reason: "thread-binding-mismatch", attemptId: attempt.id };
+  }
+  if (attempt.status === "started" && attempt.missingSince) {
+    if (typeof options.clearMissingAttempt !== "function") {
+      return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
+    }
+    const cleared = await options.clearMissingAttempt({ attemptId: attempt.id });
+    attempt = cleared?.attempt ?? attempt;
+    if (attempt.missingSince) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
   }
   if (attempt.threadId !== thread.id || attempt.status !== "started") {
     result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });

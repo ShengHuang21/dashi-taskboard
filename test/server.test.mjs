@@ -3595,6 +3595,106 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(repeatedAttach.response.status, 200);
   assert.equal(repeatedAttach.body.attempt.threadId, attachBody.threadId);
 
+  const observeMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/observe-missing`;
+  const observedMissing = await request(baseUrl, observeMissingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b1".repeat(16), observeMissingPath, {}),
+    body: {},
+  });
+  assert.equal(observedMissing.response.status, 200, JSON.stringify(observedMissing.body));
+  assert.ok(Date.parse(observedMissing.body.attempt.missingSince));
+  const observedMissingAgain = await request(baseUrl, observeMissingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b2".repeat(16), observeMissingPath, {}),
+    body: {},
+  });
+  assert.equal(observedMissingAgain.response.status, 200, JSON.stringify(observedMissingAgain.body));
+  assert.equal(
+    observedMissingAgain.body.attempt.missingSince,
+    observedMissing.body.attempt.missingSince,
+  );
+
+  const missingResetPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/reset-missing`;
+  const unprotectedMissingReset = await request(baseUrl, missingResetPath, {
+    method: "POST", body: {},
+  });
+  assert.equal(unprotectedMissingReset.response.status, 403);
+  const earlyMissingReset = await request(baseUrl, missingResetPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b3".repeat(16), missingResetPath, {}),
+    body: {},
+  });
+  assert.equal(earlyMissingReset.response.status, 409);
+  assert.equal(
+    earlyMissingReset.body.error.code,
+    "COORDINATOR_PROVISIONING_MISSING_GRACE_ACTIVE",
+  );
+  const clearMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/clear-missing`;
+  const clearedMissing = await request(baseUrl, clearMissingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b4".repeat(16), clearMissingPath, {}),
+    body: {},
+  });
+  assert.equal(clearedMissing.response.status, 200, JSON.stringify(clearedMissing.body));
+  assert.equal(clearedMissing.body.attempt.missingSince, null);
+  const reobservedMissing = await request(baseUrl, observeMissingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b5".repeat(16), observeMissingPath, {}),
+    body: {},
+  });
+  assert.equal(reobservedMissing.response.status, 200, JSON.stringify(reobservedMissing.body));
+  assert.notEqual(
+    reobservedMissing.body.attempt.missingSince,
+    observedMissing.body.attempt.missingSince,
+  );
+  const missingNoWorkInspection = new DatabaseSync(databasePath);
+  missingNoWorkInspection.prepare(
+    "UPDATE tasks SET status = 'in_review' WHERE project_id = 'local'",
+  ).run();
+  missingNoWorkInspection.close();
+  const missingNoWorkReset = await request(baseUrl, missingResetPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ac".repeat(16), missingResetPath, {}),
+    body: {},
+  });
+  assert.equal(missingNoWorkReset.response.status, 409);
+  assert.equal(
+    missingNoWorkReset.body.error.code,
+    "COORDINATOR_PROVISIONING_MISSING_RESET_CONFLICT",
+  );
+  const restoreMissingWorkInspection = new DatabaseSync(databasePath);
+  restoreMissingWorkInspection.prepare(
+    "UPDATE tasks SET status = 'todo' WHERE project_id = 'local'",
+  ).run();
+  restoreMissingWorkInspection.prepare(`
+    UPDATE agent_coordinator_provisioning_attempts
+    SET missing_since = ? WHERE id = ?
+  `).run(new Date(Date.now() - 61_000).toISOString(), created.body.attempt.id);
+  restoreMissingWorkInspection.close();
+  const missingReset = await request(baseUrl, missingResetPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ab".repeat(16), missingResetPath, {}),
+    body: {},
+  });
+  assert.equal(missingReset.response.status, 200, JSON.stringify(missingReset.body));
+  assert.equal(missingReset.body.attempt.status, "pending");
+  assert.equal(missingReset.body.attempt.threadId, null);
+  assert.equal(missingReset.body.attempt.retryCount, 2);
+  const missingRestart = await request(baseUrl, startingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "cd".repeat(16), startingPath, {}),
+    body: {},
+  });
+  assert.equal(missingRestart.response.status, 200, JSON.stringify(missingRestart.body));
+  const missingReattach = await request(baseUrl, attachPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ef".repeat(16), attachPath, attachBody),
+    body: attachBody,
+  });
+  assert.equal(missingReattach.response.status, 200, JSON.stringify(missingReattach.body));
+  assert.equal(missingReattach.body.attempt.status, "started");
+  assert.equal(missingReattach.body.attempt.threadId, attachBody.threadId);
+
   await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
