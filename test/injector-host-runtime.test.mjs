@@ -7,6 +7,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadListData,
+  coordinatorProvisioningThreadListParams,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
@@ -34,6 +35,7 @@ import {
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
+  selectCoordinatorProvisioningThread,
   selectResidentCoordinatorMonitorProjects,
   selectLaunchCoordinatorRoute,
 } from "../scripts/codex-injector-runtime.mjs";
@@ -135,6 +137,48 @@ test("Coordinator provisioning rejects an unauthenticated thread list shape", ()
   }
   const threads = [{ id: coordinatorThreadId }];
   assert.equal(coordinatorProvisioningThreadListData({ data: threads }), threads);
+});
+
+test("Coordinator provisioning searches every authenticated app-server thread source", () => {
+  const attempt = {
+    threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+    workspacePath: "/tmp/taskboard",
+  };
+  assert.deepEqual(coordinatorProvisioningThreadListParams(attempt, false), {
+    cwd: attempt.workspacePath,
+    archived: false,
+    limit: 100,
+    sourceKinds: [
+      "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+      "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+    ],
+  });
+  assert.deepEqual(coordinatorProvisioningThreadListParams(attempt, true, "next"), {
+    cwd: attempt.workspacePath,
+    archived: true,
+    limit: 100,
+    sourceKinds: [
+      "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+      "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+    ],
+    cursor: "next",
+  });
+});
+
+test("Coordinator provisioning selects only the exact active thread bound to a started attempt", () => {
+  const attempt = {
+    threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+    threadSource: "taskboard-coordinator-provision-stable",
+    workspacePath: "/tmp/taskboard",
+  };
+  const exact = {
+    id: attempt.threadId, threadSource: attempt.threadSource, cwd: attempt.workspacePath,
+  };
+  assert.equal(selectCoordinatorProvisioningThread(attempt, [exact]), exact);
+  assert.equal(selectCoordinatorProvisioningThread(attempt, []), null);
+  assert.throws(() => selectCoordinatorProvisioningThread(attempt, [{
+    ...exact, id: "01a08888-a749-7b53-81e2-af2d477f93ae",
+  }]), /conflicting threads/);
 });
 
 test("Coordinator provisioning inspection diagnostics allow only finite reasons", () => {
@@ -870,6 +914,191 @@ test("resident Coordinator provisioning persists one attempt before starting exa
   assert.equal(deliveryCalls, 2);
   assert.equal(modelReads, 1);
   assert.equal(attempt.threadId, "01a062c1-fd2b-7f61-9114-d483e695640e");
+});
+
+test("Coordinator provisioning rebinds the same active attempt after safe window revision drift", async () => {
+  const owner = {
+    taskId: "owner-root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  const currentRevision = "b".repeat(64);
+  let attempt = {
+    id: "attempt-rebind",
+    projectId: "capstone-dev",
+    idempotencyKey: "older-revision-key",
+    taskId: "coordinator-capstone-dev-stable",
+    label: "Taskboard Execution Coordinator",
+    threadSource: "taskboard-coordinator-provision-stable",
+    model: "gpt-5",
+    reasoningEffort: "high",
+    expectedRevision: "a".repeat(64),
+    ownerRootTaskId: owner.taskId,
+    ownerRootThreadId: owner.threadId,
+    codexProjectId: owner.codexProjectId,
+    codexProjectKind: owner.codexProjectKind,
+    codexHostId: owner.codexHostId,
+    workspacePath: owner.workspacePath,
+    status: "pending",
+    threadId: null,
+  };
+  let exactLookups = 0;
+  let fallbackLookups = 0;
+  let rebinds = 0;
+  let starts = 0;
+  let loseRebindResponse = true;
+  const options = {
+    policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+        ownerRootRoute: {
+          rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+        },
+        lease: null,
+      },
+      taskLanes: [{ id: owner.taskId, ...owner }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision: currentRevision, ownerRootTaskId: owner.taskId,
+      coordinatorLease: null, windows: [{ ...owner, role: "owner_root" }],
+    }),
+    getAttempt: async ({ idempotencyKey }) => {
+      if (idempotencyKey) {
+        exactLookups += 1;
+        return { attempt: null };
+      }
+      fallbackLookups += 1;
+      return { attempt: { ...attempt } };
+    },
+    requestAttempt: async () => assert.fail("the existing durable attempt must be reused"),
+    rebindAttempt: async ({ attemptId, expectedRevision }) => {
+      rebinds += 1;
+      assert.equal(attemptId, attempt.id);
+      assert.equal(expectedRevision, currentRevision);
+      attempt = { ...attempt, expectedRevision };
+      if (loseRebindResponse) {
+        loseRebindResponse = false;
+        throw new Error("simulated rebind response loss");
+      }
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => null,
+    markStarting: async () => {
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      starts += 1;
+      return { thread: {
+        id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+        cwd: settings.cwd,
+        threadSource: settings.threadSource,
+      } };
+    },
+    attachThread: async ({ threadId }) => {
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => ({ delivery: "started", turnId: "turn-1" }),
+  };
+
+  await assert.rejects(
+    runCoordinatorProvisioningMonitorOnce(options),
+    /simulated rebind response loss/,
+  );
+  assert.equal(starts, 0);
+  const result = await runCoordinatorProvisioningMonitorOnce(options);
+
+  assert.deepEqual(result, {
+    provisioned: true, reason: "thread-started", attemptId: attempt.id,
+  });
+  assert.equal(exactLookups, 2);
+  assert.equal(fallbackLookups, 2);
+  assert.equal(rebinds, 1);
+  assert.equal(starts, 1);
+});
+
+test("Coordinator provisioning rejects explicit model policy drift without rebind or thread start", async () => {
+  const owner = {
+    taskId: "owner-root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/taskboard",
+  };
+  for (const policyDrift of [
+    { model: "gpt-5.1", reasoningEffort: "high" },
+    { model: "gpt-5", reasoningEffort: "medium" },
+  ]) {
+    let rebinds = 0;
+    let starts = 0;
+    const attempt = {
+      id: "attempt-policy-drift",
+      projectId: "capstone-dev",
+      idempotencyKey: "older-revision-key",
+      taskId: "coordinator-capstone-dev-stable",
+      label: "Taskboard Execution Coordinator",
+      threadSource: "taskboard-coordinator-provision-stable",
+      model: "gpt-5",
+      reasoningEffort: "high",
+      expectedRevision: "a".repeat(64),
+      ownerRootTaskId: owner.taskId,
+      ownerRootThreadId: owner.threadId,
+      codexProjectId: owner.codexProjectId,
+      codexProjectKind: owner.codexProjectKind,
+      codexHostId: owner.codexHostId,
+      workspacePath: owner.workspacePath,
+      status: "pending",
+      threadId: null,
+    };
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: { enabled: true, projectId: "capstone-dev", ...policyDrift },
+      readSnapshot: async () => ({
+        projectId: "capstone-dev",
+        coordination: {
+          assignment: "unassigned", durableWorkPending: true, ownerRootTaskId: owner.taskId,
+          ownerRootRoute: {
+            rootTaskId: owner.taskId, rootThreadId: owner.threadId,
+            codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+          },
+          lease: null,
+        },
+        taskLanes: [{ id: owner.taskId, ...owner }],
+      }),
+      readWindows: async () => ({
+        projectId: "capstone-dev", revision: "b".repeat(64), ownerRootTaskId: owner.taskId,
+        coordinatorLease: null, windows: [{ ...owner, role: "owner_root" }],
+      }),
+      getAttempt: async ({ idempotencyKey }) => (
+        idempotencyKey ? { attempt: null } : { attempt }
+      ),
+      requestAttempt: async () => assert.fail("policy drift must not create a replacement attempt"),
+      rebindAttempt: async () => {
+        rebinds += 1;
+        return { attempt };
+      },
+      findThread: async () => null,
+      markStarting: async () => assert.fail("policy drift must not advance the attempt"),
+      startThread: async () => {
+        starts += 1;
+        return null;
+      },
+      attachThread: async () => assert.fail("policy drift must not attach a thread"),
+      deliverInstruction: async () => assert.fail("policy drift must not deliver work"),
+    });
+    assert.deepEqual(result, {
+      provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id,
+    });
+    assert.equal(rebinds, 0);
+    assert.equal(starts, 0);
+  }
 });
 
 test("Coordinator provisioning retries selected-model capacity on the same attempt and fails closed on uncertainty", async () => {

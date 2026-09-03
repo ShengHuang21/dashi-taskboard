@@ -3718,6 +3718,44 @@ export class TaskboardDatabase {
       const project = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(row.project_id);
+      if (action === "rebind") {
+        const config = project ? JSON.parse(project.config_json) : null;
+        const revision = project ? agentLaneConfigRevision(project.config_json) : null;
+        const tasks = Array.isArray(config?.tasks) ? config.tasks : [];
+        const ownerRoot = tasks.find((task) => task?.id === config?.ownerRootTaskId) ?? null;
+        const coordinatorTasks = tasks.filter((task) => task?.source === "codex"
+          && task?.taskType === "root_task" && task.id !== ownerRoot?.id);
+        const exactOwner = isValidCoordinatorProvisioningOwnerRoot(ownerRoot)
+          && ownerRoot.id === row.owner_root_task_id
+          && ownerRoot.threadId === row.owner_root_thread_id
+          && ownerRoot.codexProjectId === row.codex_project_id
+          && ownerRoot.codexProjectKind === row.codex_project_kind
+          && ownerRoot.codexHostId === row.codex_host_id
+          && path.resolve(ownerRoot.workspacePath) === path.resolve(row.workspace_path);
+        if (revision !== input.expectedRevision
+          || !exactOwner
+          || coordinatorTasks.length > 0
+          || this.#exactActiveCoordinatorLease(row.project_id, config, config?.coordinatorLease ?? null)
+          || this.getAgentLaneCoordinatorShutdownAttempt(row.project_id)
+          || !this.hasAgentLaneCoordinatorDurableWork(row.project_id, {
+            includeCoordinatorProvisioning: false,
+          })) {
+          throw new ApiError(
+            409,
+            "COORDINATOR_PROVISIONING_REBIND_CONFLICT",
+            "Replacement provisioning rebind requires the exact unassigned safe preflight",
+          );
+        }
+        const timestamp = now();
+        this.#prepare(`
+          UPDATE agent_coordinator_provisioning_attempts
+          SET expected_revision = ?, updated_at = ? WHERE id = ?
+        `).run(input.expectedRevision, timestamp, attemptId);
+        this.database.exec("COMMIT");
+        return { attempt: coordinatorProvisioningAttemptFromRow({
+          ...row, expected_revision: input.expectedRevision, updated_at: timestamp,
+        }) };
+      }
       if (!project || agentLaneConfigRevision(project.config_json) !== row.expected_revision) {
         this.#prepare(`UPDATE agent_coordinator_provisioning_attempts SET status = 'canceled', updated_at = ? WHERE id = ?`)
           .run(now(), attemptId);
@@ -3760,11 +3798,11 @@ export class TaskboardDatabase {
     }
   }
 
-  hasAgentLaneCoordinatorDurableWork(projectId) {
-    return this.getAgentLaneCoordinatorDurableWorkReason(projectId) !== null;
+  hasAgentLaneCoordinatorDurableWork(projectId, options = {}) {
+    return this.getAgentLaneCoordinatorDurableWorkReason(projectId, options) !== null;
   }
 
-  getAgentLaneCoordinatorDurableWorkReason(projectId) {
+  getAgentLaneCoordinatorDurableWorkReason(projectId, options = {}) {
     const timestamp = now();
     const probes = [
       ["eligible-task", this.#prepare(`
@@ -3815,11 +3853,13 @@ export class TaskboardDatabase {
         SELECT 1 FROM cross_domain_handoff_deliveries
         WHERE project_id = ? AND state = 'reserved' AND reservation_expires_at > ? LIMIT 1
       `).get(projectId, timestamp)],
-      ["coordinator-provisioning", this.#prepare(`
-        SELECT 1 FROM agent_coordinator_provisioning_attempts
-        WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
-          AND expires_at > ? LIMIT 1
-      `).get(projectId, timestamp)],
+      ...(options.includeCoordinatorProvisioning === false ? [] : [[
+        "coordinator-provisioning", this.#prepare(`
+          SELECT 1 FROM agent_coordinator_provisioning_attempts
+          WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
+            AND expires_at > ? LIMIT 1
+        `).get(projectId, timestamp),
+      ]]),
     ];
     const matchedProbe = probes.find(([, value]) => Boolean(value));
     if (matchedProbe) return matchedProbe[0];

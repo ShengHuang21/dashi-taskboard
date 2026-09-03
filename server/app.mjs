@@ -507,10 +507,22 @@ function parseCoordinatorProvisioningRequest(value) {
 
 function parseCoordinatorProvisioningTransition(value, action) {
   assertPlainObject(value);
-  assertAllowedKeys(value, action === "attach" ? new Set(["threadId"]) : new Set());
-  return action === "attach"
-    ? { threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }) }
-    : {};
+  assertAllowedKeys(value, action === "attach"
+    ? new Set(["threadId"])
+    : action === "rebind" ? new Set(["expectedRevision"]) : new Set());
+  if (action === "attach") {
+    return { threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }) };
+  }
+  if (action === "rebind") {
+    const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
+      required: true, maxLength: 64,
+    });
+    if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+      throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+    }
+    return { expectedRevision };
+  }
+  return {};
 }
 
 function parseCoordinatorProvisioningLookup(value) {
@@ -3847,7 +3859,7 @@ export function createTaskboardServer(options = {}) {
       }
 
       const coordinatorProvisioningTransitionRoute = pathname.match(
-        /^\/api\/local\/coordinator-provisioning-attempts\/([^/]+)\/(starting|attach|reset)$/,
+        /^\/api\/local\/coordinator-provisioning-attempts\/([^/]+)\/(starting|attach|reset|rebind)$/,
       );
       if (coordinatorProvisioningTransitionRoute) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);

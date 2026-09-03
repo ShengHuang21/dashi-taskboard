@@ -23,6 +23,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadListData,
+  coordinatorProvisioningThreadListParams,
   coordinatorThreadSelectionConfirmed,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
@@ -36,6 +37,7 @@ import {
   loadResidentCoordinatorMonitorProjects,
   reconcileInjectionRuntime,
   restartResidentInjector,
+  selectCoordinatorProvisioningThread,
   observeTaskboardOwnerDecision,
   observeTaskboardOwnerIntentCapture,
   observeTaskboardOwnerIntentPlan,
@@ -2168,37 +2170,23 @@ async function transitionCoordinatorProvisioningAttempt(attemptId, action, body 
 
 async function findCoordinatorProvisioningThread(cdp, attempt) {
   let cursor = null;
-  const matches = [];
+  const threads = [];
   for (let page = 0; page < 10; page += 1) {
     const result = await requestCodexAppServerViaCdp(
       cdp,
       undefined,
       attempt.codexHostId,
       "thread/list",
-      {
-        cwd: attempt.workspacePath,
-        archived: false,
-        limit: 100,
-        ...(cursor ? { cursor } : {}),
-      },
+      coordinatorProvisioningThreadListParams(attempt, false, cursor),
       10_000,
     );
-    for (const thread of Array.isArray(result?.data) ? result.data : []) {
-      if (thread?.threadSource === attempt.threadSource
-        && typeof thread.cwd === "string"
-        && path.resolve(thread.cwd) === path.resolve(attempt.workspacePath)) {
-        matches.push(thread);
-      }
-    }
+    threads.push(...coordinatorProvisioningThreadListData(result));
     cursor = typeof result?.nextCursor === "string" && result.nextCursor
       ? result.nextCursor
       : null;
     if (!cursor) break;
   }
-  if (matches.length > 1) {
-    throw new Error("Codex returned duplicate threads for one Coordinator provisioning marker");
-  }
-  return matches[0] ?? null;
+  return selectCoordinatorProvisioningThread(attempt, threads);
 }
 
 async function readDefaultCoordinatorModel(cdp, route) {
@@ -2918,6 +2906,11 @@ async function runBackgroundContinuationMonitor(cdp) {
           readWindows: () => readCoordinatorProvisioningWindows(projectId),
           readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
           getAttempt: getCoordinatorProvisioningAttempt,
+          rebindAttempt: ({ attemptId, expectedRevision }) => (
+            transitionCoordinatorProvisioningAttempt(
+              attemptId, "rebind", { expectedRevision },
+            )
+          ),
           inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
           requestAttempt: requestCoordinatorProvisioningAttempt,
           findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),

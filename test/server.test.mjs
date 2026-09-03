@@ -3485,6 +3485,67 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(second.response.status, 409);
   assert.equal(second.body.error.code, "COORDINATOR_PROVISIONING_IN_PROGRESS");
 
+  const revisionDrift = new DatabaseSync(databasePath);
+  const configRow = revisionDrift.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get();
+  revisionDrift.prepare(
+    "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = 'local'",
+  ).run(JSON.stringify({ ...JSON.parse(configRow.config_json), reconciliationMarker: "safe-drift" }));
+  revisionDrift.close();
+  const driftedWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const rebindPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/rebind`;
+  const rebindBody = { expectedRevision: driftedWindows.body.revision };
+  const unprotectedRebind = await request(baseUrl, rebindPath, {
+    method: "POST", body: rebindBody,
+  });
+  assert.equal(unprotectedRebind.response.status, 403);
+  const staleRebindBody = { expectedRevision: windows.body.revision };
+  const staleRebind = await request(baseUrl, rebindPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "e".repeat(32), rebindPath, staleRebindBody),
+    body: staleRebindBody,
+  });
+  assert.equal(staleRebind.response.status, 409);
+  assert.equal(staleRebind.body.error.code, "COORDINATOR_PROVISIONING_REBIND_CONFLICT");
+  const unchangedAfterConflict = await request(baseUrl, lookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "f".repeat(32), lookupPath, lookupBody),
+    body: lookupBody,
+  });
+  assert.equal(unchangedAfterConflict.body.attempt.expectedRevision, windows.body.revision);
+  const noWorkInspection = new DatabaseSync(databasePath);
+  noWorkInspection.prepare(
+    "UPDATE tasks SET status = 'in_review' WHERE project_id = 'local'",
+  ).run();
+  noWorkInspection.close();
+  const selfOnlyRebind = await request(baseUrl, rebindPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "0".repeat(32), rebindPath, rebindBody),
+    body: rebindBody,
+  });
+  assert.equal(selfOnlyRebind.response.status, 409);
+  assert.equal(selfOnlyRebind.body.error.code, "COORDINATOR_PROVISIONING_REBIND_CONFLICT");
+  const restoreWorkInspection = new DatabaseSync(databasePath);
+  restoreWorkInspection.prepare(
+    "UPDATE tasks SET status = 'todo' WHERE project_id = 'local'",
+  ).run();
+  restoreWorkInspection.close();
+  const rebound = await request(baseUrl, rebindPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "c".repeat(32), rebindPath, rebindBody),
+    body: rebindBody,
+  });
+  assert.equal(rebound.response.status, 200, JSON.stringify(rebound.body));
+  assert.equal(rebound.body.attempt.id, created.body.attempt.id);
+  assert.equal(rebound.body.attempt.idempotencyKey, body.idempotencyKey);
+  assert.equal(rebound.body.attempt.threadSource, body.threadSource);
+  assert.equal(rebound.body.attempt.model, body.model);
+  assert.equal(rebound.body.attempt.expectedRevision, driftedWindows.body.revision);
+  body.expectedRevision = driftedWindows.body.revision;
+
   const startingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
   const starting = await request(baseUrl, startingPath, {
     method: "POST",

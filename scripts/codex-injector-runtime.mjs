@@ -124,6 +124,41 @@ export function coordinatorProvisioningThreadListData(result) {
   return result.data;
 }
 
+const COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS = [
+  "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+  "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+];
+
+export function coordinatorProvisioningThreadListParams(attempt, archived, cursor = null) {
+  return {
+    cwd: attempt.workspacePath,
+    archived,
+    limit: 100,
+    sourceKinds: [...COORDINATOR_PROVISIONING_THREAD_SOURCE_KINDS],
+    ...(cursor ? { cursor } : {}),
+  };
+}
+
+export function selectCoordinatorProvisioningThread(attempt, threads) {
+  const candidates = coordinatorProvisioningThreadListData({ data: threads }).filter((thread) => (
+    thread?.threadSource === attempt.threadSource
+    && typeof thread.cwd === "string"
+    && path.resolve(thread.cwd) === path.resolve(attempt.workspacePath)
+  ));
+  if (attempt.threadId) {
+    const exact = candidates.filter((thread) => thread?.id === attempt.threadId);
+    const conflicting = candidates.filter((thread) => thread?.id !== attempt.threadId);
+    if (exact.length > 1 || conflicting.length > 0) {
+      throw new Error("Codex returned conflicting threads for one Coordinator provisioning attempt");
+    }
+    return exact[0] ?? null;
+  }
+  if (candidates.length > 1) {
+    throw new Error("Codex returned duplicate threads for one Coordinator provisioning marker");
+  }
+  return candidates[0] ?? null;
+}
+
 export function selectResidentCoordinatorMonitorProjects({
   lifecycleProjectIds,
   continuationPolicyEntries,
@@ -594,7 +629,32 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     attempt = result?.attempt ?? null;
   }
   if (!attempt?.id) return { provisioned: false, reason: "attempt-unavailable" };
-  if (attempt.projectId !== policy.projectId
+  const stableAttemptBindingMismatch = attempt.projectId !== policy.projectId
+    || attempt.label !== "Taskboard Execution Coordinator"
+    || attempt.ownerRootTaskId !== ownerRootTaskId
+    || attempt.ownerRootThreadId !== ownerRoute.rootThreadId
+    || attempt.codexProjectId !== ownerLane.codexProjectId
+    || attempt.codexProjectKind !== ownerLane.codexProjectKind
+    || attempt.codexHostId !== ownerLane.codexHostId
+    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(ownerRoute.rootWorkspacePath)
+    || typeof attempt.model !== "string" || !attempt.model
+    || typeof attempt.reasoningEffort !== "string" || !attempt.reasoningEffort
+    || (typeof policy.model === "string" && policy.model && attempt.model !== policy.model)
+    || (typeof policy.reasoningEffort === "string" && policy.reasoningEffort
+      && attempt.reasoningEffort !== policy.reasoningEffort);
+  const safeRecoveredRevisionDrift = recoveredActiveAttempt
+    && retireCoordinatorWindows.length === 0
+    && !stableAttemptBindingMismatch
+    && attempt.expectedRevision !== windows.revision;
+  if (safeRecoveredRevisionDrift && typeof options.rebindAttempt === "function") {
+    result = await options.rebindAttempt({
+      attemptId: attempt.id,
+      expectedRevision: windows.revision,
+    });
+    attempt = result?.attempt ?? attempt;
+  }
+  if (stableAttemptBindingMismatch
+    || attempt.projectId !== policy.projectId
     || (!recoveredActiveAttempt && attempt.idempotencyKey !== identity.idempotencyKey)
     || (!recoveredActiveAttempt && attempt.taskId !== identity.taskId)
     || (!recoveredActiveAttempt && attempt.threadSource !== identity.threadSource)
