@@ -15,6 +15,9 @@ import {
 
 const directories = [];
 const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+const nativeDatabaseScope = path.join("server", "database.mjs");
+const nativeSnapshotScope = path.join("server", "agent-lane-snapshot.mjs");
+const nativeCoordinationTestScope = path.join("test", "agent-lane-coordination.test.mjs");
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -39,7 +42,7 @@ async function setup() {
     codexProjectId: "capstone-dev",
     codexProjectKind: "local",
     codexHostId: "local",
-    workspacePath: "/tmp/agent-coordination-worktree",
+    workspacePath: path.resolve("/tmp/agent-coordination-worktree"),
   };
   const developmentContext = {
     type: "worktree",
@@ -1181,6 +1184,8 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   assert.deepEqual(snapshot.todos[0].domainAssignment, {
     domainId: "frontend", status: "active", coordinatorTaskId: "frontend", leaseId: "frontend-lease",
   });
+  assert.equal(snapshot.coordination.domainCoordinators[0].durableWorkPending, false);
+  assert.deepEqual(snapshot.coordination.domainCoordinators[0].durableWorkTaskIds, []);
   assert.deepEqual(snapshot.todos[0].dispatchTarget, {
     rootThreadId: "frontend-thread", codexHostId: "local",
     rootWorkspacePath: "/tmp/frontend", worktreePath: "/tmp/product",
@@ -1206,6 +1211,11 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   }).getProjectSnapshot("domain-project");
   assert.equal(unavailable.todos[0].domainAssignment.status, "needs_coordinator");
   assert.equal(unavailable.todos[0].dispatchTarget, null);
+  assert.equal(unavailable.coordination.domainCoordinators[0].durableWorkPending, true);
+  assert.deepEqual(
+    unavailable.coordination.domainCoordinators[0].durableWorkTaskIds,
+    [mixedCaseClaimTask.identifier, task.identifier],
+  );
   const { holderThreadId, holderCodexHostId, holderWorkspacePath, ...legacyDomainLease } = (
     laneConfig.domainCoordinatorLeases.frontend
   );
@@ -1224,6 +1234,11 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   }).getProjectSnapshot("domain-project");
   assert.equal(legacyUnavailable.todos[0].domainAssignment.status, "needs_coordinator");
   assert.equal(legacyUnavailable.todos[0].dispatchTarget, null);
+  assert.equal(legacyUnavailable.coordination.domainCoordinators[0].durableWorkPending, true);
+  assert.deepEqual(
+    legacyUnavailable.coordination.domainCoordinators[0].durableWorkTaskIds,
+    [mixedCaseClaimTask.identifier, task.identifier],
+  );
   reopened.upsertAgentLaneProject("domain-project", laneConfig);
   assert.throws(() => reopened.prepareTaskSafeActionAdmission(task.id, {
     rootThreadId: "frontend-thread", expectedResumeToken: persistedAdmission.receipt.resumeToken,
@@ -1442,19 +1457,22 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   database.createProject({ id: "domain-recovery", name: "Domain recovery", workspacePath: null });
   const activeUntil = "2099-01-01T00:00:00.000Z";
+  const globalWorkspacePath = path.resolve("/tmp/global");
+  const frontendWorkspacePath = path.resolve("/tmp/frontend");
+  const productWorkspacePath = path.resolve("/tmp/product");
   const binding = {
     threadId: "global-thread", codexProjectId: "domain-recovery", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/global",
+    codexHostId: "local", workspacePath: globalWorkspacePath,
   };
   database.upsertAgentLaneProject("domain-recovery", {
     tasks: [
-      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
-      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: frontendWorkspacePath },
     ],
     adapters: [],
     coordinatorLease: {
       id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
-      holderCodexHostId: "local", holderWorkspacePath: "/tmp/global",
+      holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
       acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
     },
     coordinationDomains: [
@@ -1463,7 +1481,7 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
     domainCoordinatorLeases: {
       frontend: {
         id: "frontend-lease-a", holderTaskId: "frontend", holderThreadId: "frontend-thread",
-        holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+        holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
         acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
       },
     },
@@ -1472,7 +1490,7 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
     projectId: "domain-recovery", title: "Frontend recovery Todo", description: "", status: "todo",
     priority: "high", labels: ["agent-todo"], threadId: binding.threadId, threadBinding: binding,
     actor, assignee: actor, workflowId: null, workflowProfile: "vibe",
-    developmentContext: { type: "worktree", path: "/tmp/product", branch: "codex/domain-recovery" },
+    developmentContext: { type: "worktree", path: productWorkspacePath, branch: "codex/domain-recovery" },
     startDate: null, dueDate: null, recurrence: null,
   });
   database.createComment(task.id, {
@@ -1515,7 +1533,7 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   });
   const recovered = database.claimAgentLaneDomainCoordinator("domain-recovery", "frontend", {
     holderTaskId: "frontend", holderThreadId: "frontend-thread",
-    holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+    holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
     expectedLeaseId: "frontend-lease-a", leaseDurationSeconds: 120, recoverOnly: true,
   });
   assert.notEqual(recovered.lease.id, "frontend-lease-a");
@@ -1681,21 +1699,25 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   const database = new TaskboardDatabase(databasePath);
   database.createProject({ id: "control-plane", name: "Control plane", workspacePath: null });
   const activeUntil = "2099-01-01T00:00:00.000Z";
+  const ownerWorkspacePath = path.resolve("/tmp/owner");
+  const globalWorkspacePath = path.resolve("/tmp/global");
+  const frontendWorkspacePath = path.resolve("/tmp/frontend");
+  const productWorkspacePath = path.resolve("/tmp/product");
   const ownerBinding = {
     threadId: "owner-thread", codexProjectId: "control-plane", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/owner",
+    codexHostId: "local", workspacePath: ownerWorkspacePath,
   };
   database.upsertAgentLaneProject("control-plane", {
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
-      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
-      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: ownerWorkspacePath },
+      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: frontendWorkspacePath },
     ],
     adapters: [],
     coordinatorLease: {
       id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
-      holderCodexHostId: "local", holderWorkspacePath: "/tmp/global",
+      holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
       acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
     },
     coordinationDomains: [
@@ -1704,7 +1726,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
     domainCoordinatorLeases: {
       frontend: {
         id: "frontend-lease-a", holderTaskId: "frontend", holderThreadId: "frontend-thread",
-        holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+        holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
         acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
       },
     },
@@ -1752,7 +1774,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   assert.equal(database.listProjectOwnerIntentPlan("control-plane").length, 1);
   const task = database.getTask(planned.revision.items[0].task.id);
   database.updateTask(task.id, task.version, {
-    developmentContext: { type: "worktree", path: "/tmp/product", branch: "codex/control-plane" },
+    developmentContext: { type: "worktree", path: productWorkspacePath, branch: "codex/control-plane" },
   }, ownerBinding.threadId, ownerBinding, actor);
   database.createComment(task.id, {
     body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
@@ -1850,7 +1872,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   });
   const recovered = database.claimAgentLaneDomainCoordinator("control-plane", "frontend", {
     holderTaskId: "frontend", holderThreadId: "frontend-thread",
-    holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+    holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
     expectedLeaseId: "frontend-lease-a", leaseDurationSeconds: 120, recoverOnly: true,
   });
   assert.notEqual(recovered.lease.id, "frontend-lease-a");
@@ -2434,7 +2456,7 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
     priority: "medium", labels: [], threadId: fixture.rootBinding.threadId, threadBinding: fixture.rootBinding,
     actor, assignee: actor, developmentContext: fixture.developmentContext,
     workingLog: {
-      path: `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`,
+      path: path.join(fixture.rootBinding.workspacePath, "CAP-READY-WORKING-LOG.md"),
       status: "planned",
     },
     startDate: null, dueDate: null, recurrence: null,
@@ -2460,7 +2482,7 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
     rootWorkspacePath: fixture.rootBinding.workspacePath,
     worktreePath: fixture.developmentContext.path,
   });
-  assert.equal(readyTodo?.workingLog?.path, `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`);
+  assert.equal(readyTodo?.workingLog?.path, path.join(fixture.rootBinding.workspacePath, "CAP-READY-WORKING-LOG.md"));
   assert.equal(readyTodo?.workingLog?.status, "planned");
   assert.match(readyTodo?.workingLog?.updatedAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(readyTodo?.run, null);
@@ -2644,7 +2666,7 @@ test("persists lease and write scope, renews the same claim, and rejects stale c
     writeScope: ["server/database.mjs"],
   });
   assert.equal(first.claim.leaseExpiresAt, "2099-01-01T00:00:00.000Z");
-  assert.deepEqual(first.claim.writeScope, ["server/database.mjs"]);
+  assert.deepEqual(first.claim.writeScope, [nativeDatabaseScope]);
 
   const renewed = fixture.database.claimAgentTask(fixture.task.id, first.task.version, {
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
@@ -2668,7 +2690,7 @@ test("persists lease and write scope, renews the same claim, and rejects stale c
   const reopened = new TaskboardDatabase(fixture.databasePath);
   assert.equal(reopened.getAgentTaskClaim(fixture.task.id).leaseExpiresAt, "2000-01-01T00:00:00.000Z");
   assert.deepEqual(reopened.getAgentTaskClaim(fixture.task.id).writeScope, [
-    "server/database.mjs", "test/agent-lane-coordination.test.mjs",
+    nativeDatabaseScope, nativeCoordinationTestScope,
   ]);
   reopened.close();
 });
@@ -2727,8 +2749,8 @@ test("leaving in-progress and archiving atomically interrupt open runs so a clai
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
     leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/./database.mjs"],
   });
-  assert.deepEqual(retried.claim.writeScope, ["server/database.mjs"]);
-  assert.deepEqual(retried.run.writeScope, ["server/database.mjs"]);
+  assert.deepEqual(retried.claim.writeScope, [nativeDatabaseScope]);
+  assert.deepEqual(retried.run.writeScope, [nativeDatabaseScope]);
 
   fixture.database.archiveTask(retried.task.id, retried.task.version, undefined, undefined, actor);
   assert.equal(fixture.database.getAgentTaskClaim(fixture.task.id).status, "interrupted");
@@ -2855,7 +2877,7 @@ test("open runs protect bindings and require worktree-relative normalized write 
     ...claimInput,
     writeScope: ["./server/database.mjs", "server/agent-lane-snapshot.mjs"],
   });
-  assert.deepEqual(claimed.run.writeScope, ["server/database.mjs", "server/agent-lane-snapshot.mjs"]);
+  assert.deepEqual(claimed.run.writeScope, [nativeDatabaseScope, nativeSnapshotScope]);
   const blocked = fixture.database.checkpointTaskAgentRun(claimed.run.id, claimed.run.version, {
     agentThreadId: claimInput.agentThreadId, status: "blocked", summary: "waiting", nextAction: "resume",
   });

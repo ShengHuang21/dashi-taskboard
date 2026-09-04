@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { afterEach, test } from "node:test";
 
@@ -32,8 +33,9 @@ test("version 2 migration creates missing projects and durable To-Dos idempotent
     },
   }));
   const script = new URL("../scripts/migrate-agent-lanes-to-db.mjs", import.meta.url);
-  await execFileAsync(process.execPath, [script.pathname, databasePath, configPath]);
-  await execFileAsync(process.execPath, [script.pathname, databasePath, configPath]);
+  const scriptPath = fileURLToPath(script);
+  await execFileAsync(process.execPath, [scriptPath, databasePath, configPath]);
+  await execFileAsync(process.execPath, [scriptPath, databasePath, configPath]);
   const database = new TaskboardDatabase(databasePath);
   assert.equal(database.getProject("capstone-dev").name, "capstone-dev");
   const tasks = database.listTasks({ projectId: "capstone-dev", archived: "all" });

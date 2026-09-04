@@ -1437,6 +1437,8 @@ test("Root records one immutable Owner decision receipt from the project-level r
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
   const instanceSecret = "b".repeat(64);
+  const ownerWorkspacePath = path.resolve("/tmp/root-owner-decision");
+  const coordinatorWorkspacePath = path.resolve("/tmp/coordinator-owner-decision");
   let task;
   let dataDirectory;
   let baseUrl = await startServer(async (directory) => {
@@ -1448,11 +1450,11 @@ test("Root records one immutable Owner decision receipt from the project-level r
       tasks: [{
         id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
         threadId: rootThreadId, taskType: "root_task", codexHostId: "local",
-        workspacePath: "/tmp/root-owner-decision",
+        workspacePath: ownerWorkspacePath,
       }, {
         id: "coordinator", label: "Coordinator", owner: "Codex Root", source: "codex",
         threadId: coordinatorThreadId, taskType: "root_task", codexHostId: "local",
-        workspacePath: "/tmp/coordinator-owner-decision",
+        workspacePath: coordinatorWorkspacePath,
       }],
       adapters: [],
       coordinatorLease: {
@@ -1460,7 +1462,7 @@ test("Root records one immutable Owner decision receipt from the project-level r
         holderTaskId: "coordinator",
         holderThreadId: coordinatorThreadId,
         holderCodexHostId: "local",
-        holderWorkspacePath: "/tmp/coordinator-owner-decision",
+        holderWorkspacePath: coordinatorWorkspacePath,
         acquiredAt: new Date(Date.now() - 1_000).toISOString(),
         expiresAt: new Date(Date.now() + 15_000).toISOString(),
       },
@@ -1470,7 +1472,7 @@ test("Root records one immutable Owner decision receipt from the project-level r
       codexProjectId: "local-project",
       codexProjectKind: "local",
       codexHostId: "local",
-      workspacePath: "/tmp/root-owner-decision",
+      workspacePath: ownerWorkspacePath,
     };
     const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
     task = database.createTask({
@@ -1713,7 +1715,7 @@ test("Root records one immutable Owner decision receipt from the project-level r
     headers: injectorHeaders("f".repeat(32)),
     body: pending,
   });
-  assert.equal(durableReplay.response.status, 200);
+  assert.equal(durableReplay.response.status, 200, JSON.stringify(durableReplay.body));
   assert.deepEqual(durableReplay.body, {
     claimed: false,
     reason: "already-delivered",
@@ -3152,6 +3154,7 @@ test("background Coordinator registration requests a protected host identity han
   let databasePath;
   const instanceSecret = "c".repeat(64);
   const backgroundThreadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
+  const workspacePath = path.resolve("/tmp/sbkk");
   const baseUrl = await startServer(async (directory) => {
     databasePath = path.join(directory, "taskboard.sqlite");
     const database = new TaskboardDatabase(databasePath);
@@ -3162,7 +3165,7 @@ test("background Coordinator registration requests a protected host identity han
         id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
         connection: "connected", threadId: "owner-thread", taskType: "root_task",
         codexProjectId: "codex-project", codexProjectKind: "local",
-        codexHostId: "local", workspacePath: "/tmp/sbkk",
+        codexHostId: "local", workspacePath,
       }],
       adapters: [],
       coordinatorLease: null,
@@ -3229,7 +3232,7 @@ test("background Coordinator registration requests a protected host identity han
   assert.equal(listed.body.handshakes.length, 1);
   assert.deepEqual(listed.body.handshakes[0].expectedHostBinding, {
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", workspacePath,
   });
   const registrationProof = { projectId: "local", ...registration };
 
@@ -3248,7 +3251,7 @@ test("background Coordinator registration requests a protected host identity han
 
   const confirmBody = { registration: registrationProof, threadBinding: {
     threadId: backgroundThreadId, codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", workspacePath,
   } };
   const unprotected = await request(baseUrl, confirmPath, { method: "POST", body: confirmBody });
   assert.equal(unprotected.response.status, 403);
@@ -3382,6 +3385,7 @@ test("background Coordinator registration requests a protected host identity han
 test("resident provisioning persists one protected idempotent attempt before replacement thread start", async () => {
   let databasePath;
   const instanceSecret = "d".repeat(64);
+  const workspacePath = path.resolve("/tmp/sbkk");
   const baseUrl = await startServer(async (directory) => {
     databasePath = path.join(directory, "taskboard.sqlite");
     const database = new TaskboardDatabase(databasePath);
@@ -3392,7 +3396,7 @@ test("resident provisioning persists one protected idempotent attempt before rep
         id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
         connection: "connected", threadId: "owner-thread", taskType: "root_task",
         codexProjectId: "codex-project", codexProjectKind: "local",
-        codexHostId: "local", workspacePath: "/tmp/sbkk",
+        codexHostId: "local", workspacePath,
       }],
       adapters: [],
       coordinatorLease: null,
@@ -3425,7 +3429,7 @@ test("resident provisioning persists one protected idempotent attempt before rep
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
-    workspacePath: "/tmp/sbkk",
+    workspacePath,
   };
   const unprotected = await request(baseUrl, pathname, { method: "POST", body });
   assert.equal(unprotected.response.status, 403);
@@ -4770,6 +4774,7 @@ test("resident shutdown fences domain writes and cancels on coordination revisio
 test("protected window registration separates Owner Root from a replaceable coordinator", async () => {
   let databasePath;
   const instanceSecret = "a".repeat(64);
+  const ownerWorkspacePath = path.resolve("/tmp/owner-root");
   const baseUrl = await startServer(async (directory) => {
     databasePath = path.join(directory, "taskboard.sqlite");
     const database = new TaskboardDatabase(databasePath);
@@ -4818,7 +4823,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     body: {
       threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
       codexProjectId: "codex-project", codexProjectKind: "local",
-      codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
+      codexHostId: "host-owner", workspacePath: ownerWorkspacePath,
     },
   });
   const owner = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
@@ -4832,7 +4837,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     taskId: "owner-root", label: "Owner conversation", role: "owner_root",
     threadId: "owner-thread", codexHostId: "host-owner",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    workspacePath: "/tmp/owner-root",
+    workspacePath: ownerWorkspacePath,
   });
 
   const replay = await request(baseUrl, "/api/local/projects/local/coordination-windows", {

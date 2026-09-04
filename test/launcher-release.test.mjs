@@ -6,6 +6,10 @@ const launcherSource = await readFile(new URL("../src-tauri/src/main.rs", import
 const tauriConfig = JSON.parse(await readFile(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
 const releaseWorkflow = await readFile(new URL("../.github/workflows/release-macos.yml", import.meta.url), "utf8");
 const checkWorkflow = await readFile(new URL("../.github/workflows/check.yml", import.meta.url), "utf8");
+const packagedTaskctlVerifier = await readFile(
+  new URL("../scripts/verify-packaged-taskctl.mjs", import.meta.url),
+  "utf8",
+);
 
 test("the macOS launcher uses one instance, serialized lifecycle changes, and a loopback CDP port", () => {
   assert.match(launcherSource, /libc::flock/);
@@ -53,6 +57,16 @@ test("Windows CI uploads the NSIS installer with the pinned Node 24 artifact act
     /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7\.0\.1/,
   );
   assert.doesNotMatch(checkWorkflow, /actions\/upload-artifact@[^\s]+ # v4/);
+});
+
+test("the packaged taskctl preflight attributes issue updates through its environment", () => {
+  const updateStart = packagedTaskctlVerifier.indexOf("const updated = runTaskctl");
+  const updateEnd = packagedTaskctlVerifier.indexOf("const comment =", updateStart);
+  assert.notEqual(updateStart, -1);
+  assert.notEqual(updateEnd, -1);
+  const updateInvocation = packagedTaskctlVerifier.slice(updateStart, updateEnd);
+  assert.doesNotMatch(updateInvocation, /--thread-id/);
+  assert.match(packagedTaskctlVerifier, /CODEX_THREAD_ID:/);
 });
 
 test("the launcher minimum system version matches the current Codex client requirement", () => {

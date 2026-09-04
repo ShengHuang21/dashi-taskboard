@@ -32,7 +32,7 @@
     "typecheck": "tsc -p web/tsconfig.json --noEmit",
     "start": "node server/index.mjs",
     "taskctl": "node cli/taskctl.mjs",
-    "test": "node --test --test-skip-pattern='Taskboard fills the workspace, opens HTTPS links and revokes hostile iframe navigation' && npm run test:inject-browser && npm run test:components",
+    "test": "node --test --test-skip-pattern=\"Taskboard fills the workspace, opens HTTPS links and revokes hostile iframe navigation\" && npm run test:inject-browser && npm run test:components",
     "test:inject-browser": "node --test test/inject-fullheight-regression.test.mjs",
     "test:components": "vitest run web/src/components/MarkdownDocument.test.tsx web/src/components/AgentLaneBoard.test.tsx --environment jsdom",
     "test:cloud": "node --test test/cloud-shared-worker.test.mjs",
