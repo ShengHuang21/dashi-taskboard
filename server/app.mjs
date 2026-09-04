@@ -534,6 +534,54 @@ function parseCoordinatorProvisioningLookup(value) {
   });
 }
 
+function parseDomainCoordinatorProvisioningRequest(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "idempotencyKey", "taskId", "label", "threadSource", "model", "reasoningEffort",
+    "expectedRevision", "expectedGlobalLeaseId", "globalHolderTaskId", "globalHolderThreadId",
+    "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath",
+  ]));
+  const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
+    required: true, maxLength: 64,
+  });
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+  }
+  const codexProjectKind = stringField(value.codexProjectKind, "codexProjectKind", {
+    required: true, maxLength: 16,
+  });
+  const codexHostId = stringField(value.codexHostId, "codexHostId", {
+    required: true, maxLength: 256,
+  });
+  if (!new Set(["local", "remote"]).has(codexProjectKind)
+    || (codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")) {
+    throw new ApiError(400, "INVALID_FIELD", "Domain Coordinator provisioning project identity is invalid");
+  }
+  const workspacePath = stringField(value.workspacePath, "workspacePath", {
+    required: true, maxLength: 4096,
+  });
+  if (!path.isAbsolute(workspacePath) || workspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be an absolute path");
+  }
+  return {
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
+    label: stringField(value.label, "label", { required: true, maxLength: 120 }),
+    threadSource: stringField(value.threadSource, "threadSource", { required: true, maxLength: 256 }),
+    model: stringField(value.model, "model", { required: true, maxLength: 256 }),
+    reasoningEffort: stringField(value.reasoningEffort, "reasoningEffort", { required: true, maxLength: 100 }),
+    expectedRevision,
+    expectedGlobalLeaseId: stringField(value.expectedGlobalLeaseId, "expectedGlobalLeaseId", { required: true, maxLength: 256 }),
+    globalHolderTaskId: stringField(value.globalHolderTaskId, "globalHolderTaskId", { required: true, maxLength: 256 }),
+    globalHolderThreadId: stringField(value.globalHolderThreadId, "globalHolderThreadId", { required: true, maxLength: 256 }),
+    codexProjectId: stringField(value.codexProjectId, "codexProjectId", { required: true, maxLength: 256 }),
+    codexProjectKind,
+    codexHostId,
+    workspacePath: path.resolve(workspacePath),
+  };
+}
+
 function parseCoordinatorShutdownRequest(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
@@ -3766,6 +3814,51 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, {
           attempt: database.getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey),
         });
+      }
+
+      const domainCoordinatorProvisioningLookupRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-provisioning-attempts\/([^/]+)\/lookup$/,
+      );
+      if (domainCoordinatorProvisioningLookupRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-coordinator-provisioning-attempts/:domainId/lookup");
+        const projectId = decodeRouteSegment(domainCoordinatorProvisioningLookupRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorProvisioningLookupRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(domainId)) {
+          throw new ApiError(400, "INVALID_COORDINATION_DOMAIN", "Coordination domain id is invalid");
+        }
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        const idempotencyKey = parseCoordinatorProvisioningLookup(body);
+        return sendJson(response, 200, {
+          attempt: database.getAgentLaneDomainCoordinatorProvisioningAttempt(
+            projectId, domainId, idempotencyKey,
+          ),
+        });
+      }
+
+      const domainCoordinatorProvisioningRequestRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-provisioning-attempts\/([^/]+)$/,
+      );
+      if (domainCoordinatorProvisioningRequestRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/projects/:id/domain-coordinator-provisioning-attempts/:domainId");
+        const projectId = decodeRouteSegment(domainCoordinatorProvisioningRequestRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorProvisioningRequestRoute[2], "Coordination domain id");
+        validateProjectId(projectId);
+        if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(domainId)) {
+          throw new ApiError(400, "INVALID_COORDINATION_DOMAIN", "Coordination domain id is invalid");
+        }
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        return sendJson(response, 200, database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+          projectId, domainId, parseDomainCoordinatorProvisioningRequest(body),
+        ));
       }
 
       const coordinatorProvisioningPreflightRoute = pathname.match(

@@ -166,6 +166,57 @@ function coordinatorProvisioningFingerprint(projectId, input) {
   })).digest("hex");
 }
 
+function domainCoordinatorProvisioningAttemptFromRow(row) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    domainId: row.domain_id,
+    idempotencyKey: row.idempotency_key,
+    taskId: row.task_id,
+    label: row.label,
+    threadSource: row.thread_source,
+    model: row.model,
+    reasoningEffort: row.reasoning_effort,
+    expectedRevision: row.expected_revision,
+    expectedGlobalLeaseId: row.expected_global_lease_id,
+    globalHolderTaskId: row.global_holder_task_id,
+    globalHolderThreadId: row.global_holder_thread_id,
+    codexProjectId: row.codex_project_id,
+    codexProjectKind: row.codex_project_kind,
+    codexHostId: row.codex_host_id,
+    workspacePath: row.workspace_path,
+    writeScope: JSON.parse(row.write_scope_json),
+    status: row.status,
+    threadId: row.thread_id,
+    retryCount: row.retry_count,
+    missingSince: row.missing_since ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function domainCoordinatorProvisioningFingerprint(projectId, domainId, input) {
+  return createHash("sha256").update(JSON.stringify({
+    projectId,
+    domainId,
+    idempotencyKey: input.idempotencyKey,
+    taskId: input.taskId,
+    label: input.label,
+    threadSource: input.threadSource,
+    model: input.model,
+    reasoningEffort: input.reasoningEffort,
+    expectedRevision: input.expectedRevision,
+    expectedGlobalLeaseId: input.expectedGlobalLeaseId,
+    globalHolderTaskId: input.globalHolderTaskId,
+    globalHolderThreadId: input.globalHolderThreadId,
+    codexProjectId: input.codexProjectId,
+    codexProjectKind: input.codexProjectKind,
+    codexHostId: input.codexHostId,
+    workspacePath: path.resolve(input.workspacePath),
+  })).digest("hex");
+}
+
 function coordinatorShutdownAttemptFromRow(row) {
   return {
     id: row.id,
@@ -1494,6 +1545,40 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS agent_coordinator_provisioning_attempts_active
         ON agent_coordinator_provisioning_attempts(project_id, status, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS agent_domain_coordinator_provisioning_attempts (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        domain_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        label TEXT NOT NULL,
+        thread_source TEXT NOT NULL,
+        model TEXT NOT NULL,
+        reasoning_effort TEXT NOT NULL,
+        expected_revision TEXT NOT NULL,
+        expected_global_lease_id TEXT NOT NULL,
+        global_holder_task_id TEXT NOT NULL,
+        global_holder_thread_id TEXT NOT NULL,
+        codex_project_id TEXT NOT NULL,
+        codex_project_kind TEXT NOT NULL CHECK (codex_project_kind IN ('local', 'remote')),
+        codex_host_id TEXT NOT NULL,
+        workspace_path TEXT NOT NULL,
+        write_scope_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'starting', 'started', 'completed', 'expired', 'canceled')),
+        thread_id TEXT,
+        retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+        missing_since TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        UNIQUE(project_id, domain_id, idempotency_key),
+        UNIQUE(project_id, thread_source)
+      );
+
+      CREATE INDEX IF NOT EXISTS agent_domain_coordinator_provisioning_attempts_active
+        ON agent_domain_coordinator_provisioning_attempts(project_id, domain_id, status, created_at, id);
 
       CREATE TABLE IF NOT EXISTS agent_coordinator_shutdown_attempts (
         id TEXT PRIMARY KEY,
@@ -3552,6 +3637,223 @@ export class TaskboardDatabase {
       });
     }
     return coordinatorProvisioningAttemptFromRow(row);
+  }
+
+  getAgentLaneDomainCoordinatorProvisioningAttempt(projectId, domainId, idempotencyKey) {
+    const row = idempotencyKey
+      ? this.#prepare(`
+          SELECT * FROM agent_domain_coordinator_provisioning_attempts
+          WHERE project_id = ? AND domain_id = ? AND idempotency_key = ?
+        `).get(projectId, domainId, idempotencyKey)
+      : this.#prepare(`
+          SELECT * FROM agent_domain_coordinator_provisioning_attempts
+          WHERE project_id = ? AND domain_id = ?
+            AND status IN ('pending', 'starting', 'started')
+          ORDER BY created_at DESC, id DESC LIMIT 1
+        `).get(projectId, domainId);
+    if (!row) return null;
+    if (["pending", "starting", "started"].includes(row.status)
+      && Date.parse(row.expires_at) <= Date.now()) {
+      const timestamp = now();
+      this.#prepare(`
+        UPDATE agent_domain_coordinator_provisioning_attempts
+        SET status = 'expired', updated_at = ? WHERE id = ?
+      `).run(timestamp, row.id);
+      return domainCoordinatorProvisioningAttemptFromRow({
+        ...row, status: "expired", updated_at: timestamp,
+      });
+    }
+    return domainCoordinatorProvisioningAttemptFromRow(row);
+  }
+
+  requestAgentLaneDomainCoordinatorProvisioningAttempt(projectId, domainId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(projectId);
+      if (!row) {
+        throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
+      }
+      const fingerprint = domainCoordinatorProvisioningFingerprint(projectId, domainId, input);
+      const existing = this.#prepare(`
+        SELECT * FROM agent_domain_coordinator_provisioning_attempts
+        WHERE project_id = ? AND domain_id = ? AND idempotency_key = ?
+      `).get(projectId, domainId, input.idempotencyKey);
+      if (existing) {
+        if (existing.request_fingerprint !== fingerprint) {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_IDEMPOTENCY_CONFLICT",
+            "The provisioning key is bound to a different domain Coordinator request",
+          );
+        }
+        if (["pending", "starting", "started"].includes(existing.status)
+          && Date.parse(existing.expires_at) <= Date.now()) {
+          const timestamp = now();
+          this.#prepare(`
+            UPDATE agent_domain_coordinator_provisioning_attempts
+            SET status = 'expired', updated_at = ? WHERE id = ?
+          `).run(timestamp, existing.id);
+          this.database.exec("COMMIT");
+          return { applied: false, attempt: domainCoordinatorProvisioningAttemptFromRow({
+            ...existing, status: "expired", updated_at: timestamp,
+          }) };
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, attempt: domainCoordinatorProvisioningAttemptFromRow(existing) };
+      }
+
+      const revision = agentLaneConfigRevision(row.config_json);
+      if (revision !== input.expectedRevision) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_REVISION_CONFLICT",
+          "Coordination windows changed since domain provisioning was planned",
+          { actualRevision: revision },
+        );
+      }
+      const config = JSON.parse(row.config_json);
+      const domain = normalizeCoordinationDomains(config)
+        .find((candidate) => candidate.id === domainId) ?? null;
+      if (!domain) {
+        throw new ApiError(404, "COORDINATION_DOMAIN_NOT_FOUND", `Coordination domain '${domainId}' does not exist`);
+      }
+      if (!domain.eligibleTaskIds.includes(input.taskId)) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_TASK_INELIGIBLE",
+          "The proposed Coordinator identity is not eligible for this domain",
+        );
+      }
+      const domainHolder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.taskId) ?? null
+        : null;
+      if (!isFullyBoundCodexPeerTask(domainHolder)
+        || domainHolder.label !== input.label
+        || domainHolder.codexProjectId !== input.codexProjectId
+        || domainHolder.codexProjectKind !== input.codexProjectKind
+        || domainHolder.codexHostId !== input.codexHostId
+        || path.resolve(domainHolder.workspacePath ?? "") !== path.resolve(input.workspacePath)) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_BINDING_MISMATCH",
+          "Domain Coordinator provisioning requires the exact configured peer binding",
+        );
+      }
+      const activeGlobal = this.#exactActiveCoordinatorLease(
+        projectId, config, config.coordinatorLease ?? null,
+      );
+      const globalLease = activeGlobal?.lease ?? null;
+      const globalHolder = activeGlobal?.holder ?? null;
+      if (!globalLease
+        || globalLease.id !== input.expectedGlobalLeaseId
+        || globalHolder.id !== input.globalHolderTaskId
+        || globalHolder.threadId !== input.globalHolderThreadId) {
+        throw new ApiError(
+          409,
+          "GLOBAL_COORDINATOR_LEASE_MISMATCH",
+          "Domain Coordinator provisioning requires the exact active Global Coordinator binding",
+        );
+      }
+      if (this.#exactActiveCoordinatorLease(
+        projectId,
+        config,
+        config.domainCoordinatorLeases?.[domainId] ?? null,
+        Date.now(),
+        domainId,
+      )) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_LEASE_ACTIVE",
+          "The domain already has an active Coordinator lease",
+        );
+      }
+      const durableWork = this.#prepare(`
+        SELECT task.id
+        FROM agent_task_domain_assignments AS assignment
+        JOIN tasks AS task ON task.id = assignment.task_id
+        WHERE assignment.project_id = ? AND assignment.domain_id = ?
+          AND task.archived_at IS NULL AND task.status = 'todo'
+          AND EXISTS (
+            SELECT 1 FROM json_each(task.labels) AS label WHERE label.value = 'agent-todo'
+          )
+        ORDER BY task.sort_order, task.created_at, task.id
+        LIMIT 1
+      `).get(projectId, domainId);
+      if (!durableWork) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_NO_ELIGIBLE_WORK",
+          "Domain Coordinator provisioning requires assigned durable Todo work",
+        );
+      }
+      const reusedThreadSource = this.#prepare(`
+        SELECT domain_id FROM agent_domain_coordinator_provisioning_attempts
+        WHERE project_id = ? AND thread_source = ?
+      `).get(projectId, input.threadSource);
+      if (reusedThreadSource) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_THREAD_SOURCE_CONFLICT",
+          "The Coordinator thread source is already bound to another domain provisioning attempt",
+        );
+      }
+      const nonterminal = this.#prepare(`
+        SELECT * FROM agent_domain_coordinator_provisioning_attempts
+        WHERE project_id = ? AND domain_id = ?
+          AND status IN ('pending', 'starting', 'started')
+        ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(projectId, domainId);
+      if (nonterminal) {
+        if (Date.parse(nonterminal.expires_at) <= Date.now()) {
+          this.#prepare(`
+            UPDATE agent_domain_coordinator_provisioning_attempts
+            SET status = 'expired', updated_at = ? WHERE id = ?
+          `).run(now(), nonterminal.id);
+        } else {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_IN_PROGRESS",
+            "Another provisioning attempt is already active for this domain",
+          );
+        }
+      }
+      const timestamp = now();
+      const attemptRow = {
+        id: randomUUID(), project_id: projectId, domain_id: domainId,
+        idempotency_key: input.idempotencyKey, request_fingerprint: fingerprint,
+        task_id: input.taskId, label: input.label, thread_source: input.threadSource,
+        model: input.model, reasoning_effort: input.reasoningEffort,
+        expected_revision: revision, expected_global_lease_id: globalLease.id,
+        global_holder_task_id: globalHolder.id,
+        global_holder_thread_id: globalHolder.threadId,
+        codex_project_id: domainHolder.codexProjectId,
+        codex_project_kind: domainHolder.codexProjectKind,
+        codex_host_id: domainHolder.codexHostId,
+        workspace_path: path.resolve(domainHolder.workspacePath),
+        write_scope_json: JSON.stringify(domain.writeScope), status: "pending",
+        thread_id: null, retry_count: 0, missing_since: null,
+        created_at: timestamp, updated_at: timestamp,
+        expires_at: new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString(),
+      };
+      this.#prepare(`
+        INSERT INTO agent_domain_coordinator_provisioning_attempts (
+          id, project_id, domain_id, idempotency_key, request_fingerprint,
+          task_id, label, thread_source, model, reasoning_effort,
+          expected_revision, expected_global_lease_id,
+          global_holder_task_id, global_holder_thread_id,
+          codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+          write_scope_json, status, thread_id, retry_count, missing_since,
+          created_at, updated_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(...Object.values(attemptRow));
+      this.database.exec("COMMIT");
+      return { applied: true, attempt: domainCoordinatorProvisioningAttemptFromRow(attemptRow) };
+    } catch (error) {
+      if (this.database.isTransaction) this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   requestAgentLaneCoordinatorProvisioningAttempt(projectId, input) {
