@@ -15,6 +15,7 @@ const coordinatorIdentityHandshakeFastLaneRuns = new Map();
 const coordinatorLeaseKeepaliveMonitorRuns = new Map();
 const coordinatorLeaseRecoveryMonitorRuns = new Map();
 const coordinatorProvisioningMonitorRuns = new Map();
+const domainCoordinatorProvisioningMonitorRuns = new Map();
 const coordinatorShutdownMonitorRuns = new Map();
 const coordinatorShutdownIdleObservations = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -518,6 +519,18 @@ function coordinatorProvisioningIdentity(projectId, revision, ownerRootTaskId) {
     label: "Taskboard Execution Coordinator",
     idempotencyKey: `coordinator-provision-${fingerprint}`,
     threadSource: `taskboard-coordinator-provision-${fingerprint}`,
+  };
+}
+
+function domainCoordinatorProvisioningIdentity(
+  projectId, revision, domainId, taskId, globalLeaseId,
+) {
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    projectId, revision, domainId, taskId, globalLeaseId,
+  })).digest("hex");
+  return {
+    idempotencyKey: `domain-coordinator-provision-${fingerprint}`,
+    threadSource: `taskboard-domain-coordinator-provision-${fingerprint}`,
   };
 }
 
@@ -1143,6 +1156,205 @@ export async function runCoordinatorProvisioningMonitorOnce(options) {
   } finally {
     if (coordinatorProvisioningMonitorRuns.get(policy.projectId) === run) {
       coordinatorProvisioningMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
+  const { policy } = options;
+  const [snapshot, windows] = await Promise.all([
+    options.readSnapshot(policy.projectId),
+    options.readWindows(policy.projectId),
+  ]);
+  if (snapshot?.projectId !== policy.projectId
+    || windows?.projectId !== policy.projectId
+    || !RESUME_TOKEN_PATTERN.test(windows?.revision ?? "")
+    || !Array.isArray(snapshot?.coordination?.domainCoordinators)
+    || !Array.isArray(snapshot?.taskLanes)) {
+    return { provisioned: false, reason: "invalid-project-state" };
+  }
+  const globalLease = snapshot.coordination.lease;
+  const globalHolderTaskId = snapshot.coordination.coordinatorTaskId;
+  const globalHolder = snapshot.taskLanes.find((lane) => lane?.id === globalHolderTaskId) ?? null;
+  if (globalLease?.status !== "active"
+    || globalLease.bindingValid !== true
+    || !COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
+    || !COORDINATION_ID_PATTERN.test(globalHolderTaskId ?? "")
+    || !THREAD_ID_PATTERN.test(globalHolder?.threadId ?? "")) {
+    return { provisioned: false, reason: "global-coordinator-unavailable" };
+  }
+  const domain = snapshot.coordination.domainCoordinators.find((candidate) => (
+    candidate?.durableWorkPending === true
+    && candidate.assignment === "unassigned"
+    && COORDINATION_ID_PATTERN.test(candidate.domainId ?? "")
+    && Array.isArray(candidate.eligibleTaskIds)
+  ));
+  if (!domain) return { provisioned: false, reason: "no-domain-work" };
+  const lane = domain.eligibleTaskIds
+    .map((taskId) => snapshot.taskLanes.find((candidate) => candidate?.id === taskId) ?? null)
+    .find((candidate) => (
+      candidate?.source === "codex"
+      && candidate.taskType === "peer_task"
+      && typeof candidate.label === "string" && candidate.label
+      && typeof candidate.codexProjectId === "string" && candidate.codexProjectId
+      && ["local", "remote"].includes(candidate.codexProjectKind)
+      && COORDINATION_ID_PATTERN.test(candidate.codexHostId ?? "")
+      && typeof candidate.workspacePath === "string"
+      && path.isAbsolute(candidate.workspacePath)
+    ));
+  if (!lane) {
+    return { provisioned: false, reason: "domain-route-unavailable", domainId: domain.domainId };
+  }
+  const identity = domainCoordinatorProvisioningIdentity(
+    policy.projectId, windows.revision, domain.domainId, lane.id, globalLease.id,
+  );
+  let result = await options.getAttempt({
+    projectId: policy.projectId,
+    domainId: domain.domainId,
+    idempotencyKey: identity.idempotencyKey,
+  });
+  let attempt = result?.attempt ?? null;
+  if (!attempt) {
+    result = await options.getAttempt({
+      projectId: policy.projectId,
+      domainId: domain.domainId,
+    });
+    attempt = result?.attempt ?? null;
+  }
+  if (!attempt) {
+    let selectedModel = { model: policy.model, reasoningEffort: policy.reasoningEffort };
+    if ((!selectedModel.model || !selectedModel.reasoningEffort)
+      && typeof options.readDefaultModel === "function") {
+      selectedModel = await options.readDefaultModel({
+        codexHostId: lane.codexHostId,
+        workspacePath: lane.workspacePath,
+      });
+    }
+    if (typeof selectedModel?.model !== "string" || !selectedModel.model
+      || typeof selectedModel?.reasoningEffort !== "string" || !selectedModel.reasoningEffort) {
+      return { provisioned: false, reason: "model-policy-unavailable", domainId: domain.domainId };
+    }
+    result = await options.requestAttempt({
+      ...identity,
+      projectId: policy.projectId,
+      domainId: domain.domainId,
+      taskId: lane.id,
+      label: lane.label,
+      model: selectedModel.model,
+      reasoningEffort: selectedModel.reasoningEffort,
+      expectedRevision: windows.revision,
+      expectedGlobalLeaseId: globalLease.id,
+      globalHolderTaskId,
+      globalHolderThreadId: globalHolder.threadId,
+      codexProjectId: lane.codexProjectId,
+      codexProjectKind: lane.codexProjectKind,
+      codexHostId: lane.codexHostId,
+      workspacePath: lane.workspacePath,
+    });
+    attempt = result?.attempt ?? null;
+  }
+  if (!attempt?.id
+    || attempt.projectId !== policy.projectId
+    || attempt.domainId !== domain.domainId
+    || attempt.taskId !== lane.id
+    || attempt.codexHostId !== lane.codexHostId
+    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(lane.workspacePath)) {
+    return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
+  }
+  if (["completed", "canceled", "expired"].includes(attempt.status)) {
+    return {
+      provisioned: attempt.status === "completed",
+      reason: `attempt-${attempt.status}`,
+      domainId: domain.domainId,
+      attemptId: attempt.id,
+    };
+  }
+  let thread = await options.findThread(attempt);
+  if (!thread && ["starting", "started"].includes(attempt.status)) {
+    return {
+      provisioned: false, reason: "thread-start-uncertain",
+      domainId: domain.domainId, attemptId: attempt.id,
+    };
+  }
+  if (!thread) {
+    result = await options.markStarting({ attemptId: attempt.id });
+    attempt = result?.attempt ?? attempt;
+    try {
+      const started = await options.startThread({
+        codexHostId: attempt.codexHostId,
+        cwd: attempt.workspacePath,
+        runtimeWorkspaceRoots: [attempt.workspacePath],
+        model: attempt.model,
+        config: { model_reasoning_effort: attempt.reasoningEffort },
+        approvalPolicy: "never",
+        sandbox: "workspace-write",
+        threadSource: attempt.threadSource,
+      });
+      thread = started?.thread ?? null;
+    } catch (error) {
+      if (isSelectedModelCapacityError(error)) {
+        await options.resetAttempt({ attemptId: attempt.id });
+        return {
+          provisioned: false, reason: "model-capacity",
+          domainId: domain.domainId, attemptId: attempt.id,
+        };
+      }
+      return {
+        provisioned: false, reason: "thread-start-uncertain",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+  }
+  if (!THREAD_ID_PATTERN.test(thread?.id ?? "")
+    || thread.threadSource !== attempt.threadSource
+    || path.resolve(thread?.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
+    return {
+      provisioned: false, reason: "thread-binding-mismatch",
+      domainId: domain.domainId, attemptId: attempt.id,
+    };
+  }
+  result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
+  attempt = result?.attempt ?? null;
+  if (attempt?.status !== "started" || attempt.threadId !== thread.id) {
+    return {
+      provisioned: false, reason: "attempt-binding-mismatch",
+      domainId: domain.domainId, attemptId: attempt?.id ?? null,
+    };
+  }
+  return {
+    provisioned: true,
+    reason: "domain-thread-started",
+    domainId: domain.domainId,
+    attemptId: attempt.id,
+    threadId: thread.id,
+  };
+}
+
+export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
+  if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
+    || typeof options?.readSnapshot !== "function"
+    || typeof options?.readWindows !== "function"
+    || typeof options?.getAttempt !== "function"
+    || typeof options?.requestAttempt !== "function"
+    || typeof options?.findThread !== "function"
+    || typeof options?.markStarting !== "function"
+    || typeof options?.startThread !== "function"
+    || typeof options?.attachThread !== "function"
+    || typeof options?.resetAttempt !== "function") {
+    return { provisioned: false, reason: "invalid-monitor" };
+  }
+  const key = policy.projectId;
+  const existing = domainCoordinatorProvisioningMonitorRuns.get(key);
+  if (existing) return existing;
+  const run = runDomainCoordinatorProvisioningMonitorOnceUnlocked(options);
+  domainCoordinatorProvisioningMonitorRuns.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (domainCoordinatorProvisioningMonitorRuns.get(key) === run) {
+      domainCoordinatorProvisioningMonitorRuns.delete(key);
     }
   }
 }
