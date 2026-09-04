@@ -39,7 +39,7 @@ async function setup() {
     codexProjectId: "capstone-dev",
     codexProjectKind: "local",
     codexHostId: "local",
-    workspacePath: "/tmp/agent-coordination-worktree",
+    workspacePath: path.resolve("/tmp/agent-coordination-worktree"),
   };
   const developmentContext = {
     type: "worktree",
@@ -1454,19 +1454,22 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
   database.createProject({ id: "domain-recovery", name: "Domain recovery", workspacePath: null });
   const activeUntil = "2099-01-01T00:00:00.000Z";
+  const globalWorkspacePath = path.resolve("/tmp/global");
+  const frontendWorkspacePath = path.resolve("/tmp/frontend");
+  const productWorkspacePath = path.resolve("/tmp/product");
   const binding = {
     threadId: "global-thread", codexProjectId: "domain-recovery", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/global",
+    codexHostId: "local", workspacePath: globalWorkspacePath,
   };
   database.upsertAgentLaneProject("domain-recovery", {
     tasks: [
-      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
-      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: frontendWorkspacePath },
     ],
     adapters: [],
     coordinatorLease: {
       id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
-      holderCodexHostId: "local", holderWorkspacePath: "/tmp/global",
+      holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
       acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
     },
     coordinationDomains: [
@@ -1475,7 +1478,7 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
     domainCoordinatorLeases: {
       frontend: {
         id: "frontend-lease-a", holderTaskId: "frontend", holderThreadId: "frontend-thread",
-        holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+        holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
         acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
       },
     },
@@ -1484,7 +1487,7 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
     projectId: "domain-recovery", title: "Frontend recovery Todo", description: "", status: "todo",
     priority: "high", labels: ["agent-todo"], threadId: binding.threadId, threadBinding: binding,
     actor, assignee: actor, workflowId: null, workflowProfile: "vibe",
-    developmentContext: { type: "worktree", path: "/tmp/product", branch: "codex/domain-recovery" },
+    developmentContext: { type: "worktree", path: productWorkspacePath, branch: "codex/domain-recovery" },
     startDate: null, dueDate: null, recurrence: null,
   });
   database.createComment(task.id, {
@@ -1527,7 +1530,7 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   });
   const recovered = database.claimAgentLaneDomainCoordinator("domain-recovery", "frontend", {
     holderTaskId: "frontend", holderThreadId: "frontend-thread",
-    holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+    holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
     expectedLeaseId: "frontend-lease-a", leaseDurationSeconds: 120, recoverOnly: true,
   });
   assert.notEqual(recovered.lease.id, "frontend-lease-a");
@@ -1693,21 +1696,25 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   const database = new TaskboardDatabase(databasePath);
   database.createProject({ id: "control-plane", name: "Control plane", workspacePath: null });
   const activeUntil = "2099-01-01T00:00:00.000Z";
+  const ownerWorkspacePath = path.resolve("/tmp/owner");
+  const globalWorkspacePath = path.resolve("/tmp/global");
+  const frontendWorkspacePath = path.resolve("/tmp/frontend");
+  const productWorkspacePath = path.resolve("/tmp/product");
   const ownerBinding = {
     threadId: "owner-thread", codexProjectId: "control-plane", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/owner",
+    codexHostId: "local", workspacePath: ownerWorkspacePath,
   };
   database.upsertAgentLaneProject("control-plane", {
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
-      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
-      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: ownerWorkspacePath },
+      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: frontendWorkspacePath },
     ],
     adapters: [],
     coordinatorLease: {
       id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
-      holderCodexHostId: "local", holderWorkspacePath: "/tmp/global",
+      holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
       acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
     },
     coordinationDomains: [
@@ -1716,7 +1723,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
     domainCoordinatorLeases: {
       frontend: {
         id: "frontend-lease-a", holderTaskId: "frontend", holderThreadId: "frontend-thread",
-        holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+        holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
         acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
       },
     },
@@ -1764,7 +1771,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   assert.equal(database.listProjectOwnerIntentPlan("control-plane").length, 1);
   const task = database.getTask(planned.revision.items[0].task.id);
   database.updateTask(task.id, task.version, {
-    developmentContext: { type: "worktree", path: "/tmp/product", branch: "codex/control-plane" },
+    developmentContext: { type: "worktree", path: productWorkspacePath, branch: "codex/control-plane" },
   }, ownerBinding.threadId, ownerBinding, actor);
   database.createComment(task.id, {
     body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
@@ -1862,7 +1869,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   });
   const recovered = database.claimAgentLaneDomainCoordinator("control-plane", "frontend", {
     holderTaskId: "frontend", holderThreadId: "frontend-thread",
-    holderCodexHostId: "local", holderWorkspacePath: "/tmp/frontend",
+    holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
     expectedLeaseId: "frontend-lease-a", leaseDurationSeconds: 120, recoverOnly: true,
   });
   assert.notEqual(recovered.lease.id, "frontend-lease-a");

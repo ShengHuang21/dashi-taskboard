@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { test } from "node:test";
 
 import {
@@ -372,11 +373,12 @@ test("Coordinator provisioning excludes deterministically unsupported delivery m
     model: "gpt-5.5",
     reasoningEffort: "high",
   });
+  const taskboardWorkspacePath = path.resolve("/tmp/taskboard");
   assert.deepEqual(coordinatorProvisioningTurnStartParams(
     coordinatorThreadId,
     `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.5`,
     { model: "gpt-5.5", reasoningEffort: "high" },
-    "/tmp/taskboard",
+    taskboardWorkspacePath,
   ), {
     threadId: coordinatorThreadId,
     input: [{
@@ -388,7 +390,7 @@ test("Coordinator provisioning excludes deterministically unsupported delivery m
     approvalPolicy: "never",
     sandboxPolicy: {
       type: "workspaceWrite",
-      writableRoots: ["/tmp/taskboard"],
+      writableRoots: [taskboardWorkspacePath],
       networkAccess: true,
     },
   });
@@ -607,6 +609,7 @@ test("Coordinator provisioning inspection diagnostics allow only finite reasons"
 
 test("background Coordinator identity handshake verifies the exact host thread without changing foreground focus", async () => {
   const confirmations = [];
+  const workspacePath = path.resolve("/tmp/sbkk");
   const result = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
     projectId: "local",
     listHandshakes: async () => ({ handshakes: [{
@@ -618,13 +621,13 @@ test("background Coordinator identity handshake verifies the exact host thread w
       },
       expectedHostBinding: {
         codexProjectId: "codex-project", codexProjectKind: "local",
-        codexHostId: "local", workspacePath: "/tmp/sbkk",
+        codexHostId: "local", workspacePath,
       },
     }] }),
     readThread: async ({ threadId, codexHostId }) => {
       assert.equal(threadId, coordinatorThreadId);
       assert.equal(codexHostId, "local");
-      return { thread: { id: threadId, cwd: "/tmp/sbkk" } };
+      return { thread: { id: threadId, cwd: workspacePath } };
     },
     confirmIdentity: async (handshakeId, registration, binding) => (
       confirmations.push({ handshakeId, registration, binding })
@@ -641,7 +644,7 @@ test("background Coordinator identity handshake verifies the exact host thread w
     binding: {
     threadId: coordinatorThreadId,
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", workspacePath,
   } }]);
 
   const wrongWorkspace = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
@@ -2386,7 +2389,7 @@ test("coordinator recovery skips explicit release and busy holders", async () =>
 const coordinationAuthorization = {
   safeActionId: "safe-action",
   expectedResumeToken: "a".repeat(64),
-  rootWorkspacePath: "/tmp/taskboard/project",
+  rootWorkspacePath: path.resolve("/tmp/taskboard/project"),
   deliveryReceipt: {
     id: "coordination-receipt",
     reservationLeaseId: "reservation-lease",
@@ -2397,7 +2400,7 @@ const deliverCoordination = (request, rpc, validateExecutionTarget = async () =>
   deliverTaskboardCoordination(request, rpc, validateExecutionTarget)
 );
 const confirmedIdentity = {
-  worktreePath: "/tmp/taskboard/project",
+  worktreePath: path.resolve("/tmp/taskboard/project"),
   branch: "codex/test",
   repository: null,
 };
@@ -2412,8 +2415,8 @@ test("background continuation delivers one eligible first safe action without a 
     dispatchTarget: {
       rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
       codexHostId: "local",
-      rootWorkspacePath: "/tmp/taskboard/project",
-      worktreePath: "/tmp/taskboard/project",
+      rootWorkspacePath: coordinationAuthorization.rootWorkspacePath,
+      worktreePath: confirmedIdentity.worktreePath,
     },
     readyWork: {
       eligible: true,
@@ -2460,8 +2463,8 @@ test("background continuation delivers one eligible first safe action without a 
     todoId: todo.id,
     rootThreadId: todo.dispatchTarget.rootThreadId,
     codexHostId: "local",
-    rootWorkspacePath: "/tmp/taskboard/project",
-    targetRoot: "/tmp/taskboard/project",
+    rootWorkspacePath: coordinationAuthorization.rootWorkspacePath,
+    targetRoot: confirmedIdentity.worktreePath,
     safeActionId: "safe-first",
     expectedResumeToken: "b".repeat(64),
     deliveryReceipt: { id: "receipt", reservationLeaseId: "lease" },
@@ -4720,7 +4723,7 @@ test("Agent Todo coordination can target a Git worktree outside the Root coordin
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexHostId: "local",
     projectId: "taskboard-core", todoId: "TASKBOARD-SEPARATE",
     rootWorkspacePath: "/Users/owner/capstone-coordination",
-    targetRoot: "/tmp/capstone-execution-worktree",
+    targetRoot: path.resolve("/tmp/capstone-execution-worktree"),
     safeActionId: "safe-action-separate",
     expectedResumeToken: "f".repeat(64),
     deliveryReceipt: { id: "separate-receipt", reservationLeaseId: "separate-lease" },
@@ -4736,7 +4739,7 @@ test("Agent Todo coordination can target a Git worktree outside the Root coordin
   assert.deepEqual(result, { delivery: "started", turnId: "turn-separate" });
   assert.deepEqual(validatedTargets, [request.targetRoot]);
   const instruction = calls.find(([method]) => method === "turn/start")?.[1]?.input?.[0]?.text ?? "";
-  assert.match(instruction, /Exact execution worktree: \/tmp\/capstone-execution-worktree/);
+  assert.ok(instruction.includes(`Exact execution worktree: ${request.targetRoot}`));
   assert.match(instruction, /coordination cwd may be different/);
 });
 

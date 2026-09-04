@@ -7,7 +7,10 @@ import vm from "node:vm";
 
 import { coordinatorThreadSelectionConfirmed } from "../scripts/codex-injector-runtime.mjs";
 
-const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
+const source = (await readFile(
+  new URL("../scripts/codex-injector.mjs", import.meta.url),
+  "utf8",
+)).replace(/\r\n/g, "\n");
 const runtimeSource = await readFile(
   new URL("../scripts/codex-injector-runtime.mjs", import.meta.url),
   "utf8",
