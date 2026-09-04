@@ -3382,6 +3382,116 @@ test("background Coordinator registration requests a protected host identity han
   finalInspection.close();
 });
 
+test("domain provisioning transitions one protected attempt before thread side effects", async () => {
+  const instanceSecret = "e".repeat(64);
+  const projectId = "local";
+  const workspacePath = path.resolve("/tmp/domain-transition-frontend");
+  let revision;
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject(projectId, {
+      rootTaskId: "global",
+      tasks: [
+        {
+          id: "global", label: "Global", owner: "Codex", source: "codex",
+          threadId: "global-thread", taskType: "root_task",
+          codexProjectId: "codex-project", codexProjectKind: "local",
+          codexHostId: "local", workspacePath: "/tmp/domain-transition-global",
+        },
+        {
+          id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+          threadId: "frontend-thread", taskType: "peer_task",
+          codexProjectId: "codex-project", codexProjectKind: "local",
+          codexHostId: "local", workspacePath,
+        },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "local", holderWorkspacePath: "/tmp/domain-transition-global",
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const binding = {
+      threadId: "global-thread", codexProjectId: "codex-project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/domain-transition-global",
+    };
+    const task = database.createTask({
+      projectId, title: "Frontend work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: binding.threadId, threadBinding: binding, actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: workspacePath, branch: "codex/domain-transition",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain(projectId, task.id, {
+      domainId: "frontend", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "global-lease",
+    });
+    revision = database.getAgentLaneCoordinationWindows(projectId).revision;
+    database.close();
+    return { instanceSecret };
+  });
+  const requestPath = "/api/local/projects/local/domain-coordinator-provisioning-attempts/frontend";
+  const requestBody = {
+    idempotencyKey: "frontend-transition-a", taskId: "frontend",
+    label: "Frontend Coordinator", threadSource: "taskboard-domain-transition-frontend",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+    expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", codexProjectId: "codex-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath,
+  };
+  const created = await request(baseUrl, requestPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), requestPath, requestBody),
+    body: requestBody,
+  });
+  assert.equal(created.response.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.attempt.status, "pending");
+
+  const startingPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
+  const unprotected = await request(baseUrl, startingPath, { method: "POST", body: {} });
+  assert.equal(unprotected.response.status, 403);
+  const starting = await request(baseUrl, startingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), startingPath, {}),
+    body: {},
+  });
+  assert.equal(starting.response.status, 200, JSON.stringify(starting.body));
+  assert.equal(starting.body.attempt.status, "starting");
+  const resetPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/reset`;
+  const reset = await request(baseUrl, resetPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), resetPath, {}),
+    body: {},
+  });
+  assert.equal(reset.response.status, 200, JSON.stringify(reset.body));
+  assert.equal(reset.body.attempt.status, "pending");
+  assert.equal(reset.body.attempt.retryCount, 1);
+  await request(baseUrl, startingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), startingPath, {}),
+    body: {},
+  });
+  const attachPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/attach`;
+  const attachBody = { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" };
+  const attached = await request(baseUrl, attachPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), attachPath, attachBody),
+    body: attachBody,
+  });
+  assert.equal(attached.response.status, 200, JSON.stringify(attached.body));
+  assert.equal(attached.body.attempt.status, "started");
+  assert.equal(attached.body.attempt.threadId, attachBody.threadId);
+});
+
 test("resident provisioning persists one protected idempotent attempt before replacement thread start", async () => {
   let databasePath;
   const instanceSecret = "d".repeat(64);

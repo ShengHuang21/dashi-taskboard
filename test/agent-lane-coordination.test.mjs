@@ -1503,6 +1503,31 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
   );
   assert.equal(recovered.id, created.attempt.id);
   assert.equal(recovered.status, "pending");
+  const starting = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "starting",
+  );
+  assert.equal(starting.attempt.status, "starting");
+  assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "starting",
+  ).attempt.status, "starting");
+  const reset = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "reset",
+  );
+  assert.equal(reset.attempt.status, "pending");
+  assert.equal(reset.attempt.retryCount, 1);
+  reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(recovered.id, "starting");
+  const threadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
+  const attached = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "attach", { threadId },
+  );
+  assert.equal(attached.attempt.status, "started");
+  assert.equal(attached.attempt.threadId, threadId);
+  assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "attach", { threadId },
+  ).attempt.threadId, threadId);
+  assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "attach", { threadId: "different-thread" },
+  ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT");
   assert.equal(reopened.database.prepare(`
     SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts
   `).get().count, 2);
