@@ -45,6 +45,7 @@ import {
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCoordinatorProvisioningMonitorOnce,
+  runDomainCoordinatorProvisioningMonitorOnce,
   runCoordinatorShutdownMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
@@ -1329,6 +1330,120 @@ test("resident Coordinator provisioning persists one attempt before starting exa
   assert.equal(deliveryCalls, 2);
   assert.equal(modelReads, 1);
   assert.equal(attempt.threadId, "01a062c1-fd2b-7f61-9114-d483e695640e");
+});
+
+test("domain provisioning retries selected-model capacity on the same durable attempt", async () => {
+  const revision = "d".repeat(64);
+  const domainThreadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
+  const globalThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const snapshot = {
+    projectId: "capstone-dev",
+    coordination: {
+      coordinatorTaskId: "global",
+      lease: { id: "global-lease", status: "active", bindingValid: true },
+      domainCoordinators: [{
+        domainId: "frontend",
+        assignment: "unassigned",
+        durableWorkPending: true,
+        eligibleTaskIds: ["frontend"],
+      }],
+    },
+    taskLanes: [
+      {
+        id: "global", source: "codex", taskType: "root_task",
+        threadId: globalThreadId,
+      },
+      {
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "01a01111-a749-7b53-81e2-af2d477f93ae",
+        codexProjectId: "local-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/domain-frontend",
+      },
+    ],
+  };
+  let attempt = null;
+  let requests = 0;
+  let starts = 0;
+  let resets = 0;
+  let attaches = 0;
+  const options = {
+    policy: {
+      enabled: true, projectId: "capstone-dev",
+      model: "gpt-5", reasoningEffort: "high",
+    },
+    readSnapshot: async () => snapshot,
+    readWindows: async () => ({ projectId: "capstone-dev", revision }),
+    getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
+    requestAttempt: async (request) => {
+      requests += 1;
+      attempt = {
+        ...request,
+        id: "domain-attempt",
+        status: "pending",
+        threadId: null,
+        retryCount: 0,
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => attempt?.threadId ? {
+      id: attempt.threadId,
+      cwd: attempt.workspacePath,
+      threadSource: attempt.threadSource,
+    } : null,
+    markStarting: async () => {
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      starts += 1;
+      assert.equal(settings.codexHostId, "local");
+      assert.equal(settings.cwd, "/tmp/domain-frontend");
+      assert.equal(settings.approvalPolicy, "never");
+      if (starts === 1) {
+        throw new Error("Selected model is at capacity. Please try a different model.");
+      }
+      return { thread: {
+        id: domainThreadId,
+        cwd: settings.cwd,
+        threadSource: settings.threadSource,
+      } };
+    },
+    resetAttempt: async () => {
+      resets += 1;
+      attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
+      return { attempt: { ...attempt } };
+    },
+    attachThread: async ({ threadId }) => {
+      attaches += 1;
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+  };
+
+  assert.deepEqual(await runDomainCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: false,
+    reason: "model-capacity",
+    domainId: "frontend",
+    attemptId: "domain-attempt",
+  });
+  assert.equal(attempt.status, "pending");
+  assert.equal(attempt.retryCount, 1);
+  assert.deepEqual(await runDomainCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: true,
+    reason: "domain-thread-started",
+    domainId: "frontend",
+    attemptId: "domain-attempt",
+    threadId: domainThreadId,
+  });
+  assert.equal(requests, 1);
+  assert.equal(starts, 2);
+  assert.equal(resets, 1);
+  assert.equal(attaches, 1);
+  assert.equal(attempt.threadId, domainThreadId);
+  assert.equal((await runDomainCoordinatorProvisioningMonitorOnce(options)).threadId, domainThreadId);
+  assert.equal(requests, 1);
+  assert.equal(starts, 2);
+  assert.equal(attaches, 2);
 });
 
 test("Coordinator provisioning rebinds the same active attempt after safe window revision drift", async () => {

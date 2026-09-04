@@ -55,6 +55,7 @@ import {
   runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
   runCoordinatorIdentityHandshakeFastLane,
   runCoordinatorProvisioningMonitorOnce,
+  runDomainCoordinatorProvisioningMonitorOnce,
   runCoordinatorShutdownMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
@@ -2085,6 +2086,19 @@ async function getCoordinatorProvisioningAttempt(request) {
     : {});
 }
 
+async function requestDomainCoordinatorProvisioningAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-provisioning-attempts/${encodeURIComponent(request.domainId)}`;
+  const { projectId: _projectId, domainId: _domainId, ...body } = request;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function getDomainCoordinatorProvisioningAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-provisioning-attempts/${encodeURIComponent(request.domainId)}/lookup`;
+  return mutateCoordinatorProvisioning(pathname, request.idempotencyKey
+    ? { idempotencyKey: request.idempotencyKey }
+    : {});
+}
+
 async function getCoordinatorShutdownAttempt(request) {
   const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-shutdown-attempts/lookup`;
   return mutateCoordinatorProvisioning(pathname, {});
@@ -2194,6 +2208,11 @@ async function inspectCoordinatorProvisioningWindow(cdp, window) {
 
 async function transitionCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
   const pathname = `/api/local/coordinator-provisioning-attempts/${encodeURIComponent(attemptId)}/${action}`;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function transitionDomainCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
+  const pathname = `/api/local/domain-coordinator-provisioning-attempts/${encodeURIComponent(attemptId)}/${action}`;
   return mutateCoordinatorProvisioning(pathname, body);
 }
 
@@ -2997,6 +3016,34 @@ async function runBackgroundContinuationMonitor(cdp) {
         reportCoordinatorProvisioningDiagnostic(projectId, result);
         return result;
       },
+      () => runDomainCoordinatorProvisioningMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          model: automationPolicy?.model,
+          reasoningEffort: automationPolicy?.reasoningEffort,
+        },
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        readWindows: () => readCoordinatorProvisioningWindows(projectId),
+        readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
+        getAttempt: getDomainCoordinatorProvisioningAttempt,
+        requestAttempt: requestDomainCoordinatorProvisioningAttempt,
+        findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
+        markStarting: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "starting",
+        ),
+        startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
+          cdp, undefined, codexHostId, "thread/start", params, 10_000,
+        ),
+        attachThread: ({ attemptId, threadId }) => (
+          transitionDomainCoordinatorProvisioningAttempt(
+            attemptId, "attach", { threadId },
+          )
+        ),
+        resetAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "reset",
+        ),
+      }),
       () => runOwnerIntentCaptureMonitorOnce({
         policy: { enabled: true, projectId },
         readSnapshot: readTaskboardAgentLaneSnapshot,
