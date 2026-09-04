@@ -1181,6 +1181,8 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   assert.deepEqual(snapshot.todos[0].domainAssignment, {
     domainId: "frontend", status: "active", coordinatorTaskId: "frontend", leaseId: "frontend-lease",
   });
+  assert.equal(snapshot.coordination.domainCoordinators[0].durableWorkPending, false);
+  assert.deepEqual(snapshot.coordination.domainCoordinators[0].durableWorkTaskIds, []);
   assert.deepEqual(snapshot.todos[0].dispatchTarget, {
     rootThreadId: "frontend-thread", codexHostId: "local",
     rootWorkspacePath: "/tmp/frontend", worktreePath: "/tmp/product",
@@ -1206,6 +1208,11 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   }).getProjectSnapshot("domain-project");
   assert.equal(unavailable.todos[0].domainAssignment.status, "needs_coordinator");
   assert.equal(unavailable.todos[0].dispatchTarget, null);
+  assert.equal(unavailable.coordination.domainCoordinators[0].durableWorkPending, true);
+  assert.deepEqual(
+    unavailable.coordination.domainCoordinators[0].durableWorkTaskIds,
+    [mixedCaseClaimTask.identifier, task.identifier],
+  );
   const { holderThreadId, holderCodexHostId, holderWorkspacePath, ...legacyDomainLease } = (
     laneConfig.domainCoordinatorLeases.frontend
   );
@@ -1224,6 +1231,11 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   }).getProjectSnapshot("domain-project");
   assert.equal(legacyUnavailable.todos[0].domainAssignment.status, "needs_coordinator");
   assert.equal(legacyUnavailable.todos[0].dispatchTarget, null);
+  assert.equal(legacyUnavailable.coordination.domainCoordinators[0].durableWorkPending, true);
+  assert.deepEqual(
+    legacyUnavailable.coordination.domainCoordinators[0].durableWorkTaskIds,
+    [mixedCaseClaimTask.identifier, task.identifier],
+  );
   reopened.upsertAgentLaneProject("domain-project", laneConfig);
   assert.throws(() => reopened.prepareTaskSafeActionAdmission(task.id, {
     rootThreadId: "frontend-thread", expectedResumeToken: persistedAdmission.receipt.resumeToken,

@@ -1443,6 +1443,13 @@ export function createAgentLaneSnapshotProvider({
           && generatedAt.getTime() < Date.parse(domainLease.expiresAt);
         const domainCoordinatorTaskId = active ? domainLease.holderTaskId : null;
         const domainCoordinator = taskLanes.find((lane) => lane.id === domainCoordinatorTaskId) ?? null;
+        const durableWorkTaskIds = todos
+          .filter((todo) => (
+            todo.domainAssignment?.domainId === domain.id
+            && todo.domainAssignment.status === "needs_coordinator"
+            && todo.state !== "completed"
+          ))
+          .map((todo) => todo.id);
         return {
           domainId: domain.id,
           label: domain.label,
@@ -1452,6 +1459,8 @@ export function createAgentLaneSnapshotProvider({
           coordinatorStableIdentity: domainCoordinator?.stableIdentity ?? null,
           assignment: active ? "lease" : "unassigned",
           replaceable: true,
+          durableWorkPending: durableWorkTaskIds.length > 0,
+          durableWorkTaskIds,
           lease: domainLease ? {
             id: domainLease.id,
             holderTaskId: domainLease.holderTaskId,
