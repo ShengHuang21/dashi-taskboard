@@ -139,7 +139,6 @@ try {
     "issue", "update", created.id,
     "--title", "Packaged taskctl verified",
     "--if-version", String(fetched.version),
-    "--thread-id", "00000000-0000-4000-8000-000000000001",
     "--json",
   ]).task;
   if (updated.title !== "Packaged taskctl verified") throw new Error("Packaged issue update failed");
