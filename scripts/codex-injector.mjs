@@ -29,6 +29,7 @@ import {
   coordinatorProvisioningThreadListData,
   findCoordinatorProvisioningThreadAcrossPages,
   coordinatorThreadSelectionConfirmed,
+  createDisposableMonitorTimer,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
   deliverTaskboardAdmissionRecovery,
@@ -52,6 +53,7 @@ import {
   runOwnerIntentCaptureMonitorOnce,
   runOwnerIntentPlanningMonitorOnce,
   runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
+  runCoordinatorIdentityHandshakeFastLane,
   runCoordinatorProvisioningMonitorOnce,
   runCoordinatorShutdownMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
@@ -157,6 +159,7 @@ const taskConversationOperations = new Map();
 const taskConversationFailureTtlMs = 120_000;
 const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
 const backgroundContinuationIntervalMs = 15_000;
+const coordinatorIdentityHandshakeIntervalMs = 2_000;
 const coordinatorLeaseRenewWindowMs = 45_000;
 const coordinatorLeaseDurationSeconds = 120;
 const coordinatorShutdownIdleGraceMs = 60_000;
@@ -558,6 +561,7 @@ class CdpConnection {
     this.pending = new Map();
     this.eventWaiters = new Map();
     this.eventHandlers = new Map();
+    this.closeHandlers = new Set();
     this.closed = false;
   }
 
@@ -613,6 +617,15 @@ class CdpConnection {
       this.eventWaiters.forEach((waiters) => waiters.forEach((waiter) => waiter.reject(error)));
       this.eventWaiters.clear();
       this.eventHandlers.clear();
+      const closeHandlers = [...this.closeHandlers];
+      this.closeHandlers.clear();
+      closeHandlers.forEach((handler) => {
+        try {
+          handler();
+        } catch (error) {
+          console.error(`CDP close handler failed: ${error.message}`);
+        }
+      });
     });
   }
 
@@ -656,6 +669,16 @@ class CdpConnection {
         (this.eventHandlers.get(method) || []).filter((candidate) => candidate !== handler),
       );
     };
+  }
+
+  onClose(handler) {
+    if (typeof handler !== "function") throw new Error("CDP close handler must be a function");
+    if (this.closed) {
+      queueMicrotask(handler);
+      return () => {};
+    }
+    this.closeHandlers.add(handler);
+    return () => this.closeHandlers.delete(handler);
   }
 
   close() {
@@ -2846,19 +2869,6 @@ async function runBackgroundContinuationMonitor(cdp) {
     const automationPolicy = quotaPolicyRecords.get(projectId)?.request ?? null;
     const monitors = [];
     if (continuationEnabled) monitors.push(
-      () => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
-        projectId,
-        listHandshakes: listCoordinatorIdentityHandshakes,
-        readThread: (route) => requestCodexAppServerViaCdp(
-          cdp,
-          undefined,
-          route.codexHostId,
-          "thread/read",
-          { threadId: route.threadId, includeTurns: false },
-          10_000,
-        ),
-        confirmIdentity: confirmCoordinatorIdentityHandshake,
-      }),
       () => runCoordinatorShutdownMonitorOnce({
         policy: {
           enabled: true,
@@ -3141,7 +3151,8 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   let activeContextId = null;
   let activeMainContextId = null;
   let installInFlight = null;
-  let backgroundContinuationTimer = null;
+  let disposeBackgroundContinuationTimer = null;
+  let disposeCoordinatorIdentityHandshakeTimer = null;
   let hostRequestQueueTimer = null;
   let hostRequestQueueInFlight = false;
   let taskboardNetworkProxyInstalled = false;
@@ -3159,19 +3170,59 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   });
 
   const scheduleBackgroundContinuation = () => {
-    if (backgroundContinuationTimer || cdp.closed) return;
-    const tick = createSerializedMonitorTick(async () => {
+    if (disposeBackgroundContinuationTimer || cdp.closed) return;
+    disposeBackgroundContinuationTimer = createDisposableMonitorTimer(async () => {
       if (cdp.closed) return;
       try {
         await runBackgroundContinuationMonitor(cdp);
       } catch (error) {
         console.error(`Taskboard background continuation check failed: ${error.message}`);
       }
-    });
-    void tick();
-    backgroundContinuationTimer = setInterval(() => void tick(), backgroundContinuationIntervalMs);
-    backgroundContinuationTimer.unref?.();
+    }, backgroundContinuationIntervalMs);
   };
+
+  const scheduleCoordinatorIdentityHandshakeFastLane = () => {
+    if (disposeCoordinatorIdentityHandshakeTimer || cdp.closed) return;
+    disposeCoordinatorIdentityHandshakeTimer = createDisposableMonitorTimer(async () => {
+      if (cdp.closed) return;
+      try {
+        const projects = await loadResidentCoordinatorMonitorProjects({
+          listLifecycleProjects: listResidentCoordinatorMonitorProjects,
+          readContinuationPolicyEntries: readTaskboardClientStorageEntries,
+          continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
+        });
+        await runCoordinatorIdentityHandshakeFastLane({
+          projects,
+          runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+            projectId,
+            listHandshakes: listCoordinatorIdentityHandshakes,
+            readThread: (route) => requestCodexAppServerViaCdp(
+              cdp,
+              undefined,
+              route.codexHostId,
+              "thread/read",
+              { threadId: route.threadId, includeTurns: false },
+              10_000,
+            ),
+            confirmIdentity: confirmCoordinatorIdentityHandshake,
+          }),
+        });
+      } catch (error) {
+        console.error(`Taskboard Coordinator identity fast lane failed: ${error.message}`);
+      }
+    }, coordinatorIdentityHandshakeIntervalMs);
+  };
+
+  cdp.onClose(() => {
+    disposeCoordinatorIdentityHandshakeTimer?.();
+    disposeCoordinatorIdentityHandshakeTimer = null;
+    disposeBackgroundContinuationTimer?.();
+    disposeBackgroundContinuationTimer = null;
+    if (hostRequestQueueTimer) {
+      clearInterval(hostRequestQueueTimer);
+      hostRequestQueueTimer = null;
+    }
+  });
 
   const installTaskboardNetworkProxy = async () => {
     if (taskboardNetworkProxyInstalled) return;
@@ -3392,6 +3443,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         returnByValue: true,
       });
       await restoreQuotaPolicies(cdp);
+      scheduleCoordinatorIdentityHandshakeFastLane();
       scheduleBackgroundContinuation();
       return activeContextId;
     })();

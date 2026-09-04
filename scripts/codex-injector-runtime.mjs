@@ -11,6 +11,7 @@ const ownerIntentCaptureMonitorRuns = new Map();
 const ownerIntentAdoptionMonitorRuns = new Map();
 const ownerIntentPlanningMonitorRuns = new Map();
 const crossDomainHandoffMonitorRuns = new Map();
+const coordinatorIdentityHandshakeFastLaneRuns = new Map();
 const coordinatorLeaseKeepaliveMonitorRuns = new Map();
 const coordinatorLeaseRecoveryMonitorRuns = new Map();
 const coordinatorProvisioningMonitorRuns = new Map();
@@ -43,6 +44,31 @@ export function createSerializedMonitorTick(run) {
     } finally {
       inFlight = false;
     }
+  };
+}
+
+export function createDisposableMonitorTimer(
+  run,
+  intervalMs,
+  { schedule = setInterval, cancel = clearInterval } = {},
+) {
+  if (typeof run !== "function"
+    || !Number.isFinite(intervalMs) || intervalMs <= 0
+    || typeof schedule !== "function" || typeof cancel !== "function") {
+    throw new Error("Disposable monitor timer requires an exact schedule");
+  }
+  let disposed = false;
+  const tick = createSerializedMonitorTick(async () => {
+    if (disposed) return;
+    await run();
+  });
+  const timer = schedule(() => void tick(), intervalMs);
+  timer?.unref?.();
+  void tick();
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    cancel(timer);
   };
 }
 
@@ -1934,6 +1960,37 @@ export async function runTaskboardProjectMonitorSequence(monitors) {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+  }
+  return results;
+}
+
+export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHandshake }) {
+  if (!Array.isArray(projects) || typeof runHandshake !== "function") {
+    throw new Error("Coordinator identity handshake fast lane requires exact project state");
+  }
+  const results = [];
+  for (const project of projects) {
+    if (project?.continuationEnabled !== true
+      || !COORDINATION_ID_PATTERN.test(project?.projectId ?? "")) continue;
+    const projectId = project.projectId;
+    let run = coordinatorIdentityHandshakeFastLaneRuns.get(projectId);
+    if (!run) {
+      run = Promise.resolve().then(() => runHandshake(projectId));
+      coordinatorIdentityHandshakeFastLaneRuns.set(projectId, run);
+    }
+    try {
+      results.push({ projectId, ok: true, result: await run });
+    } catch (error) {
+      results.push({
+        projectId,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      if (coordinatorIdentityHandshakeFastLaneRuns.get(projectId) === run) {
+        coordinatorIdentityHandshakeFastLaneRuns.delete(projectId);
+      }
     }
   }
   return results;

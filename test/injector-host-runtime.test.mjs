@@ -14,6 +14,7 @@ import {
   coordinatorProvisioningThreadListData,
   coordinatorProvisioningThreadListParams,
   coordinatorThreadSelectionConfirmed,
+  createDisposableMonitorTimer,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
   deliverTaskboardCoordination,
@@ -39,6 +40,7 @@ import {
   runOwnerIntentCaptureMonitorOnce,
   runOwnerIntentPlanningMonitorOnce,
   runBackgroundCoordinatorIdentityHandshakeMonitorOnce,
+  runCoordinatorIdentityHandshakeFastLane,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCoordinatorProvisioningMonitorOnce,
@@ -3931,6 +3933,63 @@ test("Owner Intent adoption failure cannot starve continuation or Owner decision
   ]);
 });
 
+test("Coordinator identity handshakes run in a dedicated continuation fast lane", async () => {
+  const calls = [];
+  const results = await runCoordinatorIdentityHandshakeFastLane({
+    projects: [
+      { projectId: "disabled-project", continuationEnabled: false },
+      { projectId: "capstone-dev", continuationEnabled: true },
+      { projectId: "second-project", continuationEnabled: true },
+    ],
+    runHandshake: async (projectId) => {
+      calls.push(projectId);
+      if (projectId === "second-project") throw new Error("host unavailable");
+      return { confirmed: 1, skipped: 0, failed: 0 };
+    },
+  });
+  assert.deepEqual(calls, ["capstone-dev", "second-project"]);
+  assert.deepEqual(results, [
+    {
+      projectId: "capstone-dev",
+      ok: true,
+      result: { confirmed: 1, skipped: 0, failed: 0 },
+    },
+    { projectId: "second-project", ok: false, error: "host unavailable" },
+  ]);
+});
+
+test("disposed Coordinator fast-lane timers stop old renderer ticks", async () => {
+  const events = [];
+  let scheduledTick;
+  let canceledTimer = null;
+  const timer = { unref: () => events.push("unref") };
+  const dispose = createDisposableMonitorTimer(
+    async () => { events.push("tick"); },
+    2_000,
+    {
+      schedule: (callback, intervalMs) => {
+        events.push(`schedule:${intervalMs}`);
+        scheduledTick = callback;
+        return timer;
+      },
+      cancel: (candidate) => {
+        canceledTimer = candidate;
+        events.push("cancel");
+      },
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["schedule:2000", "unref", "tick"]);
+  scheduledTick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["schedule:2000", "unref", "tick", "tick"]);
+  dispose();
+  assert.equal(canceledTimer, timer);
+  scheduledTick();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["schedule:2000", "unref", "tick", "tick", "cancel"]);
+});
+
 test("cross-domain handoff waits for an idle Coordinator without steering", async () => {
   const request = {
     projectId: "taskboard-core",
@@ -4424,7 +4483,8 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /"thread\/start"/);
   assert.match(source, /TASKBOARD_COORDINATOR_PROVISIONING_V1/);
   assert.doesNotMatch(source, /background-continuation-receipts/);
-  assert.match(source, /setInterval\(\(\) => void tick\(\), backgroundContinuationIntervalMs\)/);
+  assert.match(source, /createDisposableMonitorTimer\(async \(\) => \{[\s\S]+backgroundContinuationIntervalMs\)/);
+  assert.match(source, /cdp\.onClose\(\(\) => \{[\s\S]+disposeCoordinatorIdentityHandshakeTimer[\s\S]+disposeBackgroundContinuationTimer/);
 });
 
 test("the authenticated network proxy signs host-runtime publications", async () => {
