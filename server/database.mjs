@@ -3856,6 +3856,162 @@ export class TaskboardDatabase {
     }
   }
 
+  transitionAgentLaneDomainCoordinatorProvisioningAttempt(attemptId, action, input = {}) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const row = this.#prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+      ).get(attemptId);
+      if (!row) {
+        throw new ApiError(
+          404,
+          "DOMAIN_COORDINATOR_PROVISIONING_NOT_FOUND",
+          "The domain Coordinator provisioning attempt does not exist",
+        );
+      }
+      if (["completed", "canceled", "expired"].includes(row.status)) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_TERMINAL",
+          "The domain Coordinator provisioning attempt is terminal",
+        );
+      }
+      if (Date.parse(row.expires_at) <= Date.now()) {
+        this.#prepare(`
+          UPDATE agent_domain_coordinator_provisioning_attempts
+          SET status = 'expired', updated_at = ? WHERE id = ?
+        `).run(now(), attemptId);
+        this.database.exec("COMMIT");
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_TERMINAL",
+          "The domain Coordinator provisioning attempt is terminal",
+        );
+      }
+      const project = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(row.project_id);
+      const config = project ? JSON.parse(project.config_json) : null;
+      const domain = config
+        ? normalizeCoordinationDomains(config).find((candidate) => candidate.id === row.domain_id) ?? null
+        : null;
+      const domainHolder = Array.isArray(config?.tasks)
+        ? config.tasks.find((task) => task?.id === row.task_id) ?? null
+        : null;
+      const activeGlobal = config
+        ? this.#exactActiveCoordinatorLease(row.project_id, config, config.coordinatorLease ?? null)
+        : null;
+      const globalLease = activeGlobal?.lease ?? null;
+      const globalHolder = activeGlobal?.holder ?? null;
+      const durableWork = this.#prepare(`
+        SELECT task.id
+        FROM agent_task_domain_assignments AS assignment
+        JOIN tasks AS task ON task.id = assignment.task_id
+        WHERE assignment.project_id = ? AND assignment.domain_id = ?
+          AND task.archived_at IS NULL AND task.status = 'todo'
+          AND EXISTS (
+            SELECT 1 FROM json_each(task.labels) AS label WHERE label.value = 'agent-todo'
+          )
+        ORDER BY task.sort_order, task.created_at, task.id
+        LIMIT 1
+      `).get(row.project_id, row.domain_id);
+      const stableBinding = project
+        && agentLaneConfigRevision(project.config_json) === row.expected_revision
+        && domain
+        && domain.eligibleTaskIds.includes(row.task_id)
+        && JSON.stringify(domain.writeScope) === row.write_scope_json
+        && isFullyBoundCodexPeerTask(domainHolder)
+        && domainHolder.label === row.label
+        && domainHolder.codexProjectId === row.codex_project_id
+        && domainHolder.codexProjectKind === row.codex_project_kind
+        && domainHolder.codexHostId === row.codex_host_id
+        && path.resolve(domainHolder.workspacePath ?? "") === path.resolve(row.workspace_path)
+        && globalLease?.id === row.expected_global_lease_id
+        && globalHolder?.id === row.global_holder_task_id
+        && globalHolder?.threadId === row.global_holder_thread_id
+        && !this.#exactActiveCoordinatorLease(
+          row.project_id,
+          config,
+          config.domainCoordinatorLeases?.[row.domain_id] ?? null,
+          Date.now(),
+          row.domain_id,
+        )
+        && durableWork;
+      if (!stableBinding) {
+        const timestamp = now();
+        this.#prepare(`
+          UPDATE agent_domain_coordinator_provisioning_attempts
+          SET status = 'canceled', updated_at = ? WHERE id = ?
+        `).run(timestamp, attemptId);
+        this.database.exec("COMMIT");
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_CANCELED",
+          "Domain coordination drift canceled the provisioning attempt",
+        );
+      }
+
+      let nextStatus = row.status;
+      let threadId = row.thread_id;
+      let retryCount = row.retry_count;
+      let expiresAt = row.expires_at;
+      if (action === "starting") {
+        if (row.status === "pending") nextStatus = "starting";
+        else if (row.status !== "starting") {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_STATE_CONFLICT",
+            "Only a pending domain attempt can start a thread",
+          );
+        }
+      } else if (action === "attach") {
+        if (!["pending", "starting", "started"].includes(row.status)) {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_STATE_CONFLICT",
+            "The domain attempt cannot attach a thread",
+          );
+        }
+        if (row.thread_id && row.thread_id !== input.threadId) {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT",
+            "The domain attempt is already bound to another thread",
+          );
+        }
+        nextStatus = "started";
+        threadId = input.threadId;
+      } else if (action === "reset") {
+        if (row.status !== "starting" || row.thread_id) {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_STATE_CONFLICT",
+            "Only an unbound starting domain attempt can retry selected-model capacity",
+          );
+        }
+        nextStatus = "pending";
+        retryCount += 1;
+        expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
+      } else {
+        throw new ApiError(400, "INVALID_FIELD", "Unknown domain Coordinator provisioning transition");
+      }
+      const timestamp = now();
+      this.#prepare(`
+        UPDATE agent_domain_coordinator_provisioning_attempts
+        SET status = ?, thread_id = ?, retry_count = ?, missing_since = NULL,
+            updated_at = ?, expires_at = ? WHERE id = ?
+      `).run(nextStatus, threadId, retryCount, timestamp, expiresAt, attemptId);
+      this.database.exec("COMMIT");
+      return { attempt: domainCoordinatorProvisioningAttemptFromRow({
+        ...row, status: nextStatus, thread_id: threadId, retry_count: retryCount,
+        missing_since: null, updated_at: timestamp, expires_at: expiresAt,
+      }) };
+    } catch (error) {
+      if (this.database.isTransaction) this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   requestAgentLaneCoordinatorProvisioningAttempt(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {

@@ -3861,6 +3861,33 @@ export function createTaskboardServer(options = {}) {
         ));
       }
 
+      const domainCoordinatorProvisioningTransitionRoute = pathname.match(
+        /^\/api\/local\/domain-coordinator-provisioning-attempts\/([^/]+)\/(starting|attach|reset)$/,
+      );
+      if (domainCoordinatorProvisioningTransitionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(
+          url.searchParams,
+          "POST /api/local/domain-coordinator-provisioning-attempts/:id/:action",
+        );
+        const attemptId = decodeRouteSegment(
+          domainCoordinatorProvisioningTransitionRoute[1], "Attempt id",
+        );
+        const action = domainCoordinatorProvisioningTransitionRoute[2];
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(
+          request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
+        );
+        const input = parseCoordinatorProvisioningTransition(body, action);
+        return sendJson(
+          response,
+          200,
+          database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+            attemptId, action, input,
+          ),
+        );
+      }
+
       const coordinatorProvisioningPreflightRoute = pathname.match(
         /^\/api\/local\/projects\/([^/]+)\/coordinator-provisioning-preflight$/,
       );
