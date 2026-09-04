@@ -2273,7 +2273,9 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   ].join("\n");
   const started = await rpc(
     "turn/start",
-    coordinatorProvisioningTurnStartParams(threadId, instruction, selectedModel),
+    coordinatorProvisioningTurnStartParams(
+      threadId, instruction, selectedModel, attempt.workspacePath,
+    ),
   );
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a provisioning delivery turn receipt");

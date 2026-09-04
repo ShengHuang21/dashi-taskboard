@@ -374,6 +374,7 @@ test("Coordinator provisioning excludes deterministically unsupported delivery m
     coordinatorThreadId,
     `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.5`,
     { model: "gpt-5.5", reasoningEffort: "high" },
+    "/tmp/taskboard",
   ), {
     threadId: coordinatorThreadId,
     input: [{
@@ -382,6 +383,12 @@ test("Coordinator provisioning excludes deterministically unsupported delivery m
     }],
     model: "gpt-5.5",
     effort: "high",
+    approvalPolicy: "never",
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      writableRoots: ["/tmp/taskboard"],
+      networkAccess: true,
+    },
   });
 });
 

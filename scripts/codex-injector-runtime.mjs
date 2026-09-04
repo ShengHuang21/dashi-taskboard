@@ -339,19 +339,26 @@ export function selectCoordinatorProvisioningFallbackModel(
 }
 
 export function coordinatorProvisioningTurnStartParams(
-  threadId, instruction, selectedModel,
+  threadId, instruction, selectedModel, workspacePath,
 ) {
   if (!THREAD_ID_PATTERN.test(threadId ?? "")
     || typeof instruction !== "string" || !instruction
     || typeof selectedModel?.model !== "string" || !selectedModel.model
-    || typeof selectedModel?.reasoningEffort !== "string" || !selectedModel.reasoningEffort) {
-    throw new Error("Coordinator turn start requires exact thread and model settings");
+    || typeof selectedModel?.reasoningEffort !== "string" || !selectedModel.reasoningEffort
+    || typeof workspacePath !== "string" || !path.isAbsolute(workspacePath)) {
+    throw new Error("Coordinator turn start requires exact thread, model, and workspace settings");
   }
   return {
     threadId,
     input: [{ type: "text", text: instruction }],
     model: selectedModel.model,
     effort: selectedModel.reasoningEffort,
+    approvalPolicy: "never",
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      writableRoots: [path.resolve(workspacePath)],
+      networkAccess: true,
+    },
   };
 }
 
