@@ -26,6 +26,11 @@ const OWNER_INTENT_PLAN_MARKER = "TASKBOARD_OWNER_INTENT_PLAN_V1";
 const CROSS_DOMAIN_HANDOFF_MARKER = "Taskboard cross-domain handoff delivery id:";
 const SENSITIVE_COORDINATION_TEXT = /-----BEGIN [^-]+-----|\bAKIA[A-Z0-9]{16}\b|https?:\/\/[^\s/:@]+:[^\s/@]+@|\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*\S+|\bBearer\s+\S+|\b(?:sk|ghp|github_pat)-?[A-Za-z0-9_]{16,}\b/i;
 const SELECTED_MODEL_CAPACITY_ERROR = /selected model is at capacity\.\s*please try a different model\.?/i;
+const CHATGPT_ACCOUNT_UNSUPPORTED_MODEL_ERROR = /model is not supported when using Codex with a ChatGPT account/i;
+const COORDINATOR_DELIVERY_MODEL_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:";
+const COORDINATOR_DELIVERY_EFFORT_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:";
+const COORDINATOR_DELIVERY_RETRY_BASE_MS = 15_000;
+const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
 
 export function createSerializedMonitorTick(run) {
   let inFlight = false;
@@ -199,6 +204,155 @@ export function classifyCoordinatorProvisioningDeliveryTurns(turns, marker) {
     };
   }
   return { delivery: "retry", turnId: null };
+}
+
+function coordinatorProvisioningTurnTimestamp(turn) {
+  for (const value of [turn?.completedAt, turn?.startedAt, turn?.createdAt]) {
+    const parsed = typeof value === "number" ? value : Date.parse(value ?? "");
+    if (!Number.isFinite(parsed)) continue;
+    return parsed < 1_000_000_000_000 ? parsed * 1_000 : parsed;
+  }
+  const uuidV7 = typeof turn?.id === "string"
+    ? turn.id.match(/^([0-9a-f]{8})-([0-9a-f]{4})-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    : null;
+  if (uuidV7) return Number.parseInt(`${uuidV7[1]}${uuidV7[2]}`, 16);
+  return null;
+}
+
+function coordinatorProvisioningDeliverySetting(turn, marker, fallback) {
+  const serialized = JSON.stringify(turn);
+  const index = serialized.indexOf(marker);
+  if (index < 0) return fallback;
+  const suffix = serialized.slice(index);
+  const match = suffix.match(new RegExp(`${marker}([A-Za-z0-9._-]+)`));
+  return match?.[1] ?? fallback;
+}
+
+function coordinatorProvisioningDeliveryFailureKind(turn) {
+  const message = typeof turn?.error?.message === "string"
+    ? turn.error.message
+    : JSON.stringify(turn?.error ?? "");
+  if (CHATGPT_ACCOUNT_UNSUPPORTED_MODEL_ERROR.test(message)) return "model-unsupported";
+  if (SELECTED_MODEL_CAPACITY_ERROR.test(message)) return "model-capacity";
+  return "transient";
+}
+
+export function planCoordinatorProvisioningDeliveryRetry(turns, marker, {
+  defaultModel,
+  defaultReasoningEffort,
+  now = Date.now(),
+} = {}) {
+  if (!Array.isArray(turns) || typeof marker !== "string" || !marker
+    || typeof defaultModel !== "string" || !defaultModel
+    || typeof defaultReasoningEffort !== "string" || !defaultReasoningEffort
+    || !Number.isFinite(now)) {
+    throw new Error("Coordinator delivery retry planning requires exact turn and model state");
+  }
+  const terminals = turns
+    .map((turn, index) => ({ turn, index, timestamp: coordinatorProvisioningTurnTimestamp(turn) }))
+    .filter(({ turn }) => JSON.stringify(turn).includes(marker)
+      && ["failed", "interrupted", "canceled"].includes(turn?.status))
+    .sort((left, right) => {
+      if (left.timestamp !== null && right.timestamp !== null) return right.timestamp - left.timestamp;
+      if (left.timestamp !== null) return -1;
+      if (right.timestamp !== null) return 1;
+      return right.index - left.index;
+    });
+  const latest = terminals[0] ?? null;
+  const currentModel = latest
+    ? coordinatorProvisioningDeliverySetting(
+        latest.turn, COORDINATOR_DELIVERY_MODEL_MARKER, defaultModel,
+      )
+    : defaultModel;
+  const currentReasoningEffort = latest
+    ? coordinatorProvisioningDeliverySetting(
+        latest.turn, COORDINATOR_DELIVERY_EFFORT_MARKER, defaultReasoningEffort,
+      )
+    : defaultReasoningEffort;
+  const failureKind = latest
+    ? coordinatorProvisioningDeliveryFailureKind(latest.turn)
+    : "transient";
+  const sameFailureCount = terminals.filter(({ turn }) => (
+    coordinatorProvisioningDeliverySetting(
+      turn, COORDINATOR_DELIVERY_MODEL_MARKER, defaultModel,
+    ) === currentModel
+      && coordinatorProvisioningDeliveryFailureKind(turn) === failureKind
+  )).length;
+  const retryDelayMs = sameFailureCount > 0
+    ? Math.min(
+        COORDINATOR_DELIVERY_RETRY_MAX_MS,
+        COORDINATOR_DELIVERY_RETRY_BASE_MS * (2 ** Math.min(sameFailureCount - 1, 8)),
+      )
+    : 0;
+  let retryAfterMs = 0;
+  if (latest) {
+    retryAfterMs = latest.timestamp === null
+      ? COORDINATOR_DELIVERY_RETRY_MAX_MS
+      : Math.max(0, latest.timestamp + retryDelayMs - now);
+  }
+  const unsupportedModels = [];
+  for (const { turn } of [...terminals].reverse()) {
+    if (coordinatorProvisioningDeliveryFailureKind(turn) !== "model-unsupported") continue;
+    const model = coordinatorProvisioningDeliverySetting(
+      turn, COORDINATOR_DELIVERY_MODEL_MARKER, defaultModel,
+    );
+    if (!unsupportedModels.includes(model)) unsupportedModels.push(model);
+  }
+  return {
+    failureKind,
+    currentModel,
+    currentReasoningEffort,
+    unsupportedModels,
+    retryAfterMs,
+  };
+}
+
+export function selectCoordinatorProvisioningFallbackModel(
+  models, excludedModels, preferredReasoningEffort,
+) {
+  if (!Array.isArray(models) || !Array.isArray(excludedModels)
+    || typeof preferredReasoningEffort !== "string" || !preferredReasoningEffort) {
+    throw new Error("Coordinator fallback selection requires an exact model catalog");
+  }
+  const excluded = new Set(excludedModels);
+  const candidates = models
+    .map((model, index) => ({ model, index }))
+    .filter(({ model }) => typeof model?.id === "string" && model.id
+      && model.hidden !== true && !excluded.has(model.id))
+    .sort((left, right) => Number(right.model.isDefault === true)
+      - Number(left.model.isDefault === true) || left.index - right.index);
+  for (const { model } of candidates) {
+    const efforts = Array.isArray(model.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts.map((entry) => (
+          typeof entry === "string" ? entry : entry?.reasoningEffort
+        )).filter((value) => typeof value === "string" && value)
+      : [];
+    const reasoningEffort = efforts.includes(preferredReasoningEffort)
+      ? preferredReasoningEffort
+      : model.defaultReasoningEffort;
+    if (typeof reasoningEffort === "string" && reasoningEffort
+      && (efforts.length === 0 || efforts.includes(reasoningEffort))) {
+      return { model: model.id, reasoningEffort };
+    }
+  }
+  return null;
+}
+
+export function coordinatorProvisioningTurnStartParams(
+  threadId, instruction, selectedModel,
+) {
+  if (!THREAD_ID_PATTERN.test(threadId ?? "")
+    || typeof instruction !== "string" || !instruction
+    || typeof selectedModel?.model !== "string" || !selectedModel.model
+    || typeof selectedModel?.reasoningEffort !== "string" || !selectedModel.reasoningEffort) {
+    throw new Error("Coordinator turn start requires exact thread and model settings");
+  }
+  return {
+    threadId,
+    input: [{ type: "text", text: instruction }],
+    model: selectedModel.model,
+    effort: selectedModel.reasoningEffort,
+  };
 }
 
 export function normalizeCoordinatorProvisioningPersistedThread(attempt, thread) {
@@ -903,6 +1057,16 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     threadId: thread.id,
     projectId: policy.projectId,
   });
+  if (delivery?.delivery === "deferred") {
+    return {
+      provisioned: false,
+      reason: delivery.reason ?? "delivery-deferred",
+      attemptId: attempt.id,
+      ...(Number.isFinite(delivery.retryAfterMs)
+        ? { retryAfterMs: delivery.retryAfterMs }
+        : {}),
+    };
+  }
   return {
     provisioned: true,
     reason: delivery?.delivery === "observed" ? "thread-observed" : "thread-started",

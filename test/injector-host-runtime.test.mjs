@@ -6,6 +6,9 @@ import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
+  coordinatorProvisioningTurnStartParams,
+  planCoordinatorProvisioningDeliveryRetry,
+  selectCoordinatorProvisioningFallbackModel,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadReadData,
   coordinatorProvisioningThreadListData,
@@ -291,6 +294,154 @@ test("Coordinator provisioning retries terminal delivery turns on the same threa
     ], marker),
     { delivery: "busy", turnId: "unrelated-active" },
   );
+});
+
+test("Coordinator provisioning backs off capacity on the same delivery model", () => {
+  const marker = "TASKBOARD_COORDINATOR_PROVISIONING_V1:attempt-capacity";
+  const completedAt = Date.parse("2026-09-04T02:00:00Z");
+  const turns = [{
+    id: "turn-capacity",
+    status: "failed",
+    completedAt: completedAt / 1_000,
+    input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.5\nTASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:high`,
+    error: { message: "Selected model is at capacity. Please try a different model." },
+  }];
+
+  assert.deepEqual(planCoordinatorProvisioningDeliveryRetry(turns, marker, {
+    defaultModel: "gpt-5.6-sol",
+    defaultReasoningEffort: "ultra",
+    now: completedAt + 5_000,
+  }), {
+    failureKind: "model-capacity",
+    currentModel: "gpt-5.5",
+    currentReasoningEffort: "high",
+    unsupportedModels: [],
+    retryAfterMs: 10_000,
+  });
+});
+
+test("Coordinator provisioning excludes deterministically unsupported delivery models", () => {
+  const marker = "TASKBOARD_COORDINATOR_PROVISIONING_V1:attempt-unsupported";
+  const turns = [
+    {
+      id: "turn-terra",
+      status: "failed",
+      completedAt: "2026-09-04T02:01:00Z",
+      input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.6-terra\nTASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:high`,
+      error: { message: "The 'gpt-5.6-terra' model is not supported when using Codex with a ChatGPT account." },
+    },
+    {
+      id: "turn-sol",
+      status: "failed",
+      completedAt: "2026-09-04T02:00:00Z",
+      input: marker,
+      error: { message: "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account." },
+    },
+  ];
+  const plan = planCoordinatorProvisioningDeliveryRetry(turns, marker, {
+    defaultModel: "gpt-5.6-sol",
+    defaultReasoningEffort: "ultra",
+    now: Date.parse("2026-09-04T02:02:00Z"),
+  });
+  assert.deepEqual(plan, {
+    failureKind: "model-unsupported",
+    currentModel: "gpt-5.6-terra",
+    currentReasoningEffort: "high",
+    unsupportedModels: ["gpt-5.6-sol", "gpt-5.6-terra"],
+    retryAfterMs: 0,
+  });
+  assert.deepEqual(selectCoordinatorProvisioningFallbackModel([
+    {
+      id: "gpt-5.6-sol", hidden: false, isDefault: true,
+      defaultReasoningEffort: "ultra",
+      supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
+    },
+    {
+      id: "gpt-5.6-terra", hidden: false, isDefault: false,
+      defaultReasoningEffort: "high",
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+    },
+    {
+      id: "gpt-5.5", hidden: false, isDefault: false,
+      defaultReasoningEffort: "xhigh",
+      supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "xhigh" }],
+    },
+  ], plan.unsupportedModels, plan.currentReasoningEffort), {
+    model: "gpt-5.5",
+    reasoningEffort: "high",
+  });
+  assert.deepEqual(coordinatorProvisioningTurnStartParams(
+    coordinatorThreadId,
+    `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.5`,
+    { model: "gpt-5.5", reasoningEffort: "high" },
+  ), {
+    threadId: coordinatorThreadId,
+    input: [{
+      type: "text",
+      text: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.5`,
+    }],
+    model: "gpt-5.5",
+    effort: "high",
+  });
+});
+
+test("Coordinator provisioning fails closed on chronological terminal turns without durable time", () => {
+  const marker = "TASKBOARD_COORDINATOR_PROVISIONING_V1:attempt-no-time";
+  const plan = planCoordinatorProvisioningDeliveryRetry([
+    {
+      id: "legacy-turn-old",
+      status: "failed",
+      input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-old`,
+      error: { message: "Selected model is at capacity. Please try a different model." },
+    },
+    {
+      id: "legacy-turn-new",
+      status: "failed",
+      input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-new`,
+      error: { message: "The 'gpt-new' model is not supported when using Codex with a ChatGPT account." },
+    },
+  ], marker, {
+    defaultModel: "gpt-default",
+    defaultReasoningEffort: "high",
+    now: Date.parse("2026-09-04T02:02:00Z"),
+  });
+  assert.deepEqual(plan, {
+    failureKind: "model-unsupported",
+    currentModel: "gpt-new",
+    currentReasoningEffort: "high",
+    unsupportedModels: ["gpt-new"],
+    retryAfterMs: 300_000,
+  });
+});
+
+test("Coordinator provisioning derives durable backoff time from App Server UUIDv7 turn ids", () => {
+  const marker = "TASKBOARD_COORDINATOR_PROVISIONING_V1:attempt-uuid-time";
+  const latestTurnId = "01a067da-f4a5-7583-847e-63aea37d1205";
+  const latestTurnTime = Number.parseInt("01a067daf4a5", 16);
+  assert.deepEqual(planCoordinatorProvisioningDeliveryRetry([
+    {
+      id: "01a067d9-d160-7d53-b5d2-fc7a2999b197",
+      status: "failed",
+      input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-old`,
+      error: { message: "Selected model is at capacity. Please try a different model." },
+    },
+    {
+      id: latestTurnId,
+      status: "failed",
+      input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-new`,
+      error: { message: "The 'gpt-new' model is not supported when using Codex with a ChatGPT account." },
+    },
+  ], marker, {
+    defaultModel: "gpt-default",
+    defaultReasoningEffort: "high",
+    now: latestTurnTime + 5_000,
+  }), {
+    failureKind: "model-unsupported",
+    currentModel: "gpt-new",
+    currentReasoningEffort: "high",
+    unsupportedModels: ["gpt-new"],
+    retryAfterMs: 10_000,
+  });
 });
 
 test("Coordinator provisioning recovers a persisted null source only from its exact marker", async () => {

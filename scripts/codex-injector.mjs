@@ -22,6 +22,9 @@ import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
+  coordinatorProvisioningTurnStartParams,
+  planCoordinatorProvisioningDeliveryRetry,
+  selectCoordinatorProvisioningFallbackModel,
   coordinatorProvisioningInspectionDiagnosticReason,
   coordinatorProvisioningThreadListData,
   findCoordinatorProvisioningThreadAcrossPages,
@@ -2187,10 +2190,8 @@ async function findCoordinatorProvisioningThread(cdp, attempt, archived = false)
 }
 
 async function readDefaultCoordinatorModel(cdp, route) {
-  const result = await requestCodexAppServerViaCdp(
-    cdp, undefined, route.codexHostId, "model/list", { includeHidden: false, limit: 100 }, 10_000,
-  );
-  const defaults = (Array.isArray(result?.data) ? result.data : []).filter(
+  const models = await readCoordinatorModelCatalog(cdp, route.codexHostId);
+  const defaults = models.filter(
     (model) => model?.isDefault === true,
   );
   if (defaults.length !== 1
@@ -2203,6 +2204,16 @@ async function readDefaultCoordinatorModel(cdp, route) {
     model: defaults[0].id,
     reasoningEffort: defaults[0].defaultReasoningEffort,
   };
+}
+
+async function readCoordinatorModelCatalog(cdp, codexHostId) {
+  const result = await requestCodexAppServerViaCdp(
+    cdp, undefined, codexHostId, "model/list", { includeHidden: false, limit: 100 }, 10_000,
+  );
+  if (!Array.isArray(result?.data)) {
+    throw new Error("Codex did not return one exact model catalog for Coordinator provisioning");
+  }
+  return result.data;
 }
 
 async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId, projectId) {
@@ -2218,6 +2229,31 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
   const priorDelivery = classifyCoordinatorProvisioningDeliveryTurns(turns, marker);
   if (priorDelivery.delivery !== "retry") return priorDelivery;
+  const retryPlan = planCoordinatorProvisioningDeliveryRetry(turns, marker, {
+    defaultModel: attempt.model,
+    defaultReasoningEffort: attempt.reasoningEffort,
+  });
+  if (retryPlan.retryAfterMs > 0) {
+    return {
+      delivery: "deferred",
+      reason: "retry-backoff",
+      retryAfterMs: retryPlan.retryAfterMs,
+    };
+  }
+  let selectedModel = {
+    model: retryPlan.currentModel,
+    reasoningEffort: retryPlan.currentReasoningEffort,
+  };
+  if (retryPlan.failureKind === "model-unsupported") {
+    selectedModel = selectCoordinatorProvisioningFallbackModel(
+      await readCoordinatorModelCatalog(cdp, attempt.codexHostId),
+      retryPlan.unsupportedModels,
+      retryPlan.currentReasoningEffort,
+    );
+    if (!selectedModel) {
+      return { delivery: "deferred", reason: "model-fallback-unavailable" };
+    }
+  }
   await resumeCoordinatorProvisioningDeliveryThread(
     thread,
     () => rpc("thread/resume", { threadId }),
@@ -2225,22 +2261,24 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   const registrationKey = `${attempt.idempotencyKey}-window`;
   const instruction = [
     marker,
+    `TASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:${selectedModel.model}`,
+    `TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:${selectedModel.reasoningEffort}`,
     "You are a separate Taskboard Execution Coordinator window. Never become or alter Owner Root.",
     `Use only node ${path.join(projectRoot, "cli", "taskctl.mjs")} --runtime-file ${taskboardRuntimeFile} for Taskboard reads and writes; never read or expose the runtime token and never edit SQLite directly.`,
     `Bootstrap CAP-15 and its current children for project ${projectId}; read complete Capsules before choosing work and do not create duplicate issues.`,
     `Register exactly this window with task identity ${attempt.taskId}, role coordinator, label ${JSON.stringify(attempt.label)}, exact thread id ${threadId}, and stable idempotency key ${registrationKey}.`,
     "First read protected coordination windows and use their exact current revision. Allow the resident protected host handshake to authenticate the exact project, kind, host, and workspace; do not self-report or bypass host identity.",
     "After exact registration, read Coordinator status. Acquire one 300-second Global Coordinator lease only if still unassigned, using this same task/thread and the exact expected current lease id (or null). Replay the same registration after success to verify one receipt; never create a second window or lease.",
-    "On selected-model capacity, retry the same task and thread with the same model. On uncertainty, inspect durable state before retrying. Preserve one writer and the standing safety boundaries in AGENTS.md.",
+    "On selected-model capacity, retry the same task and thread with the same model. A host-confirmed unsupported model may be replaced while preserving this exact task, thread, and Coordinator identity. On uncertainty, inspect durable state before retrying. Preserve one writer and the standing safety boundaries in AGENTS.md.",
   ].join("\n");
-  const started = await rpc("turn/start", {
-    threadId,
-    input: [{ type: "text", text: instruction }],
-  });
+  const started = await rpc(
+    "turn/start",
+    coordinatorProvisioningTurnStartParams(threadId, instruction, selectedModel),
+  );
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a provisioning delivery turn receipt");
   }
-  return { delivery: "started", turnId: started.turn.id };
+  return { delivery: "started", turnId: started.turn.id, model: selectedModel.model };
 }
 
 async function confirmCoordinatorIdentityHandshake(handshakeId, registration, threadBinding) {
