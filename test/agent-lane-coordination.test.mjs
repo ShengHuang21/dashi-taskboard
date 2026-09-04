@@ -15,6 +15,9 @@ import {
 
 const directories = [];
 const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+const nativeDatabaseScope = path.join("server", "database.mjs");
+const nativeSnapshotScope = path.join("server", "agent-lane-snapshot.mjs");
+const nativeCoordinationTestScope = path.join("test", "agent-lane-coordination.test.mjs");
 
 afterEach(async () => {
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -2453,7 +2456,7 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
     priority: "medium", labels: [], threadId: fixture.rootBinding.threadId, threadBinding: fixture.rootBinding,
     actor, assignee: actor, developmentContext: fixture.developmentContext,
     workingLog: {
-      path: `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`,
+      path: path.join(fixture.rootBinding.workspacePath, "CAP-READY-WORKING-LOG.md"),
       status: "planned",
     },
     startDate: null, dueDate: null, recurrence: null,
@@ -2479,7 +2482,7 @@ test("projects Capsule eligibility, dispatch targets, Working Logs, and durable 
     rootWorkspacePath: fixture.rootBinding.workspacePath,
     worktreePath: fixture.developmentContext.path,
   });
-  assert.equal(readyTodo?.workingLog?.path, `${fixture.rootBinding.workspacePath}/CAP-READY-WORKING-LOG.md`);
+  assert.equal(readyTodo?.workingLog?.path, path.join(fixture.rootBinding.workspacePath, "CAP-READY-WORKING-LOG.md"));
   assert.equal(readyTodo?.workingLog?.status, "planned");
   assert.match(readyTodo?.workingLog?.updatedAt ?? "", /^\d{4}-\d{2}-\d{2}T/);
   assert.equal(readyTodo?.run, null);
@@ -2663,7 +2666,7 @@ test("persists lease and write scope, renews the same claim, and rejects stale c
     writeScope: ["server/database.mjs"],
   });
   assert.equal(first.claim.leaseExpiresAt, "2099-01-01T00:00:00.000Z");
-  assert.deepEqual(first.claim.writeScope, ["server/database.mjs"]);
+  assert.deepEqual(first.claim.writeScope, [nativeDatabaseScope]);
 
   const renewed = fixture.database.claimAgentTask(fixture.task.id, first.task.version, {
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
@@ -2687,7 +2690,7 @@ test("persists lease and write scope, renews the same claim, and rejects stale c
   const reopened = new TaskboardDatabase(fixture.databasePath);
   assert.equal(reopened.getAgentTaskClaim(fixture.task.id).leaseExpiresAt, "2000-01-01T00:00:00.000Z");
   assert.deepEqual(reopened.getAgentTaskClaim(fixture.task.id).writeScope, [
-    "server/database.mjs", "test/agent-lane-coordination.test.mjs",
+    nativeDatabaseScope, nativeCoordinationTestScope,
   ]);
   reopened.close();
 });
@@ -2746,8 +2749,8 @@ test("leaving in-progress and archiving atomically interrupt open runs so a clai
     agentPath: "/root/acceptance", agentThreadId: "acceptance-thread",
     leaseExpiresAt: "2099-01-01T00:00:00.000Z", writeScope: ["server/./database.mjs"],
   });
-  assert.deepEqual(retried.claim.writeScope, ["server/database.mjs"]);
-  assert.deepEqual(retried.run.writeScope, ["server/database.mjs"]);
+  assert.deepEqual(retried.claim.writeScope, [nativeDatabaseScope]);
+  assert.deepEqual(retried.run.writeScope, [nativeDatabaseScope]);
 
   fixture.database.archiveTask(retried.task.id, retried.task.version, undefined, undefined, actor);
   assert.equal(fixture.database.getAgentTaskClaim(fixture.task.id).status, "interrupted");
@@ -2874,7 +2877,7 @@ test("open runs protect bindings and require worktree-relative normalized write 
     ...claimInput,
     writeScope: ["./server/database.mjs", "server/agent-lane-snapshot.mjs"],
   });
-  assert.deepEqual(claimed.run.writeScope, ["server/database.mjs", "server/agent-lane-snapshot.mjs"]);
+  assert.deepEqual(claimed.run.writeScope, [nativeDatabaseScope, nativeSnapshotScope]);
   const blocked = fixture.database.checkpointTaskAgentRun(claimed.run.id, claimed.run.version, {
     agentThreadId: claimInput.agentThreadId, status: "blocked", summary: "waiting", nextAction: "resume",
   });
