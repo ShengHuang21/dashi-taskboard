@@ -3595,6 +3595,103 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(repeatedAttach.response.status, 200);
   assert.equal(repeatedAttach.body.attempt.threadId, attachBody.threadId);
 
+  const resumeExpiredPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/resume-expired`;
+  const activeResume = await request(baseUrl, resumeExpiredPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "d1".repeat(16), resumeExpiredPath, {}),
+    body: {},
+  });
+  assert.equal(activeResume.response.status, 409);
+  assert.equal(activeResume.body.error.code, "COORDINATOR_PROVISIONING_STATE_CONFLICT");
+  const activeResumeInspection = new DatabaseSync(databasePath);
+  const activeResumeRow = activeResumeInspection.prepare(`
+    SELECT status, thread_id AS threadId, expires_at AS expiresAt
+    FROM agent_coordinator_provisioning_attempts WHERE id = ?
+  `).get(created.body.attempt.id);
+  assert.equal(activeResumeRow.status, "started");
+  assert.equal(activeResumeRow.threadId, attachBody.threadId);
+  assert.equal(activeResumeRow.expiresAt, repeatedAttach.body.attempt.expiresAt);
+  activeResumeInspection.close();
+  for (const [index, status] of ["pending", "starting", "completed", "canceled"].entries()) {
+    const stateInspection = new DatabaseSync(databasePath);
+    stateInspection.prepare(`
+      UPDATE agent_coordinator_provisioning_attempts SET status = ? WHERE id = ?
+    `).run(status, created.body.attempt.id);
+    stateInspection.close();
+    const rejectedResume = await request(baseUrl, resumeExpiredPath, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret,
+        (index + 20).toString(16).padStart(2, "0").repeat(16),
+        resumeExpiredPath,
+        {},
+      ),
+      body: {},
+    });
+    assert.equal(rejectedResume.response.status, 409);
+    const rejectedInspection = new DatabaseSync(databasePath);
+    const rejectedRow = rejectedInspection.prepare(`
+      SELECT status, thread_id AS threadId, expires_at AS expiresAt
+      FROM agent_coordinator_provisioning_attempts WHERE id = ?
+    `).get(created.body.attempt.id);
+    assert.equal(rejectedRow.status, status);
+    assert.equal(rejectedRow.threadId, attachBody.threadId);
+    assert.equal(rejectedRow.expiresAt, repeatedAttach.body.attempt.expiresAt);
+    rejectedInspection.prepare(`
+      UPDATE agent_coordinator_provisioning_attempts SET status = 'started' WHERE id = ?
+    `).run(created.body.attempt.id);
+    rejectedInspection.close();
+  }
+
+  const exactRegistrationBody = {
+    role: "coordinator", taskId: body.taskId, label: body.label,
+    threadId: attachBody.threadId, expectedRevision: body.expectedRevision,
+    idempotencyKey: `${body.idempotencyKey}-window`,
+  };
+  const pendingRegistration = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    {
+      method: "POST",
+      headers: { "x-taskboard-client": "taskctl" },
+      body: exactRegistrationBody,
+    },
+  );
+  assert.equal(pendingRegistration.response.status, 202, JSON.stringify(pendingRegistration.body));
+  const expiredHandshakeInspection = new DatabaseSync(databasePath);
+  expiredHandshakeInspection.prepare(`
+    UPDATE agent_coordination_identity_handshakes
+    SET status = 'confirmed', thread_binding_json = ?, expires_at = ?, updated_at = ?
+    WHERE id = ?
+  `).run(JSON.stringify({
+    threadId: attachBody.threadId,
+    codexProjectId: body.codexProjectId,
+    codexProjectKind: body.codexProjectKind,
+    codexHostId: body.codexHostId,
+    workspacePath: body.workspacePath,
+  }), new Date(Date.now() - 1_000).toISOString(), new Date().toISOString(), pendingRegistration.body.handshake.id);
+  expiredHandshakeInspection.close();
+  const resumedExpiredHandshake = await request(
+    baseUrl,
+    "/api/local/projects/local/coordination-windows",
+    {
+      method: "POST",
+      headers: { "x-taskboard-client": "taskctl" },
+      body: exactRegistrationBody,
+    },
+  );
+  assert.equal(resumedExpiredHandshake.response.status, 202, JSON.stringify(resumedExpiredHandshake.body));
+  assert.equal(resumedExpiredHandshake.body.handshake.id, pendingRegistration.body.handshake.id);
+  assert.equal(resumedExpiredHandshake.body.handshake.status, "confirmed");
+  const resumedHandshakeInspection = new DatabaseSync(databasePath);
+  assert.equal(resumedHandshakeInspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_identity_handshakes WHERE project_id = 'local'",
+  ).get().count, 1);
+  assert.equal(resumedHandshakeInspection.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordination_window_receipts WHERE project_id = 'local'",
+  ).get().count, 0);
+  resumedHandshakeInspection.close();
+
   const observeMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/observe-missing`;
   const observedMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
@@ -3714,6 +3811,20 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(observedExpiredMissing.body.attempt.status, "expired");
   assert.ok(Date.parse(observedExpiredMissing.body.attempt.missingSince));
 
+  const unprotectedExpiredResume = await request(baseUrl, resumeExpiredPath, {
+    method: "POST", body: {},
+  });
+  assert.equal(unprotectedExpiredResume.response.status, 403);
+  const resumedExpiredAttempt = await request(baseUrl, resumeExpiredPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b7".repeat(16), resumeExpiredPath, {}),
+    body: {},
+  });
+  assert.equal(resumedExpiredAttempt.response.status, 200, JSON.stringify(resumedExpiredAttempt.body));
+  assert.equal(resumedExpiredAttempt.body.attempt.status, "started");
+  assert.equal(resumedExpiredAttempt.body.attempt.threadId, attachBody.threadId);
+  assert.ok(Date.parse(resumedExpiredAttempt.body.attempt.expiresAt) > Date.now());
+
   await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
@@ -3723,11 +3834,6 @@ test("resident provisioning persists one protected idempotent attempt before rep
       codexHostId: "local", workspacePath: "/tmp/sbkk",
     },
   });
-  const exactRegistrationBody = {
-    role: "coordinator", taskId: body.taskId, label: body.label,
-    threadId: attachBody.threadId, expectedRevision: body.expectedRevision,
-    idempotencyKey: `${body.idempotencyKey}-window`,
-  };
   for (const terminalStatus of ["expired", "canceled"]) {
     const terminalInspection = new DatabaseSync(databasePath);
     terminalInspection.prepare(`

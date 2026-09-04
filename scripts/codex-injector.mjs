@@ -2987,6 +2987,9 @@ async function runBackgroundContinuationMonitor(cdp) {
           clearMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
             attemptId, "clear-missing",
           ),
+          resumeExpiredAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "resume-expired",
+          ),
           deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
             cdp, attempt, threadId, projectId,
           ),

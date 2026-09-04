@@ -1776,6 +1776,7 @@ test("Coordinator provisioning clears a transient missing observation when the o
   let listReads = 0;
   let starts = 0;
   let resets = 0;
+  let expiredResumes = 0;
   const options = {
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     now: () => currentTime,
@@ -1820,6 +1821,11 @@ test("Coordinator provisioning clears a transient missing observation when the o
       resets += 1;
       return { attempt: { ...attempt } };
     },
+    resumeExpiredAttempt: async () => {
+      expiredResumes += 1;
+      attempt = { ...attempt, status: "started" };
+      return { attempt: { ...attempt } };
+    },
     markStarting: async () => assert.fail("an attached thread must not start again"),
     attachThread: async () => ({ attempt: { ...attempt } }),
     deliverInstruction: async () => ({ delivery: "already-delivered", turnId: "turn-1" }),
@@ -1858,6 +1864,8 @@ test("Coordinator provisioning clears a transient missing observation when the o
     input: `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
   }];
   assert.equal((await runCoordinatorProvisioningMonitorOnce(options)).reason, "thread-started");
+  assert.equal(expiredResumes, 1);
+  attempt = { ...attempt, status: "expired" };
   activeThread.turns = [];
   assert.equal(
     (await runCoordinatorProvisioningMonitorOnce(options)).reason,

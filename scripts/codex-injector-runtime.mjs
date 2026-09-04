@@ -1081,6 +1081,19 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   if (attempt.status === "expired" && !recoverableExpiredDelivery) {
     return { provisioned: false, reason: "attempt-expired-thread-active", attemptId: attempt.id };
   }
+  if (recoverableExpiredDelivery) {
+    if (typeof options.resumeExpiredAttempt !== "function") {
+      return { provisioned: false, reason: "attempt-expired-thread-active", attemptId: attempt.id };
+    }
+    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const resumedAttempt = resumed?.attempt ?? null;
+    if (resumedAttempt?.id !== attempt.id
+      || resumedAttempt.status !== "started"
+      || resumedAttempt.threadId !== thread.id) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
+    attempt = resumedAttempt;
+  }
   if (attempt.threadId !== thread.id || !["started", "expired"].includes(attempt.status)) {
     result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
     attempt = result?.attempt ?? attempt;

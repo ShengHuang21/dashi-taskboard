@@ -3719,11 +3719,17 @@ export class TaskboardDatabase {
       const recoverableExpiredMissing = row.status === "expired"
         && Boolean(row.thread_id)
         && ["observe-missing", "clear-missing", "reset-missing"].includes(action);
+      const recoverableExpiredResume = row.status === "expired"
+        && Boolean(row.thread_id)
+        && action === "resume-expired";
       if (["completed", "canceled", "expired"].includes(row.status)
-        && !recoverableExpiredMissing) {
+        && !recoverableExpiredMissing
+        && !recoverableExpiredResume) {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_TERMINAL", "The replacement provisioning attempt is terminal");
       }
-      if (!recoverableExpiredMissing && Date.parse(row.expires_at) <= Date.now()) {
+      if (!recoverableExpiredMissing
+        && !recoverableExpiredResume
+        && Date.parse(row.expires_at) <= Date.now()) {
         this.#prepare(`UPDATE agent_coordinator_provisioning_attempts SET status = 'expired', updated_at = ? WHERE id = ?`)
           .run(now(), attemptId);
         this.database.exec("COMMIT");
@@ -3792,6 +3798,41 @@ export class TaskboardDatabase {
         if (row.status !== "starting" || row.thread_id) throw new ApiError(409, "COORDINATOR_PROVISIONING_STATE_CONFLICT", "Only an unbound starting attempt can retry selected-model capacity");
         nextStatus = "pending";
         retryCount += 1;
+        expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
+      } else if (action === "resume-expired") {
+        if (!recoverableExpiredResume) {
+          throw new ApiError(
+            409,
+            "COORDINATOR_PROVISIONING_STATE_CONFLICT",
+            "Only an expired attempt with its exact attached thread can resume",
+          );
+        }
+        const config = JSON.parse(project.config_json);
+        const tasks = Array.isArray(config?.tasks) ? config.tasks : [];
+        const ownerRoot = tasks.find((task) => task?.id === config?.ownerRootTaskId) ?? null;
+        const coordinatorTasks = tasks.filter((task) => task?.source === "codex"
+          && task?.taskType === "root_task" && task.id !== ownerRoot?.id);
+        const exactOwner = isValidCoordinatorProvisioningOwnerRoot(ownerRoot)
+          && ownerRoot.id === row.owner_root_task_id
+          && ownerRoot.threadId === row.owner_root_thread_id
+          && ownerRoot.codexProjectId === row.codex_project_id
+          && ownerRoot.codexProjectKind === row.codex_project_kind
+          && ownerRoot.codexHostId === row.codex_host_id
+          && path.resolve(ownerRoot.workspacePath) === path.resolve(row.workspace_path);
+        if (!exactOwner
+          || coordinatorTasks.length > 0
+          || this.#exactActiveCoordinatorLease(row.project_id, config, config?.coordinatorLease ?? null)
+          || this.getAgentLaneCoordinatorShutdownAttempt(row.project_id)
+          || !this.hasAgentLaneCoordinatorDurableWork(row.project_id, {
+            includeCoordinatorProvisioning: false,
+          })) {
+          throw new ApiError(
+            409,
+            "COORDINATOR_PROVISIONING_EXPIRED_RESUME_CONFLICT",
+            "Expired-thread resume requires the exact unassigned safe preflight",
+          );
+        }
+        nextStatus = "started";
         expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
       } else if (["observe-missing", "reset-missing"].includes(action)) {
         const config = JSON.parse(project.config_json);
@@ -4232,10 +4273,63 @@ export class TaskboardDatabase {
         if (existing.request_fingerprint !== requestFingerprint) {
           throw new ApiError(409, "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT", "The idempotency key is bound to a different coordination window registration");
         }
-        if (["expired", "canceled"].includes(existing.status)
+        const handshakeExpired = existing.status === "expired"
           || (["pending", "confirmed"].includes(existing.status)
-            && Date.parse(existing.expires_at) <= Date.now())) {
-          throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake is terminal and cannot be retried");
+            && Date.parse(existing.expires_at) <= Date.now());
+        if (existing.status === "canceled" || handshakeExpired) {
+          const expectedHostBinding = JSON.parse(existing.expected_host_binding_json);
+          const provisioningAttempt = this.#prepare(`
+            SELECT * FROM agent_coordinator_provisioning_attempts
+            WHERE project_id = ? AND idempotency_key || '-window' = ?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+          `).get(projectId, input.idempotencyKey);
+          const exactRecoverableAttempt = existing.status !== "canceled"
+            && provisioningAttempt?.status === "started"
+            && Date.parse(provisioningAttempt.expires_at) > Date.now()
+            && input.role === "coordinator"
+            && input.taskId === provisioningAttempt.task_id
+            && input.label === provisioningAttempt.label
+            && input.threadId === provisioningAttempt.thread_id
+            && input.expectedRevision === provisioningAttempt.expected_revision
+            && agentLaneConfigRevision(row.config_json) === input.expectedRevision
+            && expectedHostBinding.codexProjectId === provisioningAttempt.codex_project_id
+            && expectedHostBinding.codexProjectKind === provisioningAttempt.codex_project_kind
+            && expectedHostBinding.codexHostId === provisioningAttempt.codex_host_id
+            && path.resolve(expectedHostBinding.workspacePath)
+              === path.resolve(provisioningAttempt.workspace_path)
+            && !this.hasAgentLaneCoordinationWindowReceipt(projectId, input.idempotencyKey);
+          if (!exactRecoverableAttempt) {
+            throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake is terminal and cannot be retried");
+          }
+          const timestamp = now();
+          const expiresAt = new Date(
+            Date.parse(timestamp) + COORDINATION_IDENTITY_HANDSHAKE_TTL_MS,
+          ).toISOString();
+          let reusableBinding = null;
+          try {
+            const candidate = existing.thread_binding_json
+              ? JSON.parse(existing.thread_binding_json)
+              : null;
+            if (candidate?.threadId === existing.thread_id
+              && candidate.codexProjectId === expectedHostBinding.codexProjectId
+              && candidate.codexProjectKind === expectedHostBinding.codexProjectKind
+              && candidate.codexHostId === expectedHostBinding.codexHostId
+              && path.resolve(candidate.workspacePath ?? "")
+                === path.resolve(expectedHostBinding.workspacePath)) {
+              reusableBinding = existing.thread_binding_json;
+            }
+          } catch {}
+          const resumedStatus = reusableBinding ? "confirmed" : "pending";
+          this.#prepare(`
+            UPDATE agent_coordination_identity_handshakes
+            SET status = ?, thread_binding_json = ?, updated_at = ?, expires_at = ?
+            WHERE id = ?
+          `).run(resumedStatus, reusableBinding, timestamp, expiresAt, existing.id);
+          this.database.exec("COMMIT");
+          return coordinationIdentityHandshakeFromRow({
+            ...existing, status: resumedStatus, thread_binding_json: reusableBinding,
+            updated_at: timestamp, expires_at: expiresAt,
+          });
         }
         this.database.exec("COMMIT");
         return coordinationIdentityHandshakeFromRow(existing);
