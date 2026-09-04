@@ -1376,6 +1376,139 @@ test("completed and canceled domain Todos can clear assignments while active wor
   database.close();
 });
 
+test("domain Coordinator provisioning persists one idempotent attempt per domain", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agent-domain-provisioning-"));
+  directories.push(directory);
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const database = new TaskboardDatabase(databasePath);
+  const projectId = "domain-provisioning";
+  const acquiredAt = new Date(Date.now() - 60_000).toISOString();
+  const expiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  database.createProject({ id: projectId, name: "Domain provisioning", workspacePath: null });
+  database.upsertAgentLaneProject(projectId, {
+    rootTaskId: "global",
+    tasks: [
+      {
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        threadId: "global-thread", taskType: "root_task",
+        codexProjectId: projectId, codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/domain-provisioning-global",
+      },
+      {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        threadId: "frontend-thread", taskType: "peer_task",
+        codexProjectId: projectId, codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/domain-provisioning-frontend",
+      },
+      {
+        id: "backend", label: "Backend Coordinator", owner: "Codex", source: "codex",
+        threadId: "backend-thread", taskType: "peer_task",
+        codexProjectId: projectId, codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/domain-provisioning-backend",
+      },
+    ],
+    adapters: [],
+    coordinatorLease: {
+      id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+      holderCodexHostId: "local", holderWorkspacePath: "/tmp/domain-provisioning-global",
+      acquiredAt, expiresAt,
+    },
+    coordinationDomains: [
+      { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+      { id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["backend"] },
+    ],
+  });
+  const globalBinding = {
+    threadId: "global-thread", codexProjectId: projectId, codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/domain-provisioning-global",
+  };
+  const createAssignedTodo = (title, domainId) => {
+    const task = database.createTask({
+      projectId, title, description: "", status: "todo", priority: "high",
+      labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: globalBinding.threadId, threadBinding: globalBinding,
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: `/tmp/domain-provisioning-${domainId}`,
+        branch: `codex/domain-provisioning-${domainId}`,
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain(projectId, task.id, {
+      domainId, taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "global-lease",
+    });
+  };
+  createAssignedTodo("Frontend work", "frontend");
+  createAssignedTodo("Backend work", "backend");
+  const revision = database.getAgentLaneCoordinationWindows(projectId).revision;
+  const requestFor = (domainId) => ({
+    idempotencyKey: `${domainId}-attempt-a`, taskId: domainId,
+    label: `${domainId[0].toUpperCase()}${domainId.slice(1)} Coordinator`,
+    threadSource: `taskboard-${domainId}-coordinator`,
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+    expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", codexProjectId: projectId,
+    codexProjectKind: "local", codexHostId: "local",
+    workspacePath: `/tmp/domain-provisioning-${domainId}`,
+  });
+
+  const frontendRequest = requestFor("frontend");
+  const created = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend", frontendRequest,
+  );
+  assert.equal(created.applied, true);
+  assert.equal(created.attempt.status, "pending");
+  assert.deepEqual(created.attempt.writeScope, ["web"]);
+  const replayed = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend", frontendRequest,
+  );
+  assert.equal(replayed.applied, false);
+  assert.equal(replayed.attempt.id, created.attempt.id);
+  assert.throws(() => database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend", { ...frontendRequest, label: "Different Coordinator" },
+  ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_IDEMPOTENCY_CONFLICT");
+  assert.throws(() => database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend", {
+      ...frontendRequest,
+      idempotencyKey: "frontend-attempt-b",
+      threadSource: "taskboard-frontend-coordinator-b",
+    },
+  ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_IN_PROGRESS");
+  assert.throws(() => database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend", {
+      ...frontendRequest,
+      idempotencyKey: "frontend-attempt-host-mismatch",
+      threadSource: "taskboard-frontend-host-mismatch",
+      codexHostId: "different-host",
+    },
+  ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_BINDING_MISMATCH");
+  assert.throws(() => database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "backend", {
+      ...requestFor("backend"), threadSource: frontendRequest.threadSource,
+    },
+  ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_SOURCE_CONFLICT");
+  const backend = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "backend", requestFor("backend"),
+  );
+  assert.equal(backend.applied, true);
+  assert.deepEqual(backend.attempt.writeScope, ["server"]);
+  assert.notEqual(backend.attempt.id, created.attempt.id);
+  database.close();
+
+  const reopened = new TaskboardDatabase(databasePath);
+  const recovered = reopened.getAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend", frontendRequest.idempotencyKey,
+  );
+  assert.equal(recovered.id, created.attempt.id);
+  assert.equal(recovered.status, "pending");
+  assert.equal(reopened.database.prepare(`
+    SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts
+  `).get().count, 2);
+  reopened.close();
+});
+
 test("default domain containment fails closed for a symlinked case-sensitive target", async (t) => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "agent-domain-case-probe-"));
   directories.push(directory);
