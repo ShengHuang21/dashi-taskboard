@@ -22,14 +22,14 @@ test("injection is an idempotent IIFE guarded by its current source hash", () =>
   assert.match(source, /window\[SENTINEL_KEY\] = api/);
 });
 
-test("embedded page uses the launcher URL inside an opaque sandbox", () => {
+test("embedded page navigates to the authenticated launcher origin inside a cross-origin sandbox", () => {
   assert.match(source, /http:\/\/127\.0\.0\.1:47823\/\?host=codex/);
   assert.match(source, /window\.__CODEX_TASKBOARD_URL__/);
   assert.match(source, /nextFrame\.name = frameName/);
   assert.match(source, /nextFrame\.src = "about:blank"/);
   assert.match(source, /requestHost\("load-frame", \{ frameName, frameCapability: capability \}\)/);
   assert.match(source, /frameCapability = crypto\.randomUUID\(\)/);
-  assert.match(source, /nextFrame\.setAttribute\("sandbox", "allow-scripts/);
+  assert.match(source, /nextFrame\.setAttribute\(\s*"sandbox",\s*"allow-scripts allow-forms/);
   assert.match(source, /taskboardOrigin = taskboardUrl\.origin/);
   assert.match(source, /frameOrigin = "null"/);
   assert.doesNotMatch(source, /allow-same-origin/);
@@ -61,6 +61,14 @@ test("opening Taskboard suppresses native selection and contextual header until 
   assert.match(source, /restoreNativeSelection\(\)/);
   assert.match(source, /function onDocumentClick[\s\S]*closeTaskboard\(false\);/);
   assert.doesNotMatch(source, /setTimeout\(\(\) => closeTaskboard\(false\), 0\)/);
+});
+
+test("opening waits for the native browser panel to close before loading the embedded app", () => {
+  assert.match(source, /if \(suspendedNativeBrowserPanel\)/);
+  assert.match(source, /data-browser-sidebar-webview/);
+  assert.match(source, /Date\.now\(\) \+ 2_000/);
+  assert.match(source, /function onNativeRouteChange\(\) \{\s*if \(!active \|\| suspendedNativeBrowserPanel\) return;/);
+  assert.match(source, /await prepareTaskboard\(generation\)/);
 });
 
 test("the embedded header fills the native titlebar without clipping or a full-page no-drag region", () => {
@@ -120,6 +128,8 @@ test("the embedded header exposes Codex's native sidebar expansion when collapse
 
 test("opening asks the resident launcher to ensure the service and rebuilds failed frames", () => {
   assert.match(source, /const HOST_REQUEST_MESSAGE = "__codexTaskboardHostRequestV1"/);
+  assert.match(source, /HOST_REQUEST_QUEUE_NAME/);
+  assert.match(source, /requestQueue\.push/);
   assert.match(source, /return requestHost\("ensure"\)/);
   assert.match(source, /result\.restarted/);
   assert.match(source, /loadTaskboardFrame\(\)/);
@@ -127,6 +137,13 @@ test("opening asks the resident launcher to ensure the service and rebuilds fail
   assert.match(source, /function onHostBridgeMessage/);
   assert.match(source, /function hasLiveHostBinding/);
   assert.match(source, /HOST_HEARTBEAT_MAX_AGE_MS/);
+  assert.match(source, /const FRAME_RETRY_INITIAL_MS = 1_000/);
+  assert.match(source, /const FRAME_RETRY_MAX_MS = 30_000/);
+  assert.match(source, /function showLoadError\(error\)[\s\S]*scheduleFrameRetry\(\)/);
+  assert.match(source, /function scheduleFrameRetry\(\)[\s\S]*Math\.min\([\s\S]*FRAME_RETRY_MAX_MS/);
+  assert.match(source, /generation !== openGeneration/);
+  assert.match(source, /function showFrame\(resetRetry = true\) \{\s*if \(resetRetry\) clearFrameRetry\(\)/);
+  assert.match(source, /function closeTaskboard\(restoreFocus = true\) \{\s*clearFrameRetry\(\)/);
 });
 
 test("the injected iframe can be cache-busted without reloading the Codex shell", () => {
@@ -134,6 +151,250 @@ test("the injected iframe can be cache-busted without reloading the Codex shell"
   assert.match(source, /function reloadFrame\(\)/);
   assert.match(source, /loadTaskboardFrame\(true\)/);
   assert.match(source, /reloadFrame,/);
+});
+
+test("failed embedded frames retry with bounded backoff and stop after cancellation", () => {
+  const retryStart = source.indexOf("  function clearFrameRetry");
+  const retryEnd = source.indexOf("\n\n  function syncHostUiLanguage", retryStart);
+  const scheduled = [];
+  const cleared = [];
+  let preparations = 0;
+  const seam = vm.runInNewContext(
+    `(() => {
+      const FRAME_RETRY_INITIAL_MS = 1_000;
+      const FRAME_RETRY_MAX_MS = 30_000;
+      let frameRetryTimer = null;
+      let frameRetryAttempt = 0;
+      let destroyed = false;
+      let active = true;
+      let openGeneration = 1;
+      function prepareTaskboard() { preparations(); }
+      ${source.slice(retryStart, retryEnd)}
+      return {
+        scheduleFrameRetry,
+        clearFrameRetry,
+        setGeneration: (value) => { openGeneration = value; },
+        setActive: (value) => { active = value; },
+      };
+    })()`,
+    {
+      preparations: () => { preparations += 1; },
+      window: {
+        setTimeout: (callback, delay) => {
+          const timer = { callback, delay };
+          scheduled.push(timer);
+          return timer;
+        },
+        clearTimeout: (timer) => { cleared.push(timer); },
+      },
+    },
+  );
+
+  seam.scheduleFrameRetry();
+  seam.scheduleFrameRetry();
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000]);
+  scheduled[0].callback();
+  assert.equal(preparations, 1);
+
+  seam.scheduleFrameRetry();
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000, 2_000]);
+  scheduled[1].callback();
+  seam.scheduleFrameRetry();
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000, 2_000, 4_000]);
+  seam.setGeneration(2);
+  scheduled[2].callback();
+  assert.equal(preparations, 2);
+
+  seam.scheduleFrameRetry();
+  seam.clearFrameRetry();
+  assert.equal(cleared.length, 1);
+  seam.scheduleFrameRetry();
+  assert.equal(scheduled.at(-1).delay, 1_000);
+  seam.setActive(false);
+  scheduled.at(-1).callback();
+  assert.equal(preparations, 2);
+});
+
+test("manual frame retry preserves the pinned Coordinator identity", () => {
+  const renderStart = source.indexOf("  function renderLoadError");
+  const renderEnd = source.indexOf("\n\n  function syncHostUiLanguage", renderStart);
+  const coordinatorIdentity = {
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    projectId: "coordinator-project",
+    workspacePath: "/workspace/coordinator",
+  };
+  let clickHandler;
+  let openedIdentity;
+  const element = () => ({
+    hidden: false,
+    append() {},
+    addEventListener: (_type, handler) => { clickHandler = handler; },
+  });
+  vm.runInNewContext(
+    `(() => {
+      let pinnedHostIdentity = identity;
+      const loadError = new Error("temporary");
+      const frame = null;
+      const status = { replaceChildren() {}, hidden: true };
+      function openTaskboard(nextIdentity) { opened(nextIdentity); }
+      ${source.slice(renderStart, renderEnd)}
+      renderLoadError();
+    })()`,
+    {
+      identity: coordinatorIdentity,
+      opened: (identity) => { openedIdentity = identity; },
+      hostText: (_zh, en) => en,
+      hostErrorText: (error) => error.message,
+      document: { createElement: element },
+    },
+  );
+  clickHandler({ type: "click" });
+  assert.deepEqual(JSON.parse(JSON.stringify(openedIdentity)), coordinatorIdentity);
+});
+
+test("an initial ensure failure retries the complete prepare flow before any frame exists", async () => {
+  const retryStart = source.indexOf("  function clearFrameRetry");
+  const retryEnd = source.indexOf("\n\n  function renderLoadError", retryStart);
+  const prepareStart = source.indexOf("  async function prepareTaskboard");
+  const prepareEnd = source.indexOf("\n\n  function restoreNativeContent", prepareStart);
+  const scheduled = [];
+  let ensureAttempts = 0;
+  let frameLoads = 0;
+  let framesShown = 0;
+  const seam = vm.runInNewContext(
+    `(() => {
+      const FRAME_RETRY_INITIAL_MS = 1_000;
+      const FRAME_RETRY_MAX_MS = 30_000;
+      let frameRetryTimer = null;
+      let frameRetryAttempt = 0;
+      let destroyed = false;
+      let active = true;
+      let openGeneration = 1;
+      let frameReady = false;
+      let frame = null;
+      let hostContextSnapshot = null;
+      function showLoadError() { scheduleFrameRetry(); }
+      function renderLoadError() {}
+      function resolveTaskboardUrl() { return new URL("http://127.0.0.1:47823/"); }
+      function frameMatchesTaskboardUrl() { return false; }
+      function showLoading() {}
+      function showFrame() { framesShown(); clearFrameRetry(); }
+      async function requestHostEnsure() {
+        ensureAttempted();
+        if (ensureAttempts() === 1) throw new Error("not ready");
+        return { restarted: false };
+      }
+      async function captureHostContext() { return { projects: [] }; }
+      function loadTaskboardFrame() { frameLoads(); frame = {}; return {}; }
+      async function requestHostLoadFrame() {}
+      async function waitForFrameReady() { frameReady = true; }
+      function postHostContext() {}
+      function hasLiveHostBinding() { return true; }
+      function hostError(_zh, en) { return new Error(en); }
+      ${source.slice(retryStart, retryEnd)}
+      ${source.slice(prepareStart, prepareEnd)}
+      return { prepareTaskboard };
+    })()`,
+    {
+      URL,
+      ensureAttempted: () => { ensureAttempts += 1; },
+      ensureAttempts: () => ensureAttempts,
+      frameLoads: () => { frameLoads += 1; },
+      framesShown: () => { framesShown += 1; },
+      window: {
+        setTimeout: (callback, delay) => {
+          const timer = { callback, delay };
+          scheduled.push(timer);
+          return timer;
+        },
+        clearTimeout() {},
+      },
+    },
+  );
+
+  await seam.prepareTaskboard(1);
+  assert.equal(ensureAttempts, 1);
+  assert.equal(frameLoads, 0);
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000]);
+  scheduled[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(ensureAttempts, 2);
+  assert.equal(frameLoads, 1);
+  assert.equal(framesShown, 1);
+});
+
+test("a reusable frame preserves exponential backoff until ensure succeeds", async () => {
+  const showStart = source.indexOf("  function showFrame");
+  const showEnd = source.indexOf("\n\n  function showLoadError", showStart);
+  const retryStart = source.indexOf("  function clearFrameRetry");
+  const retryEnd = source.indexOf("\n\n  function renderLoadError", retryStart);
+  const prepareStart = source.indexOf("  async function prepareTaskboard");
+  const prepareEnd = source.indexOf("\n\n  function restoreNativeContent", prepareStart);
+  const scheduled = [];
+  let ensureAttempts = 0;
+  const seam = vm.runInNewContext(
+    `(() => {
+      const FRAME_RETRY_INITIAL_MS = 1_000;
+      const FRAME_RETRY_MAX_MS = 30_000;
+      let frameRetryTimer = null;
+      let frameRetryAttempt = 0;
+      let destroyed = false;
+      let active = true;
+      let openGeneration = 1;
+      let frameReady = true;
+      let frame = { isConnected: true, hidden: true, focus() {} };
+      let hostContextSnapshot = null;
+      let statusView = "idle";
+      let loadError = null;
+      const status = { hidden: true };
+      function showLoadError() { scheduleFrameRetry(); }
+      function renderLoadError() {}
+      function resolveTaskboardUrl() { return new URL("http://127.0.0.1:47823/"); }
+      function frameMatchesTaskboardUrl() { return true; }
+      function showLoading() {}
+      async function requestHostEnsure() {
+        ensureAttempted();
+        if (ensureAttempts() <= 3) throw new Error("not ready");
+        return { restarted: false };
+      }
+      async function captureHostContext() { return { projects: [] }; }
+      function loadTaskboardFrame() { throw new Error("ready frame must be reused"); }
+      async function requestHostLoadFrame() {}
+      async function waitForFrameReady() {}
+      function postHostContext() {}
+      function hasLiveHostBinding() { return true; }
+      function hostError(_zh, en) { return new Error(en); }
+      ${source.slice(showStart, showEnd)}
+      ${source.slice(retryStart, retryEnd)}
+      ${source.slice(prepareStart, prepareEnd)}
+      return { prepareTaskboard, scheduleFrameRetry };
+    })()`,
+    {
+      URL,
+      ensureAttempted: () => { ensureAttempts += 1; },
+      ensureAttempts: () => ensureAttempts,
+      window: {
+        setTimeout: (callback, delay) => {
+          const timer = { callback, delay };
+          scheduled.push(timer);
+          return timer;
+        },
+        clearTimeout() {},
+      },
+    },
+  );
+
+  await seam.prepareTaskboard(1);
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal(scheduled[index].delay, 1_000 * (2 ** index));
+    scheduled[index].callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(ensureAttempts, 4);
+  seam.scheduleFrameRetry();
+  assert.equal(scheduled.at(-1).delay, 1_000);
 });
 
 test("reopening reuses a ready cache-busted iframe without showing the startup placeholder", () => {
@@ -145,7 +406,7 @@ test("reopening reuses a ready cache-busted iframe without showing the startup p
     source.indexOf("function restoreNativeContent"),
   );
   assert.match(prepareSource, /const canReuseFrame = Boolean\([\s\S]*frameMatchesTaskboardUrl\(taskboardUrl\)/);
-  assert.match(prepareSource, /if \(canReuseFrame\) showFrame\(\);\s*else showLoading\(\);/);
+  assert.match(prepareSource, /if \(canReuseFrame\) showFrame\(false\);\s*else showLoading\(\);/);
   assert.match(
     prepareSource,
     /if \(!frameReady \|\| result\.restarted \|\| !frameMatchesTaskboardUrl\(taskboardUrl\)\) \{\s*showLoading\(\);/,
@@ -153,7 +414,7 @@ test("reopening reuses a ready cache-busted iframe without showing the startup p
   assert.doesNotMatch(prepareSource, /async function prepareTaskboard\(generation\) \{\s*showLoading\(\);/);
 });
 
-test("opaque iframe messages require the current document capability", () => {
+test("cross-origin iframe messages require the current document capability", () => {
   assert.match(
     source,
     /event\.source !== frame\.contentWindow \|\| event\.origin !== frameOrigin/,
@@ -313,6 +574,313 @@ test("the injected app opens an existing local Codex task instead of a new compo
   assert.doesNotMatch(webApp, /payload: \{ threadId, legacyLocal: true, [^}]*codexProject/);
 });
 
+test("native thread selection updates the later host context even without an active row", () => {
+  const normalizeStart = source.indexOf("  function normalizeThreadId");
+  const normalizeEnd = source.indexOf("\n\n  function resolveTaskboardUrl", normalizeStart);
+  const contextStart = source.indexOf("  function readHostContext");
+  const contextEnd = source.indexOf("\n\n  function postToFrame", contextStart);
+  const selectionStart = source.indexOf("  function selectNativeThread");
+  const selectionEnd = source.indexOf("\n\n  async function openThread", selectionStart);
+  assert.notEqual(selectionStart, -1, "native selection API must exist");
+  assert.notEqual(selectionEnd, -1, "native selection API boundary must exist");
+
+  const owner = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const navigations = [];
+  const seam = vm.runInNewContext(
+    `(() => {
+      let active = false;
+      let pinnedNativeThreadId = "";
+      let pinnedHostIdentity = null;
+      let lastNativeThreadId = ${JSON.stringify(owner)};
+      let lastNativeProjectId = "";
+      ${source.slice(normalizeStart, normalizeEnd)}
+      ${source.slice(contextStart, contextEnd)}
+      ${source.slice(selectionStart, selectionEnd)}
+      return {
+        selectNativeThread,
+        readThreadId: () => readHostContext([], "").threadId,
+      };
+    })()`,
+    {
+      activeThreadRow: () => null,
+      nativeRunningThreadRow: () => null,
+      nativeThreadRunning: () => undefined,
+      workspaceFromLocation: () => "",
+      threadIdFromLocation: () => "",
+      hostLanguage: () => "en",
+      currentTheme: () => "dark",
+      readCodexUser: () => null,
+      titlebarLeftInset: () => 0,
+      nativeSidebarCollapsed: () => false,
+      findThreadRow: () => null,
+      routeForThread: (threadId) => `/local/${threadId}`,
+      dispatchHostMessage: (message) => { navigations.push(message); },
+      document: { querySelector: () => null },
+    },
+  );
+
+  assert.equal(seam.selectNativeThread(coordinator), true);
+  assert.equal(seam.readThreadId(), coordinator);
+  assert.deepEqual(JSON.parse(JSON.stringify(navigations)), [{
+    type: "navigate-to-route",
+    path: `/local/${coordinator}`,
+  }]);
+
+  assert.equal(seam.selectNativeThread("not-a-thread-id"), false);
+  assert.equal(seam.readThreadId(), coordinator);
+  assert.equal(navigations.length, 1);
+});
+
+test("a pinned native thread remains coherent and accepts only exact live dynamics", async () => {
+  const normalizeStart = source.indexOf("  function normalizeThreadId");
+  const normalizeEnd = source.indexOf("\n\n  function resolveTaskboardUrl", normalizeStart);
+  const contextStart = source.indexOf("  function readHostContext");
+  const contextEnd = source.indexOf("\n\n  function postToFrame", contextStart);
+  const postStart = source.indexOf("  function postHostContext");
+  const postEnd = source.indexOf("\n\n  function findThreadRow", postStart);
+  const closeStart = source.indexOf("  function closeTaskboard");
+  const closeEnd = source.indexOf("\n\n  function openTaskboard", closeStart);
+  const projectStart = source.indexOf("  function threadRowProjectId");
+  const projectEnd = source.indexOf("\n\n  function findThreadRowInProject", projectStart);
+  const prepareStart = source.indexOf("  async function prepareNativeThreadOpen");
+  const openEnd = source.indexOf("\n\n  function isNativePageNavigation", prepareStart);
+  assert.notEqual(prepareStart, -1, "native open preparation API must exist");
+  assert.notEqual(openEnd, -1, "native open API boundary must exist");
+
+  const owner = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const row = (threadId, projectId) => ({
+    isConnected: true,
+    getAttribute: (name) => name === "data-app-action-sidebar-thread-id" ? threadId : null,
+    closest: (selector) => selector === "[data-app-action-sidebar-project-list-id]"
+      ? { getAttribute: () => projectId }
+      : null,
+  });
+  const coordinatorRow = {
+    ...row(coordinator, "coordinator-project"),
+    closest: () => null,
+  };
+  let activeRow = coordinatorRow;
+  let coordinatorRunning = true;
+  let todoProgress = { completed: 1, total: 2 };
+  let releaseMetadata;
+  const messages = [];
+  const seam = vm.runInNewContext(
+    `(() => {
+      let active = false;
+      let pinnedNativeThreadId = "";
+      let pinnedHostIdentity = null;
+      let preparedNativeOpen = null;
+      let preparedNativeOpenSequence = 0;
+      let lastNativeThreadId = ${JSON.stringify(owner)};
+      let lastNativeProjectId = "coordinator-project";
+      let hostContextSnapshot = null;
+      let frame = {};
+      let page = null;
+      ${source.slice(normalizeStart, normalizeEnd)}
+      ${source.slice(contextStart, contextEnd)}
+      ${source.slice(postStart, postEnd)}
+      function clearFrameRetry() {}
+      ${source.slice(closeStart, closeEnd)}
+      ${source.slice(projectStart, projectEnd)}
+      function openTaskboard(pinnedIdentity = null) {
+        pinnedHostIdentity = pinnedIdentity;
+        pinnedNativeThreadId = pinnedIdentity?.threadId || "";
+        hostContextSnapshot = readHostContext([], "");
+        active = true;
+        return true;
+      }
+      ${source.slice(prepareStart, openEnd)}
+      return {
+        prepareNativeThreadOpen,
+        commitPreparedNativeOpen,
+        postHostContext,
+        close: () => {
+          active = false;
+          closeTaskboard(false);
+        },
+        open: openTaskboard,
+      };
+    })()`,
+    {
+      activeThreadRow: () => activeRow,
+      nativeRunningThreadRow: () => null,
+      nativeThreadRunning: (threadId) => threadId === coordinator ? coordinatorRunning : false,
+      nativeTodoProgress: () => todoProgress,
+      workspaceFromLocation: () => "",
+      threadIdFromLocation: () => "",
+      hostLanguage: () => "en",
+      currentTheme: () => "dark",
+      readCodexUser: () => null,
+      readCodexProjects: () => [
+        { id: "owner-project", workspacePath: "/workspace/owner" },
+        { id: "coordinator-project", workspacePath: "/workspace/coordinator" },
+      ],
+      captureHostContext: async () => {
+        await new Promise((resolve) => { releaseMetadata = resolve; });
+        return {
+          threadId: coordinator,
+          projectId: "coordinator-project",
+          workspacePath: "/workspace/coordinator",
+          projects: [
+            { id: "owner-project", workspacePath: "/workspace/owner" },
+            { id: "coordinator-project", workspacePath: "/workspace/coordinator" },
+          ],
+        };
+      },
+      crypto: { randomUUID: () => "prepared-native-open-token" },
+      titlebarLeftInset: () => 0,
+      nativeSidebarCollapsed: () => false,
+      findThreadRowInProject: (threadId, projectId) => (
+        threadId === coordinator && projectId === "coordinator-project" ? coordinatorRow : null
+      ),
+      syncHostUiLanguage: () => {},
+      postToFrame: (message) => { messages.push(message); },
+      document: { querySelector: () => null },
+    },
+  );
+
+  assert.equal(await seam.prepareNativeThreadOpen("invalid"), false);
+  assert.equal(messages.length, 0);
+  const opening = seam.prepareNativeThreadOpen(coordinator);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(messages.length, 0);
+  releaseMetadata();
+  const token = await opening;
+  assert.equal(token, "prepared-native-open-token");
+  assert.equal(messages.length, 0);
+  assert.equal(seam.commitPreparedNativeOpen("stale-token"), false);
+  assert.equal(seam.commitPreparedNativeOpen(token), true);
+  assert.equal(seam.commitPreparedNativeOpen(token), false);
+  seam.postHostContext();
+  coordinatorRunning = false;
+  seam.postHostContext();
+  coordinatorRunning = true;
+  todoProgress = { completed: 2, total: 3 };
+  seam.postHostContext();
+  activeRow = row(owner, "owner-project");
+  activeRow = null;
+  seam.postHostContext();
+  activeRow = row(owner, "owner-project");
+  todoProgress = { completed: 99, total: 99 };
+  seam.postHostContext();
+  assert.deepEqual(
+    messages.filter((message) => message.type === "taskboard:host-context")
+      .map((message) => ({
+        threadId: message.payload.threadId,
+        projectId: message.payload.projectId,
+        workspacePath: message.payload.workspacePath,
+        threadRunning: message.payload.threadRunning,
+        threadTodoProgress: message.payload.threadTodoProgress,
+      })),
+    [
+      {
+        threadId: coordinator,
+        projectId: "coordinator-project",
+        workspacePath: "/workspace/coordinator",
+        threadRunning: true,
+        threadTodoProgress: { completed: 1, total: 2 },
+      },
+      {
+        threadId: coordinator,
+        projectId: "coordinator-project",
+        workspacePath: "/workspace/coordinator",
+        threadRunning: false,
+        threadTodoProgress: undefined,
+      },
+      {
+        threadId: coordinator,
+        projectId: "coordinator-project",
+        workspacePath: "/workspace/coordinator",
+        threadRunning: true,
+        threadTodoProgress: { completed: 2, total: 3 },
+      },
+      {
+        threadId: coordinator,
+        projectId: "coordinator-project",
+        workspacePath: "/workspace/coordinator",
+        threadRunning: true,
+        threadTodoProgress: undefined,
+      },
+      {
+        threadId: coordinator,
+        projectId: "coordinator-project",
+        workspacePath: "/workspace/coordinator",
+        threadRunning: true,
+        threadTodoProgress: undefined,
+      },
+    ],
+  );
+
+  seam.close();
+  seam.open();
+  seam.postHostContext();
+  assert.equal(
+    messages.filter((message) => message.type === "taskboard:host-context").at(-1).payload.threadId,
+    owner,
+  );
+  assert.match(source, /function openTaskboard\(pinnedIdentity = null\) \{[\s\S]*?pinnedHostIdentity = pinnedIdentity;/);
+  assert.match(source, /prepareNativeThreadOpen,/);
+  assert.match(source, /commitPreparedNativeOpen,/);
+});
+
+test("a delayed native route event closes only after leaving the pinned Coordinator", () => {
+  const routeStart = source.indexOf("  function onNativeRouteChange");
+  const routeEnd = source.indexOf("\n\n  const api", routeStart);
+  const coordinator = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const owner = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  let activeThreadId = coordinator;
+  let routeThreadId = coordinator;
+  let closes = 0;
+  let posts = 0;
+  const seam = vm.runInNewContext(
+    `(() => {
+      let active = true;
+      let suspendedNativeBrowserPanel = null;
+      let pinnedNativeThreadId = ${JSON.stringify(coordinator)};
+      function normalizeThreadId(value) { return String(value || "").replace(/^(?:local|cloud):/i, ""); }
+      function activeThreadRow() {
+        return activeId() ? { getAttribute: () => activeId() } : null;
+      }
+      function threadIdFromLocation() { return routeId(); }
+      function postHostContext() { posted(); }
+      function closeTaskboard() { closed(); active = false; }
+      ${source.slice(routeStart, routeEnd)}
+      return {
+        onNativeRouteChange,
+        reactivate: () => { active = true; },
+        setPinned: (value) => { pinnedNativeThreadId = value; },
+      };
+    })()`,
+    {
+      activeId: () => activeThreadId,
+      routeId: () => routeThreadId,
+      closed: () => { closes += 1; },
+      posted: () => { posts += 1; },
+    },
+  );
+
+  seam.onNativeRouteChange();
+  assert.deepEqual({ closes, posts }, { closes: 0, posts: 1 });
+  activeThreadId = null;
+  seam.onNativeRouteChange();
+  assert.deepEqual({ closes, posts }, { closes: 0, posts: 2 });
+  activeThreadId = owner;
+  seam.onNativeRouteChange();
+  assert.deepEqual({ closes, posts }, { closes: 1, posts: 2 });
+  seam.reactivate();
+  routeThreadId = owner;
+  seam.onNativeRouteChange();
+  assert.deepEqual({ closes, posts }, { closes: 2, posts: 2 });
+  seam.reactivate();
+  seam.setPinned("");
+  activeThreadId = coordinator;
+  routeThreadId = coordinator;
+  seam.onNativeRouteChange();
+  assert.deepEqual({ closes, posts }, { closes: 3, posts: 2 });
+});
+
 test("remote Codex tasks wait for the exact project and host without a local route fallback", () => {
   const remoteProjectSource = source.slice(
     source.indexOf("async function waitForRemoteProject"),
@@ -373,8 +941,11 @@ test("host context captures all Codex projects even when the sidebar section is 
   assert.match(source, /while \(!section && Date\.now\(\) < sectionDeadline\)/);
   assert.match(source, /requestHostEnsure\(taskboardUrl\),\s*captureHostContext\(\),/);
   assert.match(source, /let lastNativeThreadId = ""/);
+  assert.match(source, /let pinnedNativeThreadId = ""/);
+  assert.match(source, /let pinnedHostIdentity = null/);
   assert.match(source, /clickedThreadId.*lastNativeThreadId/s);
-  assert.match(source, /const currentThreadId = activeThreadId \|\| runningThreadId \|\| lastNativeThreadId/);
+  assert.match(source, /const currentThreadId = pinnedThreadId \|\| activeThreadId \|\| runningThreadId \|\| lastNativeThreadId/);
+  assert.match(source, /if \(active && pinnedHostIdentity\)/);
   assert.match(source, /const threadId = currentThreadId \|\| lastNativeThreadId \|\| normalizeThreadId\(threadIdFromLocation\(\)\)/);
   assert.match(source, /replace\(\/\^\(\?:local\|cloud\):\/i, ""\)/);
   assert.match(source, /function findTasksSection\(\)/);
@@ -441,6 +1012,11 @@ test("cleanup removes observers, listeners, timers and owned DOM", () => {
   assert.match(source, /window\.clearTimeout\(reattachTimer\)/);
   assert.match(source, /data-codex-taskboard-owned/);
   assert.match(source, /delete window\[SENTINEL_KEY\]/);
+});
+
+test("coordination bridge forwards the authorized action frontier", () => {
+  assert.match(source, /safeActionId: payload\?\.safeActionId/);
+  assert.match(source, /expectedResumeToken: payload\?\.expectedResumeToken/);
 });
 
 test("host integration stays thin", () => {

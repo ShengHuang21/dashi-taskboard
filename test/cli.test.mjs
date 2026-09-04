@@ -9,6 +9,7 @@ function capture() {
   return {
     stream: { write(chunk) { value += chunk; } },
     json() { return JSON.parse(value); },
+    text() { return value; },
   };
 }
 
@@ -45,6 +46,21 @@ test("parseArgs supports equals syntax and boolean --json", () => {
   });
 });
 
+test("built-in help leads fresh windows through complete Capsule bootstrap", async () => {
+  for (const argv of [["--help"], ["issue", "--help"]]) {
+    const stdout = capture();
+    const exitCode = await main(argv, {
+      stdout: stdout.stream,
+      stderr: capture().stream,
+      fetch: async () => assert.fail("help must not call the service"),
+    });
+
+    assert.equal(exitCode, 0);
+    assert.match(stdout.text(), /taskctl issue bootstrap LOCAL-275 --json/);
+    assert.doesNotMatch(stdout.text(), /taskctl issue get LOCAL-275 --json/);
+  }
+});
+
 test("project list uses the default local service and adds schemaVersion", async () => {
   const calls = [];
   const result = await run(["project", "list"], async (url, init) => {
@@ -60,6 +76,558 @@ test("project list uses the default local service and adds schemaVersion", async
   assert.equal(calls[0].url, "http://127.0.0.1:47823/api/projects");
   assert.equal(calls[0].init.method, "GET");
   assert.equal(calls[0].init.headers["x-taskboard-client"], "taskctl");
+});
+
+test("owner-intent list exposes the protected read-only frontier", async () => {
+  let requestUrl;
+  const result = await run(["owner-intent", "list", "taskboard-core", "--json"], async (url, init) => {
+    requestUrl = url.toString();
+    assert.equal(init.method, "GET");
+    return response({ intents: [{ intentId: "intent-1", kind: "append", status: "queued" }] });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestUrl, "http://127.0.0.1:47823/api/local/projects/taskboard-core/owner-intents");
+  assert.equal(result.stdout.intents[0].intentId, "intent-1");
+});
+
+test("coordinator status reports an unassigned project when no active Coordinator lane exists", async () => {
+  const calls = [];
+  const result = await run([
+    "coordinator", "status", "capstone-dev", "--json",
+  ], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({
+        error: {
+          code: "AGENT_LANES_NOT_CONFIGURED",
+          message: "Project 'capstone-dev' has no valid Agent Lane mapping",
+        },
+      }, 404);
+    }
+    assert.equal(
+      url.pathname,
+      "/api/local/projects/capstone-dev/coordination-windows",
+    );
+    return response({
+      projectId: "capstone-dev",
+      revision: "a".repeat(64),
+      ownerRootTaskId: "owner-root",
+      coordinatorLease: {
+        id: "released-lease",
+        holderTaskId: "old-coordinator",
+        holderThreadId: "old-thread",
+        releasedAt: "2026-09-02T22:55:28.211Z",
+      },
+      windows: [{ taskId: "owner-root", role: "owner_root", threadId: "owner-thread" }],
+    });
+  });
+
+  assert.equal(result.exitCode, 0, JSON.stringify(result.stderr));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(result.stdout.coordination, {
+    assignment: "unassigned",
+    coordinatorTaskId: null,
+    coordinatorThreadId: null,
+    lease: {
+      id: "released-lease",
+      holderTaskId: "old-coordinator",
+      holderThreadId: "old-thread",
+      releasedAt: "2026-09-02T22:55:28.211Z",
+      status: "expired",
+    },
+  });
+});
+
+test("coordinator window commands inspect and register the current protected window", async () => {
+  const calls = [];
+  const inspect = await run(["coordinator", "windows", "taskboard-core", "--json"], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return response({ projectId: "taskboard-core", revision: "a".repeat(64), windows: [] });
+  });
+  assert.equal(inspect.exitCode, 0, JSON.stringify(inspect.stderr));
+  assert.equal(calls[0].url, "http://127.0.0.1:47823/api/local/projects/taskboard-core/coordination-windows");
+  assert.equal(calls[0].init.method, "GET");
+
+  const register = await run([
+    "coordinator", "register-window", "taskboard-core",
+    "--role", "owner_root", "--task", "owner-root", "--label", "Owner conversation",
+    "--thread-id", "thread-current", "--expected-revision", "b".repeat(64),
+    "--idempotency-key", "owner-root-window-1", "--json",
+  ], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(register.exitCode, 0, JSON.stringify(register.stderr));
+  assert.equal(calls[1].url, "http://127.0.0.1:47823/api/local/projects/taskboard-core/coordination-windows");
+  assert.equal(calls[1].init.method, "POST");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    role: "owner_root", taskId: "owner-root", label: "Owner conversation",
+    threadId: "thread-current", expectedRevision: "b".repeat(64),
+    idempotencyKey: "owner-root-window-1",
+  });
+});
+
+test("background coordinator registration retries the same protected handshake request", async () => {
+  const calls = [];
+  const result = await run([
+    "coordinator", "register-window", "taskboard-core",
+    "--role", "coordinator", "--task", "background-coordinator", "--label", "Coordinator",
+    "--thread-id", "01a062c1-fd2b-7f61-9114-d483e695640e",
+    "--expected-revision", "c".repeat(64),
+    "--idempotency-key", "background-window-1", "--json",
+  ], async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    return calls.length === 1
+      ? response({ pending: true, handshake: { id: "handshake-1" } }, 202)
+      : response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(result.exitCode, 0, JSON.stringify(result.stderr));
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, calls[1].url);
+  assert.equal(calls[0].init.body, calls[1].init.body);
+  assert.equal(result.stdout.receipt.id, "receipt-1");
+});
+
+test("background coordinator registration fails closed when the protected handshake stays pending", async () => {
+  let calls = 0;
+  const result = await run([
+    "coordinator", "register-window", "taskboard-core",
+    "--role", "coordinator", "--task", "background-coordinator", "--label", "Coordinator",
+    "--thread-id", "01a062c1-fd2b-7f61-9114-d483e695640e",
+    "--expected-revision", "d".repeat(64),
+    "--idempotency-key", "background-window-pending", "--json",
+  ], async () => {
+    calls += 1;
+    return response({ pending: true, handshake: { id: "handshake-1" } }, 202);
+  }, { waitForRetry: async () => {} });
+  assert.equal(calls, 81);
+  assert.equal(result.exitCode, 5);
+  assert.equal(result.stderr.error.code, "HOST_IDENTITY_UNAVAILABLE");
+});
+
+test("owner-intent list uses only the loopback companion and rejects a remote-only origin", async () => {
+  const calls = [];
+  const result = await run(
+    ["owner-intent", "list", "taskboard-core", "--json"],
+    async (url) => {
+      calls.push(url.toString());
+      return response({ intents: [] });
+    },
+    {
+      env: {
+        CODEX_TASKBOARD_URL: "https://tasks.example.test",
+        CODEX_TASKBOARD_COMPANION_URL: "http://127.0.0.1:51550/runtime-token-1234",
+      },
+    },
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/taskboard-core/owner-intents",
+  ]);
+
+  let remoteFetches = 0;
+  const rejected = await run(
+    ["owner-intent", "list", "taskboard-core", "--json"],
+    async () => {
+      remoteFetches += 1;
+      return response({ intents: [] });
+    },
+    { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } },
+  );
+  assert.equal(rejected.exitCode, 2);
+  assert.equal(rejected.stderr.error.code, "USAGE_ERROR");
+  assert.match(rejected.stderr.error.message, /loopback/);
+  assert.equal(remoteFetches, 0);
+});
+
+test("standing authority CLI normalizes a narrow grant and supports list and revoke", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url: url.toString(), init, body: init.body ? JSON.parse(init.body) : null });
+    return response({ ok: true });
+  };
+
+  const grant = await run([
+    "authority", "grant", "personal",
+    "--repository", "HTTPS://GitHub.com/Owner/Repo.git",
+    "--actions", "edit,test,ordinary_push,draft_pr",
+    "--source-task", "CAP-8",
+    "--source-thread-id", "root-thread",
+    "--evidence", "Owner standing instruction",
+    "--receipt", "owner-turn:1",
+    "--granted-at", "2026-08-30T00:00:00.000Z",
+  ], fetchImplementation);
+  assert.equal(grant.exitCode, 0);
+  assert.equal(calls[0].url, "http://127.0.0.1:47823/api/projects/personal/standing-authorities");
+  assert.deepEqual(calls[0].body, {
+    repository: "github.com/owner/repo",
+    actions: ["draft_pr", "edit", "ordinary_push", "test"],
+    sourceTaskId: "CAP-8",
+    sourceThreadId: "root-thread",
+    evidence: "Owner standing instruction",
+    receipt: "owner-turn:1",
+    grantedAt: "2026-08-30T00:00:00.000Z",
+  });
+
+  assert.equal((await run(["authority", "list", "personal"], fetchImplementation)).exitCode, 0);
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal((await run([
+    "authority", "revoke", "personal", "authority-1",
+    "--evidence", "Owner revoked it",
+    "--receipt", "owner-turn:2",
+  ], fetchImplementation)).exitCode, 0);
+  assert.equal(calls[2].url, "http://127.0.0.1:47823/api/projects/personal/standing-authorities/authority-1/revoke");
+});
+
+test("coordinator CLI reads, acquires, renews, releases, and audits one exact lease", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({ coordination: { assignment: "unassigned", coordinatorTaskId: null } });
+    }
+    if (url.pathname.endsWith("/receipts")) return response({ receipts: [] });
+    return response({ lease: { id: "lease-1", status: "active" }, receipt: { action: "acquired" } });
+  };
+
+  const status = await run(["coordinator", "status", "personal"], fetchImplementation);
+  const acquired = await run([
+    "coordinator", "acquire", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "none", "--lease-seconds", "60",
+  ], fetchImplementation);
+  const replacedExpired = await run([
+    "coordinator", "acquire", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "expired-lease", "--lease-seconds", "60",
+  ], fetchImplementation);
+  const renewed = await run([
+    "coordinator", "renew", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "lease-1", "--lease-seconds", "120",
+  ], fetchImplementation);
+  const released = await run([
+    "coordinator", "release", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "lease-1",
+  ], fetchImplementation);
+  const receipts = await run(["coordinator", "receipts", "personal"], fetchImplementation);
+
+  for (const result of [status, acquired, replacedExpired, renewed, released, receipts]) {
+    assert.equal(result.exitCode, 0);
+  }
+  assert.deepEqual(status.stdout.coordination, { assignment: "unassigned", coordinatorTaskId: null });
+  assert.deepEqual(calls, [
+    { pathname: "/api/local/projects/personal/agent-lanes", method: "GET", body: null },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: null, leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: "expired-lease", leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: "lease-1", leaseDurationSeconds: 120 },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordinator-lease/release", method: "POST",
+      body: { holderTaskId: "root", holderThreadId: "thread-root", expectedLeaseId: "lease-1" },
+    },
+    { pathname: "/api/local/projects/personal/coordinator-lease/receipts", method: "GET", body: null },
+  ]);
+});
+
+test("coordinator CLI rejects unsafe duration and incomplete lease identity before network access", async () => {
+  let called = false;
+  const fetchImplementation = async () => {
+    called = true;
+    return response({});
+  };
+  const invalidDuration = await run([
+    "coordinator", "acquire", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "none", "--lease-seconds", "10",
+  ], fetchImplementation);
+  const missingLease = await run([
+    "coordinator", "renew", "personal",
+    "--holder-task", "root", "--holder-thread-id", "thread-root", "--lease-seconds", "60",
+  ], fetchImplementation);
+  assert.equal(invalidDuration.exitCode, 2);
+  assert.equal(missingLease.exitCode, 2);
+  assert.equal(called, false);
+});
+
+test("domain coordinator CLI acquires two-operand scoped leases without changing Global Coordinator commands", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({
+        coordination: {
+          coordinatorTaskId: "global",
+          domainCoordinators: [{ domainId: "frontend", coordinatorTaskId: "frontend", assignment: "lease" }],
+        },
+      });
+    }
+    if (url.pathname.endsWith("/receipts")) return response({ receipts: [] });
+    return response({ lease: { id: "domain-lease", status: "active" }, receipt: { action: "acquired" } });
+  };
+
+  const status = await run(["domain-coordinator", "status", "personal", "frontend"], fetchImplementation);
+  const acquired = await run([
+    "domain-coordinator", "acquire", "personal", "frontend",
+    "--holder-task", "frontend", "--holder-thread-id", "frontend-thread",
+    "--expected-lease-id", "none", "--lease-seconds", "60",
+  ], fetchImplementation);
+  const released = await run([
+    "domain-coordinator", "release", "personal", "frontend",
+    "--holder-task", "frontend", "--holder-thread-id", "frontend-thread",
+    "--expected-lease-id", "domain-lease",
+  ], fetchImplementation);
+  const receipts = await run(["domain-coordinator", "receipts", "personal", "frontend"], fetchImplementation);
+
+  for (const result of [status, acquired, released, receipts]) assert.equal(result.exitCode, 0);
+  assert.equal(status.stdout.domainCoordinator.domainId, "frontend");
+  assert.deepEqual(calls, [
+    { pathname: "/api/local/projects/personal/agent-lanes", method: "GET", body: null },
+    {
+      pathname: "/api/local/projects/personal/domain-coordinator-leases/frontend", method: "POST",
+      body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: null, leaseDurationSeconds: 60 },
+    },
+    {
+      pathname: "/api/local/projects/personal/domain-coordinator-leases/frontend/release", method: "POST",
+      body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: "domain-lease" },
+    },
+    { pathname: "/api/local/projects/personal/domain-coordinator-leases/frontend/receipts", method: "GET", body: null },
+  ]);
+});
+
+test("domain coordinator CLI configures and removes durable routing domains", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    return response({ projectId: "personal", revision: "b".repeat(64), domains: [] });
+  };
+  const listed = await run(["domain-coordinator", "domains", "personal"], fetchImplementation);
+  const configured = await run([
+    "domain-coordinator", "configure", "personal", "frontend",
+    "--label", "Frontend", "--write-scope", "web,shared/ui",
+    "--eligible-task", "frontend-a,frontend-b",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--expected-revision", "a".repeat(64),
+    "--idempotency-key", "configure-frontend-v1",
+  ], fetchImplementation);
+  const removed = await run([
+    "domain-coordinator", "remove", "personal", "frontend",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--expected-revision", "b".repeat(64),
+    "--idempotency-key", "remove-frontend-v1",
+  ], fetchImplementation);
+  for (const result of [listed, configured, removed]) assert.equal(result.exitCode, 0, JSON.stringify(result.stderr));
+  assert.deepEqual(calls, [
+    { pathname: "/api/local/projects/personal/coordination-domains", method: "GET", body: null },
+    {
+      pathname: "/api/local/projects/personal/coordination-domains/frontend", method: "PUT",
+      body: {
+        label: "Frontend", writeScope: ["web", "shared/ui"], eligibleTaskIds: ["frontend-a", "frontend-b"],
+        holderTaskId: "global", holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+        expectedRevision: "a".repeat(64), idempotencyKey: "configure-frontend-v1",
+      },
+    },
+    {
+      pathname: "/api/local/projects/personal/coordination-domains/frontend", method: "DELETE",
+      body: {
+        holderTaskId: "global", holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+        expectedRevision: "b".repeat(64), idempotencyKey: "remove-frontend-v1",
+      },
+    },
+  ]);
+});
+
+test("domain Todo CLI assigns through the exact active Global Coordinator lease", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url, init });
+    return response({ assignment: { taskId: "task-uuid", domainId: "frontend" } });
+  };
+  const result = await run([
+    "domain-todo", "assign", "personal", "CAP-20", "--domain", "frontend",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--if-version", "2",
+  ], fetchImplementation);
+  assert.equal(result.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/local/projects/personal/domain-todo-assignments/CAP-20");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    domainId: "frontend", taskVersion: 2, holderTaskId: "global",
+    holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+  });
+});
+
+test("domain Todo CLI clears through the same protected Global Coordinator boundary", async () => {
+  let requestRecord;
+  const result = await run([
+    "domain-todo", "clear", "personal", "CAP-20",
+    "--holder-task", "global", "--holder-thread-id", "global-thread",
+    "--expected-lease-id", "global-lease", "--if-version", "3",
+  ], async (url, init) => {
+    requestRecord = { url, init };
+    return response({ assignment: null, task: { identifier: "CAP-20", version: 4 } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(requestRecord.init.method, "DELETE");
+  assert.deepEqual(JSON.parse(requestRecord.init.body), {
+    taskVersion: 3, holderTaskId: "global", holderThreadId: "global-thread",
+    expectedCoordinatorLeaseId: "global-lease",
+  });
+});
+
+test("dependency handoff CLI accepts only through the exact target domain route", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ pathname: url.pathname, method: init.method, body: init.body ? JSON.parse(init.body) : null });
+    return response({ applied: true, clearance: { status: "accepted" } });
+  };
+  const status = await run([
+    "dependency-handoff", "status", "personal", "CAP-24",
+  ], fetchImplementation);
+  const accepted = await run([
+    "dependency-handoff", "accept", "personal", "CAP-24",
+    "--source", "CAP-20", "--idempotency-key", "handoff-1",
+    "--holder-task", "backend", "--holder-thread-id", "backend-thread",
+    "--expected-lease-id", "backend-lease",
+  ], fetchImplementation);
+  assert.equal(status.exitCode, 0);
+  assert.equal(accepted.exitCode, 0);
+  assert.deepEqual(calls, [
+    {
+      pathname: "/api/local/projects/personal/cross-domain-dependency-clearances/CAP-24",
+      method: "GET", body: null,
+    },
+    {
+      pathname: "/api/local/projects/personal/cross-domain-dependency-clearances/CAP-24",
+      method: "POST",
+      body: {
+        sourceTaskId: "CAP-20", idempotencyKey: "handoff-1",
+        holderTaskId: "backend", holderThreadId: "backend-thread",
+        expectedTargetDomainLeaseId: "backend-lease",
+      },
+    },
+  ]);
+});
+
+test("domain coordination controls and proxied business APIs use the configured loopback companion", async () => {
+  const calls = [];
+  const env = {
+    CODEX_TASKBOARD_URL: "https://tasks.example.test",
+    CODEX_TASKBOARD_COMPANION_URL: "http://127.0.0.1:51550/runtime-token-1234",
+  };
+  const fetchImplementation = async (url) => {
+    calls.push(url.toString());
+    if (url.pathname.endsWith("/agent-lanes")) {
+      return response({ coordination: { domainCoordinators: [] } });
+    }
+    if (url.pathname.includes("domain-todo-assignments")) return response({ assignment: null });
+    if (url.pathname.includes("cross-domain-dependency-clearances")) return response({ clearances: [] });
+    return response({ task: { identifier: "CAP-20" } });
+  };
+
+  const domain = await run([
+    "domain-coordinator", "status", "personal", "frontend",
+  ], fetchImplementation, { env });
+  const todo = await run([
+    "domain-todo", "status", "personal", "CAP-20",
+  ], fetchImplementation, { env });
+  const handoff = await run([
+    "dependency-handoff", "status", "personal", "CAP-24",
+  ], fetchImplementation, { env });
+  const issue = await run(["issue", "get", "CAP-20"], fetchImplementation, { env });
+
+  for (const result of [domain, todo, handoff, issue]) assert.equal(result.exitCode, 0);
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/personal/agent-lanes",
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/personal/domain-todo-assignments/CAP-20",
+    "http://127.0.0.1:51550/runtime-token-1234/api/local/projects/personal/cross-domain-dependency-clearances/CAP-24",
+    "http://127.0.0.1:51550/runtime-token-1234/api/tasks/CAP-20",
+  ]);
+
+  let remoteControlFetches = 0;
+  const rejectedControl = await run([
+    "domain-todo", "status", "personal", "CAP-20",
+  ], async () => {
+    remoteControlFetches += 1;
+    return response({});
+  }, { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } });
+  assert.equal(rejectedControl.exitCode, 2);
+  assert.equal(remoteControlFetches, 0);
+
+  let ordinaryUrl;
+  const ordinaryRemote = await run(["issue", "get", "CAP-20"], async (url) => {
+    ordinaryUrl = url.toString();
+    return response({ task: { identifier: "CAP-20" } });
+  }, { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } });
+  assert.equal(ordinaryRemote.exitCode, 0);
+  assert.equal(ordinaryUrl, "https://tasks.example.test/api/tasks/CAP-20");
+});
+
+test("coordinator CLI repairs a legacy Root binding without caller-supplied host identity", async () => {
+  let call;
+  const result = await run([
+    "coordinator", "repair-binding", "personal", "CAP-12",
+    "--holder-task", "root", "--holder-thread-id", "thread-root",
+    "--expected-lease-id", "lease-1", "--if-version", "3",
+  ], async (url, init) => {
+    call = {
+      pathname: url.pathname,
+      method: init.method,
+      body: JSON.parse(init.body),
+    };
+    return response({ task: { identifier: "CAP-12", version: 4 }, receipt: { id: "activity-1" } });
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(call, {
+    pathname: "/api/local/projects/personal/coordinator-lease/repair-binding",
+    method: "POST",
+    body: {
+      taskId: "CAP-12",
+      taskVersion: 3,
+      holderTaskId: "root",
+      holderThreadId: "thread-root",
+      expectedLeaseId: "lease-1",
+    },
+  });
+});
+
+test("standing authority CLI rejects unknown and duplicate actions before network access", async () => {
+  let called = false;
+  for (const actions of ["edit,deploy", "edit,edit"]) {
+    const result = await run([
+      "authority", "grant", "personal",
+      "--repository", "github.com/owner/repo",
+      "--actions", actions,
+      "--source-task", "CAP-8",
+      "--source-thread-id", "root-thread",
+      "--evidence", "Owner standing instruction",
+      "--receipt", "owner-turn:1",
+      "--granted-at", "2026-08-30T00:00:00.000Z",
+    ], async () => { called = true; return response({}); });
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.stderr.error.code, "USAGE_ERROR");
+  }
+  assert.equal(called, false);
+});
+
+test("Owner decisions cannot be forged through taskctl", async () => {
+  let called = false;
+  const result = await run(["decision", "record", "CAP-10"], async () => {
+    called = true;
+    return response({});
+  });
+  assert.equal(result.exitCode, 2);
+  assert.equal(result.stderr.error.code, "USAGE_ERROR");
+  assert.equal(called, false);
 });
 
 test("CODEX_TASKBOARD_URL overrides the service origin", async () => {
@@ -127,6 +695,27 @@ test("issue list serializes project and status filters", async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(requestedUrl.searchParams.get("projectId"), "local");
   assert.equal(requestedUrl.searchParams.get("status"), "todo");
+});
+
+test("issue bootstrap recovers the complete Task Capsule through one direct request", async () => {
+  const capsule = {
+    task: { identifier: "TASK/1", version: 7 },
+    comments: [{ id: "comment-1" }],
+    attachments: [{ id: "attachment-1" }],
+    inbox: { pendingCount: 1, latestReceipt: { id: "delivery-1" } },
+    handoffs: { pendingAcknowledgementCount: 1, latestEvent: { eventId: "handoff-1" } },
+    resumeToken: "a".repeat(64),
+  };
+  let request;
+  const result = await run(["issue", "bootstrap", "TASK/1"], async (url, init) => {
+    request = { url, init };
+    return response({ capsule });
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(request.url.pathname, "/api/tasks/TASK%2F1/capsule");
+  assert.equal(request.init.method, "GET");
+  assert.deepEqual(result.stdout.capsule, capsule);
 });
 
 test("issue commands accept in-review, blocked, and canceled statuses", async () => {
@@ -235,9 +824,89 @@ test("issue update sends an explicit optimistic concurrency version", async () =
   assert.equal(calls[0].url.pathname, "/api/tasks/TASK%2F1");
   assert.deepEqual(JSON.parse(calls[0].init.body), {
     title: "New title",
-    threadId: "thread-current",
     version: 7,
   });
+});
+
+test("issue create and update accept an explicit workflow profile", async () => {
+  const bodies = [];
+  const fetchImpl = async (_url, init) => {
+    bodies.push(JSON.parse(init.body));
+    return response({ task: { id: "TASK-1", version: bodies.length } }, bodies.length === 1 ? 201 : 200);
+  };
+  const created = await run([
+    "issue", "create", "--project", "local", "--title", "Personal skill", "--workflow-profile", "vibe",
+  ], fetchImpl);
+  const updated = await run([
+    "issue", "update", "TASK-1", "--workflow-profile", "formal", "--if-version", "1",
+  ], fetchImpl);
+
+  assert.equal(created.exitCode, 0);
+  assert.equal(updated.exitCode, 0);
+  assert.equal(bodies[0].workflowProfile, "vibe");
+  assert.deepEqual(bodies[1], { workflowProfile: "formal", version: 1 });
+});
+
+test("activation CLI audits and explicitly applies one legacy workflow profile candidate", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    if (init.method === "GET") {
+      return response({
+        workflowProfileCandidates: [{ taskId: "task-1", identifier: "CAP-13", taskVersion: 7 }],
+        legacyRootBindings: [],
+      });
+    }
+    return response({
+      applied: true,
+      receipt: { taskId: "task-1", taskVersionBefore: 7, taskVersionAfter: 8 },
+    });
+  };
+
+  const audit = await run(["activation", "audit"], fetchImpl);
+  const applied = await run([
+    "activation", "apply-workflow-profile", "CAP-13", "--if-version", "7",
+  ], fetchImpl);
+
+  assert.equal(audit.exitCode, 0);
+  assert.equal(applied.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/local/activation-readiness");
+  assert.equal(calls[1].url.pathname, "/api/local/activation-readiness/workflow-profiles/CAP-13");
+  assert.deepEqual(JSON.parse(calls[1].init.body), { version: 7 });
+});
+
+test("activation commands use only the loopback companion and fail closed on a remote-only origin", async () => {
+  const calls = [];
+  const env = {
+    CODEX_TASKBOARD_URL: "https://tasks.example.test",
+    CODEX_TASKBOARD_COMPANION_URL: "http://127.0.0.1:51550/activation-token-1",
+  };
+  const fetchImpl = async (url) => {
+    calls.push(url.toString());
+    return response({ workflowProfileCandidates: [], legacyRootBindings: [] });
+  };
+
+  const audit = await run(["activation", "audit"], fetchImpl, { env });
+  const applied = await run([
+    "activation", "apply-workflow-profile", "CAP-13", "--if-version", "7",
+  ], fetchImpl, { env });
+
+  assert.equal(audit.exitCode, 0);
+  assert.equal(applied.exitCode, 0);
+  assert.deepEqual(calls, [
+    "http://127.0.0.1:51550/activation-token-1/api/local/activation-readiness",
+    "http://127.0.0.1:51550/activation-token-1/api/local/activation-readiness/workflow-profiles/CAP-13",
+  ]);
+
+  let remoteFetches = 0;
+  const rejected = await run(["activation", "audit"], async () => {
+    remoteFetches += 1;
+    return response({});
+  }, { env: { CODEX_TASKBOARD_URL: "https://tasks.example.test" } });
+  assert.equal(rejected.exitCode, 2);
+  assert.equal(rejected.stderr.error.code, "USAGE_ERROR");
+  assert.match(rejected.stderr.error.message, /loopback/);
+  assert.equal(remoteFetches, 0);
 });
 
 test("issue update binds one worktree context", async () => {
@@ -265,7 +934,6 @@ test("issue update binds one worktree context", async () => {
       path: worktreePath,
       branch: "worktree/taskboard",
     },
-    threadId: "thread-current",
     version: 4,
   });
 });
@@ -349,19 +1017,247 @@ test("issue move can clear an unconfirmed task binding", async () => {
   });
 });
 
-test("an explicit --thread-id overrides CODEX_THREAD_ID on issue writes", async () => {
+test("Root Sub-Agent claims a real To-Do with durable identity", async () => {
+  const calls = [];
+  const result = await run([
+    "issue", "claim", "TASK-1", "--agent-path", "/root/review",
+    "--thread-id", "agent-thread", "--root-thread-id", "root-thread", "--if-version", "3",
+    "--lease-minutes", "30", "--write-scope", "server/database.mjs,test/cli.test.mjs",
+    "--admission-receipt-id", "receipt-1", "--admission-attempt-id", "attempt-1",
+  ], async (url, init) => {
+    calls.push({ url, init });
+    return response({ task: { id: "TASK-1", status: "in_progress", version: 4 } });
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(String(calls[0].url), "http://127.0.0.1:47823/api/tasks/TASK-1/claim");
+  const claimBody = JSON.parse(calls[0].init.body);
+  assert.match(claimBody.leaseExpiresAt, /^\d{4}-\d{2}-\d{2}T/);
+  assert.deepEqual({ ...claimBody, leaseExpiresAt: "future" }, {
+    agentPath: "/root/review",
+    agentThreadId: "agent-thread",
+    rootThreadId: "root-thread",
+    leaseExpiresAt: "future",
+    writeScope: ["server/database.mjs", "test/cli.test.mjs"],
+    admissionReceiptId: "receipt-1",
+    admissionAttemptId: "attempt-1",
+    version: 3,
+  });
+});
+
+test("capacity deferral is bound to one exact durable admission attempt", async () => {
+  let requestBody;
+  const result = await run([
+    "issue", "admission-defer", "TASK-1",
+    "--root-thread-id", "root-thread",
+    "--expected-resume-token", "resume-token",
+    "--safe-action-id", "continue",
+    "--admission-receipt-id", "receipt-1",
+    "--admission-attempt-id", "attempt-1",
+  ], async (url, init) => {
+    assert.equal(url.pathname, "/api/tasks/TASK-1/admission-defer");
+    requestBody = JSON.parse(init.body);
+    return response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    rootThreadId: "root-thread",
+    expectedResumeToken: "resume-token",
+    safeActionId: "continue",
+    admissionReceiptId: "receipt-1",
+    admissionAttemptId: "attempt-1",
+  });
+});
+
+test("admission preparation persists one bounded write scope before spawn", async () => {
+  let requestBody;
+  const result = await run([
+    "issue", "admission-prepare", "TASK-1",
+    "--root-thread-id", "root-thread",
+    "--expected-resume-token", "resume-token",
+    "--safe-action-id", "continue",
+    "--admission-receipt-id", "receipt-1",
+    "--admission-attempt-id", "attempt-1",
+    "--write-scope", "server,test",
+  ], async (url, init) => {
+    assert.equal(url.pathname, "/api/tasks/TASK-1/admission-prepare");
+    requestBody = JSON.parse(init.body);
+    return response({ applied: true, receipt: { id: "receipt-1" } });
+  });
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(requestBody, {
+    rootThreadId: "root-thread",
+    expectedResumeToken: "resume-token",
+    safeActionId: "continue",
+    admissionReceiptId: "receipt-1",
+    admissionAttemptId: "attempt-1",
+    writeScope: ["server", "test"],
+  });
+});
+
+test("run commands use durable lifecycle endpoints and agent thread attribution", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url, init });
+    return response({ run: { id: "RUN/1", version: 2 }, task: { id: "TASK-1" }, applied: true });
+  };
+
+  const checkpoint = await run(
+    [
+      "run", "checkpoint", "RUN/1", "--summary", "Checkpoint", "--next-action", "Resume",
+      "--status", "blocked", "--if-version", "1",
+    ],
+    fetchImplementation,
+  );
+  const finish = await run(
+    [
+      "run", "finish", "RUN/1", "--status", "completed", "--summary", "Finished",
+      "--next-action", "Review", "--if-version", "2",
+    ],
+    fetchImplementation,
+  );
+  const get = await run(["run", "get", "RUN/1"], fetchImplementation);
+
+  assert.equal(checkpoint.exitCode, 0);
+  assert.equal(finish.exitCode, 0);
+  assert.equal(get.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/runs/RUN%2F1/checkpoint");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    agentThreadId: "thread-current",
+    summary: "Checkpoint",
+    nextAction: "Resume",
+    status: "blocked",
+    version: 1,
+  });
+  assert.equal(calls[1].url.pathname, "/api/runs/RUN%2F1/finish");
+  assert.deepEqual(JSON.parse(calls[1].init.body), {
+    agentThreadId: "thread-current",
+    summary: "Finished",
+    nextAction: "Review",
+    status: "completed",
+    version: 2,
+  });
+  assert.equal(calls[2].url.pathname, "/api/runs/RUN%2F1");
+  assert.equal(calls[2].init.method, "GET");
+});
+
+test("handoff commands append, replay, and acknowledge structured coordination events", async () => {
+  const calls = [];
+  const fetchImplementation = async (url, init) => {
+    calls.push({ url, init });
+    if (init.method === "GET") return response({ events: [] });
+    if (url.pathname.endsWith("/acknowledgements")) {
+      return response({ applied: true, acknowledgement: { id: "ack-receipt-1" } }, 201);
+    }
+    return response({ applied: true, event: { eventId: "handoff-1" } }, 201);
+  };
+
+  const add = await run([
+    "handoff", "add", "TASK/1",
+    "--event-id", "handoff-1",
+    "--idempotency-key", "handoff-key-1",
+    "--agent-path", "/root/backend",
+    "--sequence", "3",
+    "--timestamp", "2026-08-29T05:00:00.000Z",
+    "--summary", "Backend complete",
+    "--evidence-ref", "test/server.test.mjs#handoff,artifact://focused-result",
+    "--next-action", "Root reviews evidence",
+    "--requires-ack", "true",
+    "--causation-id", "claim-1",
+    "--correlation-id", "feature-1",
+  ], fetchImplementation);
+  const list = await run(["handoff", "list", "TASK/1"], fetchImplementation);
+  const ack = await run([
+    "handoff", "ack", "handoff-1",
+    "--acknowledgement-id", "root-ack-1",
+    "--agent-path", "/root",
+  ], fetchImplementation);
+
+  assert.equal(add.exitCode, 0);
+  assert.equal(list.exitCode, 0);
+  assert.equal(ack.exitCode, 0);
+  assert.equal(calls[0].url.pathname, "/api/tasks/TASK%2F1/coordination-events");
+  assert.deepEqual(JSON.parse(calls[0].init.body), {
+    eventId: "handoff-1",
+    idempotencyKey: "handoff-key-1",
+    parentTaskId: null,
+    senderThreadId: "thread-current",
+    senderAgentPath: "/root/backend",
+    eventType: "handoff",
+    sequence: 3,
+    timestamp: "2026-08-29T05:00:00.000Z",
+    summary: "Backend complete",
+    evidenceRefs: ["test/server.test.mjs#handoff", "artifact://focused-result"],
+    blocker: null,
+    nextAction: "Root reviews evidence",
+    requiresAck: true,
+    causationId: "claim-1",
+    correlationId: "feature-1",
+  });
+  assert.equal(calls[1].url.pathname, "/api/tasks/TASK%2F1/coordination-events");
+  assert.equal(calls[1].init.method, "GET");
+  assert.equal(calls[2].url.pathname, "/api/coordination-events/handoff-1/acknowledgements");
+  assert.deepEqual(JSON.parse(calls[2].init.body), {
+    acknowledgementId: "root-ack-1",
+    senderThreadId: "thread-current",
+    senderAgentPath: "/root",
+  });
+});
+
+test("handoff commands reject unsafe acknowledgement and boolean shapes before fetch", async () => {
+  const neverFetch = async () => assert.fail("fetch should not be called");
+  const invalidAck = await run([
+    "handoff", "ack", "handoff-1",
+    "--acknowledgement-id", "root-ack-1",
+    "--agent-path", "/root/backend",
+  ], neverFetch);
+  const invalidBoolean = await run([
+    "handoff", "add", "TASK-1",
+    "--event-id", "handoff-1",
+    "--idempotency-key", "handoff-key-1",
+    "--agent-path", "/root/backend",
+    "--sequence", "1",
+    "--summary", "Backend complete",
+    "--next-action", "Root reviews evidence",
+    "--requires-ack", "yes",
+  ], neverFetch);
+
+  assert.equal(invalidAck.exitCode, 2);
+  assert.match(invalidAck.stderr.error.message, /must be \/root/);
+  assert.equal(invalidBoolean.exitCode, 2);
+  assert.match(invalidBoolean.stderr.error.message, /must be true or false/);
+});
+
+test("issue update rebinds only with explicit binding identity", async () => {
   let requestBody;
   const result = await run(
-    ["issue", "update", "TASK-1", "--title", "Attributed", "--thread-id", "thread-9", "--if-version", "2"],
+    [
+      "issue", "update", "TASK-1", "--title", "Rebound", "--if-version", "2",
+      "--binding-thread-id", "thread-9",
+      "--binding-codex-project-id", "project-9",
+      "--binding-codex-project-kind", "local",
+      "--binding-codex-host-id", "local",
+      "--binding-workspace-path", "/work/rebound",
+    ],
     async (_url, init) => {
       requestBody = JSON.parse(init.body);
-      return response({ task: { id: "TASK-1", threadId: "thread-9", version: 3 } });
+      return response({ task: { id: "TASK-1", threadBinding: requestBody.threadBinding, version: 3 } });
     },
   );
 
   assert.equal(result.exitCode, 0);
-  assert.deepEqual(requestBody, { title: "Attributed", threadId: "thread-9", version: 2 });
-  assert.equal(result.stdout.task.threadId, "thread-9");
+  assert.deepEqual(requestBody, {
+    title: "Rebound",
+    threadBinding: {
+      threadId: "thread-9",
+      codexProjectId: "project-9",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/work/rebound",
+    },
+    version: 2,
+  });
+  assert.equal(result.stdout.task.threadBinding.threadId, "thread-9");
 });
 
 test("issue restore uses the mutation thread and optimistic version", async () => {
@@ -531,14 +1427,18 @@ test("context current falls back to the local project", async () => {
   assert.equal(result.stdout.project.id, "local");
 });
 
-test("issue and comment writes require Codex conversation attribution", async () => {
+test("issue updates preserve the existing binding while comment writes require attribution", async () => {
+  let issueBody;
   const issueResult = await run(
     ["issue", "update", "TASK-1", "--title", "No attribution", "--if-version", "1"],
-    async () => assert.fail("fetch should not be called"),
+    async (_url, init) => {
+      issueBody = JSON.parse(init.body);
+      return response({ task: { id: "TASK-1", ...issueBody, version: 2 } });
+    },
     { env: {} },
   );
-  assert.equal(issueResult.exitCode, 2);
-  assert.match(issueResult.stderr.error.message, /--thread-id or CODEX_THREAD_ID/);
+  assert.equal(issueResult.exitCode, 0);
+  assert.deepEqual(issueBody, { title: "No attribution", version: 1 });
 
   const commentResult = await run(
     ["comment", "add", "TASK-1", "--body", "No attribution"],
@@ -562,7 +1462,7 @@ test("manual linked-thread options and commands are no longer accepted", async (
     async () => assert.fail("fetch should not be called"),
   );
   assert.equal(commandResult.exitCode, 2);
-  assert.match(commandResult.stderr.error.message, /Expected one of/);
+  assert.match(commandResult.stderr.error.message, /Expected one of:[\s\S]*issue list\/get\/bootstrap\/create/);
 });
 
 test("API conflicts produce stable JSON on stderr and exit code 5", async () => {

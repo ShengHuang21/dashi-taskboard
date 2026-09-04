@@ -43,6 +43,8 @@ export function createTaskboardSupervisor({
   start,
   onProcessError = () => {},
   onUnexpectedExit = () => {},
+  startupTimeoutMs = 10_000,
+  unhealthyChildGraceMs = 3_000,
 }) {
   let child = null;
   let ensureInFlight = null;
@@ -62,7 +64,7 @@ export function createTaskboardSupervisor({
       const managedChild = child;
       if (isRunning(managedChild)) {
         try {
-          await waitUntilReachable(3_000);
+          await waitUntilReachable(unhealthyChildGraceMs);
           return { status: "ok", restarted: false };
         } catch (_) {}
         await terminateManagedChild(managedChild);
@@ -82,7 +84,7 @@ export function createTaskboardSupervisor({
       });
 
       try {
-        await waitUntilReachable(10_000);
+        await waitUntilReachable(startupTimeoutMs);
         retryAfter = 0;
         return { status: "ok", restarted: true };
       } catch (error) {

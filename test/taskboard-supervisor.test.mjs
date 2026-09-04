@@ -53,3 +53,35 @@ test("an unhealthy live child exits before its replacement starts", async () => 
   ]);
   await supervisor.stop();
 });
+
+test("a caller can preserve one slow-starting child with a longer health grace", async () => {
+  const events = [];
+  const child = new ManagedChild("slow-child", events);
+  let reachable = false;
+  const supervisor = createTaskboardSupervisor({
+    detached: false,
+    isReachable: async () => reachable,
+    waitUntilReachable: async (timeoutMs) => {
+      events.push(["health", timeoutMs]);
+      reachable = true;
+    },
+    start: () => {
+      events.push(["start", child.name]);
+      return child;
+    },
+    startupTimeoutMs: 120_000,
+    unhealthyChildGraceMs: 120_000,
+  });
+
+  await supervisor.ensure();
+
+  reachable = false;
+  await supervisor.ensure();
+
+  assert.deepEqual(events, [
+    ["start", "slow-child"],
+    ["health", 120_000],
+    ["health", 120_000],
+  ]);
+  await supervisor.stop();
+});

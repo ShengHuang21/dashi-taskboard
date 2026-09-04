@@ -1,5 +1,6 @@
 import type {
   ActorIdentity,
+  AgentLaneSnapshot,
   AiChatCatalog,
   AiChatAttachmentInput,
   AiChatRun,
@@ -137,6 +138,11 @@ export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
   return data.projects;
 }
 
+export async function listAgentLaneProjectIds(signal?: AbortSignal): Promise<string[]> {
+  const data = await request<{ projectIds: string[] }>("/api/local/agent-lane-projects", { signal });
+  return data.projectIds;
+}
+
 export async function getJiraConnection(signal?: AbortSignal): Promise<JiraConnection> {
   try {
     const data = await request<{ connection: JiraConnection }>("/api/local/jira-connection", { signal });
@@ -188,6 +194,23 @@ export async function getProjectSummary(
   return request<ProjectSummary>(
     `/api/local/projects/${encodeURIComponent(projectId)}/summary`,
     { signal },
+  );
+}
+
+export async function getAgentLaneSnapshot(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<AgentLaneSnapshot> {
+  return request<AgentLaneSnapshot>(
+    `/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`,
+    { signal },
+  );
+}
+
+export async function openCodexThread(threadId: string): Promise<void> {
+  await request<{ opened: true }>(
+    `/api/local/codex-threads/${encodeURIComponent(threadId)}/open`,
+    { method: "POST" },
   );
 }
 

@@ -59,7 +59,38 @@ Except for built-in help, every successful command writes one JSON object with `
 ```bash
 taskctl issue list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
 taskctl issue get ID [--json]
+taskctl issue bootstrap ISSUE_ID [--json]
 ```
+
+For a replaceable project coordinator, inspect and mutate only the exact configured Agent Lane task/thread binding:
+
+```bash
+taskctl coordinator windows PROJECT_ID [--json]
+taskctl coordinator register-window PROJECT_ID --role owner_root|coordinator --task TASK --label LABEL --thread-id THREAD --expected-revision SHA256 --idempotency-key KEY [--json]
+taskctl coordinator status PROJECT_ID [--json]
+taskctl coordinator acquire PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id none|LEASE_ID --lease-seconds 300 [--json]
+taskctl coordinator renew PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id LEASE_ID --lease-seconds 300 [--json]
+taskctl coordinator release PROJECT_ID --holder-task TASK --holder-thread-id THREAD --expected-lease-id LEASE_ID [--json]
+taskctl coordinator receipts PROJECT_ID [--json]
+```
+
+Register the Owner-facing Root and replaceable coordinator from their respective live Codex windows. Registration is protected, optimistic, and idempotent: Taskboard derives host/workspace identity from the fresh authenticated Codex runtime, and the caller supplies only the semantic role plus exact current thread id. Do not reuse one task id for both roles or mutate SQLite/config files directly.
+
+Acquire requires an explicit expected identity: use `none` only when status has no stored lease, or pass the expired lease id when replacing an expired coordinator. Renew/release require the exact active lease id. Conflicts fail closed. Persist a checkpoint or handoff before release, and remember that coordinator ownership never grants execution ownership.
+
+The active Global Coordinator may create the durable disjoint routing map through protected Taskboard state:
+
+```bash
+taskctl domain-coordinator domains PROJECT_ID [--json]
+taskctl domain-coordinator configure PROJECT_ID DOMAIN_ID --label LABEL --write-scope PATH[,PATH] --eligible-task TASK[,TASK] --holder-task GLOBAL_TASK --holder-thread-id GLOBAL_THREAD --expected-lease-id GLOBAL_LEASE --expected-revision SHA256 --idempotency-key KEY [--json]
+taskctl domain-coordinator remove PROJECT_ID DOMAIN_ID --holder-task GLOBAL_TASK --holder-thread-id GLOBAL_THREAD --expected-lease-id GLOBAL_LEASE --expected-revision SHA256 --idempotency-key KEY [--json]
+```
+
+Read the current revision immediately before every configuration write. Scopes must be relative and disjoint, and eligible task ids must name configured peer windows. Taskboard rejects policy changes while a Todo remains assigned or a domain lease is reserved; release the lease and clear assignments first. Do not edit SQLite or the Agent Lane config directly.
+
+Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
+
+If the Capsule returns `readyWork.ownerDecisionRequest`, do not send the Owner to Taskboard and do not let a Sub-Agent ask them. The authenticated host Injector reserves the exact current request and Root route atomically, delivers the question once, and reads the delivery id back from the exact Root thread after uncertain transport. Once delivery is confirmed, Taskboard keeps that exact Root coordinator route protected for a bounded human-response window until the decision is recorded. After the Owner replies, Root bootstraps again and follows the injected instruction to emit one `TASKBOARD_OWNER_DECISION_V1` marker only when the request remains current. The Injector accepts that marker only after a real Owner input in the exact Root thread and records the immutable receipt through its host-authenticated route. `taskctl` has no Owner-decision mutation command. This is Root-attested Owner provenance, not Agent self-approval.
 
 ## Create issues
 
@@ -108,11 +139,15 @@ taskctl issue update ID \
   [--json]
 
 taskctl issue move ID --status STATUS [--thread-id ID] [--if-version N] [--json]
+
+taskctl issue claim ID --agent-path /root/NAME --thread-id AGENT_THREAD_ID --lease-minutes N --write-scope PATH[,PATH] [--if-version N] [--json]
 taskctl issue archive ID [--thread-id ID] [--if-version N] [--json]
 taskctl issue restore ID [--thread-id ID] [--if-version N] [--json]
 ```
 
 Use `issue move` to set `in_progress` before implementation and `in_review` after implementation and self-verification. Codex must not move work directly from `in_progress` to `done`; use `done` only after the user explicitly confirms acceptance or explicitly asks to mark the issue complete. Use `blocked` when work cannot continue and `canceled` when it will not continue. On a version conflict, fetch the issue again and reconcile before retrying.
+
+Use `issue claim` for a Root Sub-Agent. It records the Sub-Agent identity and moves a real `todo` issue to `in_progress` atomically; the completion reconciler later appends one short result comment and moves it to `in_review`.
 
 Use either `--git-branch` or `--worktree-path`/`--worktree-branch`; an issue has only one development context. Issue JSON stores it as `developmentContext`, either `{ "type": "branch", "branch": "..." }` or `{ "type": "worktree", "path": "...", "branch": "..." }`. Its singular `threadId` is the Codex conversation that most recently created or changed the issue itself. Recurrence requires a due date.
 
@@ -163,6 +198,41 @@ taskctl comment delete COMMENT_ID --if-version N [--thread-id ID] [--json]
 Without `--after`, `comment list` returns the full list. Its response includes `nextCursor`; keep that value and pass it to the next read of the same issue to return only comments created or modified after that cursor. `--body-file` reads the UTF-8 file and passes its contents directly to the existing comment write path.
 
 Each comment JSON object independently records the most recent conversation that created or changed that comment as `threadId`. Comment operations never change the parent issue's `threadId`.
+
+## Structured handoffs
+
+Append a compact, durable Sub-Agent-to-Root handoff only from the Sub-Agent that holds the task's active exact claim. Read events to replay/recover them, then acknowledge a `requiresAck` event from the parent Root identity:
+
+```bash
+taskctl handoff add ISSUE_ID \
+  --event-id EVENT_ID \
+  --idempotency-key KEY \
+  --agent-path /root/NAME \
+  --sequence N \
+  [--timestamp ISO] \
+  --summary TEXT \
+  [--evidence-ref REF[,REF]] \
+  [--blocker TEXT] \
+  --next-action TEXT \
+  --requires-ack true|false \
+  [--parent-task TASK_ID] \
+  [--causation-id ID] \
+  [--correlation-id ID] \
+  [--thread-id ID] \
+  [--json]
+
+taskctl handoff list ISSUE_ID [--json]
+
+taskctl handoff ack EVENT_ID \
+  --acknowledgement-id ID \
+  --agent-path /root \
+  [--thread-id ID] \
+  [--json]
+```
+
+`handoff add` reads the sender conversation from `CODEX_THREAD_ID` unless `--thread-id` is explicit. `--parent-task` is the exact durable parent task id and must be omitted when the task has no parent. `--evidence-ref` accepts at most 32 unique comma-separated references; store only compact pointers, never credentials, complete prompts, or sensitive payloads.
+
+The service persists the structured event and its compact Task Comment atomically. Repeating an idempotency key with the identical envelope returns the same receipt; changing the envelope conflicts. Handoffs and acknowledgements are append-only and do not change the task version/status, active run, claim, coordinator lease, Ready Work, or authorization boundary. `handoff ack` accepts only the `/root` agent path and the exact parent Root conversation for an event that requires acknowledgement.
 
 ## Attachments
 

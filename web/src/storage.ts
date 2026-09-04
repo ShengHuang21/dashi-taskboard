@@ -34,6 +34,22 @@ function persist(key: string, value: string | null) {
   });
 }
 
+export async function readTaskboardServerStorage() {
+  const response = await fetch(new URL("api/client-storage", document.baseURI));
+  if (!response.ok) throw new Error(`Taskboard storage returned ${response.status}`);
+  const payload = await response.json() as { entries?: Record<string, string> };
+  return payload.entries ?? {};
+}
+
+export async function writeTaskboardServerStorage(key: string, value: string | null) {
+  const response = await fetch(new URL("api/client-storage", document.baseURI), {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ key, value }),
+  });
+  if (!response.ok) throw new Error(`Taskboard storage returned ${response.status}`);
+}
+
 export async function initializeTaskboardStorage() {
   try {
     localStorageBackend = window.localStorage;
