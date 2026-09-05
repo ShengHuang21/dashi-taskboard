@@ -41,17 +41,46 @@ function agentLaneConfigRevision(configJson) {
   return createHash("sha256").update(configJson).digest("hex");
 }
 
+function hasProtectedCodexBinding(task) {
+  return [
+    task?.codexProjectId, task?.codexProjectKind, task?.codexHostId, task?.workspacePath,
+  ].some((value) => value !== undefined && value !== null && value !== "");
+}
+
+function hasExactCodexHostBinding(task) {
+  return Boolean(
+    typeof task?.codexProjectId === "string"
+    && task.codexProjectId.trim()
+    && ["local", "remote"].includes(task.codexProjectKind)
+    && typeof task.codexHostId === "string"
+    && task.codexHostId.trim()
+    && ((task.codexProjectKind === "local" && task.codexHostId === "local")
+      || (task.codexProjectKind === "remote" && task.codexHostId !== "local"))
+    && typeof task.workspacePath === "string"
+    && path.isAbsolute(task.workspacePath),
+  );
+}
+
 function isFullyBoundCodexPeerTask(task) {
   return Boolean(
     task?.source === "codex"
     && task?.taskType === "peer_task"
     && typeof task.threadId === "string"
     && task.threadId.trim()
-    && typeof task.codexHostId === "string"
-    && task.codexHostId.trim()
-    && typeof task.workspacePath === "string"
-    && path.isAbsolute(task.workspacePath),
+    && hasExactCodexHostBinding(task),
   );
+}
+
+function isConfiguredCodexPeerTask(task) {
+  const base = Boolean(
+    task?.source === "codex"
+    && task?.taskType === "peer_task"
+    && typeof task.id === "string" && task.id.trim()
+    && typeof task.label === "string" && task.label.trim()
+    && typeof task.owner === "string" && task.owner.trim()
+    && typeof task.threadId === "string" && task.threadId.trim()
+  );
+  return base && (!hasProtectedCodexBinding(task) || isFullyBoundCodexPeerTask(task));
 }
 
 function coordinationWindowReceiptFromRow(row) {
@@ -505,7 +534,7 @@ function normalizeCoordinationDomains(config) {
     }
   }
   const configuredPeerTaskIds = new Set((Array.isArray(config.tasks) ? config.tasks : [])
-    .filter(isFullyBoundCodexPeerTask)
+    .filter(isConfiguredCodexPeerTask)
     .map((task) => task.id));
   if (domains.some((domain) => domain.eligibleTaskIds.some((taskId) => !configuredPeerTaskIds.has(taskId)))) {
     throw new ApiError(409, "COORDINATION_DOMAIN_BINDING_MISMATCH", "Coordination domain holders must be configured peer windows");
@@ -3816,16 +3845,11 @@ export class TaskboardDatabase {
       const domainHolder = Array.isArray(config.tasks)
         ? config.tasks.find((task) => task?.id === input.taskId) ?? null
         : null;
-      if (!isFullyBoundCodexPeerTask(domainHolder)
-        || domainHolder.label !== input.label
-        || domainHolder.codexProjectId !== input.codexProjectId
-        || domainHolder.codexProjectKind !== input.codexProjectKind
-        || domainHolder.codexHostId !== input.codexHostId
-        || path.resolve(domainHolder.workspacePath ?? "") !== path.resolve(input.workspacePath)) {
+      if (!isConfiguredCodexPeerTask(domainHolder) || domainHolder.label !== input.label) {
         throw new ApiError(
           409,
           "DOMAIN_COORDINATOR_PROVISIONING_BINDING_MISMATCH",
-          "Domain Coordinator provisioning requires the exact configured peer binding",
+          "Domain Coordinator provisioning requires an exact configured peer identity",
         );
       }
       const activeGlobal = this.#exactActiveCoordinatorLease(
@@ -3841,6 +3865,18 @@ export class TaskboardDatabase {
           409,
           "GLOBAL_COORDINATOR_LEASE_MISMATCH",
           "Domain Coordinator provisioning requires the exact active Global Coordinator binding",
+        );
+      }
+      const launchHolder = isFullyBoundCodexPeerTask(domainHolder) ? domainHolder : globalHolder;
+      if (!hasExactCodexHostBinding(launchHolder)
+        || launchHolder.codexProjectId !== input.codexProjectId
+        || launchHolder.codexProjectKind !== input.codexProjectKind
+        || launchHolder.codexHostId !== input.codexHostId
+        || path.resolve(launchHolder.workspacePath ?? "") !== path.resolve(input.workspacePath)) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_BINDING_MISMATCH",
+          "Domain Coordinator provisioning requires the exact peer or Global launch binding",
         );
       }
       if (this.#exactActiveCoordinatorLease(
@@ -3904,10 +3940,10 @@ export class TaskboardDatabase {
         expected_revision: revision, expected_global_lease_id: globalLease.id,
         global_holder_task_id: globalHolder.id,
         global_holder_thread_id: globalHolder.threadId,
-        codex_project_id: domainHolder.codexProjectId,
-        codex_project_kind: domainHolder.codexProjectKind,
-        codex_host_id: domainHolder.codexHostId,
-        workspace_path: path.resolve(domainHolder.workspacePath),
+        codex_project_id: launchHolder.codexProjectId,
+        codex_project_kind: launchHolder.codexProjectKind,
+        codex_host_id: launchHolder.codexHostId,
+        workspace_path: path.resolve(launchHolder.workspacePath),
         write_scope_json: JSON.stringify(domain.writeScope), status: "pending",
         thread_id: null, retry_count: 0, missing_since: null,
         created_at: timestamp, updated_at: timestamp,
@@ -4004,17 +4040,27 @@ export class TaskboardDatabase {
         Date.now(),
         row.domain_id,
       ) : null;
-      const stableIdentityBinding = project
-        && stableRevision
-        && domain
-        && domain.eligibleTaskIds.includes(row.task_id)
-        && JSON.stringify(domain.writeScope) === row.write_scope_json
-        && isFullyBoundCodexPeerTask(domainHolder)
+      const exactBoundLaunchOrRegisteredHolder = isFullyBoundCodexPeerTask(domainHolder)
         && domainHolder.label === row.label
         && domainHolder.codexProjectId === row.codex_project_id
         && domainHolder.codexProjectKind === row.codex_project_kind
         && domainHolder.codexHostId === row.codex_host_id
         && path.resolve(domainHolder.workspacePath ?? "") === path.resolve(row.workspace_path)
+        && (!registrationReceipt || !row.thread_id || domainHolder.threadId === row.thread_id);
+      const exactLegacyLaunchBinding = isConfiguredCodexPeerTask(domainHolder)
+        && !hasProtectedCodexBinding(domainHolder)
+        && hasExactCodexHostBinding(globalHolder)
+        && globalHolder.codexProjectId === row.codex_project_id
+        && globalHolder.codexProjectKind === row.codex_project_kind
+        && globalHolder.codexHostId === row.codex_host_id
+        && path.resolve(globalHolder.workspacePath ?? "") === path.resolve(row.workspace_path);
+      const stableIdentityBinding = project
+        && stableRevision
+        && domain
+        && domain.eligibleTaskIds.includes(row.task_id)
+        && JSON.stringify(domain.writeScope) === row.write_scope_json
+        && domainHolder?.label === row.label
+        && (exactBoundLaunchOrRegisteredHolder || exactLegacyLaunchBinding)
         && globalLease?.id === row.expected_global_lease_id
         && globalHolder?.id === row.global_holder_task_id
         && globalHolder?.threadId === row.global_holder_thread_id
@@ -5966,6 +6012,7 @@ export class TaskboardDatabase {
         || holder.taskType !== "root_task") return null;
     }
     if (domainId) {
+      if (!isFullyBoundCodexPeerTask(holder)) return null;
       const domain = normalizeCoordinationDomains(config ?? {})
         .find((candidate) => candidate.id === domainId);
       if (!domain?.eligibleTaskIds.includes(lease.holderTaskId)) return null;

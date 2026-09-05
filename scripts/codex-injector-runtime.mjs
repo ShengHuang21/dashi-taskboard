@@ -1437,7 +1437,12 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || globalLease.bindingValid !== true
     || !COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
     || !COORDINATION_ID_PATTERN.test(globalHolderTaskId ?? "")
-    || !THREAD_ID_PATTERN.test(globalHolder?.threadId ?? "")) {
+    || !THREAD_ID_PATTERN.test(globalHolder?.threadId ?? "")
+    || typeof globalHolder?.codexProjectId !== "string" || !globalHolder.codexProjectId
+    || !["local", "remote"].includes(globalHolder?.codexProjectKind)
+    || !COORDINATION_ID_PATTERN.test(globalHolder?.codexHostId ?? "")
+    || typeof globalHolder?.workspacePath !== "string"
+    || !path.isAbsolute(globalHolder.workspacePath)) {
     return { provisioned: false, reason: "global-coordinator-unavailable" };
   }
   const domain = snapshot.coordination.domainCoordinators.find((candidate) => (
@@ -1453,15 +1458,16 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       candidate?.source === "codex"
       && candidate.taskType === "peer_task"
       && typeof candidate.label === "string" && candidate.label
-      && typeof candidate.codexProjectId === "string" && candidate.codexProjectId
-      && ["local", "remote"].includes(candidate.codexProjectKind)
-      && COORDINATION_ID_PATTERN.test(candidate.codexHostId ?? "")
-      && typeof candidate.workspacePath === "string"
-      && path.isAbsolute(candidate.workspacePath)
     ));
   if (!lane) {
     return { provisioned: false, reason: "domain-route-unavailable", domainId: domain.domainId };
   }
+  const launchLane = (
+    typeof lane.codexProjectId === "string" && lane.codexProjectId
+    && ["local", "remote"].includes(lane.codexProjectKind)
+    && COORDINATION_ID_PATTERN.test(lane.codexHostId ?? "")
+    && typeof lane.workspacePath === "string" && path.isAbsolute(lane.workspacePath)
+  ) ? lane : globalHolder;
   const identity = domainCoordinatorProvisioningIdentity(
     policy.projectId, windows.revision, domain.domainId, lane.id, globalLease.id,
   );
@@ -1483,8 +1489,8 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     if ((!selectedModel.model || !selectedModel.reasoningEffort)
       && typeof options.readDefaultModel === "function") {
       selectedModel = await options.readDefaultModel({
-        codexHostId: lane.codexHostId,
-        workspacePath: lane.workspacePath,
+        codexHostId: launchLane.codexHostId,
+        workspacePath: launchLane.workspacePath,
       });
     }
     if (typeof selectedModel?.model !== "string" || !selectedModel.model
@@ -1503,10 +1509,10 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       expectedGlobalLeaseId: globalLease.id,
       globalHolderTaskId,
       globalHolderThreadId: globalHolder.threadId,
-      codexProjectId: lane.codexProjectId,
-      codexProjectKind: lane.codexProjectKind,
-      codexHostId: lane.codexHostId,
-      workspacePath: lane.workspacePath,
+      codexProjectId: launchLane.codexProjectId,
+      codexProjectKind: launchLane.codexProjectKind,
+      codexHostId: launchLane.codexHostId,
+      workspacePath: launchLane.workspacePath,
     });
     attempt = result?.attempt ?? null;
   }
@@ -1514,8 +1520,8 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || attempt.projectId !== policy.projectId
     || attempt.domainId !== domain.domainId
     || attempt.taskId !== lane.id
-    || attempt.codexHostId !== lane.codexHostId
-    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(lane.workspacePath)) {
+    || attempt.codexHostId !== launchLane.codexHostId
+    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(launchLane.workspacePath)) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
   if (["completed", "canceled"].includes(attempt.status)) {
