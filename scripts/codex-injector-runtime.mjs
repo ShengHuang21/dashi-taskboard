@@ -37,6 +37,10 @@ const COORDINATOR_DELIVERY_EFFORT_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_EFFOR
 const COORDINATOR_DELIVERY_RETRY_BASE_MS = 15_000;
 const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
 
+export function admissionRecoveryRpcTimeoutMs(method) {
+  return method === "thread/resume" || method === "turn/start" ? 30_000 : 10_000;
+}
+
 export function createSerializedMonitorTick(run) {
   let inFlight = false;
   return async (...args) => {
@@ -3802,6 +3806,13 @@ export async function deliverTaskboardAdmissionRecovery(request, rpc) {
   });
   if (threadResult?.thread?.id !== request.rootThreadId) {
     throw new Error("Codex did not confirm the admission recovery Root");
+  }
+  if (typeof request.rootWorkspacePath !== "string"
+    || !path.isAbsolute(request.rootWorkspacePath)
+    || typeof threadResult.thread.cwd !== "string"
+    || !path.isAbsolute(threadResult.thread.cwd)
+    || path.resolve(threadResult.thread.cwd) !== path.resolve(request.rootWorkspacePath)) {
+    throw new Error("Codex admission recovery Root workspace does not match");
   }
   const marker = `Taskboard admission recovery ${request.mode} id: ${request.admissionReceiptId}:${request.admissionAttemptId}${request.mode === "probe" ? `:${request.admissionProbeId}` : ""}`;
   const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
