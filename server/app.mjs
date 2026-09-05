@@ -3862,7 +3862,7 @@ export function createTaskboardServer(options = {}) {
       }
 
       const domainCoordinatorProvisioningTransitionRoute = pathname.match(
-        /^\/api\/local\/domain-coordinator-provisioning-attempts\/([^/]+)\/(starting|attach|reset)$/,
+        /^\/api\/local\/domain-coordinator-provisioning-attempts\/([^/]+)\/(starting|attach|reset|resume-expired)$/,
       );
       if (domainCoordinatorProvisioningTransitionRoute) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);

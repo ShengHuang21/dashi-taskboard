@@ -1531,6 +1531,37 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
   assert.equal(reopened.database.prepare(`
     SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts
   `).get().count, 2);
+  reopened.database.prepare(`
+    UPDATE agent_domain_coordinator_provisioning_attempts
+    SET status = 'expired', expires_at = ? WHERE id = ?
+  `).run(new Date(Date.now() - 1_000).toISOString(), recovered.id);
+  const driftedConfig = reopened.getAgentLaneProject(projectId);
+  reopened.upsertAgentLaneProject(projectId, {
+    ...driftedConfig,
+    tasks: driftedConfig.tasks.map((lane) => lane.id === "frontend"
+      ? { ...lane, label: "Frontend Coordinator v2" }
+      : lane),
+  });
+  assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "resume-expired",
+  ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_CANCELED");
+  assert.equal(reopened.getAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, "frontend",
+  ), null);
+  const driftedRevision = reopened.getAgentLaneCoordinationWindows(projectId).revision;
+  const replacement = reopened.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId,
+    "frontend",
+    {
+      ...frontendRequest,
+      idempotencyKey: "frontend-attempt-after-drift",
+      threadSource: "taskboard-frontend-coordinator-after-drift",
+      label: "Frontend Coordinator v2",
+      expectedRevision: driftedRevision,
+    },
+  );
+  assert.equal(replacement.applied, true);
+  assert.notEqual(replacement.attempt.id, recovered.id);
   reopened.close();
 });
 

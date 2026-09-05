@@ -94,6 +94,24 @@ function coordinationIdentityHandshakeFromRow(row) {
   };
 }
 
+function matchesProvisionedCoordinatorRegistration(attempt, input, binding, statuses) {
+  return Boolean(
+    attempt
+    && statuses.includes(attempt.status)
+    && input.role === "coordinator"
+    && input.taskId === attempt.task_id
+    && input.label === attempt.label
+    && input.threadId === attempt.thread_id
+    && input.expectedRevision === attempt.expected_revision
+    && input.idempotencyKey === `${attempt.idempotency_key}-window`
+    && binding.threadId === attempt.thread_id
+    && binding.codexProjectId === attempt.codex_project_id
+    && binding.codexProjectKind === attempt.codex_project_kind
+    && binding.codexHostId === attempt.codex_host_id
+    && path.resolve(binding.workspacePath) === path.resolve(attempt.workspace_path)
+  );
+}
+
 function coordinationIdentityRequestFingerprint(projectId, input) {
   return createHash("sha256").update(JSON.stringify({
     projectId,
@@ -3648,7 +3666,10 @@ export class TaskboardDatabase {
       : this.#prepare(`
           SELECT * FROM agent_domain_coordinator_provisioning_attempts
           WHERE project_id = ? AND domain_id = ?
-            AND status IN ('pending', 'starting', 'started')
+            AND (
+              status IN ('pending', 'starting', 'started')
+              OR (status = 'expired' AND thread_id IS NOT NULL)
+            )
           ORDER BY created_at DESC, id DESC LIMIT 1
         `).get(projectId, domainId);
     if (!row) return null;
@@ -3869,14 +3890,18 @@ export class TaskboardDatabase {
           "The domain Coordinator provisioning attempt does not exist",
         );
       }
-      if (["completed", "canceled", "expired"].includes(row.status)) {
+      const recoverableExpiredResume = row.status === "expired"
+        && Boolean(row.thread_id)
+        && action === "resume-expired";
+      if (["completed", "canceled", "expired"].includes(row.status)
+        && !recoverableExpiredResume) {
         throw new ApiError(
           409,
           "DOMAIN_COORDINATOR_PROVISIONING_TERMINAL",
           "The domain Coordinator provisioning attempt is terminal",
         );
       }
-      if (Date.parse(row.expires_at) <= Date.now()) {
+      if (!recoverableExpiredResume && Date.parse(row.expires_at) <= Date.now()) {
         this.#prepare(`
           UPDATE agent_domain_coordinator_provisioning_attempts
           SET status = 'expired', updated_at = ? WHERE id = ?
@@ -3915,8 +3940,26 @@ export class TaskboardDatabase {
         ORDER BY task.sort_order, task.created_at, task.id
         LIMIT 1
       `).get(row.project_id, row.domain_id);
-      const stableBinding = project
-        && agentLaneConfigRevision(project.config_json) === row.expected_revision
+      const registrationReceipt = row.thread_id ? this.#prepare(`
+        SELECT role, task_id, thread_id, config_revision
+        FROM agent_coordination_window_receipts
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(row.project_id, `${row.idempotency_key}-window`) : null;
+      const currentRevision = project ? agentLaneConfigRevision(project.config_json) : null;
+      const stableRevision = currentRevision === row.expected_revision
+        || (registrationReceipt?.role === "coordinator"
+          && registrationReceipt.task_id === row.task_id
+          && registrationReceipt.thread_id === row.thread_id
+          && registrationReceipt.config_revision === currentRevision);
+      const activeDomainLease = config ? this.#exactActiveCoordinatorLease(
+        row.project_id,
+        config,
+        config.domainCoordinatorLeases?.[row.domain_id] ?? null,
+        Date.now(),
+        row.domain_id,
+      ) : null;
+      const stableIdentityBinding = project
+        && stableRevision
         && domain
         && domain.eligibleTaskIds.includes(row.task_id)
         && JSON.stringify(domain.writeScope) === row.write_scope_json
@@ -3929,15 +3972,8 @@ export class TaskboardDatabase {
         && globalLease?.id === row.expected_global_lease_id
         && globalHolder?.id === row.global_holder_task_id
         && globalHolder?.threadId === row.global_holder_thread_id
-        && !this.#exactActiveCoordinatorLease(
-          row.project_id,
-          config,
-          config.domainCoordinatorLeases?.[row.domain_id] ?? null,
-          Date.now(),
-          row.domain_id,
-        )
-        && durableWork;
-      if (!stableBinding) {
+        && !activeDomainLease;
+      if (!stableIdentityBinding) {
         const timestamp = now();
         this.#prepare(`
           UPDATE agent_domain_coordinator_provisioning_attempts
@@ -3948,6 +3984,15 @@ export class TaskboardDatabase {
           409,
           "DOMAIN_COORDINATOR_PROVISIONING_CANCELED",
           "Domain coordination drift canceled the provisioning attempt",
+        );
+      }
+      if (!durableWork) {
+        throw new ApiError(
+          409,
+          recoverableExpiredResume
+            ? "DOMAIN_COORDINATOR_PROVISIONING_EXPIRED_RESUME_CONFLICT"
+            : "DOMAIN_COORDINATOR_PROVISIONING_NO_ELIGIBLE_WORK",
+          "Domain Coordinator provisioning is waiting for assigned durable Todo work",
         );
       }
 
@@ -3991,6 +4036,16 @@ export class TaskboardDatabase {
         }
         nextStatus = "pending";
         retryCount += 1;
+        expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
+      } else if (action === "resume-expired") {
+        if (!recoverableExpiredResume) {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_STATE_CONFLICT",
+            "Only an expired domain attempt with its exact attached thread can resume",
+          );
+        }
+        nextStatus = "started";
         expiresAt = new Date(Date.now() + COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS).toISOString();
       } else {
         throw new ApiError(400, "INVALID_FIELD", "Unknown domain Coordinator provisioning transition");
@@ -4741,20 +4796,21 @@ export class TaskboardDatabase {
             WHERE project_id = ? AND idempotency_key || '-window' = ?
             ORDER BY created_at DESC, id DESC LIMIT 1
           `).get(projectId, input.idempotencyKey);
+          const domainProvisioningAttempt = this.#prepare(`
+            SELECT * FROM agent_domain_coordinator_provisioning_attempts
+            WHERE project_id = ? AND idempotency_key || '-window' = ?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+          `).get(projectId, input.idempotencyKey);
+          const recoverableAttempt = provisioningAttempt ?? domainProvisioningAttempt;
           const exactRecoverableAttempt = existing.status !== "canceled"
-            && provisioningAttempt?.status === "started"
-            && Date.parse(provisioningAttempt.expires_at) > Date.now()
-            && input.role === "coordinator"
-            && input.taskId === provisioningAttempt.task_id
-            && input.label === provisioningAttempt.label
-            && input.threadId === provisioningAttempt.thread_id
-            && input.expectedRevision === provisioningAttempt.expected_revision
+            && Date.parse(recoverableAttempt?.expires_at ?? "") > Date.now()
             && agentLaneConfigRevision(row.config_json) === input.expectedRevision
-            && expectedHostBinding.codexProjectId === provisioningAttempt.codex_project_id
-            && expectedHostBinding.codexProjectKind === provisioningAttempt.codex_project_kind
-            && expectedHostBinding.codexHostId === provisioningAttempt.codex_host_id
-            && path.resolve(expectedHostBinding.workspacePath)
-              === path.resolve(provisioningAttempt.workspace_path)
+            && matchesProvisionedCoordinatorRegistration(
+              recoverableAttempt,
+              input,
+              { threadId: input.threadId, ...expectedHostBinding },
+              ["started"],
+            )
             && !this.hasAgentLaneCoordinationWindowReceipt(projectId, input.idempotencyKey);
           if (!exactRecoverableAttempt) {
             throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake is terminal and cannot be retried");
@@ -4800,9 +4856,35 @@ export class TaskboardDatabase {
         throw new ApiError(409, "COORDINATION_WINDOW_REVISION_CONFLICT", "Agent Lane coordination windows changed since they were read", { actualRevision: revision });
       }
       const config = JSON.parse(row.config_json);
+      const domainProvisioningAttempt = this.#prepare(`
+        SELECT * FROM agent_domain_coordinator_provisioning_attempts
+        WHERE project_id = ? AND idempotency_key || '-window' = ?
+        ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(projectId, input.idempotencyKey);
+      if (domainProvisioningAttempt && (
+        Date.parse(domainProvisioningAttempt.expires_at) <= Date.now()
+        || !matchesProvisionedCoordinatorRegistration(
+          domainProvisioningAttempt,
+          input,
+          {
+            threadId: input.threadId,
+            codexProjectId: domainProvisioningAttempt.codex_project_id,
+            codexProjectKind: domainProvisioningAttempt.codex_project_kind,
+            codexHostId: domainProvisioningAttempt.codex_host_id,
+            workspacePath: domainProvisioningAttempt.workspace_path,
+          },
+          ["started"],
+        )
+      )) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH",
+          "Window registration must consume the exact durable domain provisioning attempt",
+        );
+      }
       const ownerRoot = (Array.isArray(config.tasks) ? config.tasks : [])
         .find((task) => task?.id === config.ownerRootTaskId) ?? null;
-      if (ownerRoot?.source !== "codex"
+      if (!domainProvisioningAttempt && (ownerRoot?.source !== "codex"
         || ownerRoot.taskType !== "root_task"
         || typeof ownerRoot.threadId !== "string"
         || !ownerRoot.threadId
@@ -4814,10 +4896,15 @@ export class TaskboardDatabase {
         || (ownerRoot.codexProjectKind === "local" && ownerRoot.codexHostId !== "local")
         || (ownerRoot.codexProjectKind === "remote" && ownerRoot.codexHostId === "local")
         || typeof ownerRoot.workspacePath !== "string"
-        || !path.isAbsolute(ownerRoot.workspacePath)) {
+        || !path.isAbsolute(ownerRoot.workspacePath))) {
         throw new ApiError(409, "OWNER_ROOT_HOST_IDENTITY_UNAVAILABLE", "The configured Owner Root does not have an exact protected host identity");
       }
-      const expectedHostBinding = {
+      const expectedHostBinding = domainProvisioningAttempt ? {
+        codexProjectId: domainProvisioningAttempt.codex_project_id,
+        codexProjectKind: domainProvisioningAttempt.codex_project_kind,
+        codexHostId: domainProvisioningAttempt.codex_host_id,
+        workspacePath: path.resolve(domainProvisioningAttempt.workspace_path),
+      } : {
         codexProjectId: ownerRoot.codexProjectId,
         codexProjectKind: ownerRoot.codexProjectKind,
         codexHostId: ownerRoot.codexHostId,
@@ -5143,21 +5230,38 @@ export class TaskboardDatabase {
         WHERE project_id = ? AND (task_id = ? OR thread_id = ?)
         ORDER BY created_at DESC, id DESC LIMIT 1
       `).get(projectId, input.taskId, binding.threadId);
+      const domainProvisioningAttempt = this.#prepare(`
+        SELECT * FROM agent_domain_coordinator_provisioning_attempts
+        WHERE project_id = ? AND (task_id = ? OR thread_id = ?)
+        ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(projectId, input.taskId, binding.threadId);
+      if (provisioningAttempt && domainProvisioningAttempt) {
+        throw new ApiError(
+          409,
+          "COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH",
+          "Window registration matches more than one durable provisioning attempt",
+        );
+      }
       if (provisioningAttempt) {
-        const exactProvisionedRegistration = ["started", "completed"].includes(provisioningAttempt.status)
-          && input.role === "coordinator"
-          && input.taskId === provisioningAttempt.task_id
-          && input.label === provisioningAttempt.label
-          && input.threadId === provisioningAttempt.thread_id
-          && input.expectedRevision === provisioningAttempt.expected_revision
-          && input.idempotencyKey === `${provisioningAttempt.idempotency_key}-window`
-          && binding.codexProjectId === provisioningAttempt.codex_project_id
-          && binding.codexProjectKind === provisioningAttempt.codex_project_kind
-          && binding.codexHostId === provisioningAttempt.codex_host_id
-          && binding.workspacePath === path.resolve(provisioningAttempt.workspace_path);
+        const exactProvisionedRegistration = matchesProvisionedCoordinatorRegistration(
+          provisioningAttempt, input, binding, ["started", "completed"],
+        );
         if (!exactProvisionedRegistration) {
           throw new ApiError(409, "COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH", "Window registration must consume the exact durable replacement provisioning attempt");
         }
+      }
+      if (domainProvisioningAttempt && (
+        (domainProvisioningAttempt.status === "started"
+          && Date.parse(domainProvisioningAttempt.expires_at) <= Date.now())
+        || !matchesProvisionedCoordinatorRegistration(
+          domainProvisioningAttempt, input, binding, ["started", "completed"],
+        )
+      )) {
+        throw new ApiError(
+          409,
+          "DOMAIN_COORDINATOR_PROVISIONING_REGISTRATION_MISMATCH",
+          "Window registration must consume the exact durable domain provisioning attempt",
+        );
       }
       const identityHandshakeRow = this.#prepare(`
         SELECT * FROM agent_coordination_identity_handshakes
@@ -5226,7 +5330,13 @@ export class TaskboardDatabase {
       const config = JSON.parse(row.config_json);
       const tasks = Array.isArray(config.tasks) ? config.tasks : [];
       const existingTask = tasks.find((task) => task?.id === input.taskId) ?? null;
-      if (existingTask && (existingTask.source !== "codex" || existingTask.taskType !== "root_task")) {
+      const domainProvisionedRegistration = Boolean(domainProvisioningAttempt);
+      if (existingTask && (
+        existingTask.source !== "codex"
+        || (domainProvisionedRegistration
+          ? existingTask.taskType !== "peer_task"
+          : existingTask.taskType !== "root_task")
+      )) {
         throw new ApiError(
           409,
           "COORDINATION_WINDOW_TASK_CONFLICT",
@@ -5322,11 +5432,13 @@ export class TaskboardDatabase {
         ...(existingTask ?? {}),
         id: input.taskId,
         label: input.label,
-        owner: input.role === "owner_root" ? "Codex Owner Root" : "Codex Global Coordinator",
+        owner: domainProvisionedRegistration
+          ? existingTask.owner
+          : input.role === "owner_root" ? "Codex Owner Root" : "Codex Global Coordinator",
         source: "codex",
         connection: "connected",
         threadId: binding.threadId,
-        taskType: "root_task",
+        taskType: domainProvisionedRegistration ? "peer_task" : "root_task",
         codexProjectId: binding.codexProjectId,
         codexProjectKind: binding.codexProjectKind,
         codexHostId: binding.codexHostId,
@@ -5366,6 +5478,11 @@ export class TaskboardDatabase {
       this.#prepare(`
         UPDATE agent_coordinator_provisioning_attempts
         SET status = 'completed', updated_at = ?
+        WHERE project_id = ? AND task_id = ? AND thread_id = ? AND status = 'started'
+      `).run(timestamp, projectId, input.taskId, binding.threadId);
+      this.#prepare(`
+        UPDATE agent_domain_coordinator_provisioning_attempts
+        SET updated_at = ?
         WHERE project_id = ? AND task_id = ? AND thread_id = ? AND status = 'started'
       `).run(timestamp, projectId, input.taskId, binding.threadId);
       if (identityHandshakeRow) {
@@ -6143,6 +6260,14 @@ export class TaskboardDatabase {
         action: active ? "renewed" : "acquired",
         createdAt: timestamp,
       });
+      this.#prepare(`
+        UPDATE agent_domain_coordinator_provisioning_attempts
+        SET status = 'completed', updated_at = ?
+        WHERE project_id = ? AND domain_id = ?
+          AND task_id = ? AND thread_id = ? AND status = 'started'
+      `).run(
+        timestamp, projectId, domainId, input.holderTaskId, input.holderThreadId,
+      );
       this.database.exec("COMMIT");
       return { lease: { ...lease, status: "active" }, receipt };
     } catch (error) {

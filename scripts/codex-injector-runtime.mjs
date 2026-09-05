@@ -178,7 +178,7 @@ export function coordinatorProvisioningThreadReadData(result) {
 }
 
 export async function readCoordinatorProvisioningDeliveryThread({
-  attempt, threadId, readThread,
+  attempt, threadId, readThread, marker,
 }) {
   let thread;
   let materialized = true;
@@ -190,7 +190,7 @@ export async function readCoordinatorProvisioningDeliveryThread({
     thread = coordinatorProvisioningThreadReadData(await readThread(false));
   }
   if (materialized) {
-    thread = normalizeCoordinatorProvisioningPersistedThread(attempt, thread);
+    thread = normalizeCoordinatorProvisioningPersistedThread(attempt, thread, marker);
   }
   if (thread.id !== threadId
     || thread.threadSource !== attempt.threadSource
@@ -214,13 +214,15 @@ export async function resumeCoordinatorProvisioningDeliveryThread(thread, resume
   return true;
 }
 
-export function classifyCoordinatorProvisioningDeliveryTurns(turns, marker) {
+export function classifyCoordinatorProvisioningDeliveryTurns(
+  turns, marker, { completedIsSuccess = true } = {},
+) {
   if (!Array.isArray(turns) || typeof marker !== "string" || !marker) {
     throw new Error("Codex did not return exact Coordinator delivery turns");
   }
   const matching = turns.filter((turn) => JSON.stringify(turn).includes(marker));
   const completed = matching.find((turn) => turn?.status === "completed");
-  if (typeof completed?.id === "string" && completed.id) {
+  if (completedIsSuccess && typeof completed?.id === "string" && completed.id) {
     return { delivery: "observed", turnId: completed.id };
   }
   const active = turns.find((turn) => turn?.status === "inProgress");
@@ -268,6 +270,7 @@ export function planCoordinatorProvisioningDeliveryRetry(turns, marker, {
   defaultModel,
   defaultReasoningEffort,
   now = Date.now(),
+  retryCompleted = false,
 } = {}) {
   if (!Array.isArray(turns) || typeof marker !== "string" || !marker
     || typeof defaultModel !== "string" || !defaultModel
@@ -278,7 +281,8 @@ export function planCoordinatorProvisioningDeliveryRetry(turns, marker, {
   const terminals = turns
     .map((turn, index) => ({ turn, index, timestamp: coordinatorProvisioningTurnTimestamp(turn) }))
     .filter(({ turn }) => JSON.stringify(turn).includes(marker)
-      && ["failed", "interrupted", "canceled"].includes(turn?.status))
+      && (["failed", "interrupted", "canceled"].includes(turn?.status)
+        || (retryCompleted && turn?.status === "completed")))
     .sort((left, right) => {
       if (left.timestamp !== null && right.timestamp !== null) return right.timestamp - left.timestamp;
       if (left.timestamp !== null) return -1;
@@ -389,9 +393,12 @@ export function coordinatorProvisioningTurnStartParams(
   };
 }
 
-export function normalizeCoordinatorProvisioningPersistedThread(attempt, thread) {
+export function normalizeCoordinatorProvisioningPersistedThread(
+  attempt,
+  thread,
+  marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+) {
   if (thread?.threadSource !== null) return thread;
-  const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const exactMarker = Array.isArray(thread?.turns)
     && thread.turns.some((turn) => JSON.stringify(turn).includes(marker));
   if (thread?.id === attempt.threadId
@@ -1261,7 +1268,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || path.resolve(attempt.workspacePath ?? "") !== path.resolve(lane.workspacePath)) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
-  if (["completed", "canceled", "expired"].includes(attempt.status)) {
+  if (["completed", "canceled"].includes(attempt.status)) {
     return {
       provisioned: attempt.status === "completed",
       reason: `attempt-${attempt.status}`,
@@ -1270,7 +1277,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     };
   }
   let thread = await options.findThread(attempt);
-  if (!thread && ["starting", "started"].includes(attempt.status)) {
+  if (!thread && ["starting", "started", "expired"].includes(attempt.status)) {
     return {
       provisioned: false, reason: "thread-start-uncertain",
       domainId: domain.domainId, attemptId: attempt.id,
@@ -1313,6 +1320,49 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       domainId: domain.domainId, attemptId: attempt.id,
     };
   }
+  let deliveryThread = thread;
+  if (attempt.status === "expired" && typeof options.readThread === "function") {
+    deliveryThread = await options.readThread({ attempt, threadId: thread.id });
+    if (deliveryThread?.id !== thread.id
+      || deliveryThread.threadSource !== attempt.threadSource
+      || path.resolve(deliveryThread?.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
+      return {
+        provisioned: false, reason: "thread-binding-mismatch",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+  }
+  const exactDeliveryMarker = `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const recoverableExpiredDelivery = attempt.status === "expired"
+    && Array.isArray(deliveryThread.turns)
+    && deliveryThread.turns.some(
+      (turn) => JSON.stringify(turn).includes(exactDeliveryMarker),
+    );
+  if (attempt.status === "expired" && !recoverableExpiredDelivery) {
+    return {
+      provisioned: false, reason: "attempt-expired-thread-active",
+      domainId: domain.domainId, attemptId: attempt.id,
+    };
+  }
+  if (recoverableExpiredDelivery) {
+    if (typeof options.resumeExpiredAttempt !== "function") {
+      return {
+        provisioned: false, reason: "attempt-expired-thread-active",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const resumedAttempt = resumed?.attempt ?? null;
+    if (resumedAttempt?.id !== attempt.id
+      || resumedAttempt.status !== "started"
+      || resumedAttempt.threadId !== thread.id) {
+      return {
+        provisioned: false, reason: "attempt-binding-mismatch",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+    attempt = resumedAttempt;
+  }
   result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
   attempt = result?.attempt ?? null;
   if (attempt?.status !== "started" || attempt.threadId !== thread.id) {
@@ -1321,9 +1371,28 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       domainId: domain.domainId, attemptId: attempt?.id ?? null,
     };
   }
+  const delivery = await options.deliverInstruction({
+    attempt,
+    threadId: thread.id,
+    projectId: policy.projectId,
+    domainId: domain.domainId,
+  });
+  if (delivery?.delivery === "deferred") {
+    return {
+      provisioned: false,
+      reason: delivery.reason ?? "delivery-deferred",
+      domainId: domain.domainId,
+      attemptId: attempt.id,
+      ...(Number.isFinite(delivery.retryAfterMs)
+        ? { retryAfterMs: delivery.retryAfterMs }
+        : {}),
+    };
+  }
   return {
     provisioned: true,
-    reason: "domain-thread-started",
+    reason: delivery?.delivery === "observed"
+      ? "domain-thread-observed"
+      : "domain-thread-started",
     domainId: domain.domainId,
     attemptId: attempt.id,
     threadId: thread.id,
@@ -1342,7 +1411,8 @@ export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
     || typeof options?.markStarting !== "function"
     || typeof options?.startThread !== "function"
     || typeof options?.attachThread !== "function"
-    || typeof options?.resetAttempt !== "function") {
+    || typeof options?.resetAttempt !== "function"
+    || typeof options?.deliverInstruction !== "function") {
     return { provisioned: false, reason: "invalid-monitor" };
   }
   const key = policy.projectId;

@@ -3386,9 +3386,11 @@ test("domain provisioning transitions one protected attempt before thread side e
   const instanceSecret = "e".repeat(64);
   const projectId = "local";
   const workspacePath = path.resolve("/tmp/domain-transition-frontend");
+  let databasePath;
   let revision;
   const baseUrl = await startServer(async (directory) => {
-    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
     database.upsertAgentLaneProject(projectId, {
       rootTaskId: "global",
       tasks: [
@@ -3490,6 +3492,126 @@ test("domain provisioning transitions one protected attempt before thread side e
   assert.equal(attached.response.status, 200, JSON.stringify(attached.body));
   assert.equal(attached.body.attempt.status, "started");
   assert.equal(attached.body.attempt.threadId, attachBody.threadId);
+
+  const registrationPath = "/api/local/projects/local/coordination-windows";
+  const registration = {
+    role: "coordinator", taskId: "frontend", label: "Frontend Coordinator",
+    threadId: attachBody.threadId, expectedRevision: revision,
+    idempotencyKey: `${requestBody.idempotencyKey}-window`,
+  };
+  const pending = await request(baseUrl, registrationPath, {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: registration,
+  });
+  assert.equal(pending.response.status, 202, JSON.stringify(pending.body));
+  assert.deepEqual(pending.body.handshake.expectedHostBinding, {
+    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath,
+  });
+  const confirmPath = `/api/local/coordination-identity-handshakes/${pending.body.handshake.id}/confirm`;
+  const confirmBody = {
+    registration: { projectId, ...registration },
+    threadBinding: {
+      threadId: attachBody.threadId, codexProjectId: "codex-project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath,
+    },
+  };
+  const confirmed = await request(baseUrl, confirmPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), confirmPath, confirmBody),
+    body: confirmBody,
+  });
+  assert.equal(confirmed.response.status, 200, JSON.stringify(confirmed.body));
+  const registered = await request(baseUrl, registrationPath, {
+    method: "POST", headers: { "x-taskboard-client": "taskctl" }, body: registration,
+  });
+  assert.equal(registered.response.status, 200, JSON.stringify(registered.body));
+  const registeredInspection = new DatabaseSync(databasePath);
+  const registeredAttempt = registeredInspection.prepare(
+    "SELECT status, expected_revision FROM agent_domain_coordinator_provisioning_attempts",
+  ).get();
+  assert.equal(registeredAttempt.status, "started");
+  assert.equal(registeredAttempt.expected_revision, revision);
+  registeredInspection.prepare(`
+    UPDATE agent_domain_coordinator_provisioning_attempts
+    SET status = 'expired', expires_at = ? WHERE id = ?
+  `).run(new Date(Date.now() - 1_000).toISOString(), created.body.attempt.id);
+  registeredInspection.close();
+  const lookupPath = `${requestPath}/lookup`;
+  const expiredLookup = await request(baseUrl, lookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "9a".repeat(16), lookupPath, {},
+    ),
+    body: {},
+  });
+  assert.equal(expiredLookup.response.status, 200, JSON.stringify(expiredLookup.body));
+  assert.equal(expiredLookup.body.attempt.id, created.body.attempt.id);
+  assert.equal(expiredLookup.body.attempt.status, "expired");
+  const resumeExpiredPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/resume-expired`;
+  const demandInspection = new DatabaseSync(databasePath);
+  demandInspection.prepare("UPDATE tasks SET status = 'done' WHERE title = 'Frontend work'").run();
+  demandInspection.close();
+  const deferredResume = await request(baseUrl, resumeExpiredPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "7a".repeat(16), resumeExpiredPath, {},
+    ),
+    body: {},
+  });
+  assert.equal(deferredResume.response.status, 409, JSON.stringify(deferredResume.body));
+  assert.equal(deferredResume.body.error.code, "DOMAIN_COORDINATOR_PROVISIONING_EXPIRED_RESUME_CONFLICT");
+  const restoredDemandInspection = new DatabaseSync(databasePath);
+  assert.equal(restoredDemandInspection.prepare(
+    "SELECT status FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+  ).get(created.body.attempt.id).status, "expired");
+  restoredDemandInspection.prepare("UPDATE tasks SET status = 'todo' WHERE title = 'Frontend work'").run();
+  restoredDemandInspection.close();
+  const resumedExpired = await request(baseUrl, resumeExpiredPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "7".repeat(32), resumeExpiredPath, {},
+    ),
+    body: {},
+  });
+  assert.equal(resumedExpired.response.status, 200, JSON.stringify(resumedExpired.body));
+  assert.equal(resumedExpired.body.attempt.id, created.body.attempt.id);
+  assert.equal(resumedExpired.body.attempt.threadId, attachBody.threadId);
+  assert.equal(resumedExpired.body.attempt.status, "started");
+  assert.ok(Date.parse(resumedExpired.body.attempt.expiresAt) > Date.now() + 9 * 60_000);
+  const reattached = await request(baseUrl, attachPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "8".repeat(32), attachPath, attachBody),
+    body: attachBody,
+  });
+  assert.equal(reattached.response.status, 200, JSON.stringify(reattached.body));
+  assert.equal(reattached.body.attempt.status, "started");
+
+  const acquired = await request(baseUrl, "/api/local/projects/local/domain-coordinator-leases/frontend", {
+    method: "POST",
+    body: {
+      holderTaskId: "frontend", holderThreadId: attachBody.threadId,
+      expectedLeaseId: null, leaseDurationSeconds: 300,
+    },
+  });
+  assert.equal(acquired.response.status, 200, JSON.stringify(acquired.body));
+  assert.deepEqual(acquired.body.lease.writeScope, ["web"]);
+  const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  assert.equal(snapshot.response.status, 200);
+  assert.equal(snapshot.body.coordination.coordinatorTaskId, "global");
+  assert.equal(snapshot.body.coordination.lease.id, "global-lease");
+  assert.deepEqual(
+    snapshot.body.coordination.domainCoordinators.map((domain) => [
+      domain.domainId, domain.assignment, domain.coordinatorTaskId,
+    ]),
+    [["frontend", "lease", "frontend"]],
+  );
+  const inspection = new DatabaseSync(databasePath);
+  const persistedAttempt = inspection.prepare(
+    "SELECT status, thread_id FROM agent_domain_coordinator_provisioning_attempts",
+  ).get();
+  assert.equal(persistedAttempt.status, "completed");
+  assert.equal(persistedAttempt.thread_id, attachBody.threadId);
+  inspection.close();
 });
 
 test("resident provisioning persists one protected idempotent attempt before replacement thread start", async () => {

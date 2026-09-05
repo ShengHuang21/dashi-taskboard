@@ -282,6 +282,19 @@ test("Coordinator provisioning retries terminal delivery turns on the same threa
     { delivery: "observed", turnId: "turn-complete" },
   );
   assert.deepEqual(
+    classifyCoordinatorProvisioningDeliveryTurns(
+      [marked("completed", "turn-complete")], marker, { completedIsSuccess: false },
+    ),
+    { delivery: "retry", turnId: null },
+  );
+  assert.deepEqual(
+    classifyCoordinatorProvisioningDeliveryTurns([
+      marked("completed", "turn-complete"),
+      marked("inProgress", "turn-retry"),
+    ], marker, { completedIsSuccess: false }),
+    { delivery: "busy", turnId: "turn-retry" },
+  );
+  assert.deepEqual(
     classifyCoordinatorProvisioningDeliveryTurns([marked("inProgress", "turn-active")], marker),
     { delivery: "busy", turnId: "turn-active" },
   );
@@ -318,6 +331,30 @@ test("Coordinator provisioning backs off capacity on the same delivery model", (
   }), {
     failureKind: "model-capacity",
     currentModel: "gpt-5.5",
+    currentReasoningEffort: "high",
+    unsupportedModels: [],
+    retryAfterMs: 10_000,
+  });
+});
+
+test("Domain provisioning backs off a completed turn until its lease exists", () => {
+  const marker = "TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:attempt-domain";
+  const completedAt = Date.parse("2026-09-05T02:00:00Z");
+  const turns = [{
+    id: "turn-domain-incomplete",
+    status: "completed",
+    completedAt: completedAt / 1_000,
+    input: `${marker}\nTASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:gpt-5.6-sol\nTASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:high`,
+  }];
+
+  assert.deepEqual(planCoordinatorProvisioningDeliveryRetry(turns, marker, {
+    defaultModel: "gpt-5.6-sol",
+    defaultReasoningEffort: "high",
+    now: completedAt + 5_000,
+    retryCompleted: true,
+  }), {
+    failureKind: "transient",
+    currentModel: "gpt-5.6-sol",
     currentReasoningEffort: "high",
     unsupportedModels: [],
     retryAfterMs: 10_000,
@@ -488,6 +525,19 @@ test("Coordinator provisioning recovers a persisted null source only from its ex
     }).threadSource,
     "conflicting-source",
   );
+  const domainMarker = `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const recoveredDomain = await readCoordinatorProvisioningDeliveryThread({
+    attempt,
+    threadId: attempt.threadId,
+    marker: domainMarker,
+    readThread: async () => ({
+      thread: {
+        ...persisted,
+        turns: [{ id: "turn-domain", status: "completed", input: domainMarker }],
+      },
+    }),
+  });
+  assert.equal(recoveredDomain.threadSource, attempt.threadSource);
 
   const calls = [];
   const recovered = await readCoordinatorProvisioningAttemptThread({
@@ -1366,6 +1416,8 @@ test("domain provisioning retries selected-model capacity on the same durable at
   let starts = 0;
   let resets = 0;
   let attaches = 0;
+  let deliveries = 0;
+  let expiredResumes = 0;
   const options = {
     policy: {
       enabled: true, projectId: "capstone-dev",
@@ -1390,6 +1442,16 @@ test("domain provisioning retries selected-model capacity on the same durable at
       cwd: attempt.workspacePath,
       threadSource: attempt.threadSource,
     } : null,
+    readThread: async ({ attempt: readAttempt, threadId }) => ({
+      id: threadId,
+      cwd: readAttempt.workspacePath,
+      threadSource: readAttempt.threadSource,
+      turns: [{
+        id: "domain-turn",
+        status: "completed",
+        input: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${readAttempt.id}`,
+      }],
+    }),
     markStarting: async () => {
       attempt = { ...attempt, status: "starting" };
       return { attempt: { ...attempt } };
@@ -1413,10 +1475,22 @@ test("domain provisioning retries selected-model capacity on the same durable at
       attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
       return { attempt: { ...attempt } };
     },
+    resumeExpiredAttempt: async () => {
+      expiredResumes += 1;
+      attempt = { ...attempt, status: "started" };
+      return { attempt: { ...attempt } };
+    },
     attachThread: async ({ threadId }) => {
       attaches += 1;
       attempt = { ...attempt, status: "started", threadId };
       return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async ({ attempt: deliveredAttempt, threadId, domainId }) => {
+      deliveries += 1;
+      assert.equal(deliveredAttempt.id, "domain-attempt");
+      assert.equal(threadId, domainThreadId);
+      assert.equal(domainId, "frontend");
+      return { delivery: deliveries === 1 ? "started" : "observed", turnId: "domain-turn" };
     },
   };
 
@@ -1439,11 +1513,21 @@ test("domain provisioning retries selected-model capacity on the same durable at
   assert.equal(starts, 2);
   assert.equal(resets, 1);
   assert.equal(attaches, 1);
+  assert.equal(deliveries, 1);
   assert.equal(attempt.threadId, domainThreadId);
-  assert.equal((await runDomainCoordinatorProvisioningMonitorOnce(options)).threadId, domainThreadId);
+  attempt = { ...attempt, status: "expired" };
+  assert.deepEqual(await runDomainCoordinatorProvisioningMonitorOnce(options), {
+    provisioned: true,
+    reason: "domain-thread-observed",
+    domainId: "frontend",
+    attemptId: "domain-attempt",
+    threadId: domainThreadId,
+  });
   assert.equal(requests, 1);
   assert.equal(starts, 2);
   assert.equal(attaches, 2);
+  assert.equal(deliveries, 2);
+  assert.equal(expiredResumes, 1);
 });
 
 test("Coordinator provisioning rebinds the same active attempt after safe window revision drift", async () => {
@@ -4608,6 +4692,8 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /"thread\/list"/);
   assert.match(source, /"thread\/start"/);
   assert.match(source, /TASKBOARD_COORDINATOR_PROVISIONING_V1/);
+  assert.match(source, /TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1/);
+  assert.match(source, /domain-coordinator status/);
   assert.doesNotMatch(source, /background-continuation-receipts/);
   assert.match(source, /createDisposableMonitorTimer\(async \(\) => \{[\s\S]+backgroundContinuationIntervalMs\)/);
   assert.match(source, /cdp\.onClose\(\(\) => \{[\s\S]+disposeCoordinatorIdentityHandshakeTimer[\s\S]+disposeBackgroundContinuationTimer/);
