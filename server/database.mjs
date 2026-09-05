@@ -9148,7 +9148,7 @@ export class TaskboardDatabase {
         SET admission_state = 'recovery_confirmed', admission_registry_observed_at = ?,
           admission_recovered_agent_thread_id = ?, domain_coordinator_lease_id = ?, resume_token = ?
         WHERE id = ? AND status = 'delivering' AND admission_state = 'admission_uncertain'
-          AND admission_attempt_id = ? AND domain_coordinator_lease_id = ?
+          AND admission_attempt_id = ? AND domain_coordinator_lease_id IS ?
       `).run(
         registryObservation.observedAt,
         observed.agentThreadId,

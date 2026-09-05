@@ -1779,16 +1779,16 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
     safeActionId: "test",
     admissionReceiptId: reservationA.receipt.id,
     admissionAttemptId: reservationA.receipt.admissionAttemptId,
-  }), (error) => error?.code === "ADMISSION_DEADLINE_ACTIVE");
+  }, new Date(Date.parse(fenced.receipt.admissionDeadlineAt) - 1).toISOString()),
+  (error) => error?.code === "ADMISSION_DEADLINE_ACTIVE");
 
-  await new Promise((resolve) => setTimeout(resolve, 20));
   const uncertain = database.markTaskSafeActionAdmissionUncertain(task.id, {
     rootThreadId: "frontend-thread",
     expectedResumeToken: tokenA,
     safeActionId: "test",
     admissionReceiptId: reservationA.receipt.id,
     admissionAttemptId: reservationA.receipt.admissionAttemptId,
-  });
+  }, new Date(Date.parse(fenced.receipt.admissionDeadlineAt) + 1).toISOString());
   assert.equal(uncertain.receipt.admissionState, "admission_uncertain");
   assert.equal(uncertain.receipt.domainCoordinatorLeaseId, "frontend-lease-a");
   const probe = database.claimTaskSafeActionAdmissionProbe(task.id, {
@@ -1849,12 +1849,11 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
     holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
     expectedLeaseId: recovered.lease.id, leaseDurationSeconds: 120, recoverOnly: true,
   });
-  await new Promise((resolve) => setTimeout(resolve, 20));
   database.markTaskSafeActionAdmissionUncertain(task.id, {
     rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
     admissionReceiptId: rotated.receipt.id,
     admissionAttemptId: rotated.receipt.admissionAttemptId,
-  });
+  }, new Date(Date.parse(prepared.receipt.admissionDeadlineAt) + 1).toISOString());
   const presentProbe = database.claimTaskSafeActionAdmissionProbe(task.id, {
     rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
     admissionReceiptId: rotated.receipt.id,
