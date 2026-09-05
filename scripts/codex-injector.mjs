@@ -2400,7 +2400,7 @@ async function deliverDomainCoordinatorProvisioningInstruction(
     `Register exactly this protected window with task identity ${attempt.taskId}, role coordinator, label ${JSON.stringify(attempt.label)}, exact thread id ${threadId}, and stable idempotency key ${registrationKey}.`,
     "First read protected coordination windows and use their exact current revision. Allow the resident protected host handshake to authenticate the exact project, kind, host, and workspace; do not self-report or bypass host identity.",
     `After exact registration, read domain-coordinator status for project ${projectId} and domain ${domainId}. Acquire one 300-second lease only for that domain if still unassigned, using this same task/thread and the exact expected current lease id (or null). Never acquire the Global lease or another domain lease.`,
-    "Replay the same registration after success to verify one receipt; never create a second window, attempt, or lease. Bootstrap the routed Todo before execution, stay inside the domain write scope, and preserve one writer.",
+    "Replay the same registration after success to verify one receipt: reuse every original register-window argument, especially the pre-acquire --expected-revision; do not substitute the post-acquire coordination revision. Never create a second window, attempt, or lease. Bootstrap the routed Todo before execution, stay inside the domain write scope, and preserve one writer.",
     "On selected-model capacity, retry the same task and thread with the same model. A host-confirmed unsupported model may be replaced while preserving this exact task, thread, and Domain Coordinator identity. On uncertainty, inspect durable state before retrying.",
   ].join("\n");
   const started = await rpc(
