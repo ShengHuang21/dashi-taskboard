@@ -3249,11 +3249,15 @@ function continuationCapacity(snapshot, target, policy, observedAtMs) {
     || !Number.isSafeInteger(active)
     || active < 0
     || !Number.isFinite(capacityObservedAt)) {
-    return { available: false, reason: "capacity-unobserved" };
+    return { available: false, reason: "capacity-unobserved", observationId: "unobserved" };
   }
   if (capacityObservedAt > observedAtMs
     || observedAtMs - capacityObservedAt > policy.capacityObservationMaxAgeMs) {
-    return { available: false, reason: "capacity-observation-stale" };
+    return {
+      available: false,
+      reason: "capacity-observation-stale",
+      observationId: tree.capacityObservation.observedAt,
+    };
   }
   const childSlotLimit = Math.max(0, policy.maxActiveAgents - 1);
   return active < childSlotLimit
@@ -3316,6 +3320,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   claimReplacementAdmissionProbe,
   reconcileReplacementAdmission,
   deliverAdmissionRecovery,
+  requestCapacityObservation,
   now = Date.now,
 }) {
   if (
@@ -3497,6 +3502,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     };
   }
   let capacityReason = null;
+  let capacityProbe = null;
   const capacityObservedAt = now();
   const todo = snapshot.todos.find((candidate) => {
     const target = candidate?.dispatchTarget;
@@ -3543,12 +3549,48 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
         && ["capacity-unobserved", "capacity-observation-stale"].includes(capacity.reason)) {
         return true;
       }
+      if (!capacityProbe
+        && typeof requestCapacityObservation === "function"
+        && ["capacity-unobserved", "capacity-observation-stale"].includes(capacity.reason)) {
+        const probeEpoch = Math.floor(capacityObservedAt / policy.capacityObservationMaxAgeMs);
+        capacityProbe = {
+          projectId: policy.projectId,
+          todoId: candidate.id,
+          taskId: candidate.taskId,
+          rootThreadId: target.rootThreadId,
+          codexHostId: target.codexHostId,
+          rootWorkspacePath: target.rootWorkspacePath,
+          reason: capacity.reason,
+          observationId: capacity.observationId,
+          probeId: createHash("sha256").update([
+            policy.projectId,
+            target.rootThreadId,
+            capacity.reason,
+            capacity.observationId,
+            String(probeEpoch),
+          ].join(":"), "utf8").digest("hex"),
+        };
+      }
       capacityReason ??= capacity.reason;
       return false;
     }
     return true;
   });
-  if (!todo) return { delivered: false, reason: capacityReason ?? "no-eligible-work" };
+  if (!todo) {
+    if (capacityProbe) {
+      const capacityDelivery = await requestCapacityObservation(capacityProbe);
+      return {
+        delivered: false,
+        todoId: capacityProbe.todoId,
+        reason: ["started", "observed"].includes(capacityDelivery?.delivery)
+          ? "capacity-observation-instructed"
+          : capacityDelivery?.delivery === "busy"
+            ? "capacity-observation-busy"
+            : "capacity-observation-unavailable",
+      };
+    }
+    return { delivered: false, reason: capacityReason ?? "no-eligible-work" };
+  }
 
   const safeAction = todo.readyWork.safeActions[0];
   const authorization = {
@@ -3635,6 +3677,52 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     throw new Error("Taskboard did not record the Root coordination delivery");
   }
   return { delivered: true, todoId: todo.id, actionId: safeAction.id };
+}
+
+export async function deliverTaskboardCapacityObservation(request, rpc) {
+  if (typeof rpc !== "function"
+    || !COORDINATION_ID_PATTERN.test(request?.projectId ?? "")
+    || !THREAD_ID_PATTERN.test(request?.rootThreadId ?? "")
+    || typeof request?.codexHostId !== "string" || !request.codexHostId
+    || typeof request?.rootWorkspacePath !== "string" || !path.isAbsolute(request.rootWorkspacePath)
+    || !["capacity-unobserved", "capacity-observation-stale"].includes(request?.reason)
+    || !RESUME_TOKEN_PATTERN.test(request?.probeId ?? "")) {
+    throw new Error("Taskboard capacity observation request is invalid");
+  }
+  const threadResult = await rpc("thread/read", {
+    threadId: request.rootThreadId,
+    includeTurns: true,
+  });
+  if (threadResult?.thread?.id !== request.rootThreadId) {
+    throw new Error("Codex did not confirm the capacity observation Root");
+  }
+  const rootCwd = typeof threadResult.thread.cwd === "string"
+    ? path.resolve(threadResult.thread.cwd)
+    : null;
+  if (!rootCwd || rootCwd !== path.resolve(request.rootWorkspacePath)) {
+    throw new Error("Capacity observation Root cwd does not match the protected workspace");
+  }
+  const marker = `Taskboard capacity observation id: ${request.probeId}`;
+  const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
+  const observed = turns.find((turn) => collectStringValues(turn).some((value) => value.includes(marker)));
+  if (observed?.id) return { delivery: "observed", turnId: observed.id };
+  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
+  if (activeTurn?.id) return { delivery: "busy", turnId: activeTurn.id };
+  const instruction = [
+    marker,
+    `Taskboard capacity evidence is ${request.reason === "capacity-unobserved" ? "not yet observed" : "stale"}.`,
+    "Do not spawn, claim, defer, edit, test, or mutate Taskboard.",
+    "Invoke collaboration.list_agents exactly once for this Root and then stop at the next safe boundary. Taskboard will use only that fresh call-linked registry observation.",
+  ].join("\n");
+  await rpc("thread/resume", { threadId: request.rootThreadId });
+  const started = await rpc("turn/start", {
+    threadId: request.rootThreadId,
+    input: [{ type: "text", text: instruction }],
+  });
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a valid capacity observation turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id };
 }
 
 async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget) {
