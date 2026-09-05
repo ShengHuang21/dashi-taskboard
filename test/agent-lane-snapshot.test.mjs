@@ -1030,13 +1030,44 @@ test("an explicit Owner Root invalidates a legacy non-Root Global coordinator le
   assert.equal(snapshot.coordination.lease.status, "expired");
 });
 
+test("projects an unbound Codex peer as an eligible domain provisioning template", async () => {
+  const paths = await fixture({
+    rootTaskId: "root",
+    ownerRootTaskId: "root",
+    tasks: [
+      {
+        id: "root", label: "Global", owner: "Codex Root", source: "codex",
+        connection: "connected", threadId: "root-thread", taskType: "root_task",
+        issueIdentifier: "CAPSTONEDEV-1", codexProjectId: "local-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/root",
+      },
+      {
+        id: "coding", label: "Coding", owner: "Codex Coding", source: "codex",
+        threadId: "legacy-coding-thread", taskType: "peer_task",
+        issueIdentifier: "CAPSTONEDEV-2",
+      },
+    ],
+    adapters: [],
+    coordinationDomains: [{
+      id: "activation", label: "Activation",
+      writeScope: ["tmp/activation"], eligibleTaskIds: ["coding"],
+    }],
+  });
+
+  const snapshot = await createAgentLaneSnapshotProvider(paths).getProjectSnapshot("capstone-dev");
+
+  assert.equal(snapshot.coordination.domainCoordinators[0].domainId, "activation");
+  assert.equal(snapshot.coordination.domainCoordinators[0].assignment, "unassigned");
+  assert.deepEqual(snapshot.coordination.domainCoordinators[0].eligibleTaskIds, ["coding"]);
+});
+
 test("projects concurrent disjoint domain coordinators without replacing the Global Coordinator", async () => {
   const paths = await fixture({
     rootTaskId: "root",
     tasks: [
       { id: "root", label: "Global", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1" },
-      { id: "frontend", label: "Frontend", owner: "Codex Frontend", source: "codex", threadId: "visual-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1", codexHostId: "local", workspacePath: "/tmp/frontend" },
-      { id: "backend", label: "Backend", owner: "Codex Backend", source: "codex", threadId: "backend-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1", codexHostId: "local", workspacePath: "/tmp/backend" },
+      { id: "frontend", label: "Frontend", owner: "Codex Frontend", source: "codex", threadId: "visual-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "backend", label: "Backend", owner: "Codex Backend", source: "codex", threadId: "backend-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/backend" },
     ],
     adapters: [],
     coordinationDomains: [
@@ -1109,7 +1140,7 @@ test("accepts zero-duration released Global and domain leases as unassigned", as
   const paths = await fixture({
     tasks: [
       { id: "root", label: "Global", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", issueIdentifier: "CAPSTONEDEV-1" },
-      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "visual-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "visual-thread", taskType: "peer_task", issueIdentifier: "CAPSTONEDEV-1", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
     ],
     adapters: [],
     coordinatorLease: {
@@ -1147,7 +1178,7 @@ test("future and released exact-bound leases remain unassigned in snapshots", as
     const paths = await fixture({
       tasks: [
         { id: "root", label: "Global", owner: "Codex", source: "codex", threadId: "root-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/snapshot-root" },
-        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/snapshot-frontend" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/snapshot-frontend" },
       ],
       adapters: [],
       coordinatorLease: {

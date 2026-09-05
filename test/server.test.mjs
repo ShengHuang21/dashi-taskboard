@@ -1799,7 +1799,7 @@ test("project coordinator leases acquire and renew atomically without granting e
       rootTaskId: "root",
       tasks: [
         { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/inbox-delivery-worktree" },
-        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexHostId: "host-visual", workspacePath: "/tmp/taskboard/visual" },
+        { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-visual", workspacePath: "/tmp/taskboard/visual" },
       ],
       adapters: [],
     });
@@ -1909,7 +1909,7 @@ test("project coordinator leases acquire and renew atomically without granting e
     coordinatorLease: { ...renewed.body.lease, status: undefined },
     tasks: [
       { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
-      { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "drifted-thread", taskType: "peer_task", codexHostId: "host-drifted", workspacePath: "/tmp/taskboard/drifted" },
+      { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "drifted-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-drifted", workspacePath: "/tmp/taskboard/drifted" },
     ],
     adapters: [],
   };
@@ -1928,7 +1928,7 @@ test("project coordinator leases acquire and renew atomically without granting e
     coordinatorLease: { ...renewed.body.lease, status: undefined },
     tasks: [
       { id: "root", label: "Root", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
-      { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexHostId: "host-visual", workspacePath: "/tmp/taskboard/visual" },
+      { id: "visual", label: "Visual", owner: "Codex Visual", source: "codex", threadId: "visual-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-visual", workspacePath: "/tmp/taskboard/visual" },
     ],
     adapters: [],
   });
@@ -2144,9 +2144,9 @@ test("domain coordinator leases allow disjoint parallel owners while preserving 
       rootTaskId: "root",
       tasks: [
         { id: "root", label: "Global", owner: "Codex Root", source: "codex", threadId: "root-thread", taskType: "root_task" },
-        { id: "frontend-a", label: "Frontend A", owner: "Codex", source: "codex", threadId: "frontend-a-thread", taskType: "peer_task", codexHostId: "host-frontend-a", workspacePath: "/tmp/taskboard/frontend-a" },
-        { id: "frontend-b", label: "Frontend B", owner: "Codex", source: "codex", threadId: "frontend-b-thread", taskType: "peer_task", codexHostId: "host-frontend-b", workspacePath: "/tmp/taskboard/frontend-b" },
-        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexHostId: "host-backend", workspacePath: "/tmp/taskboard/backend" },
+        { id: "frontend-a", label: "Frontend A", owner: "Codex", source: "codex", threadId: "frontend-a-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-frontend-a", workspacePath: "/tmp/taskboard/frontend-a" },
+        { id: "frontend-b", label: "Frontend B", owner: "Codex", source: "codex", threadId: "frontend-b-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-frontend-b", workspacePath: "/tmp/taskboard/frontend-b" },
+        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-backend", workspacePath: "/tmp/taskboard/backend" },
       ],
       adapters: [],
       coordinationDomains: [
@@ -2267,6 +2267,83 @@ test("domain coordinator leases allow disjoint parallel owners while preserving 
   assert.notEqual(replacementLease.body.lease.id, frontend.body.lease.id);
 });
 
+test("protected domain configuration accepts an unbound Codex peer as a provisioning template", async () => {
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    const config = {
+      rootTaskId: "global",
+      ownerRootTaskId: "owner-root",
+      tasks: [
+        {
+          id: "owner-root", label: "Owner Root", owner: "Codex Owner", source: "codex",
+          connection: "connected", threadId: "owner-thread", taskType: "root_task",
+          codexProjectId: "local-project", codexProjectKind: "local",
+          codexHostId: "local", workspacePath: "/tmp/taskboard",
+        },
+        {
+          id: "global", label: "Global", owner: "Codex", source: "codex",
+          connection: "connected", threadId: "global-thread", taskType: "root_task",
+          codexProjectId: "local-project", codexProjectKind: "local",
+          codexHostId: "local", workspacePath: "/tmp/taskboard/global",
+        },
+        {
+          id: "coding", label: "Coding", owner: "Codex Coding", source: "codex",
+          threadId: "legacy-coding-thread", taskType: "peer_task",
+        },
+      ],
+      adapters: [],
+    };
+    for (const partialBinding of [
+      { codexHostId: "local" },
+      { codexHostId: "local", workspacePath: "/tmp/taskboard/coding" },
+      {
+        codexProjectId: "local-project", codexProjectKind: "remote",
+        codexHostId: "local", workspacePath: "/tmp/taskboard/coding",
+      },
+    ]) {
+      assert.throws(() => database.upsertAgentLaneProject("local", {
+        ...config,
+        tasks: config.tasks.map((task) => task.id === "coding"
+          ? { ...task, ...partialBinding }
+          : task),
+        coordinationDomains: [{
+          id: "invalid", label: "Invalid",
+          writeScope: ["tmp/invalid"], eligibleTaskIds: ["coding"],
+        }],
+      }), (error) => error?.code === "COORDINATION_DOMAIN_BINDING_MISMATCH");
+    }
+    database.upsertAgentLaneProject("local", config);
+    database.close();
+    return {};
+  });
+  const globalLease = await request(baseUrl, "/api/local/projects/local/coordinator-lease", {
+    method: "POST",
+    body: {
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedLeaseId: null, leaseDurationSeconds: 120,
+    },
+  });
+  assert.equal(globalLease.response.status, 200, JSON.stringify(globalLease.body));
+  const initial = await request(baseUrl, "/api/local/projects/local/coordination-domains", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const configured = await request(baseUrl, "/api/local/projects/local/coordination-domains/activation", {
+    method: "PUT",
+    headers: { "x-taskboard-client": "taskctl" },
+    body: {
+      label: "Activation", writeScope: ["tmp/activation"], eligibleTaskIds: ["coding"],
+      expectedRevision: initial.body.revision, idempotencyKey: "configure-unbound-peer-v1",
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.body.lease.id,
+    },
+  });
+  assert.equal(configured.response.status, 200, JSON.stringify(configured.body));
+  assert.deepEqual(configured.body.configuration.domains, [{
+    id: "activation", label: "Activation",
+    writeScope: ["tmp/activation"], eligibleTaskIds: ["coding"],
+  }]);
+});
+
 test("protected domain configuration creates the live routing path with optimistic idempotent writes", async () => {
   const baseUrl = await startServer(async (directory) => {
     const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
@@ -2274,8 +2351,8 @@ test("protected domain configuration creates the live routing path with optimist
       rootTaskId: "global",
       tasks: [
         { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: "/tmp/taskboard/global" },
-        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "host-frontend", workspacePath: "/tmp/taskboard/frontend" },
-        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexHostId: "host-backend", workspacePath: "/tmp/taskboard/backend" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-frontend", workspacePath: "/tmp/taskboard/frontend" },
+        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-backend", workspacePath: "/tmp/taskboard/backend" },
       ],
       adapters: [],
     });
@@ -2413,7 +2490,7 @@ test("domain creation rejects reserved orphan leases and clears expired migratio
       rootTaskId: "global",
       tasks: [
         { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: "/tmp/taskboard/global" },
-        { id: "peer", label: "Peer", owner: "Codex", source: "codex", threadId: "peer-thread", taskType: "peer_task", codexHostId: "host-peer", workspacePath: "/tmp/taskboard/peer" },
+        { id: "peer", label: "Peer", owner: "Codex", source: "codex", threadId: "peer-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-peer", workspacePath: "/tmp/taskboard/peer" },
       ],
       adapters: [],
       coordinatorLease: globalLease,
@@ -2463,7 +2540,7 @@ test("naturally expired coordinator leases recover the same holders with new epo
       rootTaskId: "global",
       tasks: [
         { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: "/tmp/global" },
-        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "host-frontend", workspacePath: "/tmp/frontend" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-frontend", workspacePath: "/tmp/frontend" },
       ],
       adapters: [],
       coordinatorLease: {
@@ -2610,7 +2687,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
           id: "frontend", label: "Frontend", owner: "Codex", source: "codex",
           threadId: "frontend-thread", taskType: "peer_task",
           codexProjectId: "sbkk-project", codexProjectKind: "local",
-          codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+          codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
         },
       ],
       adapters: [],
@@ -2625,7 +2702,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
       domainCoordinatorLeases: {
         frontend: {
           id: "frontend-lease", holderTaskId: "frontend", holderThreadId: "frontend-thread",
-          holderCodexHostId: "host-frontend", holderWorkspacePath: "/tmp/sbkk/frontend",
+          holderCodexHostId: "local", holderWorkspacePath: "/tmp/sbkk/frontend",
           acquiredAt, expiresAt, writeScope: ["web"],
         },
       },
@@ -2668,7 +2745,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     body: {
       threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
       codexProjectId: "market-project", codexProjectKind: "local",
-      codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+      codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
     },
   });
   const domainSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
@@ -2681,7 +2758,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     body: {
       threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
       codexProjectId: "sbkk-project", codexProjectKind: "remote",
-      codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
+      codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
     },
   });
   const domainKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
@@ -2766,7 +2843,7 @@ test("legacy unbound coordinator leases fail closed instead of upgrading to a ne
     database.upsertAgentLaneProject("local", {
       tasks: [
         { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "host-global", workspacePath: process.cwd() },
-        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "host-frontend", workspacePath: process.cwd() },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "project", codexProjectKind: "remote", codexHostId: "host-frontend", workspacePath: process.cwd() },
       ],
       adapters: [],
       coordinatorLease: {
@@ -2850,7 +2927,7 @@ test("legacy unbound coordinator leases fail closed instead of upgrading to a ne
   assert.deepEqual(afterConfig.domainCoordinatorLeases, beforeConfig.domainCoordinatorLeases);
 });
 
-test("fresh coordinator acquisition rejects incomplete Global and domain window bindings", async () => {
+test("fresh coordinator acquisition rejects incomplete bindings after accepting a peer template", async () => {
   const baseUrl = await startServer(async (directory) => {
     const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
     const invalidLegacyConfig = {
@@ -2864,15 +2941,7 @@ test("fresh coordinator acquisition rejects incomplete Global and domain window 
         { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
       ],
     };
-    assert.throws(() => database.upsertAgentLaneProject("local", invalidLegacyConfig), (error) => (
-      error?.code === "COORDINATION_DOMAIN_BINDING_MISMATCH"
-    ));
-    database.upsertAgentLaneProject("local", {
-      ...invalidLegacyConfig,
-      tasks: invalidLegacyConfig.tasks.map((task) => task.id === "frontend"
-        ? { ...task, codexHostId: "local", workspacePath: "/tmp/frontend" }
-        : task),
-    });
+    database.upsertAgentLaneProject("local", invalidLegacyConfig);
     database.close();
     return {};
   });
@@ -2883,7 +2952,7 @@ test("fresh coordinator acquisition rejects incomplete Global and domain window 
     },
     {
       pathname: "/api/local/projects/local/domain-coordinator-leases/frontend",
-      body: { holderTaskId: "global", holderThreadId: "global-thread", expectedLeaseId: null, leaseDurationSeconds: 60 },
+      body: { holderTaskId: "frontend", holderThreadId: "frontend-thread", expectedLeaseId: null, leaseDurationSeconds: 60 },
     },
   ]) {
     const acquisition = await request(baseUrl, candidate.pathname, {
@@ -2942,7 +3011,7 @@ test("protected domain Todo assignment persists the Global Coordinator decision"
       rootTaskId: "global",
       tasks: [
         { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
-        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
       ],
       adapters: [],
       coordinationDomains: [
@@ -3033,8 +3102,8 @@ test("protected cross-domain clearance binds the exact target coordinator fronti
     database.upsertAgentLaneProject("local", {
       tasks: [
         { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/global" },
-        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/frontend" },
-        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexHostId: "local", workspacePath: "/tmp/backend" },
+        { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
+        { id: "backend", label: "Backend", owner: "Codex", source: "codex", threadId: "backend-thread", taskType: "peer_task", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/backend" },
       ],
       adapters: [],
       coordinatorLease: { id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread", holderCodexHostId: "local", holderWorkspacePath: "/tmp/global", acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt },
@@ -3382,7 +3451,7 @@ test("background Coordinator registration requests a protected host identity han
   finalInspection.close();
 });
 
-test("domain provisioning transitions one protected attempt before thread side effects", async () => {
+test("domain provisioning bootstraps a legacy peer through registration and lease acquisition", async () => {
   const instanceSecret = "e".repeat(64);
   const projectId = "local";
   const workspacePath = path.resolve("/tmp/domain-transition-frontend");
@@ -3403,8 +3472,6 @@ test("domain provisioning transitions one protected attempt before thread side e
         {
           id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
           threadId: "frontend-thread", taskType: "peer_task",
-          codexProjectId: "codex-project", codexProjectKind: "local",
-          codexHostId: "local", workspacePath,
         },
       ],
       adapters: [],
@@ -3448,7 +3515,8 @@ test("domain provisioning transitions one protected attempt before thread side e
     model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
     globalHolderThreadId: "global-thread", codexProjectId: "codex-project",
-    codexProjectKind: "local", codexHostId: "local", workspacePath,
+    codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/domain-transition-global",
   };
   const created = await request(baseUrl, requestPath, {
     method: "POST",
@@ -3505,14 +3573,15 @@ test("domain provisioning transitions one protected attempt before thread side e
   assert.equal(pending.response.status, 202, JSON.stringify(pending.body));
   assert.deepEqual(pending.body.handshake.expectedHostBinding, {
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath,
+    codexHostId: "local", workspacePath: "/tmp/domain-transition-global",
   });
   const confirmPath = `/api/local/coordination-identity-handshakes/${pending.body.handshake.id}/confirm`;
   const confirmBody = {
     registration: { projectId, ...registration },
     threadBinding: {
       threadId: attachBody.threadId, codexProjectId: "codex-project",
-      codexProjectKind: "local", codexHostId: "local", workspacePath,
+      codexProjectKind: "local", codexHostId: "local",
+      workspacePath: "/tmp/domain-transition-global",
     },
   };
   const confirmed = await request(baseUrl, confirmPath, {
@@ -5674,6 +5743,7 @@ test("window registration preserves an active domain coordinator binding", async
         {
           id: "domain-root", label: "Domain Root", owner: "Codex", source: "codex",
           threadId: "domain-thread", taskType: "peer_task",
+          codexProjectId: "codex-project", codexProjectKind: "remote",
           codexHostId: "domain-host", workspacePath: "/tmp/domain-old",
         },
       ],

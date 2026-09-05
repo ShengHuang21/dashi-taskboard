@@ -78,17 +78,46 @@ function validateConfigTask(value) {
   };
 }
 
+function hasProtectedCodexBinding(task) {
+  return [
+    task?.codexProjectId, task?.codexProjectKind, task?.codexHostId, task?.workspacePath,
+  ].some((value) => value !== undefined && value !== null && value !== "");
+}
+
+function hasExactCodexHostBinding(task) {
+  return Boolean(
+    typeof task?.codexProjectId === "string"
+    && task.codexProjectId.trim()
+    && ["local", "remote"].includes(task.codexProjectKind)
+    && typeof task.codexHostId === "string"
+    && task.codexHostId.trim()
+    && ((task.codexProjectKind === "local" && task.codexHostId === "local")
+      || (task.codexProjectKind === "remote" && task.codexHostId !== "local"))
+    && typeof task.workspacePath === "string"
+    && path.isAbsolute(task.workspacePath),
+  );
+}
+
 function isFullyBoundCodexPeerTask(task) {
   return Boolean(
     task?.source === "codex"
     && task?.taskType === "peer_task"
     && typeof task.threadId === "string"
     && task.threadId.trim()
-    && typeof task.codexHostId === "string"
-    && task.codexHostId.trim()
-    && typeof task.workspacePath === "string"
-    && path.isAbsolute(task.workspacePath),
+    && hasExactCodexHostBinding(task),
   );
+}
+
+function isConfiguredCodexPeerTask(task) {
+  const base = Boolean(
+    task?.source === "codex"
+    && task?.taskType === "peer_task"
+    && typeof task.id === "string" && task.id.trim()
+    && typeof task.label === "string" && task.label.trim()
+    && typeof task.owner === "string" && task.owner.trim()
+    && typeof task.threadId === "string" && task.threadId.trim()
+  );
+  return base && (!hasProtectedCodexBinding(task) || isFullyBoundCodexPeerTask(task));
 }
 
 function validateConfigAdapter(value) {
@@ -232,7 +261,7 @@ async function readConfig(configPath, projectId, getLaneConfig) {
     && domain.writeScope.length > 0
     && domain.eligibleTaskIds.length > 0
     && domain.eligibleTaskIds.every((taskId) => (
-      isFullyBoundCodexPeerTask(rawTasks.find((task) => task?.id === taskId))
+      isConfiguredCodexPeerTask(rawTasks.find((task) => task?.id === taskId))
     ))
   )) && new Set(coordinationDomains.map((domain) => domain.id)).size === coordinationDomains.length;
   const rawDomainLeases = project?.domainCoordinatorLeases ?? {};

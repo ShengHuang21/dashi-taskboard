@@ -1652,12 +1652,12 @@ test("domain provisioning retries selected-model capacity on the same durable at
       {
         id: "global", source: "codex", taskType: "root_task",
         threadId: globalThreadId,
+        codexProjectId: "local-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/taskboard",
       },
       {
         id: "frontend", label: "Frontend Coordinator", source: "codex",
-        taskType: "peer_task", threadId: "01a01111-a749-7b53-81e2-af2d477f93ae",
-        codexProjectId: "local-project", codexProjectKind: "local",
-        codexHostId: "local", workspacePath: "/tmp/domain-frontend",
+        taskType: "peer_task", threadId: "legacy-frontend-thread",
       },
     ],
   };
@@ -1671,13 +1671,23 @@ test("domain provisioning retries selected-model capacity on the same durable at
   const options = {
     policy: {
       enabled: true, projectId: "capstone-dev",
-      model: "gpt-5", reasoningEffort: "high",
+      model: null, reasoningEffort: null,
     },
     readSnapshot: async () => snapshot,
     readWindows: async () => ({ projectId: "capstone-dev", revision }),
+    readDefaultModel: async (binding) => {
+      assert.deepEqual(binding, {
+        codexHostId: "local", workspacePath: "/tmp/taskboard",
+      });
+      return { model: "gpt-5", reasoningEffort: "high" };
+    },
     getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
     requestAttempt: async (request) => {
       requests += 1;
+      assert.equal(request.taskId, "frontend");
+      assert.equal(request.codexProjectId, "local-project");
+      assert.equal(request.codexHostId, "local");
+      assert.equal(request.workspacePath, "/tmp/taskboard");
       attempt = {
         ...request,
         id: "domain-attempt",
@@ -1709,7 +1719,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
     startThread: async (settings) => {
       starts += 1;
       assert.equal(settings.codexHostId, "local");
-      assert.equal(settings.cwd, "/tmp/domain-frontend");
+      assert.equal(settings.cwd, "/tmp/taskboard");
       assert.equal(settings.approvalPolicy, "never");
       if (starts === 1) {
         throw new Error("Selected model is at capacity. Please try a different model.");
