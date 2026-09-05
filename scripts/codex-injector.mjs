@@ -63,6 +63,7 @@ import {
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
+  runTaskboardContinuationFastLane,
   runTaskboardContinuationMonitorOnce,
   selectLaunchCoordinatorRoute,
 } from "./codex-injector-runtime.mjs";
@@ -1781,7 +1782,7 @@ async function listResidentCoordinatorMonitorProjects() {
 async function readTaskboardAgentLaneSnapshot(projectId) {
   const response = await fetch(
     `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/agent-lanes`,
-    { cache: "no-store" },
+    { cache: "no-store", signal: AbortSignal.timeout(5_000) },
   );
   if (!response.ok) throw new Error(`Taskboard Agent Lanes returned HTTP ${response.status}`);
   return response.json();
@@ -2958,6 +2959,66 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
   }
 }
 
+function runBackgroundContinuationDispatch(cdp, projectId) {
+  return runTaskboardContinuationMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId,
+      maxActiveAgents: configuredMaxActiveAgents,
+      capacityObservationMaxAgeMs,
+    },
+    readSnapshot: readTaskboardAgentLaneSnapshot,
+    claimReceipt: claimBackgroundContinuationReceipt,
+    confirmDelivery: confirmBackgroundContinuationDelivery,
+    completeDelivery: completeBackgroundContinuationDelivery,
+    deferAdmission: (request) => mutateBackgroundAdmission(request, "defer"),
+    markAdmissionUncertain: (request) => mutateBackgroundAdmission(request, "uncertain"),
+    claimAdmissionProbe: (request) => mutateBackgroundAdmission(request, "probe"),
+    reconcileAdmission: (request) => mutateBackgroundAdmission(request, "reconcile"),
+    deliverAdmissionRecovery: (request) => deliverTaskboardAdmissionRecovery(
+      request,
+      (method, params) => requestCodexAppServerViaCdp(
+        cdp,
+        undefined,
+        request.codexHostId,
+        method,
+        params,
+        10_000,
+      ),
+    ),
+    deliver: (request) => deliverTaskboardCoordination(
+      request,
+      (method, params) => requestCodexAppServerViaCdp(
+        cdp,
+        undefined,
+        request.codexHostId,
+        method,
+        params,
+        10_000,
+      ),
+      validateGitExecutionTarget,
+    ),
+  });
+}
+
+async function runBackgroundContinuationFastLane(cdp) {
+  await ensureQuotaPoliciesLoaded();
+  const projects = await loadResidentCoordinatorMonitorProjects({
+    listLifecycleProjects: listResidentCoordinatorMonitorProjects,
+    readContinuationPolicyEntries: readTaskboardClientStorageEntries,
+    continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
+  });
+  return runTaskboardContinuationFastLane({
+    projects,
+    runContinuation: (projectId) => runBackgroundContinuationDispatch(cdp, projectId),
+    observeResult: (result) => {
+      if (!result.ok) {
+        console.error(`Taskboard continuation fast lane project ${result.projectId} failed: ${result.error}`);
+      }
+    },
+  });
+}
+
 async function runBackgroundContinuationMonitor(cdp) {
   await ensureQuotaPoliciesLoaded();
   const projects = await loadResidentCoordinatorMonitorProjects({
@@ -3266,45 +3327,6 @@ async function runBackgroundContinuationMonitor(cdp) {
           options,
         ),
       }),
-      () => runTaskboardContinuationMonitorOnce({
-        policy: {
-          enabled: true,
-          projectId,
-          maxActiveAgents: configuredMaxActiveAgents,
-          capacityObservationMaxAgeMs,
-        },
-        readSnapshot: readTaskboardAgentLaneSnapshot,
-        claimReceipt: claimBackgroundContinuationReceipt,
-        confirmDelivery: confirmBackgroundContinuationDelivery,
-        completeDelivery: completeBackgroundContinuationDelivery,
-        deferAdmission: (request) => mutateBackgroundAdmission(request, "defer"),
-        markAdmissionUncertain: (request) => mutateBackgroundAdmission(request, "uncertain"),
-        claimAdmissionProbe: (request) => mutateBackgroundAdmission(request, "probe"),
-        reconcileAdmission: (request) => mutateBackgroundAdmission(request, "reconcile"),
-        deliverAdmissionRecovery: (request) => deliverTaskboardAdmissionRecovery(
-          request,
-          (method, params) => requestCodexAppServerViaCdp(
-            cdp,
-            undefined,
-            request.codexHostId,
-            method,
-            params,
-            10_000,
-          ),
-        ),
-        deliver: (request) => deliverTaskboardCoordination(
-          request,
-          (method, params) => requestCodexAppServerViaCdp(
-            cdp,
-            undefined,
-            request.codexHostId,
-            method,
-            params,
-            10_000,
-          ),
-          validateGitExecutionTarget,
-        ),
-      }),
       () => runOwnerDecisionMonitorOnce({
         policy: { enabled: true, projectId },
         readSnapshot: readTaskboardAgentLaneSnapshot,
@@ -3346,6 +3368,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   let activeMainContextId = null;
   let installInFlight = null;
   let disposeBackgroundContinuationTimer = null;
+  let disposeBackgroundContinuationFastLaneTimer = null;
   let disposeCoordinatorIdentityHandshakeTimer = null;
   let hostRequestQueueTimer = null;
   let hostRequestQueueInFlight = false;
@@ -3371,6 +3394,18 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         await runBackgroundContinuationMonitor(cdp);
       } catch (error) {
         console.error(`Taskboard background continuation check failed: ${error.message}`);
+      }
+    }, backgroundContinuationIntervalMs);
+  };
+
+  const scheduleBackgroundContinuationFastLane = () => {
+    if (disposeBackgroundContinuationFastLaneTimer || cdp.closed) return;
+    disposeBackgroundContinuationFastLaneTimer = createDisposableMonitorTimer(async () => {
+      if (cdp.closed) return;
+      try {
+        await runBackgroundContinuationFastLane(cdp);
+      } catch (error) {
+        console.error(`Taskboard continuation fast lane failed: ${error.message}`);
       }
     }, backgroundContinuationIntervalMs);
   };
@@ -3412,6 +3447,8 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
     disposeCoordinatorIdentityHandshakeTimer = null;
     disposeBackgroundContinuationTimer?.();
     disposeBackgroundContinuationTimer = null;
+    disposeBackgroundContinuationFastLaneTimer?.();
+    disposeBackgroundContinuationFastLaneTimer = null;
     if (hostRequestQueueTimer) {
       clearInterval(hostRequestQueueTimer);
       hostRequestQueueTimer = null;
@@ -3638,6 +3675,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
       });
       await restoreQuotaPolicies(cdp);
       scheduleCoordinatorIdentityHandshakeFastLane();
+      scheduleBackgroundContinuationFastLane();
       scheduleBackgroundContinuation();
       return activeContextId;
     })();

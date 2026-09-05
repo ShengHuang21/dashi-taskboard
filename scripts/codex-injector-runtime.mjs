@@ -6,6 +6,7 @@ const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 const coordinationDeliveries = new Map();
 const COORDINATION_DEDUPLICATION_MS = 60_000;
 const continuationMonitorRuns = new Map();
+const continuationFastLaneRuns = new Map();
 const ownerDecisionMonitorRuns = new Map();
 const ownerIntentCaptureMonitorRuns = new Map();
 const ownerIntentAdoptionMonitorRuns = new Map();
@@ -2551,6 +2552,50 @@ export async function runTaskboardProjectMonitorSequence(monitors) {
     }
   }
   return results;
+}
+
+export function runTaskboardContinuationFastLane({
+  projects,
+  runContinuation,
+  observeResult = () => {},
+}) {
+  if (!Array.isArray(projects)
+    || typeof runContinuation !== "function"
+    || typeof observeResult !== "function") {
+    throw new Error("Taskboard continuation fast lane requires exact project state");
+  }
+  const eligible = projects.filter((project) => (
+    project?.continuationEnabled === true
+    && COORDINATION_ID_PATTERN.test(project?.projectId ?? "")
+  ));
+  return eligible.map((project) => {
+    const projectId = project.projectId;
+    if (continuationFastLaneRuns.has(projectId)) {
+      return { projectId, state: "in_flight" };
+    }
+    const run = Promise.resolve()
+      .then(() => runContinuation(projectId))
+      .then(
+        (result) => ({ projectId, ok: true, result }),
+        (error) => ({
+          projectId,
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    continuationFastLaneRuns.set(projectId, run);
+    void run.then((result) => {
+      if (continuationFastLaneRuns.get(projectId) === run) {
+        continuationFastLaneRuns.delete(projectId);
+      }
+      try {
+        observeResult(result);
+      } catch {
+        // Result observers must not keep a completed project in flight.
+      }
+    });
+    return { projectId, state: "started" };
+  });
 }
 
 export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHandshake }) {
