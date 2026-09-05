@@ -22,6 +22,7 @@ import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
+  buildCoordinatorProvisioningDeliveryTurnStartParams,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
   selectCoordinatorProvisioningFallbackModel,
@@ -2319,24 +2320,18 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
     thread,
     () => rpc("thread/resume", { threadId }),
   );
-  const registrationKey = `${attempt.idempotencyKey}-window`;
-  const instruction = [
-    marker,
-    `TASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:${selectedModel.model}`,
-    `TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:${selectedModel.reasoningEffort}`,
-    "You are a separate Taskboard Execution Coordinator window. Never become or alter Owner Root.",
-    `Use only node ${path.join(projectRoot, "cli", "taskctl.mjs")} --runtime-file ${taskboardRuntimeFile} for Taskboard reads and writes; never read or expose the runtime token and never edit SQLite directly.`,
-    `Bootstrap CAP-15 and its current children for project ${projectId}; read complete Capsules before choosing work and do not create duplicate issues.`,
-    `Register exactly this window with task identity ${attempt.taskId}, role coordinator, label ${JSON.stringify(attempt.label)}, exact thread id ${threadId}, and stable idempotency key ${registrationKey}.`,
-    "First read protected coordination windows and use their exact current revision. Allow the resident protected host handshake to authenticate the exact project, kind, host, and workspace; do not self-report or bypass host identity.",
-    "After exact registration, read Coordinator status. Acquire one 300-second Global Coordinator lease only if still unassigned, using this same task/thread and the exact expected current lease id (or null). Replay the same registration after success to verify one receipt; never create a second window or lease.",
-    "On selected-model capacity, retry the same task and thread with the same model. A host-confirmed unsupported model may be replaced while preserving this exact task, thread, and Coordinator identity. On uncertainty, inspect durable state before retrying. Preserve one writer and the standing safety boundaries in AGENTS.md.",
-  ].join("\n");
+  const turnStartParams = buildCoordinatorProvisioningDeliveryTurnStartParams({
+    attempt,
+    threadId,
+    projectId,
+    taskctlPath: path.join(projectRoot, "cli", "taskctl.mjs"),
+    runtimeFile: taskboardRuntimeFile,
+    selectedModel,
+    workspacePath: attempt.workspacePath,
+  });
   const started = await rpc(
     "turn/start",
-    coordinatorProvisioningTurnStartParams(
-      threadId, instruction, selectedModel, attempt.workspacePath,
-    ),
+    turnStartParams,
   );
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a provisioning delivery turn receipt");
