@@ -8,6 +8,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
   buildCoordinatorProvisioningDeliveryTurnStartParams,
+  admissionRecoveryRpcTimeoutMs,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
   selectCoordinatorProvisioningFallbackModel,
@@ -19,6 +20,7 @@ import {
   createDisposableMonitorTimer,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
+  deliverTaskboardAdmissionRecovery,
   deliverTaskboardCapacityObservation,
   deliverTaskboardCoordination,
   deliverTaskboardCrossDomainHandoff,
@@ -61,6 +63,59 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("cold admission recovery allows bounded thread loading beyond the fast RPC budget", () => {
+  assert.equal(admissionRecoveryRpcTimeoutMs("thread/read"), 10_000);
+  assert.equal(admissionRecoveryRpcTimeoutMs("thread/resume"), 30_000);
+  assert.equal(admissionRecoveryRpcTimeoutMs("turn/start"), 30_000);
+  assert.equal(admissionRecoveryRpcTimeoutMs("turn/steer"), 10_000);
+});
+
+test("admission recovery replays its exact marker and rejects Root workspace drift", async () => {
+  const request = {
+    mode: "probe",
+    rootThreadId: coordinatorThreadId,
+    rootWorkspacePath: "/tmp/taskboard/project",
+    admissionReceiptId: "receipt-cap46",
+    admissionAttemptId: "attempt-cap46",
+    admissionProbeId: "probe-cap46",
+  };
+  const calls = [];
+  let turns = [];
+  let instruction = null;
+  const rpc = async (method, params) => {
+    calls.push(method);
+    if (method === "thread/read") return {
+      thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns },
+    };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") {
+      instruction = params.input[0].text;
+      return { turn: { id: "turn-cap46-probe" } };
+    }
+    return assert.fail(`unexpected RPC ${method}`);
+  };
+
+  assert.deepEqual(await deliverTaskboardAdmissionRecovery(request, rpc), {
+    delivery: "started",
+    turnId: "turn-cap46-probe",
+  });
+  assert.match(instruction, /Taskboard admission recovery probe id: receipt-cap46:attempt-cap46:probe-cap46/);
+  turns = [{ id: "turn-cap46-probe", status: "completed", items: [{ text: instruction }] }];
+  const priorCallCount = calls.length;
+  assert.deepEqual(await deliverTaskboardAdmissionRecovery(request, rpc), {
+    delivery: "observed",
+    turnId: "turn-cap46-probe",
+  });
+  assert.deepEqual(calls.slice(priorCallCount), ["thread/read"]);
+
+  await assert.rejects(
+    deliverTaskboardAdmissionRecovery(request, async () => ({
+      thread: { id: request.rootThreadId, cwd: "/tmp/taskboard/other", turns: [] },
+    })),
+    /workspace/,
+  );
+});
 
 test("Coordinator delivery verifies identity and lease before scanning only current work", () => {
   const params = buildCoordinatorProvisioningDeliveryTurnStartParams({
@@ -5532,6 +5587,7 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /runTaskboardContinuationMonitorOnce/);
   assert.match(source, /requestCapacityObservation/);
   assert.match(source, /deliverTaskboardCapacityObservation/);
+  assert.match(source, /admissionRecoveryRpcTimeoutMs\(method\)/);
   assert.match(source, /deliverTaskboardCoordination/);
   assert.match(source, /runCoordinatorProvisioningMonitorOnce/);
   assert.match(source, /coordinator-provisioning-attempts/);

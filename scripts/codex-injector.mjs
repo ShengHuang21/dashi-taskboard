@@ -20,6 +20,7 @@ import {
 } from "../shared/taskboard-automation.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
+  admissionRecoveryRpcTimeoutMs,
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
   buildCoordinatorProvisioningDeliveryTurnStartParams,
@@ -2997,7 +2998,7 @@ function runBackgroundContinuationDispatch(cdp, projectId) {
         request.codexHostId,
         method,
         params,
-        10_000,
+        admissionRecoveryRpcTimeoutMs(method),
       ),
     ),
     deliver: (request) => deliverTaskboardCoordination(
