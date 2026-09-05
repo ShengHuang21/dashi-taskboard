@@ -2471,6 +2471,152 @@ test("protected domain configuration creates the live routing path with optimist
   assert.deepEqual(removed.body.configuration.domains, []);
 });
 
+test("removing a domain retires its recoverable expired attempt before reconfiguration", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-domain-policy-reset-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const projectId = "local";
+  const globalWorkspacePath = path.resolve("/tmp/domain-policy-reset-global");
+  const taskWorkspacePath = path.resolve("/tmp/domain-policy-reset-worktree");
+  const globalLease = {
+    id: "domain-policy-reset-lease",
+    holderTaskId: "global",
+    holderThreadId: "global-thread",
+    holderCodexHostId: "local",
+    holderWorkspacePath: globalWorkspacePath,
+    acquiredAt: new Date(Date.now() - 1_000).toISOString(),
+    expiresAt: new Date(Date.now() + 120_000).toISOString(),
+  };
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  const database = new TaskboardDatabase(databasePath);
+  try {
+    database.upsertAgentLaneProject(projectId, {
+      rootTaskId: "global",
+      tasks: [
+        {
+          id: "global", label: "Global", owner: "Codex", source: "codex",
+          threadId: "global-thread", taskType: "root_task",
+          codexProjectId: "global-project", codexProjectKind: "local",
+          codexHostId: "local", workspacePath: globalWorkspacePath,
+        },
+        {
+          id: "probe", label: "Probe", owner: "Codex", source: "codex",
+          threadId: "probe-template-thread", taskType: "peer_task",
+        },
+      ],
+      adapters: [],
+      coordinatorLease: globalLease,
+      coordinationDomains: [{
+        id: "probe", label: "Probe", writeScope: ["tmp/probe"],
+        eligibleTaskIds: ["probe"],
+      }],
+    });
+    const task = database.createTask({
+      projectId, title: "Probe work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "global-thread",
+      threadBinding: {
+        threadId: "global-thread", codexProjectId: "global-project",
+        codexProjectKind: "local", codexHostId: "local",
+        workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: taskWorkspacePath, branch: "codex/domain-policy-reset",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    const assigned = database.setAgentTaskDomain(projectId, task.id, {
+      domainId: "probe", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.id,
+    });
+    const firstRevision = database.getAgentLaneCoordinationDomains(projectId).revision;
+    const first = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+      projectId,
+      "probe",
+      {
+        idempotencyKey: "domain-policy-reset-first", taskId: "probe", label: "Probe",
+        threadSource: "taskboard-domain-policy-reset-first", model: "gpt-5",
+        reasoningEffort: "high", expectedRevision: firstRevision,
+        expectedGlobalLeaseId: globalLease.id, globalHolderTaskId: "global",
+        globalHolderThreadId: "global-thread", codexProjectId: "global-project",
+        codexProjectKind: "local", codexHostId: "local",
+        workspacePath: globalWorkspacePath,
+      },
+    );
+    database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+      first.attempt.id, "starting",
+    );
+    database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+      first.attempt.id, "attach", { threadId: "01a-domain-policy-reset-first" },
+    );
+    database.database.prepare(`
+      UPDATE agent_domain_coordinator_provisioning_attempts
+      SET status = 'expired', expires_at = ? WHERE id = ?
+    `).run(new Date(Date.now() - 1_000).toISOString(), first.attempt.id);
+
+    const cleared = database.setAgentTaskDomain(projectId, task.id, {
+      domainId: null, taskVersion: assigned.task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.id,
+    });
+    const removed = database.configureAgentLaneCoordinationDomain(projectId, "probe", {
+      domain: null,
+      expectedRevision: database.getAgentLaneCoordinationDomains(projectId).revision,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.id,
+      idempotencyKey: "domain-policy-reset-remove",
+    });
+    assert.equal(removed.applied, true);
+    assert.equal(
+      database.getAgentLaneDomainCoordinatorProvisioningAttempt(projectId, "probe"),
+      null,
+    );
+    const retired = database.database.prepare(`
+      SELECT status, thread_id FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?
+    `).get(first.attempt.id);
+    assert.deepEqual({ ...retired }, {
+      status: "canceled", thread_id: "01a-domain-policy-reset-first",
+    });
+
+    const configured = database.configureAgentLaneCoordinationDomain(projectId, "probe", {
+      domain: { label: "Probe", writeScope: ["tmp/probe"], eligibleTaskIds: ["probe"] },
+      expectedRevision: removed.configuration.revision,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.id,
+      idempotencyKey: "domain-policy-reset-configure",
+    });
+    const reassigned = database.setAgentTaskDomain(projectId, task.id, {
+      domainId: "probe", taskVersion: cleared.task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: globalLease.id,
+    });
+    assert.equal(reassigned.assignment.domainId, "probe");
+    const second = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+      projectId,
+      "probe",
+      {
+        idempotencyKey: "domain-policy-reset-second", taskId: "probe", label: "Probe",
+        threadSource: "taskboard-domain-policy-reset-second", model: "gpt-5",
+        reasoningEffort: "high", expectedRevision: configured.configuration.revision,
+        expectedGlobalLeaseId: globalLease.id, globalHolderTaskId: "global",
+        globalHolderThreadId: "global-thread", codexProjectId: "global-project",
+        codexProjectKind: "local", codexHostId: "local",
+        workspacePath: globalWorkspacePath,
+      },
+    );
+    assert.notEqual(second.attempt.id, first.attempt.id);
+    assert.equal(second.attempt.status, "pending");
+    assert.equal(second.attempt.globalHolderCodexProjectId, "global-project");
+    assert.equal(second.attempt.globalHolderCodexProjectKind, "local");
+    assert.equal(second.attempt.globalHolderCodexHostId, "local");
+    assert.equal(second.attempt.globalHolderWorkspacePath, globalWorkspacePath);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("domain creation rejects reserved orphan leases and clears expired migration residue", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-orphan-domain-test-"));
   const nowMs = Date.now();
