@@ -3562,6 +3562,44 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   assert.equal(attached.body.attempt.status, "started");
   assert.equal(attached.body.attempt.threadId, attachBody.threadId);
 
+  const renewGlobalPath = "/api/local/projects/local/coordinator-lease/renew";
+  const renewGlobalBody = {
+    holderTaskId: "global", holderThreadId: "global-thread",
+    holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+    expectedLeaseId: "global-lease", leaseDurationSeconds: 120,
+  };
+  const renewedGlobal = await request(baseUrl, renewGlobalPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "5a".repeat(16), renewGlobalPath, renewGlobalBody,
+    ),
+    body: renewGlobalBody,
+  });
+  assert.equal(renewedGlobal.response.status, 200, JSON.stringify(renewedGlobal.body));
+  const driftedWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(driftedWindows.response.status, 200, JSON.stringify(driftedWindows.body));
+  assert.notEqual(driftedWindows.body.revision, revision);
+  const rebindPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/rebind`;
+  const rebindBody = { expectedRevision: driftedWindows.body.revision };
+  const unprotectedRebind = await request(baseUrl, rebindPath, {
+    method: "POST", body: rebindBody,
+  });
+  assert.equal(unprotectedRebind.response.status, 403, JSON.stringify(unprotectedRebind.body));
+  const rebound = await request(baseUrl, rebindPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "5b".repeat(16), rebindPath, rebindBody,
+    ),
+    body: rebindBody,
+  });
+  assert.equal(rebound.response.status, 200, JSON.stringify(rebound.body));
+  assert.equal(rebound.body.attempt.id, created.body.attempt.id);
+  assert.equal(rebound.body.attempt.threadId, attachBody.threadId);
+  assert.equal(rebound.body.attempt.expectedRevision, driftedWindows.body.revision);
+  revision = driftedWindows.body.revision;
+
   const registrationPath = "/api/local/projects/local/coordination-windows";
   const registration = {
     role: "coordinator", taskId: "frontend", label: "Frontend Coordinator",

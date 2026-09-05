@@ -1524,6 +1524,27 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || path.resolve(attempt.workspacePath ?? "") !== path.resolve(launchLane.workspacePath)) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
+  if (attempt.expectedRevision !== windows.revision
+    && !["completed", "canceled"].includes(attempt.status)
+    && (attempt.status !== "expired" || attempt.threadId)) {
+    if (typeof options.rebindAttempt !== "function") {
+      return {
+        provisioned: false, reason: "attempt-rebind-unavailable",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+    result = await options.rebindAttempt({
+      attemptId: attempt.id,
+      expectedRevision: windows.revision,
+    });
+    attempt = result?.attempt ?? attempt;
+    if (attempt.expectedRevision !== windows.revision) {
+      return {
+        provisioned: false, reason: "attempt-rebind-mismatch",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+  }
   if (["completed", "canceled"].includes(attempt.status)) {
     return {
       provisioned: attempt.status === "completed",
