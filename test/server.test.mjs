@@ -3455,6 +3455,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   const instanceSecret = "e".repeat(64);
   const projectId = "local";
   const workspacePath = path.resolve("/tmp/domain-transition-frontend");
+  const globalWorkspacePath = path.resolve("/tmp/domain-transition-global");
   let databasePath;
   let revision;
   const baseUrl = await startServer(async (directory) => {
@@ -3467,7 +3468,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
           id: "global", label: "Global", owner: "Codex", source: "codex",
           threadId: "global-thread", taskType: "root_task",
           codexProjectId: "codex-project", codexProjectKind: "local",
-          codexHostId: "local", workspacePath: "/tmp/domain-transition-global",
+          codexHostId: "local", workspacePath: globalWorkspacePath,
         },
         {
           id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
@@ -3477,7 +3478,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
       adapters: [],
       coordinatorLease: {
         id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
-        holderCodexHostId: "local", holderWorkspacePath: "/tmp/domain-transition-global",
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
         acquiredAt: new Date(Date.now() - 60_000).toISOString(),
         expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
       },
@@ -3488,7 +3489,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
     const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
     const binding = {
       threadId: "global-thread", codexProjectId: "codex-project", codexProjectKind: "local",
-      codexHostId: "local", workspacePath: "/tmp/domain-transition-global",
+      codexHostId: "local", workspacePath: globalWorkspacePath,
     };
     const task = database.createTask({
       projectId, title: "Frontend work", description: "", status: "todo",
@@ -3516,7 +3517,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
     globalHolderThreadId: "global-thread", codexProjectId: "codex-project",
     codexProjectKind: "local", codexHostId: "local",
-    workspacePath: "/tmp/domain-transition-global",
+    workspacePath: globalWorkspacePath,
   };
   const created = await request(baseUrl, requestPath, {
     method: "POST",
@@ -3573,7 +3574,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   assert.equal(pending.response.status, 202, JSON.stringify(pending.body));
   assert.deepEqual(pending.body.handshake.expectedHostBinding, {
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/domain-transition-global",
+    codexHostId: "local", workspacePath: globalWorkspacePath,
   });
   const confirmPath = `/api/local/coordination-identity-handshakes/${pending.body.handshake.id}/confirm`;
   const confirmBody = {
@@ -3581,7 +3582,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
     threadBinding: {
       threadId: attachBody.threadId, codexProjectId: "codex-project",
       codexProjectKind: "local", codexHostId: "local",
-      workspacePath: "/tmp/domain-transition-global",
+      workspacePath: globalWorkspacePath,
     },
   };
   const confirmed = await request(baseUrl, confirmPath, {
