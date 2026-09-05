@@ -3792,6 +3792,12 @@ async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionT
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,
     input: [{ type: "text", text: durableInstruction }],
+    approvalPolicy: "never",
+    sandboxPolicy: {
+      type: "workspaceWrite",
+      writableRoots: [...new Set([rootWorkspacePath, targetRoot])],
+      networkAccess: true,
+    },
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid Root turn receipt");
