@@ -34,6 +34,7 @@ import {
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
   deliverTaskboardAdmissionRecovery,
+  deliverTaskboardCapacityObservation,
   deliverTaskboardCoordination,
   deliverTaskboardCrossDomainHandoff,
   deliverTaskboardOwnerDecision,
@@ -2977,6 +2978,17 @@ function runBackgroundContinuationDispatch(cdp, projectId) {
     reconcileAdmission: (request) => mutateBackgroundAdmission(request, "reconcile"),
     claimReplacementAdmissionProbe: (request) => mutateBackgroundAdmission(request, "replacement-probe"),
     reconcileReplacementAdmission: (request) => mutateBackgroundAdmission(request, "replacement-reconcile"),
+    requestCapacityObservation: (request) => deliverTaskboardCapacityObservation(
+      request,
+      (method, params) => requestCodexAppServerViaCdp(
+        cdp,
+        undefined,
+        request.codexHostId,
+        method,
+        params,
+        10_000,
+      ),
+    ),
     deliverAdmissionRecovery: (request) => deliverTaskboardAdmissionRecovery(
       request,
       (method, params) => requestCodexAppServerViaCdp(

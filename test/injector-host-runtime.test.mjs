@@ -19,6 +19,7 @@ import {
   createDisposableMonitorTimer,
   createOpenGenerationRouteResolver,
   createSerializedMonitorTick,
+  deliverTaskboardCapacityObservation,
   deliverTaskboardCoordination,
   deliverTaskboardCrossDomainHandoff,
   deliverTaskboardOwnerDecision,
@@ -3534,6 +3535,7 @@ test("background continuation waits for observed Root capacity and backfills aft
         },
       }],
     }),
+    requestCapacityObservation: async () => assert.fail("fresh full capacity must not request another observation"),
     claimReceipt: async () => {
       calls.claim += 1;
       return {
@@ -3615,6 +3617,291 @@ test("background continuation fails closed when target Root capacity is not fres
       observedAt: "2026-08-31T02:00:00.000Z",
     },
   }]), { delivered: false, reason: "capacity-observation-stale" });
+});
+
+test("background continuation bootstraps an idle Root capacity observation before first delivery", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const calls = [];
+  const result = await runTaskboardContinuationMonitorOnce({
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 4,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => Date.parse("2026-08-31T02:02:00.000Z"),
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "CAP-45",
+        taskId: "41795217-b5ff-4628-927b-864441aa2b09",
+        run: null,
+        dispatchTarget: {
+          rootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard/project",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        readyWork: {
+          eligible: true,
+          safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+          deferredActions: [],
+          resumeToken: "b".repeat(64),
+        },
+      }],
+      windowSubagentTrees: [],
+    }),
+    requestCapacityObservation: async (request) => {
+      calls.push(request);
+      return { delivery: "started", turnId: "turn-capacity-probe" };
+    },
+    claimReceipt: async () => assert.fail("capacity observation must precede bootstrap claim"),
+    confirmDelivery: async () => assert.fail("capacity observation must precede confirmation"),
+    deliver: async () => assert.fail("capacity observation must precede delivery"),
+    completeDelivery: async () => assert.fail("capacity observation must precede completion"),
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].projectId, "taskboard-core");
+  assert.equal(calls[0].todoId, "CAP-45");
+  assert.equal(calls[0].rootThreadId, rootThreadId);
+  assert.equal(calls[0].reason, "capacity-unobserved");
+  assert.deepEqual(result, {
+    delivered: false,
+    todoId: "CAP-45",
+    reason: "capacity-observation-instructed",
+  });
+});
+
+test("stale capacity probes are idempotent within one retry epoch and rotate afterward", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let observedNow = Date.parse("2026-08-31T02:02:00.000Z");
+  const probeIds = [];
+  const options = {
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 4,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => observedNow,
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "CAP-45",
+        taskId: "41795217-b5ff-4628-927b-864441aa2b09",
+        run: null,
+        dispatchTarget: {
+          rootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard/project",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        readyWork: {
+          eligible: true,
+          safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+          deferredActions: [],
+          resumeToken: "b".repeat(64),
+        },
+      }],
+      windowSubagentTrees: [{
+        rootThreadId,
+        observed: true,
+        summary: { active: 0 },
+        capacityObservation: {
+          source: "list_agents",
+          observedAt: "2026-08-31T02:00:00.000Z",
+        },
+      }],
+    }),
+    requestCapacityObservation: async (request) => {
+      probeIds.push(request.probeId);
+      assert.equal(request.reason, "capacity-observation-stale");
+      return { delivery: "observed", turnId: "turn-capacity-probe" };
+    },
+    claimReceipt: async () => assert.fail("stale capacity must not claim"),
+    confirmDelivery: async () => assert.fail("stale capacity must not confirm"),
+    deliver: async () => assert.fail("stale capacity must not deliver"),
+    completeDelivery: async () => assert.fail("stale capacity must not complete"),
+  };
+
+  await runTaskboardContinuationMonitorOnce(options);
+  await runTaskboardContinuationMonitorOnce(options);
+  assert.equal(probeIds[0], probeIds[1]);
+  observedNow += 60_000;
+  await runTaskboardContinuationMonitorOnce(options);
+  assert.notEqual(probeIds[1], probeIds[2]);
+});
+
+test("capacity observation delivery starts one idle Root turn and replays its durable marker", async () => {
+  const request = {
+    projectId: "taskboard-core",
+    todoId: "CAP-45",
+    taskId: "41795217-b5ff-4628-927b-864441aa2b09",
+    rootThreadId: coordinatorThreadId,
+    codexHostId: "local",
+    rootWorkspacePath: "/tmp/taskboard/project",
+    reason: "capacity-unobserved",
+    observationId: "unobserved",
+    probeId: "c".repeat(64),
+  };
+  const calls = [];
+  let turns = [];
+  let instruction = null;
+  const rpc = async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") return {
+      thread: {
+        id: request.rootThreadId,
+        cwd: request.rootWorkspacePath,
+        turns,
+      },
+    };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") {
+      instruction = params.input[0].text;
+      return { turn: { id: "turn-capacity-observation" } };
+    }
+    return assert.fail(`unexpected RPC ${method}`);
+  };
+
+  assert.deepEqual(await deliverTaskboardCapacityObservation(request, rpc), {
+    delivery: "started",
+    turnId: "turn-capacity-observation",
+  });
+  assert.match(instruction, new RegExp(request.probeId));
+  assert.match(instruction, /collaboration\.list_agents exactly once/);
+  assert.match(instruction, /Do not spawn, claim, defer, edit, test, or mutate Taskboard/);
+  assert.doesNotMatch(instruction, /spawn_agent|issue claim|admission-defer/);
+  turns = [{
+    id: "turn-capacity-observation",
+    status: "completed",
+    items: [{ text: instruction }],
+  }];
+  const callCountAfterStart = calls.length;
+  assert.deepEqual(await deliverTaskboardCapacityObservation(request, rpc), {
+    delivery: "observed",
+    turnId: "turn-capacity-observation",
+  });
+  assert.deepEqual(calls.slice(callCountAfterStart).map(([method]) => method), ["thread/read"]);
+  assert.deepEqual(calls.slice(0, callCountAfterStart).map(([method]) => method), [
+    "thread/read",
+    "thread/resume",
+    "turn/start",
+  ]);
+});
+
+test("capacity observation delivery never steers a busy Root and rejects workspace drift", async () => {
+  const request = {
+    projectId: "taskboard-core",
+    todoId: "CAP-45",
+    taskId: "41795217-b5ff-4628-927b-864441aa2b09",
+    rootThreadId: coordinatorThreadId,
+    codexHostId: "local",
+    rootWorkspacePath: "/tmp/taskboard/project",
+    reason: "capacity-observation-stale",
+    observationId: "2026-08-31T02:00:00.000Z",
+    probeId: "d".repeat(64),
+  };
+  const methods = [];
+  const busy = await deliverTaskboardCapacityObservation(request, async (method) => {
+    methods.push(method);
+    if (method === "thread/read") return {
+      thread: {
+        id: request.rootThreadId,
+        cwd: request.rootWorkspacePath,
+        turns: [{ id: "turn-busy", status: "inProgress" }],
+      },
+    };
+    return assert.fail(`busy Root must not receive ${method}`);
+  });
+  assert.deepEqual(busy, { delivery: "busy", turnId: "turn-busy" });
+  assert.deepEqual(methods, ["thread/read"]);
+
+  await assert.rejects(
+    deliverTaskboardCapacityObservation(request, async () => ({
+      thread: { id: request.rootThreadId, cwd: "/tmp/taskboard/other", turns: [] },
+    })),
+    /cwd does not match/,
+  );
+});
+
+test("fresh capacity after the bootstrap probe delivers exactly one Todo", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const observedAt = "2026-08-31T02:02:00.000Z";
+  let observed = false;
+  const calls = { probe: 0, claim: 0, deliver: 0, complete: 0 };
+  const todo = {
+    id: "CAP-40",
+    taskId: "494c4548-4491-4775-9ee0-865ef163b4dc",
+    run: null,
+    dispatchTarget: {
+      rootThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/project",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Create proof" }],
+      deferredActions: [],
+      resumeToken: "b".repeat(64),
+    },
+  };
+  const options = {
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      maxActiveAgents: 4,
+      capacityObservationMaxAgeMs: 60_000,
+    },
+    now: () => Date.parse("2026-08-31T02:02:15.000Z"),
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [todo],
+      windowSubagentTrees: observed ? [{
+        rootThreadId,
+        observed: true,
+        summary: { active: 0 },
+        capacityObservation: { source: "list_agents", observedAt },
+      }] : [],
+    }),
+    requestCapacityObservation: async () => {
+      calls.probe += 1;
+      observed = true;
+      return { delivery: "started", turnId: "turn-capacity-probe" };
+    },
+    claimReceipt: async () => {
+      calls.claim += 1;
+      return {
+        available: true,
+        completed: false,
+        receipt: { id: "receipt", reservationLeaseId: "lease" },
+      };
+    },
+    confirmDelivery: async () => confirmedIdentity,
+    deliver: async () => {
+      calls.deliver += 1;
+      return { delivery: "started", turnId: "turn-background" };
+    },
+    completeDelivery: async () => {
+      calls.complete += 1;
+      return { completed: true };
+    },
+  };
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    todoId: "CAP-40",
+    reason: "capacity-observation-instructed",
+  });
+  assert.deepEqual(calls, { probe: 1, claim: 0, deliver: 0, complete: 0 });
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true,
+    todoId: "CAP-40",
+    actionId: "safe-first",
+  });
+  assert.deepEqual(calls, { probe: 1, claim: 1, deliver: 1, complete: 1 });
 });
 
 test("one project Owner decision is delivered only to its exact confirmed Root window", async () => {
@@ -5243,6 +5530,8 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /api\/tasks\/\$\{encodeURIComponent\(claim\.todoId\)\}\/bootstrap-delivery/);
   assert.match(source, /validateGitExecutionTarget/);
   assert.match(source, /runTaskboardContinuationMonitorOnce/);
+  assert.match(source, /requestCapacityObservation/);
+  assert.match(source, /deliverTaskboardCapacityObservation/);
   assert.match(source, /deliverTaskboardCoordination/);
   assert.match(source, /runCoordinatorProvisioningMonitorOnce/);
   assert.match(source, /coordinator-provisioning-attempts/);
