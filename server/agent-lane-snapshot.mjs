@@ -1247,6 +1247,32 @@ export function createAgentLaneSnapshotProvider({
     sessionFilePromises.delete(threadId);
   };
   const provider = {
+    async getWindowSubagentTree(rootThreadId) {
+      const sessionFile = await resolveSessionFile(rootThreadId);
+      if (!sessionFile) return null;
+      try {
+        const state = await scanSubagents(
+          sessionFile,
+          subagentStates.get(sessionFile),
+          statSessionFile,
+          readSessionByteRange,
+        );
+        subagentStates.set(sessionFile, state);
+        return {
+          rootThreadId,
+          registryObservation: state.registrySnapshotObservedAt && Array.isArray(state.registryAgents) ? {
+            source: "list_agents",
+            observedAt: state.registrySnapshotObservedAt,
+            complete: true,
+            agents: state.registryAgents.map((agent) => ({ ...agent })),
+          } : null,
+        };
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        forgetSessionFile(rootThreadId);
+        return null;
+      }
+    },
     async getProjectSnapshot(projectId) {
       const configured = await readConfig(configPath, projectId, getLaneConfig);
       const currentHostMatches = (holderTaskId) => {

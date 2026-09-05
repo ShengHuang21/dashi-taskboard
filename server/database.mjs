@@ -1978,6 +1978,8 @@ export class TaskboardDatabase {
         admission_recovered_agent_thread_id TEXT,
         admission_probe_id TEXT,
         admission_probe_requested_at TEXT,
+        admission_probe_coordinator_lease_id TEXT,
+        admission_probe_coordinator_thread_id TEXT,
         admission_deferred_reason TEXT,
         admission_retry_count INTEGER NOT NULL DEFAULT 0,
         admission_retry_after TEXT,
@@ -2252,6 +2254,8 @@ export class TaskboardDatabase {
       ["admission_recovered_agent_thread_id", "TEXT"],
       ["admission_probe_id", "TEXT"],
       ["admission_probe_requested_at", "TEXT"],
+      ["admission_probe_coordinator_lease_id", "TEXT"],
+      ["admission_probe_coordinator_thread_id", "TEXT"],
       ["admission_deferred_reason", "TEXT"],
       ["admission_retry_count", "INTEGER NOT NULL DEFAULT 0"],
       ["admission_retry_after", "TEXT"],
@@ -8582,6 +8586,8 @@ export class TaskboardDatabase {
             admission_deadline_at = NULL, admission_uncertain_at = NULL,
             admission_registry_observed_at = NULL, admission_recovered_agent_thread_id = NULL,
             admission_probe_id = NULL, admission_probe_requested_at = NULL,
+            admission_probe_coordinator_lease_id = NULL,
+            admission_probe_coordinator_thread_id = NULL,
             global_coordinator_lease_id = ?, global_coordinator_task_id = ?,
             global_coordinator_thread_id = ?, coordination_domain_id = ?,
             domain_coordinator_lease_id = ?, domain_coordinator_task_id = ?,
@@ -9041,7 +9047,9 @@ export class TaskboardDatabase {
       if (row.status !== "delivering" || !["admission_uncertain", "recovery_confirmed"].includes(row.admission_state)) {
         throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current uncertain admission can claim a recovery probe");
       }
-      if (row.admission_probe_id) {
+      if (row.admission_probe_id
+        && row.admission_probe_coordinator_lease_id === null
+        && row.admission_probe_coordinator_thread_id === null) {
         this.database.exec("COMMIT");
         return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
       }
@@ -9049,16 +9057,194 @@ export class TaskboardDatabase {
       const requestedAt = now();
       const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
-        SET admission_probe_id = ?, admission_probe_requested_at = ?
+        SET admission_probe_id = ?, admission_probe_requested_at = ?,
+          admission_probe_coordinator_lease_id = NULL,
+          admission_probe_coordinator_thread_id = NULL
         WHERE id = ? AND status = 'delivering' AND admission_state = 'admission_uncertain'
-          AND admission_attempt_id = ? AND admission_probe_id IS NULL
-      `).run(probeId, requestedAt, row.id, admissionAttemptId);
+          AND admission_attempt_id = ? AND admission_probe_id IS ?
+      `).run(probeId, requestedAt, row.id, admissionAttemptId, row.admission_probe_id);
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_PROBE_CONFLICT", "Admission probe changed before it was persisted");
       }
       const probed = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
       return { applied: true, receipt: this.#taskSafeActionReceipt(probed) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  claimTaskSafeActionReplacementAdmissionProbe(id, {
+    rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+  }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      const row = this.#prepare(`
+        SELECT * FROM task_safe_action_receipts
+        WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
+      `).get(admissionReceiptId, task.id, expectedResumeToken, safeActionId);
+      if (!row || row.admission_attempt_id !== admissionAttemptId) {
+        throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Replacement admission probe does not match the current attempt");
+      }
+      this.#taskSafeActionReplacementRetirementEligible(row, rootRun);
+      if (row.status !== "delivering" || row.admission_state !== "admission_uncertain") {
+        throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current uncertain admission can claim a replacement probe");
+      }
+      if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
+        throw new ApiError(409, "ADMISSION_ALREADY_CLAIMED", "An admitted or open Agent run cannot claim a replacement probe");
+      }
+      if (row.admission_probe_id
+        && row.admission_probe_requested_at
+        && row.admission_probe_coordinator_lease_id === rootRun.domainCoordinatorLeaseId
+        && row.admission_probe_coordinator_thread_id === rootRun.rootThreadId) {
+        this.database.exec("COMMIT");
+        return {
+          applied: false,
+          receipt: this.#taskSafeActionReceipt(row),
+          observationTarget: {
+            rootThreadId: row.root_thread_id,
+            codexHostId: row.root_host_id,
+            rootWorkspacePath: row.root_workspace_path,
+          },
+        };
+      }
+      const probeId = randomUUID();
+      const requestedAt = now();
+      const updated = this.#prepare(`
+        UPDATE task_safe_action_receipts
+        SET admission_probe_id = ?, admission_probe_requested_at = ?,
+          admission_probe_coordinator_lease_id = ?,
+          admission_probe_coordinator_thread_id = ?
+        WHERE id = ? AND status = 'delivering' AND admission_state = 'admission_uncertain'
+          AND admission_attempt_id = ?
+      `).run(
+        probeId,
+        requestedAt,
+        rootRun.domainCoordinatorLeaseId,
+        rootRun.rootThreadId,
+        row.id,
+        admissionAttemptId,
+      );
+      if (updated.changes !== 1) {
+        throw new ApiError(409, "ADMISSION_PROBE_CONFLICT", "Replacement admission probe changed before it was persisted");
+      }
+      const probed = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      this.database.exec("COMMIT");
+      return {
+        applied: true,
+        receipt: this.#taskSafeActionReceipt(probed),
+        observationTarget: {
+          rootThreadId: probed.root_thread_id,
+          codexHostId: probed.root_host_id,
+          rootWorkspacePath: probed.root_workspace_path,
+        },
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskSafeActionReplacementAdmissionObservationTarget(id, {
+    rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    admissionProbeId,
+  }) {
+    const task = this.#requireTask(id);
+    const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+    const row = this.#prepare(`
+      SELECT * FROM task_safe_action_receipts
+      WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
+    `).get(admissionReceiptId, task.id, expectedResumeToken, safeActionId);
+    if (!row || row.admission_attempt_id !== admissionAttemptId) {
+      throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Replacement admission reconciliation does not match the current attempt");
+    }
+    this.#taskSafeActionReplacementRetirementEligible(row, rootRun);
+    if (!row.admission_probe_id || row.admission_probe_id !== admissionProbeId || !row.admission_probe_requested_at) {
+      throw new ApiError(409, "ADMISSION_PROBE_MISMATCH", "Replacement admission reconciliation requires the current durable probe");
+    }
+    if (row.admission_probe_coordinator_lease_id !== rootRun.domainCoordinatorLeaseId
+      || row.admission_probe_coordinator_thread_id !== rootRun.rootThreadId) {
+      throw new ApiError(409, "ADMISSION_PROBE_EPOCH_MISMATCH", "Replacement admission probe belongs to another coordinator epoch");
+    }
+    if (!((row.status === "delivering" && row.admission_state === "admission_uncertain")
+      || (row.status === "reserved" && row.admission_state === "deferred"
+        && row.admission_deferred_reason === "coordinator_replaced_child_absent"))) {
+      throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current replacement admission can be reconciled");
+    }
+    return {
+      rootThreadId: row.root_thread_id,
+      codexHostId: row.root_host_id,
+      rootWorkspacePath: row.root_workspace_path,
+    };
+  }
+
+  reconcileTaskSafeActionReplacementAdmission(id, {
+    rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    admissionProbeId, observationRootThreadId, registryObservation,
+  }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      const row = this.#prepare(`
+        SELECT * FROM task_safe_action_receipts
+        WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
+      `).get(admissionReceiptId, task.id, expectedResumeToken, safeActionId);
+      if (!row || row.admission_attempt_id !== admissionAttemptId) {
+        throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Replacement admission reconciliation does not match the current attempt");
+      }
+      this.#taskSafeActionReplacementRetirementEligible(row, rootRun);
+      if (!row.admission_probe_id || row.admission_probe_id !== admissionProbeId || !row.admission_probe_requested_at) {
+        throw new ApiError(409, "ADMISSION_PROBE_MISMATCH", "Replacement admission reconciliation requires the current durable probe");
+      }
+      if (row.admission_probe_coordinator_lease_id !== rootRun.domainCoordinatorLeaseId
+        || row.admission_probe_coordinator_thread_id !== rootRun.rootThreadId) {
+        throw new ApiError(409, "ADMISSION_PROBE_EPOCH_MISMATCH", "Replacement admission probe belongs to another coordinator epoch");
+      }
+      if (row.status === "reserved" && row.admission_state === "deferred"
+        && row.admission_deferred_reason === "coordinator_replaced_child_absent") {
+        this.database.exec("COMMIT");
+        return { applied: false, outcome: "absent", receipt: this.#taskSafeActionReceipt(row) };
+      }
+      if (row.status !== "delivering" || row.admission_state !== "admission_uncertain") {
+        throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current uncertain admission can be reconciled across replacement Roots");
+      }
+      const observedAt = Date.parse(registryObservation?.observedAt ?? "");
+      if (observationRootThreadId !== row.root_thread_id
+        || registryObservation?.source !== "list_agents"
+        || registryObservation?.complete !== true
+        || !Array.isArray(registryObservation?.agents)
+        || !Number.isFinite(observedAt)
+        || observedAt < Date.parse(row.admission_probe_requested_at)) {
+        this.database.exec("COMMIT");
+        return { applied: false, outcome: "unresolved", receipt: this.#taskSafeActionReceipt(row) };
+      }
+      const matches = registryObservation.agents.filter((agent) => agent?.agentPath === row.admission_agent_path);
+      if (matches.length !== 0) {
+        this.database.exec("COMMIT");
+        return { applied: false, outcome: "unresolved", receipt: this.#taskSafeActionReceipt(row) };
+      }
+      if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
+        throw new ApiError(409, "ADMISSION_ALREADY_CLAIMED", "An admitted or open Agent run cannot be retired as absent");
+      }
+      const updated = this.#prepare(`
+        UPDATE task_safe_action_receipts
+        SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
+          lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
+          admission_deferred_reason = 'coordinator_replaced_child_absent', admission_retry_after = NULL,
+          admission_registry_observed_at = ?
+        WHERE id = ? AND status = 'delivering' AND admission_state = 'admission_uncertain'
+          AND admission_attempt_id = ? AND admission_probe_id = ?
+      `).run(registryObservation.observedAt, row.id, admissionAttemptId, admissionProbeId);
+      if (updated.changes !== 1) {
+        throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Replacement admission changed during absence reconciliation");
+      }
+      const deferred = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
+      this.database.exec("COMMIT");
+      return { applied: true, outcome: "absent", receipt: this.#taskSafeActionReceipt(deferred) };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -9254,6 +9440,8 @@ export class TaskboardDatabase {
       admissionRecoveredAgentThreadId: row.admission_recovered_agent_thread_id,
       admissionProbeId: row.admission_probe_id,
       admissionProbeRequestedAt: row.admission_probe_requested_at,
+      admissionProbeCoordinatorLeaseId: row.admission_probe_coordinator_lease_id,
+      admissionProbeCoordinatorThreadId: row.admission_probe_coordinator_thread_id,
       admissionDeferredReason: row.admission_deferred_reason,
       admissionRetryCount: Number(row.admission_retry_count) || 0,
       admissionRetryAfter: row.admission_retry_after,
@@ -9311,6 +9499,33 @@ export class TaskboardDatabase {
       && row.coordination_domain_id === rootRun.domainId
       && row.domain_coordinator_task_id === rootRun.domainCoordinatorTaskId
       && row.domain_coordinator_thread_id === rootRun.rootThreadId;
+  }
+
+  #taskSafeActionReplacementRetirementEligible(row, rootRun) {
+    const exactIdentity = row.project_id === rootRun.projectId
+      && row.root_thread_id !== rootRun.rootThreadId
+      && row.root_host_id === rootRun.rootHostId
+      && typeof row.root_workspace_path === "string"
+      && path.isAbsolute(row.root_workspace_path)
+      && path.resolve(row.root_workspace_path) === path.resolve(rootRun.rootWorkspacePath)
+      && typeof row.worktree_path === "string"
+      && path.isAbsolute(row.worktree_path)
+      && path.resolve(row.worktree_path) === path.resolve(rootRun.worktreePath)
+      && row.worktree_branch === rootRun.worktreeBranch;
+    const exactDomainReplacement = row.global_coordinator_lease_id === null
+      && row.global_coordinator_task_id === null
+      && row.global_coordinator_thread_id === null
+      && typeof row.domain_coordinator_lease_id === "string"
+      && row.domain_coordinator_lease_id
+      && typeof rootRun.domainCoordinatorLeaseId === "string"
+      && rootRun.domainCoordinatorLeaseId
+      && row.domain_coordinator_lease_id !== rootRun.domainCoordinatorLeaseId
+      && row.coordination_domain_id === rootRun.domainId
+      && row.domain_coordinator_task_id === rootRun.domainCoordinatorTaskId
+      && row.domain_coordinator_thread_id === row.root_thread_id;
+    if (!exactIdentity || !exactDomainReplacement) {
+      throw new ApiError(409, "DOMAIN_COORDINATOR_REPLACEMENT_MISMATCH", "Admission attempt does not belong to the exact replaced Domain Coordinator route");
+    }
   }
 
   #rebindTaskSafeActionDomainCoordinatorEpoch(row, rootRun) {

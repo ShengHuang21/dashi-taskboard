@@ -5819,6 +5819,32 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, database.claimTaskSafeActionAdmissionProbe(id, binding));
       }
 
+      const safeActionReplacementAdmissionProbeRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-replacement-probe$/);
+      if (safeActionReplacementAdmissionProbeRoute) {
+        const id = decodeRouteSegment(safeActionReplacementAdmissionProbeRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-replacement-probe");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const binding = parseSafeActionAdmissionDeferral(await readJson(request));
+        return sendJson(response, 200, database.claimTaskSafeActionReplacementAdmissionProbe(id, binding));
+      }
+
+      const safeActionReplacementAdmissionReconcileRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-replacement-reconcile$/);
+      if (safeActionReplacementAdmissionReconcileRoute) {
+        const id = decodeRouteSegment(safeActionReplacementAdmissionReconcileRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-replacement-reconcile");
+        assertInjectorProof(request, resolved.instanceSecret);
+        const binding = parseSafeActionAdmissionReconciliation(await readJson(request));
+        const observationTarget = database.getTaskSafeActionReplacementAdmissionObservationTarget(id, binding);
+        const tree = await agentLanes.getWindowSubagentTree(observationTarget.rootThreadId);
+        return sendJson(response, 200, database.reconcileTaskSafeActionReplacementAdmission(id, {
+          ...binding,
+          observationRootThreadId: observationTarget.rootThreadId,
+          registryObservation: tree?.registryObservation ?? null,
+        }));
+      }
+
       const ownerDecisionRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/owner-decisions$/);
       if (ownerDecisionRoute) {
         const id = decodeRouteSegment(ownerDecisionRoute[1], "Task id");

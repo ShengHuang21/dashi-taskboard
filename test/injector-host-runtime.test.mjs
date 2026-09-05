@@ -3383,6 +3383,107 @@ test("background continuation recovers an uncertain deterministic child without 
   });
 });
 
+test("background continuation retires an absent child only through the original coordinator Root", async () => {
+  const calls = [];
+  let reconcileCount = 0;
+  const oldRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const replacementRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const admission = {
+    receiptId: "replacement-receipt",
+    attemptId: "replacement-attempt",
+    state: "admission_uncertain",
+    rootThreadId: oldRootThreadId,
+    rootHostId: "local",
+    rootWorkspacePath: "/tmp/taskboard",
+    resumeToken: "d".repeat(64),
+    safeActionId: "safe-action",
+    coordinationDomainId: "frontend",
+    domainCoordinatorLeaseId: "old-lease",
+    domainCoordinatorTaskId: "frontend-coordinator",
+    domainCoordinatorThreadId: oldRootThreadId,
+    agentPath: "/root/task_admission_1234",
+  };
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      todos: [{
+        id: "CAP-44",
+        taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+        dispatchTarget: {
+          rootThreadId: replacementRootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard",
+          worktreePath: "/tmp/taskboard/project",
+        },
+        domainAssignment: {
+          status: "active",
+          domainId: "frontend",
+          leaseId: "replacement-lease",
+          coordinatorTaskId: "frontend-coordinator",
+        },
+        admission,
+      }],
+    }),
+    claimReceipt: async () => assert.fail("replacement retirement must not reserve work in the same tick"),
+    confirmDelivery: async () => assert.fail("replacement retirement must not confirm ordinary delivery"),
+    deliver: async () => assert.fail("replacement retirement must not dispatch ordinary work"),
+    completeDelivery: async () => assert.fail("replacement retirement must not complete ordinary delivery"),
+    claimReplacementAdmissionProbe: async (request) => {
+      calls.push(["probe-claim", request.rootThreadId]);
+      return {
+        applied: calls.filter(([name]) => name === "probe-claim").length === 1,
+        receipt: {
+          admissionProbeId: "replacement-probe",
+          admissionProbeRequestedAt: "2026-08-31T00:01:00.000Z",
+        },
+        observationTarget: {
+          rootThreadId: oldRootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard",
+        },
+      };
+    },
+    deliverAdmissionRecovery: async (request) => {
+      const priorDeliveries = calls.filter(([name]) => name === "probe").length;
+      calls.push([request.mode, request.rootThreadId, priorDeliveries === 0 ? "started" : "observed"]);
+      assert.equal(request.mode, "probe");
+      assert.equal(request.rootThreadId, oldRootThreadId);
+      return {
+        delivery: priorDeliveries === 0 ? "started" : "observed",
+        turnId: "old-root-probe-turn",
+      };
+    },
+    reconcileReplacementAdmission: async (request) => {
+      calls.push(["reconcile", request.rootThreadId]);
+      reconcileCount += 1;
+      return reconcileCount === 1
+        ? { outcome: "unresolved", receipt: { admissionState: "admission_uncertain" } }
+        : { outcome: "absent", receipt: { admissionState: "deferred" } };
+    },
+  };
+  const first = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(first, {
+    delivered: false,
+    todoId: "CAP-44",
+    reason: "replacement-admission-unresolved",
+  });
+  const result = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(calls, [
+    ["probe-claim", replacementRootThreadId],
+    ["probe", oldRootThreadId, "started"],
+    ["reconcile", replacementRootThreadId],
+    ["probe-claim", replacementRootThreadId],
+    ["probe", oldRootThreadId, "observed"],
+    ["reconcile", replacementRootThreadId],
+  ]);
+  assert.deepEqual(result, {
+    delivered: false,
+    todoId: "CAP-44",
+    reason: "replacement-admission-deferred",
+  });
+});
+
 test("background continuation waits for observed Root capacity and backfills after a slot opens", async () => {
   const calls = { claim: 0, deliver: 0, complete: 0 };
   let active = 3;
