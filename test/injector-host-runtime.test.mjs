@@ -51,6 +51,7 @@ import {
   runCoordinatorShutdownMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
+  runTaskboardContinuationFastLane,
   runTaskboardContinuationMonitorOnce,
   restartResidentInjector,
   selectCoordinatorProvisioningThread,
@@ -4489,6 +4490,109 @@ test("Owner Intent adoption failure cannot starve continuation or Owner decision
     { ok: true, result: { delivered: true } },
     { ok: true, result: { delivered: true } },
   ]);
+});
+
+test("capacity-sensitive continuation runs independently of a slow project monitor sequence", async () => {
+  const calls = [];
+  const observations = [];
+  let releaseSlowMonitor;
+  let releaseSlowProject;
+  let confirmFirstFastProject;
+  let confirmSecondFastProject;
+  const slowMonitor = new Promise((resolve) => {
+    releaseSlowMonitor = resolve;
+  });
+  const slowProject = new Promise((resolve) => {
+    releaseSlowProject = resolve;
+  });
+  const firstFastProjectCompleted = new Promise((resolve) => {
+    confirmFirstFastProject = resolve;
+  });
+  const secondFastProjectCompleted = new Promise((resolve) => {
+    confirmSecondFastProject = resolve;
+  });
+  const slowSequence = runTaskboardProjectMonitorSequence([
+    async () => {
+      calls.push("slow-started");
+      await slowMonitor;
+      calls.push("slow-finished");
+      return { completed: true };
+    },
+  ]);
+  await Promise.resolve();
+
+  let fastProjectRuns = 0;
+  const projects = [
+    { projectId: "disabled-project", continuationEnabled: false },
+    { projectId: "slow-project", continuationEnabled: true },
+    { projectId: "capstone-dev", continuationEnabled: true },
+    { projectId: "failing-project", continuationEnabled: true },
+  ];
+  const runContinuation = async (projectId) => {
+    calls.push(`continuation:${projectId}`);
+    if (projectId === "slow-project") await slowProject;
+    if (projectId === "failing-project") throw new Error("snapshot unavailable");
+    if (projectId === "capstone-dev") {
+      fastProjectRuns += 1;
+    }
+    return { delivered: true };
+  };
+  const firstLane = runTaskboardContinuationFastLane({
+    projects,
+    runContinuation,
+    observeResult: (result) => {
+      observations.push(result);
+      if (result.projectId === "capstone-dev" && fastProjectRuns === 1) {
+        confirmFirstFastProject();
+      }
+    },
+  });
+
+  assert.deepEqual(firstLane, [{
+    projectId: "slow-project",
+    state: "started",
+  }, {
+    projectId: "capstone-dev",
+    state: "started",
+  }, {
+    projectId: "failing-project",
+    state: "started",
+  }]);
+  await firstFastProjectCompleted;
+  const secondLane = runTaskboardContinuationFastLane({
+    projects,
+    runContinuation,
+    observeResult: (result) => {
+      observations.push(result);
+      if (result.projectId === "capstone-dev" && fastProjectRuns === 2) {
+        confirmSecondFastProject();
+      }
+    },
+  });
+  await secondFastProjectCompleted;
+
+  assert.deepEqual(secondLane, [{
+    projectId: "slow-project",
+    state: "in_flight",
+  }, {
+    projectId: "capstone-dev",
+    state: "started",
+  }, {
+    projectId: "failing-project",
+    state: "started",
+  }]);
+  assert.equal(fastProjectRuns, 2);
+  assert.equal(calls.filter((call) => call === "continuation:slow-project").length, 1);
+
+  releaseSlowProject();
+  releaseSlowMonitor();
+  await slowSequence;
+  await Promise.resolve();
+  assert.equal(calls.at(-1), "slow-finished");
+  assert.equal(observations.filter((result) => result.projectId === "capstone-dev").length, 2);
+  assert.equal(observations.filter((result) => (
+    result.projectId === "failing-project" && result.ok === false
+  )).length, 2);
 });
 
 test("Coordinator identity handshakes run in a dedicated continuation fast lane", async () => {
