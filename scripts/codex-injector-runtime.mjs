@@ -1553,7 +1553,18 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       attemptId: attempt.id,
     };
   }
-  let thread = await options.findThread(attempt);
+  let deliveryThread = null;
+  let thread = null;
+  if (attempt.status === "expired"
+    && THREAD_ID_PATTERN.test(attempt.threadId ?? "")
+    && typeof options.readThread === "function") {
+    deliveryThread = await options.readThread({
+      attempt, threadId: attempt.threadId,
+    });
+    thread = deliveryThread;
+  } else {
+    thread = await options.findThread(attempt);
+  }
   if (!thread && ["starting", "started", "expired"].includes(attempt.status)) {
     return {
       provisioned: false, reason: "thread-start-uncertain",
@@ -1597,8 +1608,9 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       domainId: domain.domainId, attemptId: attempt.id,
     };
   }
-  let deliveryThread = thread;
-  if (attempt.status === "expired" && typeof options.readThread === "function") {
+  if (attempt.status === "expired"
+    && !deliveryThread
+    && typeof options.readThread === "function") {
     deliveryThread = await options.readThread({ attempt, threadId: thread.id });
     if (deliveryThread?.id !== thread.id
       || deliveryThread.threadSource !== attempt.threadSource
@@ -1609,6 +1621,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       };
     }
   }
+  deliveryThread ??= thread;
   const exactDeliveryMarker = `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const recoverableExpiredDelivery = attempt.status === "expired"
     && Array.isArray(deliveryThread.turns)

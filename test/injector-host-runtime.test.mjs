@@ -1668,6 +1668,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
   let attaches = 0;
   let deliveries = 0;
   let expiredResumes = 0;
+  let attachedThreadVisible = true;
   const options = {
     policy: {
       enabled: true, projectId: "capstone-dev",
@@ -1697,7 +1698,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
       };
       return { attempt: { ...attempt } };
     },
-    findThread: async () => attempt?.threadId ? {
+    findThread: async () => attachedThreadVisible && attempt?.threadId ? {
       id: attempt.threadId,
       cwd: attempt.workspacePath,
       threadSource: attempt.threadSource,
@@ -1776,6 +1777,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
   assert.equal(deliveries, 1);
   assert.equal(attempt.threadId, domainThreadId);
   attempt = { ...attempt, status: "expired" };
+  attachedThreadVisible = false;
   assert.deepEqual(await runDomainCoordinatorProvisioningMonitorOnce(options), {
     provisioned: true,
     reason: "domain-thread-observed",
