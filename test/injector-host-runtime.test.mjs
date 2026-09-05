@@ -1795,6 +1795,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
 test("domain provisioning rebinds the same attached attempt after Global Coordinator revision drift", async () => {
   const currentRevision = "e".repeat(64);
   const previousRevision = "d".repeat(64);
+  const currentGlobalLeaseId = "global-lease-next-epoch";
   const domainThreadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
   const globalThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
   const workspacePath = "/tmp/taskboard";
@@ -1816,7 +1817,7 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
       projectId: "capstone-dev",
       coordination: {
         coordinatorTaskId: "global",
-        lease: { id: "global-lease", status: "active", bindingValid: true },
+        lease: { id: currentGlobalLeaseId, status: "active", bindingValid: true },
         domainCoordinators: [{
           domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
           eligibleTaskIds: ["frontend"],
@@ -1839,11 +1840,12 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
       idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
     ),
     requestAttempt: async () => assert.fail("revision drift must reuse the durable attempt"),
-    rebindAttempt: async ({ attemptId, expectedRevision }) => {
+    rebindAttempt: async ({ attemptId, expectedRevision, expectedGlobalLeaseId }) => {
       assert.equal(attemptId, attempt.id);
       assert.equal(expectedRevision, currentRevision);
+      assert.equal(expectedGlobalLeaseId, currentGlobalLeaseId);
       rebinds += 1;
-      attempt = { ...attempt, expectedRevision };
+      attempt = { ...attempt, expectedRevision, expectedGlobalLeaseId };
       return { attempt: { ...attempt } };
     },
     findThread: async () => ({
@@ -1869,6 +1871,7 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
   assert.equal(rebinds, 1, JSON.stringify(result));
   assert.equal(attaches, 1);
   assert.equal(attempt.expectedRevision, currentRevision);
+  assert.equal(attempt.expectedGlobalLeaseId, currentGlobalLeaseId);
   assert.deepEqual(result, {
     provisioned: true, reason: "domain-thread-observed", domainId: "frontend",
     attemptId: attempt.id, threadId: domainThreadId,
