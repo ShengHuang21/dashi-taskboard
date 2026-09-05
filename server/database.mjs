@@ -3984,15 +3984,21 @@ export class TaskboardDatabase {
       const recoverableExpiredResume = row.status === "expired"
         && Boolean(row.thread_id)
         && action === "resume-expired";
+      const recoverableExpiredRebind = row.status === "expired"
+        && Boolean(row.thread_id)
+        && action === "rebind";
       if (["completed", "canceled", "expired"].includes(row.status)
-        && !recoverableExpiredResume) {
+        && !recoverableExpiredResume
+        && !recoverableExpiredRebind) {
         throw new ApiError(
           409,
           "DOMAIN_COORDINATOR_PROVISIONING_TERMINAL",
           "The domain Coordinator provisioning attempt is terminal",
         );
       }
-      if (!recoverableExpiredResume && Date.parse(row.expires_at) <= Date.now()) {
+      if (!recoverableExpiredResume
+        && !recoverableExpiredRebind
+        && Date.parse(row.expires_at) <= Date.now()) {
         this.#prepare(`
           UPDATE agent_domain_coordinator_provisioning_attempts
           SET status = 'expired', updated_at = ? WHERE id = ?
@@ -4054,8 +4060,7 @@ export class TaskboardDatabase {
         && globalHolder.codexProjectKind === row.codex_project_kind
         && globalHolder.codexHostId === row.codex_host_id
         && path.resolve(globalHolder.workspacePath ?? "") === path.resolve(row.workspace_path);
-      const stableIdentityBinding = project
-        && stableRevision
+      const stableIdentityBindingWithoutRevision = project
         && domain
         && domain.eligibleTaskIds.includes(row.task_id)
         && JSON.stringify(domain.writeScope) === row.write_scope_json
@@ -4065,6 +4070,27 @@ export class TaskboardDatabase {
         && globalHolder?.id === row.global_holder_task_id
         && globalHolder?.threadId === row.global_holder_thread_id
         && !activeDomainLease;
+      if (action === "rebind") {
+        if (currentRevision !== input.expectedRevision
+          || !stableIdentityBindingWithoutRevision
+          || !durableWork) {
+          throw new ApiError(
+            409,
+            "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
+            "Domain provisioning rebind requires the exact active domain, Global Coordinator, and durable work",
+          );
+        }
+        const timestamp = now();
+        this.#prepare(`
+          UPDATE agent_domain_coordinator_provisioning_attempts
+          SET expected_revision = ?, updated_at = ? WHERE id = ?
+        `).run(input.expectedRevision, timestamp, attemptId);
+        this.database.exec("COMMIT");
+        return { attempt: domainCoordinatorProvisioningAttemptFromRow({
+          ...row, expected_revision: input.expectedRevision, updated_at: timestamp,
+        }) };
+      }
+      const stableIdentityBinding = stableRevision && stableIdentityBindingWithoutRevision;
       if (!stableIdentityBinding) {
         const timestamp = now();
         this.#prepare(`

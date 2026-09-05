@@ -1790,6 +1790,89 @@ test("domain provisioning retries selected-model capacity on the same durable at
   assert.equal(expiredResumes, 1);
 });
 
+test("domain provisioning rebinds the same attached attempt after Global Coordinator revision drift", async () => {
+  const currentRevision = "e".repeat(64);
+  const previousRevision = "d".repeat(64);
+  const domainThreadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
+  const globalThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const workspacePath = "/tmp/taskboard";
+  let rebinds = 0;
+  let attaches = 0;
+  let attempt = {
+    id: "domain-attempt-rebind", projectId: "capstone-dev", domainId: "frontend",
+    idempotencyKey: "previous-revision-key", taskId: "frontend",
+    label: "Frontend Coordinator", threadSource: "taskboard-domain-rebind-frontend",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: previousRevision,
+    expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: globalThreadId, codexProjectId: "local-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath,
+    status: "started", threadId: domainThreadId, retryCount: 0,
+  };
+  const result = await runDomainCoordinatorProvisioningMonitorOnce({
+    policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        coordinatorTaskId: "global",
+        lease: { id: "global-lease", status: "active", bindingValid: true },
+        domainCoordinators: [{
+          domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+          eligibleTaskIds: ["frontend"],
+        }],
+      },
+      taskLanes: [
+        {
+          id: "global", source: "codex", taskType: "root_task", threadId: globalThreadId,
+          codexProjectId: "local-project", codexProjectKind: "local",
+          codexHostId: "local", workspacePath,
+        },
+        {
+          id: "frontend", label: "Frontend Coordinator", source: "codex",
+          taskType: "peer_task", threadId: "legacy-frontend-thread",
+        },
+      ],
+    }),
+    readWindows: async () => ({ projectId: "capstone-dev", revision: currentRevision }),
+    getAttempt: async ({ idempotencyKey }) => (
+      idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
+    ),
+    requestAttempt: async () => assert.fail("revision drift must reuse the durable attempt"),
+    rebindAttempt: async ({ attemptId, expectedRevision }) => {
+      assert.equal(attemptId, attempt.id);
+      assert.equal(expectedRevision, currentRevision);
+      rebinds += 1;
+      attempt = { ...attempt, expectedRevision };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => ({
+      id: domainThreadId, cwd: workspacePath, threadSource: attempt.threadSource,
+    }),
+    markStarting: async () => assert.fail("the attached attempt must not start another thread"),
+    startThread: async () => assert.fail("the attached attempt must not start another thread"),
+    attachThread: async ({ threadId }) => {
+      assert.equal(threadId, domainThreadId);
+      attaches += 1;
+      return { attempt: { ...attempt } };
+    },
+    resetAttempt: async () => assert.fail("revision recovery must not reset the attempt"),
+    readThread: async () => ({
+      id: domainThreadId, cwd: workspacePath, threadSource: attempt.threadSource,
+      turns: [{
+        id: "domain-turn", status: "completed",
+        input: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+      }],
+    }),
+    deliverInstruction: async () => ({ delivery: "observed", turnId: "domain-turn" }),
+  });
+  assert.equal(rebinds, 1, JSON.stringify(result));
+  assert.equal(attaches, 1);
+  assert.equal(attempt.expectedRevision, currentRevision);
+  assert.deepEqual(result, {
+    provisioned: true, reason: "domain-thread-observed", domainId: "frontend",
+    attemptId: attempt.id, threadId: domainThreadId,
+  });
+});
+
 test("Coordinator provisioning rebinds the same active attempt after safe window revision drift", async () => {
   const owner = {
     taskId: "owner-root",
