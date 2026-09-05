@@ -8983,7 +8983,11 @@ export class TaskboardDatabase {
       if (!row || row.admission_attempt_id !== admissionAttemptId) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission timeout does not match the current attempt");
       }
-      this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      const exactEpoch = this.#taskSafeActionCoordinatorEpochMatches(row, rootRun);
+      const recoverableDomainEpoch = this.#taskSafeActionDomainCoordinatorEpochRecoverable(row, rootRun);
+      if (!exactEpoch && !recoverableDomainEpoch) {
+        this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      }
       if (row.status === "delivering" && ["admission_uncertain", "recovery_confirmed"].includes(row.admission_state)) {
         this.database.exec("COMMIT");
         return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
@@ -9030,7 +9034,10 @@ export class TaskboardDatabase {
       if (!row || row.admission_attempt_id !== admissionAttemptId) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission probe does not match the current attempt");
       }
-      this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      if (!this.#taskSafeActionCoordinatorEpochMatches(row, rootRun)
+        && !this.#taskSafeActionDomainCoordinatorEpochRecoverable(row, rootRun)) {
+        this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      }
       if (row.status !== "delivering" || !["admission_uncertain", "recovery_confirmed"].includes(row.admission_state)) {
         throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current uncertain admission can claim a recovery probe");
       }
@@ -9074,14 +9081,21 @@ export class TaskboardDatabase {
       if (!row || row.admission_attempt_id !== admissionAttemptId) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission reconciliation does not match the current attempt");
       }
-      this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      const exactEpoch = this.#taskSafeActionCoordinatorEpochMatches(row, rootRun);
+      const recoverableDomainEpoch = this.#taskSafeActionDomainCoordinatorEpochRecoverable(row, rootRun);
+      if (!exactEpoch && !recoverableDomainEpoch) {
+        this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      }
       if (row.status === "reserved" && row.admission_state === "deferred") {
         this.database.exec("COMMIT");
         return { applied: false, outcome: "absent", receipt: this.#taskSafeActionReceipt(row) };
       }
       if (row.status === "delivering" && row.admission_state === "recovery_confirmed") {
+        const currentRow = recoverableDomainEpoch
+          ? this.#rebindTaskSafeActionDomainCoordinatorEpoch(row, rootRun)
+          : row;
         this.database.exec("COMMIT");
-        return { applied: false, outcome: "present", receipt: this.#taskSafeActionReceipt(row) };
+        return { applied: false, outcome: "present", receipt: this.#taskSafeActionReceipt(currentRow) };
       }
       if (row.status !== "delivering" || row.admission_state !== "admission_uncertain") {
         throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current uncertain admission can be reconciled");
@@ -9126,13 +9140,24 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return { applied: false, outcome: "unresolved", receipt: this.#taskSafeActionReceipt(row) };
       }
+      const currentResumeToken = recoverableDomainEpoch
+        ? this.getTaskCapsule(task.id).resumeToken
+        : row.resume_token;
       const updated = this.#prepare(`
         UPDATE task_safe_action_receipts
         SET admission_state = 'recovery_confirmed', admission_registry_observed_at = ?,
-          admission_recovered_agent_thread_id = ?
+          admission_recovered_agent_thread_id = ?, domain_coordinator_lease_id = ?, resume_token = ?
         WHERE id = ? AND status = 'delivering' AND admission_state = 'admission_uncertain'
-          AND admission_attempt_id = ?
-      `).run(registryObservation.observedAt, observed.agentThreadId, row.id, admissionAttemptId);
+          AND admission_attempt_id = ? AND domain_coordinator_lease_id = ?
+      `).run(
+        registryObservation.observedAt,
+        observed.agentThreadId,
+        recoverableDomainEpoch ? rootRun.domainCoordinatorLeaseId : row.domain_coordinator_lease_id,
+        currentResumeToken,
+        row.id,
+        admissionAttemptId,
+        row.domain_coordinator_lease_id,
+      );
       if (updated.changes !== 1) throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission changed during child reconciliation");
       const confirmed = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
@@ -9262,6 +9287,48 @@ export class TaskboardDatabase {
       && row.global_coordinator_task_id === rootRun.globalCoordinatorTaskId
       && row.global_coordinator_thread_id === rootRun.rootThreadId
     );
+  }
+
+  #taskSafeActionDomainCoordinatorEpochRecoverable(row, rootRun) {
+    const exactRootBinding = row.root_thread_id === rootRun.rootThreadId
+      && row.root_host_id === rootRun.rootHostId
+      && typeof row.root_workspace_path === "string"
+      && path.isAbsolute(row.root_workspace_path)
+      && path.resolve(row.root_workspace_path) === path.resolve(rootRun.rootWorkspacePath)
+      && typeof row.worktree_path === "string"
+      && path.isAbsolute(row.worktree_path)
+      && path.resolve(row.worktree_path) === path.resolve(rootRun.worktreePath)
+      && row.worktree_branch === rootRun.worktreeBranch;
+    return exactRootBinding
+      && row.global_coordinator_lease_id === null
+      && row.global_coordinator_task_id === null
+      && row.global_coordinator_thread_id === null
+      && typeof row.domain_coordinator_lease_id === "string"
+      && row.domain_coordinator_lease_id
+      && typeof rootRun.domainCoordinatorLeaseId === "string"
+      && rootRun.domainCoordinatorLeaseId
+      && row.domain_coordinator_lease_id !== rootRun.domainCoordinatorLeaseId
+      && row.coordination_domain_id === rootRun.domainId
+      && row.domain_coordinator_task_id === rootRun.domainCoordinatorTaskId
+      && row.domain_coordinator_thread_id === rootRun.rootThreadId;
+  }
+
+  #rebindTaskSafeActionDomainCoordinatorEpoch(row, rootRun) {
+    const currentResumeToken = this.getTaskCapsule(row.task_id).resumeToken;
+    const updated = this.#prepare(`
+      UPDATE task_safe_action_receipts
+      SET domain_coordinator_lease_id = ?, resume_token = ?
+      WHERE id = ? AND domain_coordinator_lease_id = ?
+    `).run(
+      rootRun.domainCoordinatorLeaseId,
+      currentResumeToken,
+      row.id,
+      row.domain_coordinator_lease_id,
+    );
+    if (updated.changes !== 1) {
+      throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission epoch changed during recovery");
+    }
+    return this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
   }
 
   #assertTaskSafeActionCoordinatorEpoch(row, rootRun) {
