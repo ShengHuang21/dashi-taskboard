@@ -1446,7 +1446,6 @@ export function createAgentLaneSnapshotProvider({
         const durableWorkTaskIds = todos
           .filter((todo) => (
             todo.domainAssignment?.domainId === domain.id
-            && todo.domainAssignment.status === "needs_coordinator"
             && todo.state !== "completed"
           ))
           .map((todo) => todo.id);

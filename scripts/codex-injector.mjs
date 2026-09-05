@@ -56,6 +56,7 @@ import {
   runCoordinatorIdentityHandshakeFastLane,
   runCoordinatorProvisioningMonitorOnce,
   runDomainCoordinatorProvisioningMonitorOnce,
+  runDomainCoordinatorShutdownMonitorOnce,
   runCoordinatorShutdownMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
@@ -2115,6 +2116,24 @@ async function transitionCoordinatorShutdownAttempt(attemptId, action) {
   return mutateCoordinatorProvisioning(pathname, {});
 }
 
+async function getDomainCoordinatorShutdownAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-shutdown-attempts/${encodeURIComponent(request.domainId)}/lookup`;
+  return mutateCoordinatorProvisioning(pathname, {});
+}
+
+async function requestDomainCoordinatorShutdownAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-shutdown-attempts/${encodeURIComponent(request.domainId)}`;
+  const {
+    projectId: _projectId, domainId: _domainId, fingerprint: _fingerprint, ...body
+  } = request;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function transitionDomainCoordinatorShutdownAttempt(attemptId, action) {
+  const pathname = `/api/local/domain-coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
+  return mutateCoordinatorProvisioning(pathname, {});
+}
+
 async function findArchivedCoordinatorThread(cdp, attempt) {
   const result = await requestCodexAppServerViaCdp(
     cdp,
@@ -2321,6 +2340,79 @@ async function deliverCoordinatorProvisioningInstruction(cdp, attempt, threadId,
   );
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a provisioning delivery turn receipt");
+  }
+  return { delivery: "started", turnId: started.turn.id, model: selectedModel.model };
+}
+
+async function deliverDomainCoordinatorProvisioningInstruction(
+  cdp, attempt, threadId, projectId, domainId,
+) {
+  const rpc = (method, params) => requestCodexAppServerViaCdp(
+    cdp, undefined, attempt.codexHostId, method, params, 10_000,
+  );
+  const marker = `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const thread = await readCoordinatorProvisioningDeliveryThread({
+    attempt,
+    threadId,
+    marker,
+    readThread: (includeTurns) => rpc("thread/read", { threadId, includeTurns }),
+  });
+  const turns = Array.isArray(thread.turns) ? thread.turns : [];
+  const priorDelivery = classifyCoordinatorProvisioningDeliveryTurns(
+    turns, marker, { completedIsSuccess: false },
+  );
+  if (priorDelivery.delivery !== "retry") return priorDelivery;
+  const retryPlan = planCoordinatorProvisioningDeliveryRetry(turns, marker, {
+    defaultModel: attempt.model,
+    defaultReasoningEffort: attempt.reasoningEffort,
+    retryCompleted: true,
+  });
+  if (retryPlan.retryAfterMs > 0) {
+    return {
+      delivery: "deferred",
+      reason: "retry-backoff",
+      retryAfterMs: retryPlan.retryAfterMs,
+    };
+  }
+  let selectedModel = {
+    model: retryPlan.currentModel,
+    reasoningEffort: retryPlan.currentReasoningEffort,
+  };
+  if (retryPlan.failureKind === "model-unsupported") {
+    selectedModel = selectCoordinatorProvisioningFallbackModel(
+      await readCoordinatorModelCatalog(cdp, attempt.codexHostId),
+      retryPlan.unsupportedModels,
+      retryPlan.currentReasoningEffort,
+    );
+    if (!selectedModel) {
+      return { delivery: "deferred", reason: "model-fallback-unavailable" };
+    }
+  }
+  await resumeCoordinatorProvisioningDeliveryThread(
+    thread,
+    () => rpc("thread/resume", { threadId }),
+  );
+  const registrationKey = `${attempt.idempotencyKey}-window`;
+  const instruction = [
+    marker,
+    `TASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:${selectedModel.model}`,
+    `TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:${selectedModel.reasoningEffort}`,
+    `You are the Taskboard Domain Coordinator for ${JSON.stringify(domainId)}. Never become or alter Owner Root or the Global Coordinator.`,
+    `Use only node ${path.join(projectRoot, "cli", "taskctl.mjs")} --runtime-file ${taskboardRuntimeFile} for Taskboard reads and writes; never read or expose the runtime token and never edit SQLite directly.`,
+    `Register exactly this protected window with task identity ${attempt.taskId}, role coordinator, label ${JSON.stringify(attempt.label)}, exact thread id ${threadId}, and stable idempotency key ${registrationKey}.`,
+    "First read protected coordination windows and use their exact current revision. Allow the resident protected host handshake to authenticate the exact project, kind, host, and workspace; do not self-report or bypass host identity.",
+    `After exact registration, read domain-coordinator status for project ${projectId} and domain ${domainId}. Acquire one 300-second lease only for that domain if still unassigned, using this same task/thread and the exact expected current lease id (or null). Never acquire the Global lease or another domain lease.`,
+    "Replay the same registration after success to verify one receipt; never create a second window, attempt, or lease. Bootstrap the routed Todo before execution, stay inside the domain write scope, and preserve one writer.",
+    "On selected-model capacity, retry the same task and thread with the same model. A host-confirmed unsupported model may be replaced while preserving this exact task, thread, and Domain Coordinator identity. On uncertainty, inspect durable state before retrying.",
+  ].join("\n");
+  const started = await rpc(
+    "turn/start",
+    coordinatorProvisioningTurnStartParams(
+      threadId, instruction, selectedModel, attempt.workspacePath,
+    ),
+  );
+  if (typeof started?.turn?.id !== "string" || !started.turn.id) {
+    throw new Error("Codex did not return a Domain Coordinator provisioning delivery receipt");
   }
   return { delivery: "started", turnId: started.turn.id, model: selectedModel.model };
 }
@@ -2918,6 +3010,41 @@ async function runBackgroundContinuationMonitor(cdp) {
           attemptId, "complete",
         ),
       }),
+      () => runDomainCoordinatorShutdownMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          idleGraceMs: coordinatorShutdownIdleGraceMs,
+        },
+        now: Date.now,
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        readWindows: readCoordinatorProvisioningWindows,
+        readThread: (route) => requestCodexAppServerViaCdp(
+          cdp, undefined, route.codexHostId, "thread/read",
+          { threadId: route.threadId, includeTurns: true }, 10_000,
+        ),
+        getAttempt: getDomainCoordinatorShutdownAttempt,
+        requestAttempt: requestDomainCoordinatorShutdownAttempt,
+        releaseAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "release",
+        ),
+        authorizeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "authorize",
+        ),
+        beginArchiveAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "begin-archive",
+        ),
+        cancelAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "cancel",
+        ),
+        findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
+        archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
+          cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
+        ),
+        completeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "complete",
+        ),
+      }),
     );
     monitors.push(
       () => runCoordinatorLeaseKeepaliveMonitorOnce({
@@ -3029,6 +3156,15 @@ async function runBackgroundContinuationMonitor(cdp) {
         getAttempt: getDomainCoordinatorProvisioningAttempt,
         requestAttempt: requestDomainCoordinatorProvisioningAttempt,
         findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
+        readThread: ({ attempt, threadId }) => readCoordinatorProvisioningDeliveryThread({
+          attempt,
+          threadId,
+          marker: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+          readThread: (includeTurns) => requestCodexAppServerViaCdp(
+            cdp, undefined, attempt.codexHostId, "thread/read",
+            { threadId, includeTurns }, 10_000,
+          ),
+        }),
         markStarting: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
           attemptId, "starting",
         ),
@@ -3042,6 +3178,14 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         resetAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
           attemptId, "reset",
+        ),
+        resumeExpiredAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "resume-expired",
+        ),
+        deliverInstruction: ({ attempt, threadId, domainId }) => (
+          deliverDomainCoordinatorProvisioningInstruction(
+            cdp, attempt, threadId, projectId, domainId,
+          )
         ),
       }),
       () => runOwnerIntentCaptureMonitorOnce({

@@ -18,6 +18,8 @@ const coordinatorProvisioningMonitorRuns = new Map();
 const domainCoordinatorProvisioningMonitorRuns = new Map();
 const coordinatorShutdownMonitorRuns = new Map();
 const coordinatorShutdownIdleObservations = new Map();
+const domainCoordinatorShutdownMonitorRuns = new Map();
+const domainCoordinatorShutdownIdleObservations = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
 const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
@@ -178,7 +180,7 @@ export function coordinatorProvisioningThreadReadData(result) {
 }
 
 export async function readCoordinatorProvisioningDeliveryThread({
-  attempt, threadId, readThread,
+  attempt, threadId, readThread, marker,
 }) {
   let thread;
   let materialized = true;
@@ -190,7 +192,7 @@ export async function readCoordinatorProvisioningDeliveryThread({
     thread = coordinatorProvisioningThreadReadData(await readThread(false));
   }
   if (materialized) {
-    thread = normalizeCoordinatorProvisioningPersistedThread(attempt, thread);
+    thread = normalizeCoordinatorProvisioningPersistedThread(attempt, thread, marker);
   }
   if (thread.id !== threadId
     || thread.threadSource !== attempt.threadSource
@@ -214,13 +216,15 @@ export async function resumeCoordinatorProvisioningDeliveryThread(thread, resume
   return true;
 }
 
-export function classifyCoordinatorProvisioningDeliveryTurns(turns, marker) {
+export function classifyCoordinatorProvisioningDeliveryTurns(
+  turns, marker, { completedIsSuccess = true } = {},
+) {
   if (!Array.isArray(turns) || typeof marker !== "string" || !marker) {
     throw new Error("Codex did not return exact Coordinator delivery turns");
   }
   const matching = turns.filter((turn) => JSON.stringify(turn).includes(marker));
   const completed = matching.find((turn) => turn?.status === "completed");
-  if (typeof completed?.id === "string" && completed.id) {
+  if (completedIsSuccess && typeof completed?.id === "string" && completed.id) {
     return { delivery: "observed", turnId: completed.id };
   }
   const active = turns.find((turn) => turn?.status === "inProgress");
@@ -268,6 +272,7 @@ export function planCoordinatorProvisioningDeliveryRetry(turns, marker, {
   defaultModel,
   defaultReasoningEffort,
   now = Date.now(),
+  retryCompleted = false,
 } = {}) {
   if (!Array.isArray(turns) || typeof marker !== "string" || !marker
     || typeof defaultModel !== "string" || !defaultModel
@@ -278,7 +283,8 @@ export function planCoordinatorProvisioningDeliveryRetry(turns, marker, {
   const terminals = turns
     .map((turn, index) => ({ turn, index, timestamp: coordinatorProvisioningTurnTimestamp(turn) }))
     .filter(({ turn }) => JSON.stringify(turn).includes(marker)
-      && ["failed", "interrupted", "canceled"].includes(turn?.status))
+      && (["failed", "interrupted", "canceled"].includes(turn?.status)
+        || (retryCompleted && turn?.status === "completed")))
     .sort((left, right) => {
       if (left.timestamp !== null && right.timestamp !== null) return right.timestamp - left.timestamp;
       if (left.timestamp !== null) return -1;
@@ -389,9 +395,12 @@ export function coordinatorProvisioningTurnStartParams(
   };
 }
 
-export function normalizeCoordinatorProvisioningPersistedThread(attempt, thread) {
+export function normalizeCoordinatorProvisioningPersistedThread(
+  attempt,
+  thread,
+  marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+) {
   if (thread?.threadSource !== null) return thread;
-  const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const exactMarker = Array.isArray(thread?.turns)
     && thread.turns.some((turn) => JSON.stringify(turn).includes(marker));
   if (thread?.id === attempt.threadId
@@ -557,6 +566,18 @@ function coordinatorShutdownIdentity(projectId, lease, lane, ownerLane) {
   };
 }
 
+function domainCoordinatorShutdownIdentity(projectId, domainId, revision, lease, lane, globalLane) {
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    projectId, domainId, revision, leaseId: lease.id, holderTaskId: lease.holderTaskId,
+    holderThreadId: lane.threadId, codexProjectId: lane.codexProjectId,
+    codexProjectKind: lane.codexProjectKind, codexHostId: lane.codexHostId,
+    workspacePath: path.resolve(lane.workspacePath),
+    globalHolderTaskId: globalLane.id, globalHolderThreadId: globalLane.threadId,
+    expectedGlobalLeaseId: globalLane.leaseId,
+  })).digest("hex");
+  return { idempotencyKey: `domain-coordinator-shutdown-${fingerprint}`, fingerprint };
+}
+
 async function continueCoordinatorShutdownAttempt(options, attempt) {
   if (!attempt?.id) return { shutdown: false, reason: "attempt-unavailable" };
   if (attempt.status === "completed") {
@@ -573,15 +594,35 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
       return { shutdown: false, reason: "release-unavailable", attemptId: attempt.id };
     }
   }
-  if (attempt.status !== "released") {
+  if (!["released", "authorized", "archiving"].includes(attempt.status)) {
     return { shutdown: false, reason: "attempt-state-unavailable", attemptId: attempt.id };
   }
+  if (typeof options.authorizeAttempt === "function" && attempt.status !== "archiving") {
+    try {
+      const authorization = await options.authorizeAttempt({ attemptId: attempt.id });
+      if (authorization?.authorized !== true
+        || authorization?.attempt?.id !== attempt.id
+        || authorization.attempt.status !== "authorized") {
+        return { shutdown: false, reason: "archive-authorization-unavailable", attemptId: attempt.id };
+      }
+      attempt = authorization.attempt;
+    } catch {
+      return { shutdown: false, reason: "archive-authorization-unavailable", attemptId: attempt.id };
+    }
+  }
+  const cancelPreArchive = async (reason) => {
+    if (attempt.status === "authorized" && typeof options.cancelAttempt === "function") {
+      try { await options.cancelAttempt({ attemptId: attempt.id }); } catch { /* retry observation */ }
+    }
+    return { shutdown: false, reason, attemptId: attempt.id };
+  };
   let archivedThread = null;
   try {
     archivedThread = await options.findArchivedThread(attempt);
   } catch {
-    return { shutdown: false, reason: "archive-observation-unavailable", attemptId: attempt.id };
+    return cancelPreArchive("archive-observation-unavailable");
   }
+  let shouldArchive = false;
   if (!archivedThread) {
     let thread;
     try {
@@ -590,15 +631,34 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
         codexHostId: attempt.codexHostId,
       }))?.thread;
     } catch {
-      return { shutdown: false, reason: "thread-unavailable", attemptId: attempt.id };
+      return cancelPreArchive("thread-unavailable");
     }
     if (thread?.id !== attempt.holderThreadId
       || typeof thread.cwd !== "string"
       || path.resolve(thread.cwd) !== path.resolve(attempt.workspacePath)
       || !Array.isArray(thread.turns)
       || thread.turns.some((turn) => turn?.status === "inProgress")) {
-      return { shutdown: false, reason: "thread-busy-or-drifted", attemptId: attempt.id };
+      return cancelPreArchive("thread-busy-or-drifted");
     }
+    shouldArchive = true;
+  } else if (archivedThread.id !== attempt.holderThreadId
+    || typeof archivedThread.cwd !== "string"
+    || path.resolve(archivedThread.cwd) !== path.resolve(attempt.workspacePath)) {
+    return cancelPreArchive("archived-thread-drifted");
+  }
+  if (typeof options.beginArchiveAttempt === "function" && attempt.status !== "archiving") {
+    try {
+      const begun = await options.beginArchiveAttempt({ attemptId: attempt.id });
+      if (begun?.archiving !== true || begun?.attempt?.id !== attempt.id
+        || begun.attempt.status !== "archiving") {
+        return { shutdown: false, reason: "archive-fence-unavailable", attemptId: attempt.id };
+      }
+      attempt = begun.attempt;
+    } catch {
+      return { shutdown: false, reason: "archive-fence-unavailable", attemptId: attempt.id };
+    }
+  }
+  if (shouldArchive) {
     try {
       await options.archiveThread({
         threadId: attempt.holderThreadId,
@@ -608,10 +668,6 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
     } catch {
       return { shutdown: false, reason: "archive-uncertain", attemptId: attempt.id };
     }
-  } else if (archivedThread.id !== attempt.holderThreadId
-    || typeof archivedThread.cwd !== "string"
-    || path.resolve(archivedThread.cwd) !== path.resolve(attempt.workspacePath)) {
-    return { shutdown: false, reason: "archived-thread-drifted", attemptId: attempt.id };
   }
   try {
     const completed = await options.completeAttempt({ attemptId: attempt.id });
@@ -775,6 +831,144 @@ export async function runCoordinatorShutdownMonitorOnce(options) {
   } finally {
     if (coordinatorShutdownMonitorRuns.get(policy.projectId) === run) {
       coordinatorShutdownMonitorRuns.delete(policy.projectId);
+    }
+  }
+}
+
+async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
+  const { policy } = options;
+  const [snapshot, windows] = await Promise.all([
+    options.readSnapshot(policy.projectId), options.readWindows(policy.projectId),
+  ]);
+  if (snapshot?.projectId !== policy.projectId || windows?.projectId !== policy.projectId
+    || !RESUME_TOKEN_PATTERN.test(windows?.revision ?? "")
+    || !Array.isArray(snapshot?.coordination?.domainCoordinators)
+    || !Array.isArray(snapshot?.taskLanes)) {
+    return { shutdown: false, reason: "invalid-project-state" };
+  }
+  const idleDomainIds = new Set(snapshot.coordination.domainCoordinators
+    .filter((candidate) => candidate?.durableWorkPending === false
+      && candidate.assignment === "lease" && candidate.lease?.status === "active"
+      && candidate.lease.bindingValid === true && !candidate.lease.releasedAt)
+    .map((candidate) => candidate.domainId));
+  for (const key of domainCoordinatorShutdownIdleObservations.keys()) {
+    const prefix = `${policy.projectId}:`;
+    if (key.startsWith(prefix) && !idleDomainIds.has(key.slice(prefix.length))) {
+      domainCoordinatorShutdownIdleObservations.delete(key);
+    }
+  }
+  for (const domain of snapshot.coordination.domainCoordinators) {
+    if (!COORDINATION_ID_PATTERN.test(domain?.domainId ?? "")) continue;
+    const existing = (await options.getAttempt({
+      projectId: policy.projectId, domainId: domain.domainId,
+    }))?.attempt ?? null;
+    if (existing && !["completed", "canceled"].includes(existing.status)) {
+      const result = await continueCoordinatorShutdownAttempt(options, existing);
+      return { ...result, domainId: domain.domainId };
+    }
+  }
+  const globalLease = snapshot.coordination.lease;
+  const globalLane = snapshot.taskLanes.find(
+    (lane) => lane?.id === snapshot.coordination.coordinatorTaskId,
+  ) ?? null;
+  const domain = snapshot.coordination.domainCoordinators.find((candidate) => (
+    candidate?.durableWorkPending === false && candidate.assignment === "lease"
+    && candidate.lease?.status === "active" && candidate.lease.bindingValid === true
+    && !candidate.lease.releasedAt
+  ));
+  if (!domain) return { shutdown: false, reason: "no-idle-domain" };
+  const lane = snapshot.taskLanes.find((candidate) => candidate?.id === domain.coordinatorTaskId) ?? null;
+  const holderWindow = windows.windows?.find((window) => window?.taskId === lane?.id) ?? null;
+  const exact = globalLease?.status === "active" && globalLease.bindingValid === true
+    && COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
+    && THREAD_ID_PATTERN.test(globalLane?.threadId ?? "")
+    && COORDINATION_ID_PATTERN.test(domain.domainId)
+    && COORDINATION_ID_PATTERN.test(domain.lease?.id ?? "")
+    && THREAD_ID_PATTERN.test(lane?.threadId ?? "")
+    && lane?.source === "codex" && lane.taskType === "peer_task"
+    && COORDINATION_ID_PATTERN.test(lane.codexHostId ?? "")
+    && typeof lane.workspacePath === "string" && path.isAbsolute(lane.workspacePath)
+    && holderWindow?.threadId === lane.threadId
+    && holderWindow.codexHostId === lane.codexHostId
+    && path.resolve(holderWindow.workspacePath ?? "") === path.resolve(lane.workspacePath);
+  const observationKey = `${policy.projectId}:${domain.domainId}`;
+  if (!exact) {
+    domainCoordinatorShutdownIdleObservations.delete(observationKey);
+    return { shutdown: false, reason: "binding-drift", domainId: domain.domainId };
+  }
+  let thread;
+  try {
+    thread = (await options.readThread({
+      threadId: lane.threadId, codexHostId: lane.codexHostId,
+    }))?.thread;
+  } catch {
+    domainCoordinatorShutdownIdleObservations.delete(observationKey);
+    return { shutdown: false, reason: "thread-unavailable", domainId: domain.domainId };
+  }
+  if (thread?.id !== lane.threadId
+    || path.resolve(thread?.cwd ?? "") !== path.resolve(lane.workspacePath)
+    || !Array.isArray(thread.turns)
+    || thread.turns.some((turn) => turn?.status === "inProgress")) {
+    domainCoordinatorShutdownIdleObservations.delete(observationKey);
+    return { shutdown: false, reason: "thread-busy-or-drifted", domainId: domain.domainId };
+  }
+  const identity = domainCoordinatorShutdownIdentity(
+    policy.projectId, domain.domainId, windows.revision, domain.lease, lane,
+    { ...globalLane, leaseId: globalLease.id },
+  );
+  const observedAt = options.now();
+  const observation = domainCoordinatorShutdownIdleObservations.get(observationKey);
+  if (!observation || observation.fingerprint !== identity.fingerprint) {
+    domainCoordinatorShutdownIdleObservations.set(observationKey, {
+      fingerprint: identity.fingerprint, firstObservedAt: observedAt,
+    });
+    return { shutdown: false, reason: "idle-grace", domainId: domain.domainId };
+  }
+  if (observedAt - observation.firstObservedAt < policy.idleGraceMs) {
+    return { shutdown: false, reason: "idle-grace", domainId: domain.domainId };
+  }
+  let attempt;
+  try {
+    attempt = (await options.requestAttempt({
+      idempotencyKey: identity.idempotencyKey,
+      projectId: policy.projectId, domainId: domain.domainId,
+      expectedRevision: windows.revision, expectedLeaseId: domain.lease.id,
+      holderTaskId: lane.id, holderThreadId: lane.threadId,
+      globalHolderTaskId: globalLane.id, globalHolderThreadId: globalLane.threadId,
+      expectedGlobalLeaseId: globalLease.id,
+      codexProjectId: lane.codexProjectId, codexProjectKind: lane.codexProjectKind,
+      codexHostId: lane.codexHostId, workspacePath: lane.workspacePath,
+    }))?.attempt ?? null;
+  } catch {
+    return { shutdown: false, reason: "attempt-unavailable", domainId: domain.domainId };
+  }
+  domainCoordinatorShutdownIdleObservations.delete(observationKey);
+  const result = await continueCoordinatorShutdownAttempt(options, attempt);
+  return { ...result, domainId: domain.domainId };
+}
+
+export async function runDomainCoordinatorShutdownMonitorOnce(options) {
+  const policy = options?.policy;
+  if (policy?.enabled !== true) return { shutdown: false, reason: "disabled" };
+  if (!COORDINATION_ID_PATTERN.test(policy.projectId ?? "")
+    || !Number.isSafeInteger(policy.idleGraceMs) || policy.idleGraceMs < 1
+    || policy.idleGraceMs > 60 * 60_000
+    || typeof options?.now !== "function" || typeof options?.readSnapshot !== "function"
+    || typeof options?.readWindows !== "function" || typeof options?.readThread !== "function"
+    || typeof options?.getAttempt !== "function" || typeof options?.requestAttempt !== "function"
+    || typeof options?.releaseAttempt !== "function" || typeof options?.authorizeAttempt !== "function"
+    || typeof options?.beginArchiveAttempt !== "function" || typeof options?.cancelAttempt !== "function"
+    || typeof options?.findArchivedThread !== "function"
+    || typeof options?.archiveThread !== "function" || typeof options?.completeAttempt !== "function") {
+    return { shutdown: false, reason: "invalid-monitor" };
+  }
+  const current = domainCoordinatorShutdownMonitorRuns.get(policy.projectId);
+  if (current) return current;
+  const run = runDomainCoordinatorShutdownMonitorOnceUnlocked(options);
+  domainCoordinatorShutdownMonitorRuns.set(policy.projectId, run);
+  try { return await run; } finally {
+    if (domainCoordinatorShutdownMonitorRuns.get(policy.projectId) === run) {
+      domainCoordinatorShutdownMonitorRuns.delete(policy.projectId);
     }
   }
 }
@@ -1261,7 +1455,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || path.resolve(attempt.workspacePath ?? "") !== path.resolve(lane.workspacePath)) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
-  if (["completed", "canceled", "expired"].includes(attempt.status)) {
+  if (["completed", "canceled"].includes(attempt.status)) {
     return {
       provisioned: attempt.status === "completed",
       reason: `attempt-${attempt.status}`,
@@ -1270,7 +1464,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     };
   }
   let thread = await options.findThread(attempt);
-  if (!thread && ["starting", "started"].includes(attempt.status)) {
+  if (!thread && ["starting", "started", "expired"].includes(attempt.status)) {
     return {
       provisioned: false, reason: "thread-start-uncertain",
       domainId: domain.domainId, attemptId: attempt.id,
@@ -1313,6 +1507,49 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       domainId: domain.domainId, attemptId: attempt.id,
     };
   }
+  let deliveryThread = thread;
+  if (attempt.status === "expired" && typeof options.readThread === "function") {
+    deliveryThread = await options.readThread({ attempt, threadId: thread.id });
+    if (deliveryThread?.id !== thread.id
+      || deliveryThread.threadSource !== attempt.threadSource
+      || path.resolve(deliveryThread?.cwd ?? "") !== path.resolve(attempt.workspacePath)) {
+      return {
+        provisioned: false, reason: "thread-binding-mismatch",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+  }
+  const exactDeliveryMarker = `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const recoverableExpiredDelivery = attempt.status === "expired"
+    && Array.isArray(deliveryThread.turns)
+    && deliveryThread.turns.some(
+      (turn) => JSON.stringify(turn).includes(exactDeliveryMarker),
+    );
+  if (attempt.status === "expired" && !recoverableExpiredDelivery) {
+    return {
+      provisioned: false, reason: "attempt-expired-thread-active",
+      domainId: domain.domainId, attemptId: attempt.id,
+    };
+  }
+  if (recoverableExpiredDelivery) {
+    if (typeof options.resumeExpiredAttempt !== "function") {
+      return {
+        provisioned: false, reason: "attempt-expired-thread-active",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const resumedAttempt = resumed?.attempt ?? null;
+    if (resumedAttempt?.id !== attempt.id
+      || resumedAttempt.status !== "started"
+      || resumedAttempt.threadId !== thread.id) {
+      return {
+        provisioned: false, reason: "attempt-binding-mismatch",
+        domainId: domain.domainId, attemptId: attempt.id,
+      };
+    }
+    attempt = resumedAttempt;
+  }
   result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
   attempt = result?.attempt ?? null;
   if (attempt?.status !== "started" || attempt.threadId !== thread.id) {
@@ -1321,9 +1558,28 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       domainId: domain.domainId, attemptId: attempt?.id ?? null,
     };
   }
+  const delivery = await options.deliverInstruction({
+    attempt,
+    threadId: thread.id,
+    projectId: policy.projectId,
+    domainId: domain.domainId,
+  });
+  if (delivery?.delivery === "deferred") {
+    return {
+      provisioned: false,
+      reason: delivery.reason ?? "delivery-deferred",
+      domainId: domain.domainId,
+      attemptId: attempt.id,
+      ...(Number.isFinite(delivery.retryAfterMs)
+        ? { retryAfterMs: delivery.retryAfterMs }
+        : {}),
+    };
+  }
   return {
     provisioned: true,
-    reason: "domain-thread-started",
+    reason: delivery?.delivery === "observed"
+      ? "domain-thread-observed"
+      : "domain-thread-started",
     domainId: domain.domainId,
     attemptId: attempt.id,
     threadId: thread.id,
@@ -1342,7 +1598,8 @@ export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
     || typeof options?.markStarting !== "function"
     || typeof options?.startThread !== "function"
     || typeof options?.attachThread !== "function"
-    || typeof options?.resetAttempt !== "function") {
+    || typeof options?.resetAttempt !== "function"
+    || typeof options?.deliverInstruction !== "function") {
     return { provisioned: false, reason: "invalid-monitor" };
   }
   const key = policy.projectId;
