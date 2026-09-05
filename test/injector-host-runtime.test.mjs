@@ -3355,6 +3355,9 @@ test("background continuation recovers an uncertain deterministic child without 
     },
     deliverAdmissionRecovery: async (request) => {
       calls.push(request.mode);
+      if (request.mode === "claim") {
+        assert.equal(request.expectedResumeToken, "c".repeat(64));
+      }
       return { delivery: "steered", turnId: "turn-recovery" };
     },
     reconcileAdmission: async () => {
@@ -3363,6 +3366,7 @@ test("background continuation recovers an uncertain deterministic child without 
         outcome: "present",
         receipt: {
           admissionState: "recovery_confirmed",
+          resumeToken: "c".repeat(64),
           admissionAgentName: admission.agentName,
           admissionAgentPath: admission.agentPath,
           admissionWriteScope: admission.writeScope,

@@ -3399,11 +3399,13 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       recovery.admission = {
         ...recovery.admission,
         state: reconciled.receipt.admissionState,
+        resumeToken: reconciled.receipt.resumeToken,
         agentName: reconciled.receipt.admissionAgentName,
         agentPath: reconciled.receipt.admissionAgentPath,
         writeScope: reconciled.receipt.admissionWriteScope,
         recoveredAgentThreadId: reconciled.receipt.admissionRecoveredAgentThreadId,
       };
+      recovery.expectedResumeToken = reconciled.receipt.resumeToken;
     }
     const delivery = await deliverAdmissionRecovery({ ...recovery, mode: "claim" });
     return {

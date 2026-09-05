@@ -1671,7 +1671,9 @@ test("default case probe treats case-distinct hardlink names as case-sensitive",
 test("domain safe-action receipts are fenced across same-holder lease recovery", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "agent-domain-recovery-"));
   directories.push(directory);
-  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"), {
+    admissionTtlMs: 10,
+  });
   database.createProject({ id: "domain-recovery", name: "Domain recovery", workspacePath: null });
   const activeUntil = "2099-01-01T00:00:00.000Z";
   const globalWorkspacePath = path.resolve("/tmp/global");
@@ -1770,6 +1772,121 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   assert.equal(fenced.coordinatorLeaseChanged, true);
   assert.equal(fenced.receipt.domainCoordinatorLeaseId, "frontend-lease-a");
   assert.equal(fenced.receipt.status, "delivering");
+
+  assert.throws(() => database.markTaskSafeActionAdmissionUncertain(task.id, {
+    rootThreadId: "frontend-thread",
+    expectedResumeToken: tokenA,
+    safeActionId: "test",
+    admissionReceiptId: reservationA.receipt.id,
+    admissionAttemptId: reservationA.receipt.admissionAttemptId,
+  }, new Date(Date.parse(fenced.receipt.admissionDeadlineAt) - 1).toISOString()),
+  (error) => error?.code === "ADMISSION_DEADLINE_ACTIVE");
+
+  const uncertain = database.markTaskSafeActionAdmissionUncertain(task.id, {
+    rootThreadId: "frontend-thread",
+    expectedResumeToken: tokenA,
+    safeActionId: "test",
+    admissionReceiptId: reservationA.receipt.id,
+    admissionAttemptId: reservationA.receipt.admissionAttemptId,
+  }, new Date(Date.parse(fenced.receipt.admissionDeadlineAt) + 1).toISOString());
+  assert.equal(uncertain.receipt.admissionState, "admission_uncertain");
+  assert.equal(uncertain.receipt.domainCoordinatorLeaseId, "frontend-lease-a");
+  const probe = database.claimTaskSafeActionAdmissionProbe(task.id, {
+    rootThreadId: "frontend-thread",
+    expectedResumeToken: tokenA,
+    safeActionId: "test",
+    admissionReceiptId: reservationA.receipt.id,
+    admissionAttemptId: reservationA.receipt.admissionAttemptId,
+  });
+  const absent = database.reconcileTaskSafeActionAdmission(task.id, {
+    rootThreadId: "frontend-thread",
+    expectedResumeToken: tokenA,
+    safeActionId: "test",
+    admissionReceiptId: reservationA.receipt.id,
+    admissionAttemptId: reservationA.receipt.admissionAttemptId,
+    admissionProbeId: probe.receipt.admissionProbeId,
+    registryObservation: {
+      source: "list_agents",
+      complete: true,
+      observedAt: new Date(Date.parse(probe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [],
+    },
+  });
+  assert.equal(absent.outcome, "absent");
+  assert.equal(absent.receipt.admissionState, "deferred");
+
+  const tokenC = database.getTaskCapsule(task.id).resumeToken;
+  const rotated = database.claimTaskSafeAction(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    reservationLeaseId: "reservation-c",
+  });
+  assert.equal(rotated.available, true);
+  assert.equal(rotated.receipt.domainCoordinatorLeaseId, recovered.lease.id);
+  assert.notEqual(rotated.receipt.admissionAttemptId, reservationA.receipt.admissionAttemptId);
+
+  database.confirmTaskSafeActionDelivery(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    reservationLeaseId: "reservation-c",
+  });
+  const prepared = database.prepareTaskSafeActionAdmission(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    admissionReceiptId: rotated.receipt.id,
+    admissionAttemptId: rotated.receipt.admissionAttemptId,
+    writeScope: ["web"],
+  });
+  const configB = database.getAgentLaneProject("domain-recovery");
+  database.upsertAgentLaneProject("domain-recovery", {
+    ...configB,
+    domainCoordinatorLeases: {
+      frontend: {
+        ...configB.domainCoordinatorLeases.frontend,
+        expiresAt: new Date(Date.now() - 1).toISOString(),
+      },
+    },
+  });
+  const recoveredAgain = database.claimAgentLaneDomainCoordinator("domain-recovery", "frontend", {
+    holderTaskId: "frontend", holderThreadId: "frontend-thread",
+    holderCodexHostId: "local", holderWorkspacePath: frontendWorkspacePath,
+    expectedLeaseId: recovered.lease.id, leaseDurationSeconds: 120, recoverOnly: true,
+  });
+  database.markTaskSafeActionAdmissionUncertain(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    admissionReceiptId: rotated.receipt.id,
+    admissionAttemptId: rotated.receipt.admissionAttemptId,
+  }, new Date(Date.parse(prepared.receipt.admissionDeadlineAt) + 1).toISOString());
+  const presentProbe = database.claimTaskSafeActionAdmissionProbe(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    admissionReceiptId: rotated.receipt.id,
+    admissionAttemptId: rotated.receipt.admissionAttemptId,
+  });
+  const present = database.reconcileTaskSafeActionAdmission(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    admissionReceiptId: rotated.receipt.id,
+    admissionAttemptId: rotated.receipt.admissionAttemptId,
+    admissionProbeId: presentProbe.receipt.admissionProbeId,
+    registryObservation: {
+      source: "list_agents",
+      complete: true,
+      observedAt: new Date(Date.parse(presentProbe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [{
+        agentPath: prepared.receipt.admissionAgentPath,
+        agentThreadId: "recovered-child-thread",
+        status: "running",
+      }],
+    },
+  });
+  assert.equal(present.outcome, "present");
+  assert.equal(present.receipt.domainCoordinatorLeaseId, recoveredAgain.lease.id);
+  const claimed = database.claimAgentTask(task.id, database.getTask(task.id).version, {
+    agentPath: prepared.receipt.admissionAgentPath,
+    agentThreadId: "recovered-child-thread",
+    rootThreadId: "frontend-thread",
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    writeScope: ["web"],
+    admissionReceiptId: rotated.receipt.id,
+    admissionAttemptId: rotated.receipt.admissionAttemptId,
+  });
+  assert.equal(claimed.claim.status, "active");
   database.close();
 });
 
