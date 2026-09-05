@@ -7,6 +7,7 @@ import {
   classifyOwnerIntentPlanHttpFailure,
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
+  buildCoordinatorProvisioningDeliveryTurnStartParams,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
   selectCoordinatorProvisioningFallbackModel,
@@ -58,6 +59,39 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+
+test("Coordinator delivery verifies identity and lease before scanning only current work", () => {
+  const params = buildCoordinatorProvisioningDeliveryTurnStartParams({
+    attempt: {
+      id: "attempt-current-work",
+      idempotencyKey: "coordinator-current-work",
+      taskId: "coordinator-capstone-dev-current",
+      label: "Taskboard Execution Coordinator",
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+    },
+    threadId: coordinatorThreadId,
+    projectId: "capstone-dev",
+    taskctlPath: "/tmp/taskboard/cli/taskctl.mjs",
+    runtimeFile: "/tmp/taskboard/.data/launcher-runtime.json",
+    selectedModel: { model: "gpt-5.6-sol", reasoningEffort: "medium" },
+    workspacePath: "/tmp/taskboard/workspace",
+  });
+  const instruction = params.input[0].text;
+
+  const registration = instruction.indexOf("Register exactly this window");
+  const lease = instruction.indexOf("Acquire one 300-second Global Coordinator lease");
+  const replay = instruction.indexOf("Replay the same registration after success");
+  const workScan = instruction.indexOf("list current issues for project capstone-dev");
+  assert.ok(registration >= 0 && registration < lease);
+  assert.ok(lease < replay && replay < workScan);
+  assert.match(instruction, /Bootstrap eligible todo issues and continue unfinished in_progress issues/);
+  assert.match(instruction, /Do not assign backlog, scan historical done or canceled issues/);
+  assert.match(instruction, /read back windows, status, and receipts/);
+  assert.doesNotMatch(instruction, /CAP-15/);
+  assert.equal(params.threadId, coordinatorThreadId);
+  assert.equal(params.model, "gpt-5.6-sol");
+});
 
 test("an idle unarchived Coordinator with a protected workspace drift is stale", () => {
   const window = {
@@ -4908,6 +4942,8 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /"thread\/list"/);
   assert.match(source, /"thread\/start"/);
   assert.match(source, /TASKBOARD_COORDINATOR_PROVISIONING_V1/);
+  assert.match(source, /buildCoordinatorProvisioningDeliveryTurnStartParams\(\{/);
+  assert.doesNotMatch(source, /Bootstrap CAP-15/);
   assert.match(source, /TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1/);
   assert.match(source, /domain-coordinator status/);
   assert.doesNotMatch(source, /background-continuation-receipts/);

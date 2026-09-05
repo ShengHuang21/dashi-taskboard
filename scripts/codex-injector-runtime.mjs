@@ -395,6 +395,69 @@ export function coordinatorProvisioningTurnStartParams(
   };
 }
 
+export function buildCoordinatorProvisioningInstruction({
+  attempt,
+  threadId,
+  projectId,
+  taskctlPath,
+  runtimeFile,
+}) {
+  if (!attempt
+    || !THREAD_ID_PATTERN.test(threadId ?? "")
+    || !COORDINATION_ID_PATTERN.test(projectId ?? "")
+    || typeof attempt.id !== "string" || !attempt.id
+    || typeof attempt.idempotencyKey !== "string" || !attempt.idempotencyKey
+    || typeof attempt.taskId !== "string" || !attempt.taskId
+    || typeof attempt.label !== "string" || !attempt.label
+    || typeof attempt.model !== "string" || !attempt.model
+    || typeof attempt.reasoningEffort !== "string" || !attempt.reasoningEffort
+    || typeof taskctlPath !== "string" || !path.isAbsolute(taskctlPath)
+    || typeof runtimeFile !== "string" || !path.isAbsolute(runtimeFile)) {
+    throw new Error("Coordinator provisioning instruction requires exact task, thread, and runtime bindings");
+  }
+  const marker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
+  const registrationKey = `${attempt.idempotencyKey}-window`;
+  return [
+    marker,
+    `TASKBOARD_COORDINATOR_DELIVERY_MODEL_V1:${attempt.model}`,
+    `TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:${attempt.reasoningEffort}`,
+    "You are a separate Taskboard Execution Coordinator window. Never become or alter Owner Root.",
+    `Use only node ${taskctlPath} --runtime-file ${runtimeFile} for Taskboard reads and writes; never read or expose the runtime token and never edit SQLite directly.`,
+    "Before inspecting project work, complete and verify the protected Coordinator registration and lease steps below.",
+    `Register exactly this window with task identity ${attempt.taskId}, role coordinator, label ${JSON.stringify(attempt.label)}, exact thread id ${threadId}, and stable idempotency key ${registrationKey}.`,
+    "First read protected coordination windows and use their exact current revision. Allow the resident protected host handshake to authenticate the exact project, kind, host, and workspace; do not self-report or bypass host identity.",
+    "After exact registration, read Coordinator status. Acquire one 300-second Global Coordinator lease only if still unassigned, using this same task/thread and the exact expected current lease id (or null).",
+    "Replay the same registration after success and read back windows, status, and receipts to verify one window, one registration receipt, and the exact current lease; never create a second window or lease.",
+    `Only after that verification, list current issues for project ${projectId}. Bootstrap eligible todo issues and continue unfinished in_progress issues before choosing work. Do not assign backlog, scan historical done or canceled issues, or create duplicate issues. If no eligible work remains, stay idle.`,
+    "On selected-model capacity, retry the same task and thread with the same model. A host-confirmed unsupported model may be replaced while preserving this exact task, thread, and Coordinator identity. On interruption or uncertainty, inspect durable state before retrying. Preserve one writer and the standing safety boundaries in AGENTS.md.",
+  ].join("\n");
+}
+
+export function buildCoordinatorProvisioningDeliveryTurnStartParams({
+  attempt,
+  threadId,
+  projectId,
+  taskctlPath,
+  runtimeFile,
+  selectedModel,
+  workspacePath,
+}) {
+  const instruction = buildCoordinatorProvisioningInstruction({
+    attempt: {
+      ...attempt,
+      model: selectedModel?.model,
+      reasoningEffort: selectedModel?.reasoningEffort,
+    },
+    threadId,
+    projectId,
+    taskctlPath,
+    runtimeFile,
+  });
+  return coordinatorProvisioningTurnStartParams(
+    threadId, instruction, selectedModel, workspacePath,
+  );
+}
+
 export function normalizeCoordinatorProvisioningPersistedThread(
   attempt,
   thread,
