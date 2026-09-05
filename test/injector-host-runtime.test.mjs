@@ -5598,6 +5598,10 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.doesNotMatch(source, /Bootstrap CAP-15/);
   assert.match(source, /TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1/);
   assert.match(source, /domain-coordinator status/);
+  assert.match(
+    source,
+    /reuse every original register-window argument, especially the pre-acquire --expected-revision/,
+  );
   assert.doesNotMatch(source, /background-continuation-receipts/);
   assert.match(source, /createDisposableMonitorTimer\(async \(\) => \{[\s\S]+backgroundContinuationIntervalMs\)/);
   assert.match(source, /cdp\.onClose\(\(\) => \{[\s\S]+disposeCoordinatorIdentityHandshakeTimer[\s\S]+disposeBackgroundContinuationTimer/);
