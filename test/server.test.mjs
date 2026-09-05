@@ -5003,6 +5003,360 @@ test("resident shutdown fences domain writes and cancels on coordination revisio
   inspection.close();
 });
 
+test("domain Coordinator shutdown releases only its exact idle lease and preserves every other lane", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-domain-shutdown-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  const current = Date.now();
+  const lease = (id, domainId, taskId, threadId, workspacePath, writeScope) => ({
+    id, domainId, holderTaskId: taskId, holderThreadId: threadId,
+    holderCodexHostId: "local", holderWorkspacePath: workspacePath,
+    acquiredAt: new Date(current - 30_000).toISOString(),
+    expiresAt: new Date(current + 300_000).toISOString(), writeScope,
+  });
+  database.upsertAgentLaneProject("local", {
+    rootTaskId: "global", ownerRootTaskId: "owner",
+    tasks: [
+      { id: "owner", label: "Owner", owner: "Owner", source: "codex", taskType: "root_task", threadId: "owner-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "global", label: "Global", owner: "Global", source: "codex", taskType: "root_task", threadId: "global-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global" },
+      { id: "frontend", label: "Frontend", owner: "Peer", source: "codex", taskType: "peer_task", threadId: "frontend-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      { id: "backend", label: "Backend", owner: "Peer", source: "codex", taskType: "peer_task", threadId: "backend-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/backend" },
+    ],
+    adapters: [],
+    coordinatorLease: lease("global-lease", undefined, "global", "global-thread", "/tmp/global", undefined),
+    coordinationDomains: [
+      { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+      { id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["backend"] },
+    ],
+    domainCoordinatorLeases: {
+      frontend: lease("frontend-lease", "frontend", "frontend", "frontend-thread", "/tmp/frontend", ["web"]),
+      backend: lease("backend-lease", "backend", "backend", "backend-thread", "/tmp/backend", ["server"]),
+    },
+  });
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  const activeTask = database.createTask({
+    projectId: "local", title: "Active frontend work", description: "",
+    status: "todo", priority: "high", labels: ["agent-todo"],
+    workflowProfile: "vibe", threadId: "global-thread",
+    threadBinding: {
+      threadId: "global-thread", codexProjectId: "project", codexProjectKind: "local",
+      codexHostId: "local", workspacePath: "/tmp/global",
+    },
+    actor, assignee: actor,
+    developmentContext: { type: "worktree", path: "/tmp/frontend", branch: "codex/frontend" },
+    workingLog: null, startDate: null, dueDate: null, recurrence: null,
+  });
+  database.setAgentTaskDomain("local", activeTask.id, {
+    domainId: "frontend", taskVersion: activeTask.version,
+    holderTaskId: "global", holderThreadId: "global-thread",
+    expectedCoordinatorLeaseId: "global-lease",
+  });
+  database.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(activeTask.id);
+  const expectedRevision = database.getAgentLaneCoordinationWindows("local").revision;
+  const input = {
+    idempotencyKey: "frontend-idle-retirement", expectedRevision,
+    expectedLeaseId: "frontend-lease", holderTaskId: "frontend",
+    holderThreadId: "frontend-thread", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", expectedGlobalLeaseId: "global-lease",
+    codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend",
+  };
+  assert.throws(
+    () => database.requestAgentLaneDomainCoordinatorShutdownAttempt("local", "frontend", input),
+    (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_WORK_PENDING",
+  );
+  database.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(activeTask.id);
+  const created = database.requestAgentLaneDomainCoordinatorShutdownAttempt("local", "frontend", input);
+  assert.equal(created.applied, true);
+  assert.equal(created.attempt.status, "pending");
+  assert.equal(database.requestAgentLaneDomainCoordinatorShutdownAttempt("local", "frontend", input).applied, false);
+  const released = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(created.attempt.id, "release");
+  assert.equal(released.attempt.status, "released");
+  assert.equal(released.receipt.action, "released");
+  const afterRelease = database.getAgentLaneProject("local");
+  assert.ok(afterRelease.domainCoordinatorLeases.frontend.releasedAt);
+  assert.equal(afterRelease.domainCoordinatorLeases.backend.id, "backend-lease");
+  assert.equal(afterRelease.coordinatorLease.id, "global-lease");
+  assert.throws(
+    () => database.claimAgentLaneDomainCoordinator("local", "frontend", {
+      holderTaskId: "frontend", holderThreadId: "frontend-thread",
+      expectedLeaseId: "frontend-lease", leaseDurationSeconds: 300,
+    }),
+    (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_IN_PROGRESS",
+  );
+  assert.throws(
+    () => database.claimAgentLaneDomainCoordinator("local", "backend", {
+      holderTaskId: "frontend", holderThreadId: "frontend-thread",
+      expectedLeaseId: "backend-lease", leaseDurationSeconds: 300,
+    }),
+    (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_IN_PROGRESS",
+  );
+  const expiredGlobal = database.getAgentLaneProject("local");
+  expiredGlobal.coordinatorLease.expiresAt = new Date(current - 1).toISOString();
+  database.database.prepare(
+    "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = 'local'",
+  ).run(JSON.stringify(expiredGlobal));
+  const authorized = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    created.attempt.id, "authorize",
+  );
+  assert.equal(authorized.authorized, true);
+  assert.equal(authorized.attempt.status, "authorized");
+  assert.throws(
+    () => database.releaseAgentLaneCoordinator("local", {
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedLeaseId: "global-lease",
+    }),
+    (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
+  );
+  assert.throws(
+    () => database.configureAgentLaneCoordinationDomain("local", "frontend", {
+      domain: null, expectedRevision: database.getAgentLaneCoordinationDomains("local").revision,
+      idempotencyKey: "must-wait-for-archive", holderTaskId: "global",
+      holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+    }),
+    (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
+  );
+  assert.throws(
+    () => database.moveTask(
+      activeTask.id, database.getTask(activeTask.id).version, "todo", undefined,
+      undefined, undefined, actor,
+    ),
+    (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
+  );
+  const archivedTask = database.archiveTask(
+    activeTask.id, database.getTask(activeTask.id).version, undefined, undefined, actor,
+  );
+  assert.throws(
+    () => database.restoreTask(
+      activeTask.id, archivedTask.version, undefined, undefined, actor,
+    ),
+    (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
+  );
+  const archiving = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    created.attempt.id, "begin-archive",
+  );
+  assert.equal(archiving.attempt.status, "archiving");
+  const completed = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(created.attempt.id, "complete");
+  assert.equal(completed.attempt.status, "completed");
+  assert.equal(database.getAgentLaneProject("local").tasks.some((task) => task.id === "frontend"), true);
+  const renewedGlobal = database.getAgentLaneProject("local");
+  renewedGlobal.coordinatorLease.expiresAt = new Date(current + 300_000).toISOString();
+  database.database.prepare(
+    "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = 'local'",
+  ).run(JSON.stringify(renewedGlobal));
+  database.restoreTask(
+    activeTask.id, database.getTask(activeTask.id).version, undefined, undefined, actor,
+  );
+  const recovered = database.claimAgentLaneDomainCoordinator("local", "frontend", {
+    holderTaskId: "frontend", holderThreadId: "frontend-thread",
+    expectedLeaseId: "frontend-lease", leaseDurationSeconds: 300,
+  });
+  assert.notEqual(recovered.lease.id, "frontend-lease");
+  const rearmInput = {
+    ...input,
+    idempotencyKey: "frontend-idle-retirement-rearm",
+    expectedRevision: database.getAgentLaneCoordinationWindows("local").revision,
+    expectedLeaseId: recovered.lease.id,
+  };
+  const canceled = database.requestAgentLaneDomainCoordinatorShutdownAttempt(
+    "local", "frontend", rearmInput,
+  ).attempt;
+  database.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(activeTask.id);
+  assert.throws(
+    () => database.transitionAgentLaneDomainCoordinatorShutdownAttempt(canceled.id, "release"),
+    (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_RELEASE_CONFLICT",
+  );
+  database.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(activeTask.id);
+  const rearmed = database.requestAgentLaneDomainCoordinatorShutdownAttempt(
+    "local", "frontend", rearmInput,
+  );
+  assert.equal(rearmed.applied, true);
+  assert.equal(rearmed.attempt.id, canceled.id);
+  assert.equal(rearmed.attempt.status, "pending");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(canceled.id, "release");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(canceled.id, "authorize");
+  database.database.prepare(`
+    UPDATE agent_domain_coordinator_shutdown_attempts SET released_at = ? WHERE id = ?
+  `).run(new Date(current - 10 * 60_000 - 1).toISOString(), canceled.id);
+  const safelyCanceled = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    canceled.id, "cancel",
+  );
+  assert.equal(safelyCanceled.attempt.status, "canceled");
+  assert.equal(safelyCanceled.abandoned, true);
+  const recoveredAfterCancel = database.claimAgentLaneDomainCoordinator("local", "frontend", {
+    holderTaskId: "frontend", holderThreadId: "frontend-thread",
+    expectedLeaseId: recovered.lease.id, leaseDurationSeconds: 300,
+  });
+  assert.notEqual(recoveredAfterCancel.lease.id, recovered.lease.id);
+  const backendRevision = database.getAgentLaneCoordinationWindows("local").revision;
+  const backendAttempt = database.requestAgentLaneDomainCoordinatorShutdownAttempt(
+    "local", "backend", {
+      ...input, idempotencyKey: "backend-global-epoch-drift",
+      expectedRevision: backendRevision, expectedLeaseId: "backend-lease",
+      holderTaskId: "backend", holderThreadId: "backend-thread",
+      workspacePath: "/tmp/backend",
+    },
+  ).attempt;
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(backendAttempt.id, "release");
+  const drifted = database.getAgentLaneProject("local");
+  drifted.coordinatorLease = { ...drifted.coordinatorLease, id: "global-lease-next" };
+  database.database.prepare(
+    "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = 'local'",
+  ).run(JSON.stringify(drifted));
+  assert.throws(
+    () => database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+      backendAttempt.id, "authorize",
+    ),
+    (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_BINDING_MISMATCH",
+  );
+  database.close();
+});
+
+test("protected domain Coordinator shutdown API replays one durable retirement", async () => {
+  const instanceSecret = "9".repeat(64);
+  const current = Date.now();
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [
+        { id: "global", label: "Global", owner: "Global", source: "codex", taskType: "root_task", threadId: "global-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global" },
+        { id: "frontend", label: "Frontend", owner: "Peer", source: "codex", taskType: "peer_task", threadId: "frontend-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "local", holderWorkspacePath: "/tmp/global",
+        acquiredAt: new Date(current - 30_000).toISOString(),
+        expiresAt: new Date(current + 300_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+      domainCoordinatorLeases: { frontend: {
+        id: "frontend-lease", domainId: "frontend", holderTaskId: "frontend",
+        holderThreadId: "frontend-thread", holderCodexHostId: "local",
+        holderWorkspacePath: "/tmp/frontend",
+        acquiredAt: new Date(current - 30_000).toISOString(),
+        expiresAt: new Date(current + 300_000).toISOString(), writeScope: ["web"],
+      } },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/domain-coordinator-shutdown-attempts/frontend";
+  const body = {
+    idempotencyKey: "frontend-api-retirement", expectedRevision: windows.body.revision,
+    expectedLeaseId: "frontend-lease", holderTaskId: "frontend",
+    holderThreadId: "frontend-thread", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", expectedGlobalLeaseId: "global-lease",
+    codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend",
+  };
+  const invalidPath = "/api/local/projects/local/domain-coordinator-shutdown-attempts/Front_end";
+  const invalid = await request(baseUrl, invalidPath, { method: "POST", body });
+  assert.equal(invalid.response.status, 400);
+  assert.equal(invalid.body.error.code, "INVALID_COORDINATION_DOMAIN");
+  const create = (nonce) => request(baseUrl, pathname, {
+    method: "POST", headers: signedCoordinatorRenewHeaders(instanceSecret, nonce, pathname, body), body,
+  });
+  const created = await create("a".repeat(32));
+  assert.equal(created.response.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.applied, true);
+  assert.equal((await create("b".repeat(32))).body.applied, false);
+  const transition = async (action, nonce) => {
+    const target = `/api/local/domain-coordinator-shutdown-attempts/${created.body.attempt.id}/${action}`;
+    return request(baseUrl, target, {
+      method: "POST", headers: signedCoordinatorRenewHeaders(instanceSecret, nonce, target, {}), body: {},
+    });
+  };
+  const released = await transition("release", "c".repeat(32));
+  assert.equal(released.response.status, 200, JSON.stringify(released.body));
+  assert.equal(released.body.attempt.status, "released");
+  const authorized = await transition("authorize", "e".repeat(32));
+  assert.equal(authorized.response.status, 200, JSON.stringify(authorized.body));
+  assert.equal(authorized.body.authorized, true);
+  const archiving = await transition("begin-archive", "f".repeat(32));
+  assert.equal(archiving.response.status, 200, JSON.stringify(archiving.body));
+  assert.equal(archiving.body.archiving, true);
+  const completed = await transition("complete", "d".repeat(32));
+  assert.equal(completed.response.status, 200, JSON.stringify(completed.body));
+  assert.equal(completed.body.attempt.status, "completed");
+});
+
+test("Jira synchronization cannot recreate domain work inside an archive fence", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-jira-domain-fence-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  const current = Date.now();
+  const issue = (status) => ({
+    id: "jira:origin:1", identifier: "JIRA:ORIGIN:1", title: "Jira domain work",
+    description: "", status, priority: "high", labels: ["agent-todo"], sortOrder: 1000,
+    creator: { type: "user", id: "jira-user", name: "Jira User", avatarUrl: null },
+    assignee: { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null },
+    dueDate: null, externalOrigin: "origin", externalId: "1", externalKey: "SOG-1",
+    externalUrl: "https://jira.example.invalid/browse/SOG-1",
+    createdAt: new Date(current - 60_000).toISOString(),
+    updatedAt: new Date(current).toISOString(),
+  });
+  database.syncJiraTasks([issue("todo")], { projectName: "Jira", archiveMissing: true });
+  database.upsertAgentLaneProject("jira-my-tasks", {
+    rootTaskId: "global", ownerRootTaskId: "owner",
+    tasks: [
+      { id: "owner", label: "Owner", owner: "Owner", source: "codex", taskType: "root_task", threadId: "owner-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "global", label: "Global", owner: "Global", source: "codex", taskType: "root_task", threadId: "global-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global" },
+      { id: "frontend", label: "Frontend", owner: "Peer", source: "codex", taskType: "peer_task", threadId: "frontend-thread", codexProjectId: "project", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend" },
+    ],
+    adapters: [],
+    coordinatorLease: {
+      id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+      holderCodexHostId: "local", holderWorkspacePath: "/tmp/global",
+      acquiredAt: new Date(current - 30_000).toISOString(),
+      expiresAt: new Date(current + 300_000).toISOString(),
+    },
+    coordinationDomains: [{
+      id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+    }],
+    domainCoordinatorLeases: { frontend: {
+      id: "frontend-lease", domainId: "frontend", holderTaskId: "frontend",
+      holderThreadId: "frontend-thread", holderCodexHostId: "local",
+      holderWorkspacePath: "/tmp/frontend",
+      acquiredAt: new Date(current - 30_000).toISOString(),
+      expiresAt: new Date(current + 300_000).toISOString(), writeScope: ["web"],
+    } },
+  });
+  let task = database.getTask("jira:origin:1");
+  database.setAgentTaskDomain("jira-my-tasks", task.id, {
+    domainId: "frontend", taskVersion: task.version,
+    holderTaskId: "global", holderThreadId: "global-thread",
+    expectedCoordinatorLeaseId: "global-lease",
+  });
+  database.syncJiraTasks([issue("done")], { projectName: "Jira", archiveMissing: true });
+  const attempt = database.requestAgentLaneDomainCoordinatorShutdownAttempt(
+    "jira-my-tasks", "frontend", {
+      idempotencyKey: "jira-domain-retirement",
+      expectedRevision: database.getAgentLaneCoordinationWindows("jira-my-tasks").revision,
+      expectedLeaseId: "frontend-lease", holderTaskId: "frontend",
+      holderThreadId: "frontend-thread", globalHolderTaskId: "global",
+      globalHolderThreadId: "global-thread", expectedGlobalLeaseId: "global-lease",
+      codexProjectId: "project", codexProjectKind: "local", codexHostId: "local",
+      workspacePath: "/tmp/frontend",
+    },
+  ).attempt;
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "release");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "authorize");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "begin-archive");
+  task = database.getTask("jira:origin:1");
+  assert.throws(
+    () => database.syncJiraTasks([issue("todo")], { projectName: "Jira", archiveMissing: true }),
+    (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
+  );
+  assert.deepEqual(database.getTask(task.id), task);
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "complete");
+  database.close();
+});
+
 test("protected window registration separates Owner Root from a replaceable coordinator", async () => {
   let databasePath;
   const instanceSecret = "a".repeat(64);

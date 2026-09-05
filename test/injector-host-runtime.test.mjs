@@ -46,6 +46,7 @@ import {
   runCoordinatorLeaseRecoveryMonitorOnce,
   runCoordinatorProvisioningMonitorOnce,
   runDomainCoordinatorProvisioningMonitorOnce,
+  runDomainCoordinatorShutdownMonitorOnce,
   runCoordinatorShutdownMonitorOnce,
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
@@ -1164,6 +1165,221 @@ test("resident Coordinator shutdown waits through idle grace and recovers one ex
   assert.equal(releaseCalls, 1);
   assert.equal(archiveCalls, 1);
   assert.equal(completionCalls, 1);
+});
+
+test("idle domain Coordinator retirement releases and archives only its exact domain thread", async () => {
+  let observedAt = Date.parse("2026-09-05T06:00:00.000Z");
+  const global = { id: "global", threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae" };
+  const holder = {
+    id: "frontend", taskId: "frontend",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    source: "codex", taskType: "peer_task", codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend",
+  };
+  let attempt = null;
+  let archived = false;
+  let releaseCalls = 0;
+  let workPending = false;
+  const lease = {
+    id: "frontend-lease", status: "active", bindingValid: true,
+    holderTaskId: holder.id, acquiredAt: "2026-09-05T05:55:00.000Z",
+    expiresAt: "2026-09-05T06:05:00.000Z", releasedAt: null,
+  };
+  const runTick = () => runDomainCoordinatorShutdownMonitorOnce({
+    policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 30_000 },
+    now: () => observedAt,
+    readSnapshot: async () => ({
+      projectId: "capstone-dev",
+      coordination: {
+        coordinatorTaskId: global.id,
+        lease: { id: "global-lease", status: "active", bindingValid: true },
+        domainCoordinators: [{
+          domainId: "frontend", assignment: "lease", durableWorkPending: workPending,
+          coordinatorTaskId: holder.id, lease,
+        }, {
+          domainId: "backend", assignment: "lease", durableWorkPending: true,
+          coordinatorTaskId: "backend", lease: {
+            id: "backend-lease", status: "active", bindingValid: true,
+          },
+        }],
+      },
+      taskLanes: [{ ...global }, { ...holder }],
+    }),
+    readWindows: async () => ({
+      projectId: "capstone-dev", revision: "a".repeat(64),
+      windows: [{ ...holder }],
+    }),
+    readThread: async () => ({
+      thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
+    }),
+    getAttempt: async () => ({ attempt }),
+    requestAttempt: async (request) => {
+      assert.equal(request.domainId, "frontend");
+      assert.equal(request.expectedLeaseId, lease.id);
+      assert.equal(request.globalHolderTaskId, global.id);
+      assert.equal(Object.hasOwn(request, "fingerprint"), false);
+      attempt = { ...request, id: "domain-shutdown", status: "pending" };
+      return { applied: true, attempt };
+    },
+    releaseAttempt: async () => {
+      releaseCalls += 1;
+      attempt = { ...attempt, status: "released" };
+      return { attempt };
+    },
+    authorizeAttempt: async () => {
+      attempt = { ...attempt, status: "authorized" };
+      return { attempt, authorized: true };
+    },
+    beginArchiveAttempt: async () => {
+      attempt = { ...attempt, status: "archiving" };
+      return { attempt, archiving: true };
+    },
+    cancelAttempt: async () => {
+      attempt = { ...attempt, status: "canceled" };
+      return { attempt };
+    },
+    findArchivedThread: async () => archived
+      ? { id: holder.threadId, cwd: holder.workspacePath }
+      : null,
+    archiveThread: async ({ threadId }) => {
+      assert.equal(threadId, holder.threadId);
+      archived = true;
+    },
+    completeAttempt: async () => {
+      attempt = { ...attempt, status: "completed" };
+      return { attempt };
+    },
+  });
+  assert.equal((await runTick()).reason, "idle-grace");
+  workPending = true;
+  observedAt += 45_000;
+  assert.equal((await runTick()).reason, "no-idle-domain");
+  workPending = false;
+  assert.equal((await runTick()).reason, "idle-grace");
+  observedAt += 30_000;
+  assert.deepEqual(await runTick(), {
+    shutdown: true, reason: "completed", attemptId: "domain-shutdown", domainId: "frontend",
+  });
+  assert.equal(releaseCalls, 1);
+  assert.equal(archived, true);
+});
+
+test("released domain retirement never archives before protected reauthorization", async () => {
+  let archiveCalls = 0;
+  const result = await runDomainCoordinatorShutdownMonitorOnce({
+    policy: { enabled: true, projectId: "authorization-project", idleGraceMs: 30_000 },
+    now: Date.now,
+    readSnapshot: async () => ({
+      projectId: "authorization-project",
+      coordination: {
+        coordinatorTaskId: "global", lease: {
+          id: "global-lease", status: "active", bindingValid: true,
+        },
+        domainCoordinators: [{
+          domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+          coordinatorTaskId: null, lease: {
+            id: "frontend-lease", status: "expired", bindingValid: true,
+            releasedAt: "2026-09-05T06:00:00.000Z",
+          },
+        }],
+      },
+      taskLanes: [],
+    }),
+    readWindows: async () => ({
+      projectId: "authorization-project", revision: "b".repeat(64), windows: [],
+    }),
+    readThread: async () => { throw new Error("must not read"); },
+    getAttempt: async () => ({ attempt: {
+      id: "released-attempt", projectId: "authorization-project", domainId: "frontend",
+      status: "released", holderTaskId: "frontend", holderThreadId: coordinatorThreadId,
+      codexHostId: "local", workspacePath: "/tmp/frontend",
+    } }),
+    requestAttempt: async () => { throw new Error("must not request"); },
+    releaseAttempt: async () => { throw new Error("must not release"); },
+    authorizeAttempt: async () => { throw new Error("Global lease drift"); },
+    beginArchiveAttempt: async () => { throw new Error("must not begin archive"); },
+    cancelAttempt: async () => { throw new Error("must not cancel without authorization"); },
+    findArchivedThread: async () => { throw new Error("must not inspect archive"); },
+    archiveThread: async () => { archiveCalls += 1; },
+    completeAttempt: async () => { throw new Error("must not complete"); },
+  });
+  assert.deepEqual(result, {
+    shutdown: false, reason: "archive-authorization-unavailable",
+    attemptId: "released-attempt", domainId: "frontend",
+  });
+  assert.equal(archiveCalls, 0);
+});
+
+test("authorized domain retirement releases its fence and retries after transient host failure", async () => {
+  let cancelCalls = 0;
+  let archiveCalls = 0;
+  let hostAvailable = false;
+  let attempt = {
+    id: "authorized-attempt", projectId: "cancel-project", domainId: "frontend",
+    status: "authorized", holderTaskId: "frontend", holderThreadId: coordinatorThreadId,
+    codexHostId: "local", workspacePath: "/tmp/frontend",
+  };
+  const runTick = () => runDomainCoordinatorShutdownMonitorOnce({
+    policy: { enabled: true, projectId: "cancel-project", idleGraceMs: 30_000 },
+    now: Date.now,
+    readSnapshot: async () => ({
+      projectId: "cancel-project",
+      coordination: {
+        coordinatorTaskId: "global",
+        lease: { id: "global-lease", status: "active", bindingValid: true },
+        domainCoordinators: [{
+          domainId: "frontend", assignment: "unassigned", durableWorkPending: false,
+          coordinatorTaskId: null, lease: {
+            id: "frontend-lease", status: "expired", bindingValid: true,
+            releasedAt: "2026-09-05T06:00:00.000Z",
+          },
+        }],
+      },
+      taskLanes: [],
+    }),
+    readWindows: async () => ({
+      projectId: "cancel-project", revision: "c".repeat(64), windows: [],
+    }),
+    readThread: async () => {
+      if (!hostAvailable) throw new Error("host unavailable");
+      return { thread: { id: coordinatorThreadId, cwd: "/tmp/frontend", turns: [] } };
+    },
+    getAttempt: async () => ({ attempt }),
+    requestAttempt: async () => { throw new Error("must not request"); },
+    releaseAttempt: async () => { throw new Error("must not release"); },
+    authorizeAttempt: async () => {
+      attempt = { ...attempt, status: "authorized" };
+      return { attempt, authorized: true };
+    },
+    beginArchiveAttempt: async () => {
+      attempt = { ...attempt, status: "archiving" };
+      return { attempt, archiving: true };
+    },
+    cancelAttempt: async () => {
+      cancelCalls += 1;
+      attempt = { ...attempt, status: "released" };
+      return { attempt, abandoned: false };
+    },
+    findArchivedThread: async () => null,
+    archiveThread: async () => { archiveCalls += 1; },
+    completeAttempt: async () => {
+      attempt = { ...attempt, status: "completed" };
+      return { attempt };
+    },
+  });
+  assert.deepEqual(await runTick(), {
+    shutdown: false, reason: "thread-unavailable", attemptId: "authorized-attempt",
+    domainId: "frontend",
+  });
+  assert.equal(cancelCalls, 1);
+  assert.equal(archiveCalls, 0);
+  assert.equal(attempt.status, "released");
+  hostAvailable = true;
+  assert.deepEqual(await runTick(), {
+    shutdown: true, reason: "completed", attemptId: "authorized-attempt",
+    domainId: "frontend",
+  });
+  assert.equal(archiveCalls, 1);
 });
 
 test("Coordinator shutdown and replacement provisioning fail closed around work and busy turns", async () => {

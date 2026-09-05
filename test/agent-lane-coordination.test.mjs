@@ -1184,8 +1184,11 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   assert.deepEqual(snapshot.todos[0].domainAssignment, {
     domainId: "frontend", status: "active", coordinatorTaskId: "frontend", leaseId: "frontend-lease",
   });
-  assert.equal(snapshot.coordination.domainCoordinators[0].durableWorkPending, false);
-  assert.deepEqual(snapshot.coordination.domainCoordinators[0].durableWorkTaskIds, []);
+  assert.equal(snapshot.coordination.domainCoordinators[0].durableWorkPending, true);
+  assert.deepEqual(
+    snapshot.coordination.domainCoordinators[0].durableWorkTaskIds,
+    [mixedCaseClaimTask.identifier, task.identifier],
+  );
   assert.deepEqual(snapshot.todos[0].dispatchTarget, {
     rootThreadId: "frontend-thread", codexHostId: "local",
     rootWorkspacePath: "/tmp/frontend", worktreePath: "/tmp/product",
@@ -1993,6 +1996,80 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   });
   assert.equal(rerouted.rerouted, true);
   assert.equal(rerouted.assignment.domainId, "frontend");
+
+  database.updateTask(task.id, database.getTask(task.id).version, {
+    status: "canceled",
+  }, ownerBinding.threadId, ownerBinding, actor);
+  const replacementIntentInput = {
+    ...intentInput,
+    intentId: "intent-control-plane-replacement",
+    deliveryId: "delivery-control-plane-replacement",
+    ownerTurnId: "owner-turn-replacement",
+    rootCaptureTurnId: "capture-turn-replacement",
+    goal: "Retry the same bounded frontend outcome",
+  };
+  database.recordProjectOwnerIntent(
+    "control-plane", replacementIntentInput, ownerBinding, actor,
+  );
+  const replacementAdoption = database.claimProjectOwnerIntentAdoption(
+    "control-plane", replacementIntentInput.intentId, {
+      coordinatorTaskId: "global", coordinatorThreadId: "global-thread",
+      coordinatorEpoch: "lease:global-lease",
+    },
+  );
+  database.confirmProjectOwnerIntentAdoption(
+    "control-plane", replacementIntentInput.intentId, {
+      adoptionId: replacementAdoption.receipt.id,
+      deliveryTurnId: "coordinator-plan-turn-replacement",
+    },
+  );
+  const replacementIntent = database.listProjectOwnerIntents("control-plane")
+    .find((candidate) => candidate.id === replacementIntentInput.intentId);
+  const fenceTimestamp = new Date().toISOString();
+  database.database.prepare(`
+    INSERT INTO agent_domain_coordinator_shutdown_attempts (
+      id, project_id, domain_id, idempotency_key, request_fingerprint,
+      expected_revision, expected_lease_id, holder_task_id, holder_thread_id,
+      global_holder_task_id, global_holder_thread_id, expected_global_lease_id,
+      codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+      status, created_at, updated_at, released_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    "owner-intent-archive-fence", "control-plane", "frontend", "owner-intent-fence",
+    "f".repeat(64), "e".repeat(64), "frontend-lease-a", "frontend", "frontend-thread",
+    "global", "global-thread", "global-lease", "control-plane", "local", "local",
+    frontendWorkspacePath, "archiving", fenceTimestamp, fenceTimestamp, fenceTimestamp,
+  );
+  const taskBeforeFencedPlan = database.getTask(task.id);
+  const assignmentBeforeFencedPlan = database.getAgentTaskDomainAssignment(task.id);
+  const plansBeforeFencedPlan = database.listProjectOwnerIntentPlan("control-plane");
+  assert.throws(
+    () => database.applyProjectOwnerIntentPlan(
+      "control-plane", replacementIntent.id, {
+        ...planInput,
+        revisionId: "revision-control-plane-replacement",
+        intentVersion: replacementIntent.version,
+        adoptionId: replacementAdoption.receipt.id,
+        summary: "Retry existing outcome",
+      },
+    ),
+    (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
+  );
+  assert.deepEqual(database.getTask(task.id), taskBeforeFencedPlan);
+  assert.deepEqual(database.getAgentTaskDomainAssignment(task.id), assignmentBeforeFencedPlan);
+  assert.deepEqual(database.listProjectOwnerIntentPlan("control-plane"), plansBeforeFencedPlan);
+  database.database.prepare(
+    "DELETE FROM agent_domain_coordinator_shutdown_attempts WHERE id = ?",
+  ).run("owner-intent-archive-fence");
+  database.database.prepare(
+    "DELETE FROM owner_intent_adoptions WHERE intent_id = ?",
+  ).run(replacementIntent.id);
+  database.database.prepare(
+    "DELETE FROM project_owner_intents WHERE id = ?",
+  ).run(replacementIntent.id);
+  database.updateTask(task.id, database.getTask(task.id).version, {
+    status: "todo",
+  }, ownerBinding.threadId, ownerBinding, actor);
 
   const domainCapsuleA = database.getTaskCapsule(task.id);
   const domainReservationA = database.claimTaskSafeAction(task.id, {

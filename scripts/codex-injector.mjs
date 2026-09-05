@@ -56,6 +56,7 @@ import {
   runCoordinatorIdentityHandshakeFastLane,
   runCoordinatorProvisioningMonitorOnce,
   runDomainCoordinatorProvisioningMonitorOnce,
+  runDomainCoordinatorShutdownMonitorOnce,
   runCoordinatorShutdownMonitorOnce,
   runCoordinatorLeaseKeepaliveMonitorOnce,
   runCoordinatorLeaseRecoveryMonitorOnce,
@@ -2115,6 +2116,24 @@ async function transitionCoordinatorShutdownAttempt(attemptId, action) {
   return mutateCoordinatorProvisioning(pathname, {});
 }
 
+async function getDomainCoordinatorShutdownAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-shutdown-attempts/${encodeURIComponent(request.domainId)}/lookup`;
+  return mutateCoordinatorProvisioning(pathname, {});
+}
+
+async function requestDomainCoordinatorShutdownAttempt(request) {
+  const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-shutdown-attempts/${encodeURIComponent(request.domainId)}`;
+  const {
+    projectId: _projectId, domainId: _domainId, fingerprint: _fingerprint, ...body
+  } = request;
+  return mutateCoordinatorProvisioning(pathname, body);
+}
+
+async function transitionDomainCoordinatorShutdownAttempt(attemptId, action) {
+  const pathname = `/api/local/domain-coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
+  return mutateCoordinatorProvisioning(pathname, {});
+}
+
 async function findArchivedCoordinatorThread(cdp, attempt) {
   const result = await requestCodexAppServerViaCdp(
     cdp,
@@ -2988,6 +3007,41 @@ async function runBackgroundContinuationMonitor(cdp) {
           cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
         ),
         completeAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "complete",
+        ),
+      }),
+      () => runDomainCoordinatorShutdownMonitorOnce({
+        policy: {
+          enabled: true,
+          projectId,
+          idleGraceMs: coordinatorShutdownIdleGraceMs,
+        },
+        now: Date.now,
+        readSnapshot: readTaskboardAgentLaneSnapshot,
+        readWindows: readCoordinatorProvisioningWindows,
+        readThread: (route) => requestCodexAppServerViaCdp(
+          cdp, undefined, route.codexHostId, "thread/read",
+          { threadId: route.threadId, includeTurns: true }, 10_000,
+        ),
+        getAttempt: getDomainCoordinatorShutdownAttempt,
+        requestAttempt: requestDomainCoordinatorShutdownAttempt,
+        releaseAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "release",
+        ),
+        authorizeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "authorize",
+        ),
+        beginArchiveAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "begin-archive",
+        ),
+        cancelAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "cancel",
+        ),
+        findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
+        archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
+          cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
+        ),
+        completeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
           attemptId, "complete",
         ),
       }),

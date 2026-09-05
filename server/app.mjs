@@ -654,6 +654,55 @@ function parseCoordinatorShutdownRequest(value) {
   };
 }
 
+function parseDomainCoordinatorShutdownRequest(value) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "idempotencyKey", "expectedRevision", "expectedLeaseId",
+    "holderTaskId", "holderThreadId", "globalHolderTaskId", "globalHolderThreadId",
+    "expectedGlobalLeaseId",
+    "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath",
+  ]));
+  const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
+    required: true, maxLength: 64,
+  });
+  if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
+  }
+  const codexProjectKind = stringField(value.codexProjectKind, "codexProjectKind", {
+    required: true, maxLength: 16,
+  });
+  if (!new Set(["local", "remote"]).has(codexProjectKind)) {
+    throw new ApiError(400, "INVALID_FIELD", "'codexProjectKind' must be local or remote");
+  }
+  const codexHostId = stringField(value.codexHostId, "codexHostId", {
+    required: true, maxLength: 256,
+  });
+  if ((codexProjectKind === "local" && codexHostId !== "local")
+    || (codexProjectKind === "remote" && codexHostId === "local")) {
+    throw new ApiError(400, "INVALID_FIELD", "Domain Coordinator shutdown project identity is invalid");
+  }
+  const workspacePath = stringField(value.workspacePath, "workspacePath", {
+    required: true, maxLength: 4096,
+  });
+  if (!path.isAbsolute(workspacePath) || workspacePath.includes("\0")) {
+    throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be an absolute path");
+  }
+  return {
+    idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    expectedRevision,
+    expectedLeaseId: stringField(value.expectedLeaseId, "expectedLeaseId", { required: true, maxLength: 256 }),
+    holderTaskId: stringField(value.holderTaskId, "holderTaskId", { required: true, maxLength: 256 }),
+    holderThreadId: stringField(value.holderThreadId, "holderThreadId", { required: true, maxLength: 256 }),
+    globalHolderTaskId: stringField(value.globalHolderTaskId, "globalHolderTaskId", { required: true, maxLength: 256 }),
+    globalHolderThreadId: stringField(value.globalHolderThreadId, "globalHolderThreadId", { required: true, maxLength: 256 }),
+    expectedGlobalLeaseId: stringField(value.expectedGlobalLeaseId, "expectedGlobalLeaseId", { required: true, maxLength: 256 }),
+    codexProjectId: stringField(value.codexProjectId, "codexProjectId", { required: true, maxLength: 256 }),
+    codexProjectKind,
+    codexHostId,
+    workspacePath: path.resolve(workspacePath),
+  };
+}
+
 function parseCoordinatorLeaseRenew(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
@@ -3957,6 +4006,62 @@ export function createTaskboardServer(options = {}) {
         );
         return sendJson(response, 200, database.transitionAgentLaneCoordinatorShutdownAttempt(
           attemptId, coordinatorShutdownTransitionRoute[2],
+        ));
+      }
+
+      const domainCoordinatorShutdownLookupRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-shutdown-attempts\/([^/]+)\/lookup$/,
+      );
+      if (domainCoordinatorShutdownLookupRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST domain Coordinator shutdown lookup");
+        const projectId = decodeRouteSegment(domainCoordinatorShutdownLookupRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorShutdownLookupRoute[2], "Domain id");
+        validateProjectId(projectId);
+        if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(domainId)) {
+          throw new ApiError(400, "INVALID_COORDINATION_DOMAIN", "Coordination domain id is invalid");
+        }
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set());
+        assertCoordinatorRenewProof(request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces);
+        return sendJson(response, 200, {
+          attempt: database.getAgentLaneDomainCoordinatorShutdownAttempt(projectId, domainId),
+        });
+      }
+
+      const domainCoordinatorShutdownRequestRoute = pathname.match(
+        /^\/api\/local\/projects\/([^/]+)\/domain-coordinator-shutdown-attempts\/([^/]+)$/,
+      );
+      if (domainCoordinatorShutdownRequestRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST domain Coordinator shutdown request");
+        const projectId = decodeRouteSegment(domainCoordinatorShutdownRequestRoute[1], "Project id");
+        const domainId = decodeRouteSegment(domainCoordinatorShutdownRequestRoute[2], "Domain id");
+        validateProjectId(projectId);
+        if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(domainId)) {
+          throw new ApiError(400, "INVALID_COORDINATION_DOMAIN", "Coordination domain id is invalid");
+        }
+        const body = await readJson(request);
+        assertCoordinatorRenewProof(request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces);
+        return sendJson(response, 200, database.requestAgentLaneDomainCoordinatorShutdownAttempt(
+          projectId, domainId, parseDomainCoordinatorShutdownRequest(body),
+        ));
+      }
+
+      const domainCoordinatorShutdownTransitionRoute = pathname.match(
+        /^\/api\/local\/domain-coordinator-shutdown-attempts\/([^/]+)\/(release|authorize|begin-archive|cancel|complete)$/,
+      );
+      if (domainCoordinatorShutdownTransitionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST domain Coordinator shutdown transition");
+        const attemptId = decodeRouteSegment(domainCoordinatorShutdownTransitionRoute[1], "Attempt id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set());
+        assertCoordinatorRenewProof(request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces);
+        return sendJson(response, 200, database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+          attemptId, domainCoordinatorShutdownTransitionRoute[2],
         ));
       }
 
