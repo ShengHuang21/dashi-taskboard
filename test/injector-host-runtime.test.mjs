@@ -5642,6 +5642,8 @@ test("Agent Todo coordination steers an active Root turn", async () => {
   assert.deepEqual(result, { delivery: "steered", turnId: "turn-active" });
   assert.equal(calls[1][0], "turn/steer");
   assert.equal(calls[1][1].expectedTurnId, "turn-active");
+  assert.equal(calls[1][1].approvalPolicy, undefined);
+  assert.equal(calls[1][1].sandboxPolicy, undefined);
   assert.match(calls[1][1].input[0].text, /taskctl issue bootstrap TASKBOARD-17 --json/);
   assert.match(calls[1][1].input[0].text, /Taskboard coordination delivery id: coordination-receipt/);
   assert.match(calls[1][1].input[0].text, /readyWork\.eligible/);
@@ -5680,6 +5682,12 @@ test("Agent Todo coordination starts an idle Root turn", async () => {
   assert.deepEqual(result, { delivery: "started", turnId: "turn-new" });
   assert.deepEqual(calls.map(([method]) => method), ["thread/read", "thread/resume", "turn/start"]);
   assert.match(calls[2][1].input[0].text, /do not spawn or claim/);
+  assert.equal(calls[2][1].approvalPolicy, "never");
+  assert.deepEqual(calls[2][1].sandboxPolicy, {
+    type: "workspaceWrite",
+    writableRoots: [request.rootWorkspacePath],
+    networkAccess: true,
+  });
 });
 
 test("Agent Todo coordination observes a prior durable Root delivery after restart", async () => {
@@ -5847,9 +5855,15 @@ test("Agent Todo coordination can target a Git worktree outside the Root coordin
   }, async (targetRoot) => validatedTargets.push(targetRoot));
   assert.deepEqual(result, { delivery: "started", turnId: "turn-separate" });
   assert.deepEqual(validatedTargets, [request.targetRoot]);
-  const instruction = calls.find(([method]) => method === "turn/start")?.[1]?.input?.[0]?.text ?? "";
+  const turnStart = calls.find(([method]) => method === "turn/start")?.[1];
+  const instruction = turnStart?.input?.[0]?.text ?? "";
   assert.ok(instruction.includes(`Exact execution worktree: ${request.targetRoot}`));
   assert.match(instruction, /coordination cwd may be different/);
+  assert.deepEqual(turnStart?.sandboxPolicy, {
+    type: "workspaceWrite",
+    writableRoots: [path.resolve(request.rootWorkspacePath), request.targetRoot],
+    networkAccess: true,
+  });
 });
 
 test("Agent Todo coordination fails closed without an execution worktree validator", async () => {
