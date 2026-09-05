@@ -5760,6 +5760,14 @@ export class TaskboardDatabase {
       if (!same) {
         this.#prepare("UPDATE agent_lane_projects SET config_json = ?, updated_at = ? WHERE project_id = ?")
           .run(configJson, timestamp, projectId);
+        if (domainChanges || removes) {
+          this.#prepare(`
+            UPDATE agent_domain_coordinator_provisioning_attempts
+            SET status = 'canceled', updated_at = ?
+            WHERE project_id = ? AND domain_id = ?
+              AND status = 'expired' AND thread_id IS NOT NULL
+          `).run(timestamp, projectId, domainId);
+        }
       }
       const receiptRow = {
         id: randomUUID(), project_id: projectId, domain_id: domainId,
