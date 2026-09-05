@@ -3313,6 +3313,8 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   markAdmissionUncertain,
   claimAdmissionProbe,
   reconcileAdmission,
+  claimReplacementAdmissionProbe,
+  reconcileReplacementAdmission,
   deliverAdmissionRecovery,
   now = Date.now,
 }) {
@@ -3327,6 +3329,86 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   const snapshot = await readSnapshot(policy.projectId);
   if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
     return { delivered: false, reason: "invalid-snapshot" };
+  }
+  const replacementRecoveryTodo = snapshot.todos.find((candidate) => {
+    const admission = candidate?.admission;
+    const target = candidate?.dispatchTarget;
+    const assignment = candidate?.domainAssignment;
+    return COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+      && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
+      && admission?.state === "admission_uncertain"
+      && typeof admission?.receiptId === "string" && admission.receiptId
+      && typeof admission?.attemptId === "string" && admission.attemptId
+      && THREAD_ID_PATTERN.test(admission?.rootThreadId ?? "")
+      && THREAD_ID_PATTERN.test(target?.rootThreadId ?? "")
+      && target.rootThreadId !== admission.rootThreadId
+      && typeof target.codexHostId === "string" && target.codexHostId
+      && typeof target.rootWorkspacePath === "string" && path.isAbsolute(target.rootWorkspacePath)
+      && typeof target.worktreePath === "string" && path.isAbsolute(target.worktreePath)
+      && assignment?.status === "active"
+      && admission.coordinationDomainId === assignment.domainId
+      && admission.domainCoordinatorTaskId === assignment.coordinatorTaskId
+      && admission.domainCoordinatorLeaseId !== assignment.leaseId
+      && admission.domainCoordinatorThreadId === admission.rootThreadId
+      && admission.globalCoordinatorLeaseId == null
+      && admission.globalCoordinatorTaskId == null
+      && admission.globalCoordinatorThreadId == null
+      && admission.rootHostId === target.codexHostId
+      && typeof admission.rootWorkspacePath === "string"
+      && path.isAbsolute(admission.rootWorkspacePath)
+      && path.resolve(admission.rootWorkspacePath) === path.resolve(target.rootWorkspacePath)
+      && RESUME_TOKEN_PATTERN.test(admission.resumeToken ?? "")
+      && COORDINATION_ID_PATTERN.test(admission.safeActionId ?? "");
+  });
+  if (replacementRecoveryTodo) {
+    if (typeof claimReplacementAdmissionProbe !== "function"
+      || typeof reconcileReplacementAdmission !== "function"
+      || typeof deliverAdmissionRecovery !== "function") {
+      return { delivered: false, reason: "invalid-replacement-recovery-monitor" };
+    }
+    const admission = replacementRecoveryTodo.admission;
+    const currentRootThreadId = replacementRecoveryTodo.dispatchTarget.rootThreadId;
+    const recovery = {
+      projectId: policy.projectId,
+      todoId: replacementRecoveryTodo.id,
+      taskId: replacementRecoveryTodo.taskId,
+      rootThreadId: currentRootThreadId,
+      codexHostId: replacementRecoveryTodo.dispatchTarget.codexHostId,
+      rootWorkspacePath: replacementRecoveryTodo.dispatchTarget.rootWorkspacePath,
+      expectedResumeToken: admission.resumeToken,
+      safeActionId: admission.safeActionId,
+      admissionReceiptId: admission.receiptId,
+      admissionAttemptId: admission.attemptId,
+      admission,
+    };
+    const probe = await claimReplacementAdmissionProbe(recovery);
+    if (typeof probe?.receipt?.admissionProbeId !== "string"
+      || !probe.receipt.admissionProbeId
+      || typeof probe.receipt.admissionProbeRequestedAt !== "string"
+      || !THREAD_ID_PATTERN.test(probe?.observationTarget?.rootThreadId ?? "")
+      || typeof probe.observationTarget.codexHostId !== "string"
+      || !probe.observationTarget.codexHostId
+      || typeof probe.observationTarget.rootWorkspacePath !== "string"
+      || !path.isAbsolute(probe.observationTarget.rootWorkspacePath)) {
+      return { delivered: false, reason: "replacement-admission-probe-unavailable" };
+    }
+    recovery.admissionProbeId = probe.receipt.admissionProbeId;
+    recovery.admissionProbeRequestedAt = probe.receipt.admissionProbeRequestedAt;
+    await deliverAdmissionRecovery({
+      ...recovery,
+      mode: "probe",
+      rootThreadId: probe.observationTarget.rootThreadId,
+      codexHostId: probe.observationTarget.codexHostId,
+      rootWorkspacePath: probe.observationTarget.rootWorkspacePath,
+    });
+    const reconciled = await reconcileReplacementAdmission(recovery);
+    return {
+      delivered: false,
+      todoId: replacementRecoveryTodo.id,
+      reason: reconciled?.outcome === "absent"
+        ? "replacement-admission-deferred"
+        : "replacement-admission-unresolved",
+    };
   }
   const recoveryTodo = snapshot.todos.find((candidate) => {
     const admission = candidate?.admission;

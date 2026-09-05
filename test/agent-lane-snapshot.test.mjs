@@ -212,6 +212,32 @@ test("separates configured Codex tasks from discovered Root-internal subagents",
   });
 });
 
+test("reads a retired coordinator Root registry without restoring it as a configured window", async () => {
+  const paths = await fixture({
+    rootTaskId: "visual",
+    tasks: [{
+      id: "visual", label: "Current coordinator", owner: "Codex", source: "codex",
+      threadId: "visual-thread", taskType: "root_task",
+    }],
+    adapters: [],
+  });
+  const provider = createAgentLaneSnapshotProvider(paths);
+  const snapshot = await provider.getProjectSnapshot("capstone-dev");
+  assert.deepEqual(snapshot.windowSubagentTrees.map((tree) => tree.rootThreadId), ["visual-thread"]);
+
+  const retired = await provider.getWindowSubagentTree("root-thread");
+  assert.equal(retired.rootThreadId, "root-thread");
+  assert.deepEqual(retired.registryObservation, {
+    source: "list_agents",
+    observedAt: "2026-08-23T08:02:40.000Z",
+    complete: true,
+    agents: [
+      { agentPath: "/root/ui_review", agentThreadId: "ui-thread", status: "running" },
+      { agentPath: "/root/retrieval_review", agentThreadId: "review-thread", status: "completed" },
+    ],
+  });
+});
+
 test("reuses an unchanged Codex task observation and refreshes it after replace or append", async () => {
   const paths = await fixture();
   const fixedTime = new Date("2026-08-23T08:04:00.000Z");

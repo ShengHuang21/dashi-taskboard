@@ -1890,6 +1890,283 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   database.close();
 });
 
+test("replacement coordinator retires only an absent child observed from the original Root", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agent-domain-replacement-"));
+  directories.push(directory);
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"), {
+    admissionTtlMs: 10,
+  });
+  const projectId = "domain-replacement";
+  const globalWorkspacePath = path.resolve("/tmp/replacement-global");
+  const domainWorkspacePath = path.resolve("/tmp/replacement-domain");
+  const productWorkspacePath = path.resolve("/tmp/replacement-product");
+  const activeUntil = "2099-01-01T00:00:00.000Z";
+  database.createProject({ id: projectId, name: "Domain replacement", workspacePath: null });
+  database.upsertAgentLaneProject(projectId, {
+    tasks: [
+      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-old-thread", taskType: "peer_task", codexProjectId: projectId, codexProjectKind: "local", codexHostId: "local", workspacePath: domainWorkspacePath },
+    ],
+    adapters: [],
+    coordinatorLease: {
+      id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+      holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+      acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
+    },
+    coordinationDomains: [
+      { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+    ],
+    domainCoordinatorLeases: {
+      frontend: {
+        id: "frontend-old-lease", holderTaskId: "frontend", holderThreadId: "frontend-old-thread",
+        holderCodexHostId: "local", holderWorkspacePath: domainWorkspacePath,
+        acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
+      },
+    },
+  });
+  const binding = {
+    threadId: "global-thread", codexProjectId: projectId, codexProjectKind: "local",
+    codexHostId: "local", workspacePath: globalWorkspacePath,
+  };
+  const task = database.createTask({
+    projectId, title: "Replacement recovery Todo", description: "", status: "todo",
+    priority: "high", labels: ["agent-todo"], threadId: binding.threadId, threadBinding: binding,
+    actor, assignee: actor, workflowId: null, workflowProfile: "vibe",
+    developmentContext: { type: "worktree", path: productWorkspacePath, branch: "codex/domain-replacement" },
+    startDate: null, dueDate: null, recurrence: null,
+  });
+  database.createComment(task.id, {
+    body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+      gates: [{
+        id: "local", kind: "test", state: "authorized", scope: "local tests",
+        approver: "Owner", approvalRequest: "同意本地测试", evidence: "Owner resumed", receipt: "turn:resume",
+      }],
+      actions: [{ id: "test", order: 10, text: "Run local acceptance", gate: "local", target: "candidate", status: "pending" }],
+    })}\n\`\`\``,
+    threadId: binding.threadId, threadBinding: binding,
+    actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+  });
+  database.setAgentTaskDomain(projectId, task.id, {
+    domainId: "frontend", taskVersion: database.getTask(task.id).version,
+    holderTaskId: "global", holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+  });
+  const oldToken = database.getTaskCapsule(task.id).resumeToken;
+  const reserved = database.claimTaskSafeAction(task.id, {
+    rootThreadId: "frontend-old-thread", expectedResumeToken: oldToken, safeActionId: "test",
+    reservationLeaseId: "old-reservation",
+  });
+  const delivering = database.confirmTaskSafeActionDelivery(task.id, {
+    rootThreadId: "frontend-old-thread", expectedResumeToken: oldToken, safeActionId: "test",
+    reservationLeaseId: "old-reservation",
+  });
+  database.markTaskSafeActionAdmissionUncertain(task.id, {
+    rootThreadId: "frontend-old-thread", expectedResumeToken: oldToken, safeActionId: "test",
+    admissionReceiptId: reserved.receipt.id,
+    admissionAttemptId: reserved.receipt.admissionAttemptId,
+  }, new Date(Date.parse(delivering.receipt.admissionDeadlineAt) + 1).toISOString());
+
+  const oldConfig = database.getAgentLaneProject(projectId);
+  database.upsertAgentLaneProject(projectId, {
+    ...oldConfig,
+    tasks: oldConfig.tasks.map((candidate) => candidate.id === "frontend"
+      ? { ...candidate, threadId: "frontend-new-thread" }
+      : candidate),
+    domainCoordinatorLeases: {
+      frontend: {
+        ...oldConfig.domainCoordinatorLeases.frontend,
+        expiresAt: new Date(Date.now() - 1).toISOString(),
+      },
+    },
+  });
+  const replacement = database.claimAgentLaneDomainCoordinator(projectId, "frontend", {
+    holderTaskId: "frontend", holderThreadId: "frontend-new-thread",
+    holderCodexHostId: "local", holderWorkspacePath: domainWorkspacePath,
+    expectedLeaseId: "frontend-old-lease", leaseDurationSeconds: 120,
+  });
+  assert.notEqual(replacement.lease.id, "frontend-old-lease");
+
+  let bindingInput = {
+    rootThreadId: "frontend-new-thread",
+    expectedResumeToken: oldToken,
+    safeActionId: "test",
+    admissionReceiptId: reserved.receipt.id,
+    admissionAttemptId: reserved.receipt.admissionAttemptId,
+  };
+  const probe = database.claimTaskSafeActionReplacementAdmissionProbe(task.id, bindingInput);
+  assert.equal(probe.observationTarget.rootThreadId, "frontend-old-thread");
+  assert.equal(probe.observationTarget.codexHostId, "local");
+  assert.equal(probe.observationTarget.rootWorkspacePath, domainWorkspacePath);
+
+  const beforeInvalidObservation = database.getTaskSafeActionAdmission(task.id);
+  for (const invalidObservation of [
+    {
+      observationRootThreadId: "frontend-new-thread",
+      observedAt: new Date(Date.parse(probe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+    },
+    {
+      observationRootThreadId: "frontend-old-thread",
+      observedAt: new Date(Date.parse(probe.receipt.admissionProbeRequestedAt) - 1).toISOString(),
+    },
+  ]) {
+    const unresolved = database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+      ...bindingInput,
+      admissionProbeId: probe.receipt.admissionProbeId,
+      observationRootThreadId: invalidObservation.observationRootThreadId,
+      registryObservation: {
+        source: "list_agents", complete: true, observedAt: invalidObservation.observedAt, agents: [],
+      },
+    });
+    assert.equal(unresolved.outcome, "unresolved");
+    assert.deepEqual(database.getTaskSafeActionAdmission(task.id), beforeInvalidObservation);
+  }
+  const replayedProbe = database.claimTaskSafeActionReplacementAdmissionProbe(task.id, bindingInput);
+  assert.equal(replayedProbe.applied, false);
+  assert.equal(replayedProbe.receipt.admissionProbeId, probe.receipt.admissionProbeId);
+  assert.equal(replayedProbe.receipt.admissionProbeRequestedAt, probe.receipt.admissionProbeRequestedAt);
+
+  const replacementConfig = database.getAgentLaneProject(projectId);
+  database.upsertAgentLaneProject(projectId, {
+    ...replacementConfig,
+    tasks: replacementConfig.tasks.map((candidate) => candidate.id === "frontend"
+      ? { ...candidate, threadId: "frontend-old-thread" }
+      : candidate),
+    domainCoordinatorLeases: {
+      frontend: {
+        ...replacementConfig.domainCoordinatorLeases.frontend,
+        expiresAt: new Date(Date.now() - 1).toISOString(),
+      },
+    },
+  });
+  const returnedOldRoot = database.claimAgentLaneDomainCoordinator(projectId, "frontend", {
+    holderTaskId: "frontend", holderThreadId: "frontend-old-thread",
+    holderCodexHostId: "local", holderWorkspacePath: domainWorkspacePath,
+    expectedLeaseId: replacement.lease.id, leaseDurationSeconds: 120,
+  });
+  const ordinaryBinding = { ...bindingInput, rootThreadId: "frontend-old-thread" };
+  const ordinaryProbe = database.claimTaskSafeActionAdmissionProbe(task.id, ordinaryBinding);
+  assert.notEqual(ordinaryProbe.receipt.admissionProbeId, probe.receipt.admissionProbeId);
+  assert.equal(ordinaryProbe.receipt.admissionProbeCoordinatorLeaseId, null);
+  assert.equal(ordinaryProbe.receipt.admissionProbeCoordinatorThreadId, null);
+  assert.throws(() => database.reconcileTaskSafeActionAdmission(task.id, {
+    ...ordinaryBinding,
+    admissionProbeId: probe.receipt.admissionProbeId,
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(ordinaryProbe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [],
+    },
+  }), (error) => error?.code === "ADMISSION_PROBE_MISMATCH");
+  const ordinaryFresh = database.reconcileTaskSafeActionAdmission(task.id, {
+    ...ordinaryBinding,
+    admissionProbeId: ordinaryProbe.receipt.admissionProbeId,
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(ordinaryProbe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [{
+        agentPath: reserved.receipt.admissionAgentPath,
+        agentThreadId: "completed-old-child",
+        status: "completed",
+      }],
+    },
+  });
+  assert.equal(ordinaryFresh.outcome, "unresolved");
+
+  const returnedConfig = database.getAgentLaneProject(projectId);
+  database.upsertAgentLaneProject(projectId, {
+    ...returnedConfig,
+    tasks: returnedConfig.tasks.map((candidate) => candidate.id === "frontend"
+      ? { ...candidate, threadId: "frontend-third-thread" }
+      : candidate),
+    domainCoordinatorLeases: {
+      frontend: {
+        ...returnedConfig.domainCoordinatorLeases.frontend,
+        expiresAt: new Date(Date.now() - 1).toISOString(),
+      },
+    },
+  });
+  const thirdEpoch = database.claimAgentLaneDomainCoordinator(projectId, "frontend", {
+    holderTaskId: "frontend", holderThreadId: "frontend-third-thread",
+    holderCodexHostId: "local", holderWorkspacePath: domainWorkspacePath,
+    expectedLeaseId: returnedOldRoot.lease.id, leaseDurationSeconds: 120,
+  });
+  bindingInput = { ...bindingInput, rootThreadId: "frontend-third-thread" };
+  const rotatedProbe = database.claimTaskSafeActionReplacementAdmissionProbe(task.id, bindingInput);
+  assert.notEqual(rotatedProbe.receipt.admissionProbeId, probe.receipt.admissionProbeId);
+  assert.equal(rotatedProbe.receipt.admissionProbeCoordinatorLeaseId, thirdEpoch.lease.id);
+  assert.equal(rotatedProbe.receipt.admissionProbeCoordinatorThreadId, "frontend-third-thread");
+  assert.throws(() => database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...bindingInput,
+    admissionProbeId: probe.receipt.admissionProbeId,
+    observationRootThreadId: "frontend-old-thread",
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(rotatedProbe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [],
+    },
+  }), (error) => error?.code === "ADMISSION_PROBE_MISMATCH");
+  assert.throws(() => database.claimTaskSafeActionReplacementAdmissionProbe(task.id, {
+    ...bindingInput,
+    rootThreadId: "frontend-old-thread",
+  }), (error) => error?.code === "DOMAIN_COORDINATOR_THREAD_MISMATCH");
+
+  const beforePresent = database.getTaskSafeActionAdmission(task.id);
+  const present = database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...bindingInput,
+    admissionProbeId: rotatedProbe.receipt.admissionProbeId,
+    observationRootThreadId: "frontend-old-thread",
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(rotatedProbe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [{
+        agentPath: reserved.receipt.admissionAgentPath,
+        agentThreadId: "old-child-thread",
+        status: "running",
+      }],
+    },
+  });
+  assert.equal(present.outcome, "unresolved");
+  assert.deepEqual(database.getTaskSafeActionAdmission(task.id), beforePresent);
+
+  const absent = database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...bindingInput,
+    admissionProbeId: rotatedProbe.receipt.admissionProbeId,
+    observationRootThreadId: "frontend-old-thread",
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(rotatedProbe.receipt.admissionProbeRequestedAt) + 2).toISOString(),
+      agents: [],
+    },
+  });
+  assert.equal(absent.outcome, "absent");
+  assert.equal(absent.receipt.status, "reserved");
+  assert.equal(absent.receipt.admissionState, "deferred");
+  assert.equal(absent.receipt.admissionDeferredReason, "coordinator_replaced_child_absent");
+  const replay = database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...bindingInput,
+    admissionProbeId: rotatedProbe.receipt.admissionProbeId,
+    observationRootThreadId: "frontend-old-thread",
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(rotatedProbe.receipt.admissionProbeRequestedAt) + 3).toISOString(),
+      agents: [],
+    },
+  });
+  assert.equal(replay.applied, false);
+  assert.equal(replay.outcome, "absent");
+
+  const currentToken = database.getTaskCapsule(task.id).resumeToken;
+  assert.notEqual(currentToken, oldToken);
+  const fresh = database.claimTaskSafeAction(task.id, {
+    rootThreadId: "frontend-third-thread", expectedResumeToken: currentToken, safeActionId: "test",
+    reservationLeaseId: "new-reservation",
+  });
+  assert.equal(fresh.available, true);
+  assert.equal(fresh.receipt.rootThreadId, "frontend-third-thread");
+  assert.equal(fresh.receipt.domainCoordinatorLeaseId, thirdEpoch.lease.id);
+  assert.notEqual(fresh.receipt.admissionAttemptId, reserved.receipt.admissionAttemptId);
+  database.close();
+});
+
 test("Owner Intent supersede reopens outcomes and reconciles plan-owned dependencies", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "owner-intent-plan-revision-"));
   directories.push(directory);

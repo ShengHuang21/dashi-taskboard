@@ -2975,6 +2975,8 @@ function runBackgroundContinuationDispatch(cdp, projectId) {
     markAdmissionUncertain: (request) => mutateBackgroundAdmission(request, "uncertain"),
     claimAdmissionProbe: (request) => mutateBackgroundAdmission(request, "probe"),
     reconcileAdmission: (request) => mutateBackgroundAdmission(request, "reconcile"),
+    claimReplacementAdmissionProbe: (request) => mutateBackgroundAdmission(request, "replacement-probe"),
+    reconcileReplacementAdmission: (request) => mutateBackgroundAdmission(request, "replacement-reconcile"),
     deliverAdmissionRecovery: (request) => deliverTaskboardAdmissionRecovery(
       request,
       (method, params) => requestCodexAppServerViaCdp(
