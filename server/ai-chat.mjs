@@ -129,6 +129,9 @@ export class AiChatService {
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
     this.killGraceMs = options.killGraceMs ?? 1_000;
+    this.catalogTtlMs = options.catalogTtlMs ?? 30_000;
+    this.discoverCatalog = options.discoverCatalog ?? discoverAiCatalog;
+    this.catalogs = new Map();
     this.appServer = options.appServer ?? new CodexAppServer({
       executable: this.codexExecutable,
       processEnv: this.processEnv,
@@ -207,11 +210,29 @@ export class AiChatService {
   }
 
   async #catalogForWorkspace(workspacePath) {
-    return discoverAiCatalog({
+    const cached = this.catalogs.get(workspacePath);
+    if (cached?.value && cached.expiresAt > Date.now()) return cached.value;
+    if (cached?.pending) return cached.pending;
+    const pending = this.discoverCatalog({
       codexExecutable: this.codexExecutable,
       workspacePath,
       processEnv: this.processEnv,
+    }).then((value) => {
+      if (this.catalogs.get(workspacePath)?.pending === pending) {
+        this.catalogs.set(workspacePath, {
+          value,
+          expiresAt: Date.now() + this.catalogTtlMs,
+        });
+      }
+      return value;
+    }, (error) => {
+      if (this.catalogs.get(workspacePath)?.pending === pending) {
+        this.catalogs.delete(workspacePath);
+      }
+      throw error;
     });
+    this.catalogs.set(workspacePath, { pending });
+    return pending;
   }
 
   async getCatalog(projectId, resolvedContext) {
@@ -624,6 +645,7 @@ export class AiChatService {
     }
     this.unsubscribeAppServer();
     this.composerCatalog.close();
+    this.catalogs.clear();
     await this.appServer.close();
     this.listeners.clear();
   }
@@ -872,6 +894,7 @@ export class AiChatService {
   }
 
   #handleAppServerNotification(notification) {
+    if (notification?.method === "skills/changed") this.catalogs.clear();
     const params = notification?.params;
     if (!params || typeof params !== "object") return;
     const active = [...this.active.values()].find((candidate) => (
