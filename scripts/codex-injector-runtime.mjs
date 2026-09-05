@@ -1524,7 +1524,8 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || path.resolve(attempt.workspacePath ?? "") !== path.resolve(launchLane.workspacePath)) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
-  if (attempt.expectedRevision !== windows.revision
+  if ((attempt.expectedRevision !== windows.revision
+    || attempt.expectedGlobalLeaseId !== globalLease.id)
     && !["completed", "canceled"].includes(attempt.status)
     && (attempt.status !== "expired" || attempt.threadId)) {
     if (typeof options.rebindAttempt !== "function") {
@@ -1536,9 +1537,11 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     result = await options.rebindAttempt({
       attemptId: attempt.id,
       expectedRevision: windows.revision,
+      expectedGlobalLeaseId: globalLease.id,
     });
     attempt = result?.attempt ?? attempt;
-    if (attempt.expectedRevision !== windows.revision) {
+    if (attempt.expectedRevision !== windows.revision
+      || attempt.expectedGlobalLeaseId !== globalLease.id) {
       return {
         provisioned: false, reason: "attempt-rebind-mismatch",
         domainId: domain.domainId, attemptId: attempt.id,

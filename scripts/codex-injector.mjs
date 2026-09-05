@@ -3150,9 +3150,9 @@ async function runBackgroundContinuationMonitor(cdp) {
         readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
         getAttempt: getDomainCoordinatorProvisioningAttempt,
         requestAttempt: requestDomainCoordinatorProvisioningAttempt,
-        rebindAttempt: ({ attemptId, expectedRevision }) => (
+        rebindAttempt: ({ attemptId, expectedRevision, expectedGlobalLeaseId }) => (
           transitionDomainCoordinatorProvisioningAttempt(
-            attemptId, "rebind", { expectedRevision },
+            attemptId, "rebind", { expectedRevision, expectedGlobalLeaseId },
           )
         ),
         findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),

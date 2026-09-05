@@ -505,11 +505,15 @@ function parseCoordinatorProvisioningRequest(value) {
   };
 }
 
-function parseCoordinatorProvisioningTransition(value, action) {
+function parseCoordinatorProvisioningTransition(value, action, options = {}) {
   assertPlainObject(value);
   assertAllowedKeys(value, action === "attach"
     ? new Set(["threadId"])
-    : action === "rebind" ? new Set(["expectedRevision"]) : new Set());
+    : action === "rebind"
+      ? new Set(options.expectedGlobalLeaseId
+        ? ["expectedRevision", "expectedGlobalLeaseId"]
+        : ["expectedRevision"])
+      : new Set());
   if (action === "attach") {
     return { threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }) };
   }
@@ -520,7 +524,16 @@ function parseCoordinatorProvisioningTransition(value, action) {
     if (!/^[a-f0-9]{64}$/.test(expectedRevision)) {
       throw new ApiError(400, "INVALID_FIELD", "'expectedRevision' must be a lowercase SHA-256 digest");
     }
-    return { expectedRevision };
+    return options.expectedGlobalLeaseId
+      ? {
+        expectedRevision,
+        expectedGlobalLeaseId: stringField(
+          value.expectedGlobalLeaseId,
+          "expectedGlobalLeaseId",
+          { required: true, maxLength: 256 },
+        ),
+      }
+      : { expectedRevision };
   }
   return {};
 }
@@ -3927,7 +3940,11 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = parseCoordinatorProvisioningTransition(body, action);
+        const input = parseCoordinatorProvisioningTransition(
+          body,
+          action,
+          { expectedGlobalLeaseId: true },
+        );
         return sendJson(
           response,
           200,

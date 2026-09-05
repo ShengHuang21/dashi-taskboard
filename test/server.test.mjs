@@ -3451,7 +3451,7 @@ test("background Coordinator registration requests a protected host identity han
   finalInspection.close();
 });
 
-test("domain provisioning bootstraps a legacy peer through registration and lease acquisition", async () => {
+test("domain provisioning recovers a cross-host peer across a Global lease epoch", async () => {
   const instanceSecret = "e".repeat(64);
   const projectId = "local";
   const workspacePath = path.resolve("/tmp/domain-transition-frontend");
@@ -3473,6 +3473,8 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
         {
           id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
           threadId: "frontend-thread", taskType: "peer_task",
+          codexProjectId: "domain-project", codexProjectKind: "remote",
+          codexHostId: "domain-host", workspacePath,
         },
       ],
       adapters: [],
@@ -3515,9 +3517,9 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
     label: "Frontend Coordinator", threadSource: "taskboard-domain-transition-frontend",
     model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
-    globalHolderThreadId: "global-thread", codexProjectId: "codex-project",
-    codexProjectKind: "local", codexHostId: "local",
-    workspacePath: globalWorkspacePath,
+    globalHolderThreadId: "global-thread", codexProjectId: "domain-project",
+    codexProjectKind: "remote", codexHostId: "domain-host",
+    workspacePath,
   };
   const created = await request(baseUrl, requestPath, {
     method: "POST",
@@ -3582,7 +3584,10 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   assert.equal(driftedWindows.response.status, 200, JSON.stringify(driftedWindows.body));
   assert.notEqual(driftedWindows.body.revision, revision);
   const rebindPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/rebind`;
-  const rebindBody = { expectedRevision: driftedWindows.body.revision };
+  const rebindBody = {
+    expectedRevision: driftedWindows.body.revision,
+    expectedGlobalLeaseId: "global-lease",
+  };
   const unprotectedRebind = await request(baseUrl, rebindPath, {
     method: "POST", body: rebindBody,
   });
@@ -3611,16 +3616,16 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   });
   assert.equal(pending.response.status, 202, JSON.stringify(pending.body));
   assert.deepEqual(pending.body.handshake.expectedHostBinding, {
-    codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: globalWorkspacePath,
+    codexProjectId: "domain-project", codexProjectKind: "remote",
+    codexHostId: "domain-host", workspacePath,
   });
   const confirmPath = `/api/local/coordination-identity-handshakes/${pending.body.handshake.id}/confirm`;
   const confirmBody = {
     registration: { projectId, ...registration },
     threadBinding: {
-      threadId: attachBody.threadId, codexProjectId: "codex-project",
-      codexProjectKind: "local", codexHostId: "local",
-      workspacePath: globalWorkspacePath,
+      threadId: attachBody.threadId, codexProjectId: "domain-project",
+      codexProjectKind: "remote", codexHostId: "domain-host",
+      workspacePath,
     },
   };
   const confirmed = await request(baseUrl, confirmPath, {
@@ -3674,6 +3679,153 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   ).get(created.body.attempt.id).status, "expired");
   restoredDemandInspection.prepare("UPDATE tasks SET status = 'todo' WHERE title = 'Frontend work'").run();
   restoredDemandInspection.close();
+
+  const expiredGlobalDatabase = new TaskboardDatabase(databasePath);
+  const expiredGlobalConfig = expiredGlobalDatabase.getAgentLaneProject(projectId);
+  expiredGlobalDatabase.upsertAgentLaneProject(projectId, {
+    ...expiredGlobalConfig,
+    coordinatorLease: {
+      ...expiredGlobalConfig.coordinatorLease,
+      expiresAt: new Date(Date.now() - 1_000).toISOString(),
+    },
+  });
+  expiredGlobalDatabase.close();
+  const recoverGlobalPath = "/api/local/projects/local/coordinator-lease/recover";
+  const recoverGlobalBody = {
+    holderTaskId: "global", holderThreadId: "global-thread",
+    holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+    expectedLeaseId: "global-lease", leaseDurationSeconds: 120,
+  };
+  const recoveredGlobal = await request(baseUrl, recoverGlobalPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "7b".repeat(16), recoverGlobalPath, recoverGlobalBody,
+    ),
+    body: recoverGlobalBody,
+  });
+  assert.equal(recoveredGlobal.response.status, 200, JSON.stringify(recoveredGlobal.body));
+  assert.notEqual(recoveredGlobal.body.lease.id, "global-lease");
+  const recoveredWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  assert.equal(recoveredWindows.response.status, 200, JSON.stringify(recoveredWindows.body));
+  const epochRebindBody = {
+    expectedRevision: recoveredWindows.body.revision,
+    expectedGlobalLeaseId: recoveredGlobal.body.lease.id,
+  };
+  const releasedFenceInspection = new DatabaseSync(databasePath);
+  const attemptBeforeReleasedConflict = JSON.stringify(releasedFenceInspection.prepare(
+    "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+  ).get(created.body.attempt.id));
+  releasedFenceInspection.prepare(`
+    INSERT INTO agent_coordinator_lease_receipts (
+      id, project_id, lease_id, holder_task_id, holder_thread_id, action, created_at
+    ) VALUES (?, ?, ?, ?, ?, 'released', ?)
+  `).run(
+    "global-release-fence", projectId, "global-lease", "global", "global-thread",
+    new Date().toISOString(),
+  );
+  releasedFenceInspection.close();
+  const releasedEpochRebind = await request(baseUrl, rebindPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "7c".repeat(16), rebindPath, epochRebindBody,
+    ),
+    body: epochRebindBody,
+  });
+  assert.equal(releasedEpochRebind.response.status, 409, JSON.stringify(releasedEpochRebind.body));
+  assert.equal(
+    releasedEpochRebind.body.error.code,
+    "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
+  );
+  const releasedConflictInspection = new DatabaseSync(databasePath);
+  assert.equal(JSON.stringify(releasedConflictInspection.prepare(
+    "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+  ).get(created.body.attempt.id)), attemptBeforeReleasedConflict);
+  releasedConflictInspection.prepare(
+    "DELETE FROM agent_coordinator_lease_receipts WHERE id = ?",
+  ).run("global-release-fence");
+  releasedConflictInspection.close();
+
+  const globalIdentityDrifts = [
+    { name: "codexProjectId", value: "other-global-project" },
+    { name: "codexProjectKind", value: "remote" },
+    { name: "codexHostId", value: "other-global-host" },
+    { name: "workspacePath", value: path.resolve("/tmp/other-global-workspace") },
+  ];
+  for (const [index, drift] of globalIdentityDrifts.entries()) {
+    const driftInspection = new DatabaseSync(databasePath);
+    const currentProject = driftInspection.prepare(
+      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+    ).get(projectId);
+    const currentConfig = JSON.parse(currentProject.config_json);
+    const driftedTasks = currentConfig.tasks.map((task) => task.id === "global"
+      ? { ...task, [drift.name]: drift.value }
+      : task);
+    const driftedLease = drift.name === "codexHostId"
+      ? { ...currentConfig.coordinatorLease, holderCodexHostId: drift.value }
+      : drift.name === "workspacePath"
+        ? { ...currentConfig.coordinatorLease, holderWorkspacePath: drift.value }
+        : currentConfig.coordinatorLease;
+    driftInspection.prepare(
+      "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = ?",
+    ).run(JSON.stringify({
+      ...currentConfig,
+      tasks: driftedTasks,
+      coordinatorLease: driftedLease,
+    }), projectId);
+    const attemptBeforeDriftConflict = JSON.stringify(driftInspection.prepare(
+      "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.body.attempt.id));
+    driftInspection.close();
+    const driftedEpochWindows = await request(
+      baseUrl,
+      "/api/local/projects/local/coordination-windows",
+      { headers: { "x-taskboard-client": "taskctl" } },
+    );
+    const driftedEpochRebindBody = {
+      expectedRevision: driftedEpochWindows.body.revision,
+      expectedGlobalLeaseId: recoveredGlobal.body.lease.id,
+    };
+    const rejectedDrift = await request(baseUrl, rebindPath, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret,
+        `${index + 1}`.repeat(64),
+        rebindPath,
+        driftedEpochRebindBody,
+      ),
+      body: driftedEpochRebindBody,
+    });
+    assert.equal(rejectedDrift.response.status, 409, `${drift.name}: ${JSON.stringify(rejectedDrift.body)}`);
+    assert.equal(
+      rejectedDrift.body.error.code,
+      "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
+    );
+    const afterDriftInspection = new DatabaseSync(databasePath);
+    assert.equal(JSON.stringify(afterDriftInspection.prepare(
+      "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.body.attempt.id)), attemptBeforeDriftConflict);
+    afterDriftInspection.prepare(
+      "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = ?",
+    ).run(currentProject.config_json, projectId);
+    afterDriftInspection.close();
+  }
+
+  const reboundEpoch = await request(baseUrl, rebindPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "7d".repeat(16), rebindPath, epochRebindBody,
+    ),
+    body: epochRebindBody,
+  });
+  assert.equal(reboundEpoch.response.status, 200, JSON.stringify(reboundEpoch.body));
+  assert.equal(reboundEpoch.body.attempt.id, created.body.attempt.id);
+  assert.equal(reboundEpoch.body.attempt.threadId, attachBody.threadId);
+  assert.equal(reboundEpoch.body.attempt.expectedRevision, recoveredWindows.body.revision);
+  assert.equal(reboundEpoch.body.attempt.expectedGlobalLeaseId, recoveredGlobal.body.lease.id);
+  revision = recoveredWindows.body.revision;
+
   const resumedExpired = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
@@ -3706,7 +3858,7 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   const snapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(snapshot.response.status, 200);
   assert.equal(snapshot.body.coordination.coordinatorTaskId, "global");
-  assert.equal(snapshot.body.coordination.lease.id, "global-lease");
+  assert.equal(snapshot.body.coordination.lease.id, recoveredGlobal.body.lease.id);
   assert.deepEqual(
     snapshot.body.coordination.domainCoordinators.map((domain) => [
       domain.domainId, domain.assignment, domain.coordinatorTaskId,
@@ -3720,6 +3872,181 @@ test("domain provisioning bootstraps a legacy peer through registration and leas
   assert.equal(persistedAttempt.status, "completed");
   assert.equal(persistedAttempt.thread_id, attachBody.threadId);
   inspection.close();
+});
+
+test("legacy attempts without a Global identity fail closed after cross-host lease recovery", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-domain-legacy-rebind-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const projectId = "local";
+  const globalWorkspacePath = path.resolve("/tmp/domain-legacy-global");
+  const domainWorkspacePath = path.resolve("/tmp/domain-legacy-worktree");
+  const domainThreadId = "01a062c1-fd2b-7f61-9114-d483e695640f";
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  let database = new TaskboardDatabase(databasePath);
+  try {
+    database.upsertAgentLaneProject(projectId, {
+      rootTaskId: "global",
+      tasks: [
+        {
+          id: "global", label: "Global", owner: "Codex", source: "codex",
+          threadId: "global-thread", taskType: "root_task",
+          codexProjectId: "global-project", codexProjectKind: "remote",
+          codexHostId: "global-host", workspacePath: globalWorkspacePath,
+        },
+        {
+          id: "legacy-domain", label: "Legacy Domain", owner: "Codex", source: "codex",
+          threadId: "legacy-domain-thread", taskType: "peer_task",
+          codexProjectId: "domain-project", codexProjectKind: "remote",
+          codexHostId: "domain-host", workspacePath: domainWorkspacePath,
+        },
+      ],
+      adapters: [],
+      coordinatorLease: {
+        id: "legacy-global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "global-host", holderWorkspacePath: globalWorkspacePath,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "legacy-domain", label: "Legacy Domain", writeScope: ["tmp/legacy-domain"],
+        eligibleTaskIds: ["legacy-domain"],
+      }],
+    });
+    const task = database.createTask({
+      projectId, title: "Legacy domain work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "global-thread",
+      threadBinding: {
+        threadId: "global-thread", codexProjectId: "global-project",
+        codexProjectKind: "local", codexHostId: "local",
+        workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: domainWorkspacePath, branch: "codex/domain-legacy",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain(projectId, task.id, {
+      domainId: "legacy-domain", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "legacy-global-lease",
+    });
+    const revision = database.getAgentLaneCoordinationWindows(projectId).revision;
+    const created = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+      projectId,
+      "legacy-domain",
+      {
+        idempotencyKey: "legacy-domain-rebind", taskId: "legacy-domain",
+        label: "Legacy Domain", threadSource: "taskboard-domain-legacy-rebind",
+        model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+        expectedGlobalLeaseId: "legacy-global-lease", globalHolderTaskId: "global",
+        globalHolderThreadId: "global-thread", codexProjectId: "domain-project",
+        codexProjectKind: "remote", codexHostId: "domain-host",
+        workspacePath: domainWorkspacePath,
+      },
+    );
+    database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+      created.attempt.id, "starting",
+    );
+    database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+      created.attempt.id, "attach", { threadId: domainThreadId },
+    );
+    database.database.prepare(`
+      UPDATE agent_domain_coordinator_provisioning_attempts
+      SET status = 'expired', expires_at = ?,
+          global_holder_codex_project_id = NULL,
+          global_holder_codex_project_kind = NULL,
+          global_holder_codex_host_id = NULL,
+          global_holder_workspace_path = NULL
+      WHERE id = ?
+    `).run(new Date(Date.now() - 1_000).toISOString(), created.attempt.id);
+    const expiredConfig = database.getAgentLaneProject(projectId);
+    database.upsertAgentLaneProject(projectId, {
+      ...expiredConfig,
+      tasks: expiredConfig.tasks.map((configuredTask) => {
+        if (configuredTask.id === "global") {
+          return {
+            ...configuredTask,
+            codexProjectId: "domain-project",
+            codexProjectKind: "remote",
+            codexHostId: "domain-host",
+            workspacePath: domainWorkspacePath,
+          };
+        }
+        if (configuredTask.id === "legacy-domain") {
+          return {
+            id: configuredTask.id,
+            label: configuredTask.label,
+            owner: configuredTask.owner,
+            source: configuredTask.source,
+            threadId: configuredTask.threadId,
+            taskType: configuredTask.taskType,
+          };
+        }
+        return configuredTask;
+      }),
+      coordinatorLease: {
+        ...expiredConfig.coordinatorLease,
+        holderCodexHostId: "domain-host",
+        holderWorkspacePath: domainWorkspacePath,
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      },
+    });
+    const recoveredGlobal = database.claimAgentLaneCoordinator(projectId, {
+      holderTaskId: "global", holderThreadId: "global-thread",
+      holderCodexHostId: "domain-host", holderWorkspacePath: domainWorkspacePath,
+      expectedLeaseId: "legacy-global-lease", leaseDurationSeconds: 120,
+      recoverOnly: true,
+    });
+    const recoveredRevision = database.getAgentLaneCoordinationWindows(projectId).revision;
+    database.database.prepare(`
+      UPDATE agent_domain_coordinator_provisioning_attempts
+      SET global_holder_codex_project_id = 'partial-legacy-binding'
+      WHERE id = ?
+    `).run(created.attempt.id);
+    const partialLegacyAttempt = JSON.stringify(database.database.prepare(
+      "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.attempt.id));
+    assert.throws(
+      () => database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+        created.attempt.id,
+        "rebind",
+        {
+          expectedRevision: recoveredRevision,
+          expectedGlobalLeaseId: recoveredGlobal.lease.id,
+        },
+      ),
+      (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
+    );
+    assert.equal(JSON.stringify(database.database.prepare(
+      "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.attempt.id)), partialLegacyAttempt);
+    database.database.prepare(`
+      UPDATE agent_domain_coordinator_provisioning_attempts
+      SET global_holder_codex_project_id = NULL WHERE id = ?
+    `).run(created.attempt.id);
+    const legacyAttempt = JSON.stringify(database.database.prepare(
+      "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.attempt.id));
+    assert.throws(
+      () => database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+        created.attempt.id,
+        "rebind",
+        {
+          expectedRevision: recoveredRevision,
+          expectedGlobalLeaseId: recoveredGlobal.lease.id,
+        },
+      ),
+      (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
+    );
+    assert.equal(JSON.stringify(database.database.prepare(
+      "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+    ).get(created.attempt.id)), legacyAttempt);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("resident provisioning persists one protected idempotent attempt before replacement thread start", async () => {

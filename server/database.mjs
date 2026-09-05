@@ -229,6 +229,10 @@ function domainCoordinatorProvisioningAttemptFromRow(row) {
     expectedGlobalLeaseId: row.expected_global_lease_id,
     globalHolderTaskId: row.global_holder_task_id,
     globalHolderThreadId: row.global_holder_thread_id,
+    globalHolderCodexProjectId: row.global_holder_codex_project_id ?? null,
+    globalHolderCodexProjectKind: row.global_holder_codex_project_kind ?? null,
+    globalHolderCodexHostId: row.global_holder_codex_host_id ?? null,
+    globalHolderWorkspacePath: row.global_holder_workspace_path ?? null,
     codexProjectId: row.codex_project_id,
     codexProjectKind: row.codex_project_kind,
     codexHostId: row.codex_host_id,
@@ -1637,6 +1641,10 @@ export class TaskboardDatabase {
         expected_global_lease_id TEXT NOT NULL,
         global_holder_task_id TEXT NOT NULL,
         global_holder_thread_id TEXT NOT NULL,
+        global_holder_codex_project_id TEXT,
+        global_holder_codex_project_kind TEXT CHECK (global_holder_codex_project_kind IN ('local', 'remote')),
+        global_holder_codex_host_id TEXT,
+        global_holder_workspace_path TEXT,
         codex_project_id TEXT NOT NULL,
         codex_project_kind TEXT NOT NULL CHECK (codex_project_kind IN ('local', 'remote')),
         codex_host_id TEXT NOT NULL,
@@ -2151,6 +2159,22 @@ export class TaskboardDatabase {
     ).all();
     if (!coordinatorProvisioningColumns.some((column) => column.name === "missing_since")) {
       this.database.exec("ALTER TABLE agent_coordinator_provisioning_attempts ADD COLUMN missing_since TEXT");
+    }
+
+    const domainCoordinatorProvisioningColumns = this.#prepare(
+      "PRAGMA table_info(agent_domain_coordinator_provisioning_attempts)",
+    ).all();
+    for (const [column, definition] of [
+      ["global_holder_codex_project_id", "TEXT"],
+      ["global_holder_codex_project_kind", "TEXT CHECK (global_holder_codex_project_kind IN ('local', 'remote'))"],
+      ["global_holder_codex_host_id", "TEXT"],
+      ["global_holder_workspace_path", "TEXT"],
+    ]) {
+      if (!domainCoordinatorProvisioningColumns.some((entry) => entry.name === column)) {
+        this.database.exec(
+          `ALTER TABLE agent_domain_coordinator_provisioning_attempts ADD COLUMN ${column} ${definition}`,
+        );
+      }
     }
 
     const ownerDecisionDeliveryColumns = this.#prepare(
@@ -3940,6 +3964,10 @@ export class TaskboardDatabase {
         expected_revision: revision, expected_global_lease_id: globalLease.id,
         global_holder_task_id: globalHolder.id,
         global_holder_thread_id: globalHolder.threadId,
+        global_holder_codex_project_id: globalHolder.codexProjectId,
+        global_holder_codex_project_kind: globalHolder.codexProjectKind,
+        global_holder_codex_host_id: globalHolder.codexHostId,
+        global_holder_workspace_path: path.resolve(globalHolder.workspacePath),
         codex_project_id: launchHolder.codexProjectId,
         codex_project_kind: launchHolder.codexProjectKind,
         codex_host_id: launchHolder.codexHostId,
@@ -3955,10 +3983,12 @@ export class TaskboardDatabase {
           task_id, label, thread_source, model, reasoning_effort,
           expected_revision, expected_global_lease_id,
           global_holder_task_id, global_holder_thread_id,
+          global_holder_codex_project_id, global_holder_codex_project_kind,
+          global_holder_codex_host_id, global_holder_workspace_path,
           codex_project_id, codex_project_kind, codex_host_id, workspace_path,
           write_scope_json, status, thread_id, retry_count, missing_since,
           created_at, updated_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(...Object.values(attemptRow));
       this.database.exec("COMMIT");
       return { applied: true, attempt: domainCoordinatorProvisioningAttemptFromRow(attemptRow) };
@@ -4053,6 +4083,33 @@ export class TaskboardDatabase {
         && domainHolder.codexHostId === row.codex_host_id
         && path.resolve(domainHolder.workspacePath ?? "") === path.resolve(row.workspace_path)
         && (!registrationReceipt || !row.thread_id || domainHolder.threadId === row.thread_id);
+      const hasAnyPersistedGlobalHolderBinding = [
+        row.global_holder_codex_project_id,
+        row.global_holder_codex_project_kind,
+        row.global_holder_codex_host_id,
+        row.global_holder_workspace_path,
+      ].some((value) => value !== null && value !== undefined && value !== "");
+      const persistedGlobalHolderCandidate = row.global_holder_codex_project_id
+        && row.global_holder_codex_project_kind
+        && row.global_holder_codex_host_id
+        && row.global_holder_workspace_path
+        ? {
+          codexProjectId: row.global_holder_codex_project_id,
+          codexProjectKind: row.global_holder_codex_project_kind,
+          codexHostId: row.global_holder_codex_host_id,
+          workspacePath: row.global_holder_workspace_path,
+        }
+        : null;
+      const persistedGlobalHolderBinding = hasExactCodexHostBinding(
+        persistedGlobalHolderCandidate,
+      ) ? persistedGlobalHolderCandidate : null;
+      const exactPersistedGlobalHolderBinding = persistedGlobalHolderBinding
+        && hasExactCodexHostBinding(globalHolder)
+        && globalHolder.codexProjectId === persistedGlobalHolderBinding.codexProjectId
+        && globalHolder.codexProjectKind === persistedGlobalHolderBinding.codexProjectKind
+        && globalHolder.codexHostId === persistedGlobalHolderBinding.codexHostId
+        && path.resolve(globalHolder.workspacePath ?? "")
+          === path.resolve(persistedGlobalHolderBinding.workspacePath);
       const exactLegacyLaunchBinding = isConfiguredCodexPeerTask(domainHolder)
         && !hasProtectedCodexBinding(domainHolder)
         && hasExactCodexHostBinding(globalHolder)
@@ -4060,19 +4117,40 @@ export class TaskboardDatabase {
         && globalHolder.codexProjectKind === row.codex_project_kind
         && globalHolder.codexHostId === row.codex_host_id
         && path.resolve(globalHolder.workspacePath ?? "") === path.resolve(row.workspace_path);
-      const stableIdentityBindingWithoutRevision = project
+      const stableIdentityBindingWithoutLease = project
         && domain
         && domain.eligibleTaskIds.includes(row.task_id)
         && JSON.stringify(domain.writeScope) === row.write_scope_json
         && domainHolder?.label === row.label
         && (exactBoundLaunchOrRegisteredHolder || exactLegacyLaunchBinding)
-        && globalLease?.id === row.expected_global_lease_id
         && globalHolder?.id === row.global_holder_task_id
         && globalHolder?.threadId === row.global_holder_thread_id
         && !activeDomainLease;
+      const sameExpectedGlobalLease = globalLease?.id === row.expected_global_lease_id;
+      const requestedGlobalLeaseIsCurrent = globalLease?.id === input.expectedGlobalLeaseId;
+      const sameLeaseGlobalIdentityIsSafe = persistedGlobalHolderBinding
+        ? exactPersistedGlobalHolderBinding
+        : !hasAnyPersistedGlobalHolderBinding;
+      const oldExpectedGlobalLeaseWasReleased = Boolean(this.#coordinatorLeaseReleasedAt(
+        row.project_id,
+        {
+          id: row.expected_global_lease_id,
+          holderTaskId: row.global_holder_task_id,
+          holderThreadId: row.global_holder_thread_id,
+        },
+      ));
+      const recoverableLeaseEpochRebind = recoverableExpiredRebind
+        && requestedGlobalLeaseIsCurrent
+        && Boolean(persistedGlobalHolderBinding)
+        && exactPersistedGlobalHolderBinding
+        && !oldExpectedGlobalLeaseWasReleased;
       if (action === "rebind") {
         if (currentRevision !== input.expectedRevision
-          || !stableIdentityBindingWithoutRevision
+          || !stableIdentityBindingWithoutLease
+          || !requestedGlobalLeaseIsCurrent
+          || (sameExpectedGlobalLease
+            ? !sameLeaseGlobalIdentityIsSafe
+            : !recoverableLeaseEpochRebind)
           || !durableWork) {
           throw new ApiError(
             409,
@@ -4083,13 +4161,24 @@ export class TaskboardDatabase {
         const timestamp = now();
         this.#prepare(`
           UPDATE agent_domain_coordinator_provisioning_attempts
-          SET expected_revision = ?, updated_at = ? WHERE id = ?
-        `).run(input.expectedRevision, timestamp, attemptId);
+          SET expected_revision = ?, expected_global_lease_id = ?, updated_at = ? WHERE id = ?
+        `).run(
+          input.expectedRevision,
+          input.expectedGlobalLeaseId,
+          timestamp,
+          attemptId,
+        );
         this.database.exec("COMMIT");
         return { attempt: domainCoordinatorProvisioningAttemptFromRow({
-          ...row, expected_revision: input.expectedRevision, updated_at: timestamp,
+          ...row,
+          expected_revision: input.expectedRevision,
+          expected_global_lease_id: input.expectedGlobalLeaseId,
+          updated_at: timestamp,
         }) };
       }
+      const stableIdentityBindingWithoutRevision = stableIdentityBindingWithoutLease
+        && sameExpectedGlobalLease
+        && sameLeaseGlobalIdentityIsSafe;
       const stableIdentityBinding = stableRevision && stableIdentityBindingWithoutRevision;
       if (!stableIdentityBinding) {
         const timestamp = now();
