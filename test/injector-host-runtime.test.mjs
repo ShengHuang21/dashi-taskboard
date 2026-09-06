@@ -3556,6 +3556,62 @@ test("background continuation recovers an uncertain deterministic child without 
   });
 });
 
+test("background continuation never reconciles an unconfirmed admission probe delivery", async () => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  for (const [deliveryReason, expectedReason] of [
+    ["terminal-retry-backoff", "admission-terminal-retry-backoff"],
+    ["delivery-status-unconfirmed", "admission-delivery-status-unconfirmed"],
+  ]) {
+    let reconciled = false;
+    const result = await runTaskboardContinuationMonitorOnce({
+      policy: { enabled: true, projectId: "taskboard-core" },
+      readSnapshot: async () => ({
+        projectId: "taskboard-core",
+        todos: [{
+          id: "CAP-51",
+          taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+          dispatchTarget: {
+            rootThreadId,
+            codexHostId: "local",
+            rootWorkspacePath: "/tmp/taskboard",
+            worktreePath: "/tmp/taskboard/project",
+          },
+          admission: {
+            receiptId: "recovery-receipt",
+            attemptId: "recovery-attempt",
+            state: "admission_uncertain",
+            rootThreadId,
+            resumeToken: "b".repeat(64),
+            safeActionId: "safe-action",
+          },
+        }],
+      }),
+      claimReceipt: async () => assert.fail("deferred recovery must not reserve work"),
+      confirmDelivery: async () => assert.fail("deferred recovery must not confirm work"),
+      deliver: async () => assert.fail("deferred recovery must not deliver ordinary work"),
+      completeDelivery: async () => assert.fail("deferred recovery must not complete work"),
+      markAdmissionUncertain: async () => assert.fail("admission is already uncertain"),
+      claimAdmissionProbe: async () => ({
+        receipt: {
+          admissionProbeId: "probe-cap51",
+          admissionProbeRequestedAt: "2026-09-06T05:37:23Z",
+        },
+      }),
+      deliverAdmissionRecovery: async () => ({ delivery: "deferred", reason: deliveryReason }),
+      reconcileAdmission: async () => {
+        reconciled = true;
+        return { outcome: "absent" };
+      },
+    });
+    assert.equal(reconciled, false, deliveryReason);
+    assert.deepEqual(result, {
+      delivered: false,
+      todoId: "CAP-51",
+      reason: expectedReason,
+    }, deliveryReason);
+  }
+});
+
 test("background continuation retires an absent child only through the original coordinator Root", async () => {
   const calls = [];
   let reconcileCount = 0;
@@ -3655,6 +3711,82 @@ test("background continuation retires an absent child only through the original 
     todoId: "CAP-44",
     reason: "replacement-admission-deferred",
   });
+});
+
+test("replacement recovery never reconciles an unconfirmed admission probe delivery", async () => {
+  const oldRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const replacementRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  for (const [deliveryReason, expectedReason] of [
+    ["terminal-retry-backoff", "replacement-admission-terminal-retry-backoff"],
+    ["delivery-status-unconfirmed", "replacement-admission-delivery-status-unconfirmed"],
+  ]) {
+    let reconciled = false;
+    const result = await runTaskboardContinuationMonitorOnce({
+      policy: { enabled: true, projectId: "taskboard-core" },
+      readSnapshot: async () => ({
+        projectId: "taskboard-core",
+        todos: [{
+          id: "CAP-51",
+          taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+          dispatchTarget: {
+            rootThreadId: replacementRootThreadId,
+            codexHostId: "local",
+            rootWorkspacePath: "/tmp/taskboard",
+            worktreePath: "/tmp/taskboard/project",
+          },
+          domainAssignment: {
+            status: "active",
+            domainId: "frontend",
+            leaseId: "replacement-lease",
+            coordinatorTaskId: "frontend-coordinator",
+          },
+          admission: {
+            receiptId: "replacement-receipt",
+            attemptId: "replacement-attempt",
+            state: "admission_uncertain",
+            rootThreadId: oldRootThreadId,
+            rootHostId: "local",
+            rootWorkspacePath: "/tmp/taskboard",
+            resumeToken: "d".repeat(64),
+            safeActionId: "safe-action",
+            coordinationDomainId: "frontend",
+            domainCoordinatorLeaseId: "old-lease",
+            domainCoordinatorTaskId: "frontend-coordinator",
+            domainCoordinatorThreadId: oldRootThreadId,
+            globalCoordinatorLeaseId: null,
+            globalCoordinatorTaskId: null,
+            globalCoordinatorThreadId: null,
+          },
+        }],
+      }),
+      claimReceipt: async () => assert.fail("deferred replacement must not reserve work"),
+      confirmDelivery: async () => assert.fail("deferred replacement must not confirm work"),
+      deliver: async () => assert.fail("deferred replacement must not deliver ordinary work"),
+      completeDelivery: async () => assert.fail("deferred replacement must not complete work"),
+      claimReplacementAdmissionProbe: async () => ({
+        receipt: {
+          admissionProbeId: "replacement-probe",
+          admissionProbeRequestedAt: "2026-09-06T05:37:23Z",
+        },
+        observationTarget: {
+          rootThreadId: oldRootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/taskboard",
+        },
+      }),
+      deliverAdmissionRecovery: async () => ({ delivery: "deferred", reason: deliveryReason }),
+      reconcileReplacementAdmission: async () => {
+        reconciled = true;
+        return { outcome: "absent" };
+      },
+    });
+    assert.equal(reconciled, false, deliveryReason);
+    assert.deepEqual(result, {
+      delivered: false,
+      todoId: "CAP-51",
+      reason: expectedReason,
+    }, deliveryReason);
+  }
 });
 
 test("background continuation recovers expired pending admissions after coordinator replacement", async () => {

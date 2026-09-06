@@ -3417,13 +3417,21 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     }
     recovery.admissionProbeId = probe.receipt.admissionProbeId;
     recovery.admissionProbeRequestedAt = probe.receipt.admissionProbeRequestedAt;
-    await deliverAdmissionRecovery({
+    const probeDelivery = await deliverAdmissionRecovery({
       ...recovery,
       mode: "probe",
       rootThreadId: probe.observationTarget.rootThreadId,
       codexHostId: probe.observationTarget.codexHostId,
       rootWorkspacePath: probe.observationTarget.rootWorkspacePath,
     });
+    if (!["started", "steered", "observed"].includes(probeDelivery?.delivery)) {
+      const reason = probeDelivery?.reason === "terminal-retry-backoff"
+        ? "replacement-admission-terminal-retry-backoff"
+        : probeDelivery?.reason === "delivery-status-unconfirmed"
+          ? "replacement-admission-delivery-status-unconfirmed"
+          : "replacement-admission-probe-not-confirmed";
+      return { delivered: false, todoId: replacementRecoveryTodo.id, reason };
+    }
     const reconciled = await reconcileReplacementAdmission(recovery);
     return {
       delivered: false,
@@ -3493,7 +3501,15 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       }
       recovery.admissionProbeId = probe.receipt.admissionProbeId;
       recovery.admissionProbeRequestedAt = probe.receipt.admissionProbeRequestedAt;
-      await deliverAdmissionRecovery({ ...recovery, mode: "probe" });
+      const probeDelivery = await deliverAdmissionRecovery({ ...recovery, mode: "probe" });
+      if (!["started", "steered", "observed"].includes(probeDelivery?.delivery)) {
+        const reason = probeDelivery?.reason === "terminal-retry-backoff"
+          ? "admission-terminal-retry-backoff"
+          : probeDelivery?.reason === "delivery-status-unconfirmed"
+            ? "admission-delivery-status-unconfirmed"
+            : "admission-probe-not-confirmed";
+        return { delivered: false, todoId: recoveryTodo.id, reason };
+      }
       const reconciled = await reconcileAdmission(recovery);
       if (reconciled?.outcome === "absent") {
         return { delivered: false, reason: "admission-deferred" };
