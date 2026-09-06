@@ -1991,11 +1991,13 @@ test("replacement coordinator retires only an absent child observed from the ori
     rootThreadId: "frontend-old-thread", expectedResumeToken: oldToken, safeActionId: "test",
     reservationLeaseId: "old-reservation",
   });
-  database.markTaskSafeActionAdmissionUncertain(task.id, {
+  const preparedReplacement = database.prepareTaskSafeActionAdmission(task.id, {
     rootThreadId: "frontend-old-thread", expectedResumeToken: oldToken, safeActionId: "test",
     admissionReceiptId: reserved.receipt.id,
     admissionAttemptId: reserved.receipt.admissionAttemptId,
-  }, new Date(Date.parse(delivering.receipt.admissionDeadlineAt) + 1).toISOString());
+    writeScope: ["web"],
+  });
+  assert.equal(preparedReplacement.receipt.admissionState, "prepared");
 
   const oldConfig = database.getAgentLaneProject(projectId);
   database.upsertAgentLaneProject(projectId, {
@@ -2024,7 +2026,20 @@ test("replacement coordinator retires only an absent child observed from the ori
     admissionReceiptId: reserved.receipt.id,
     admissionAttemptId: reserved.receipt.admissionAttemptId,
   };
-  const probe = database.claimTaskSafeActionReplacementAdmissionProbe(task.id, bindingInput);
+  assert.throws(
+    () => database.claimTaskSafeActionReplacementAdmissionProbe(
+      task.id,
+      bindingInput,
+      new Date(Date.parse(preparedReplacement.receipt.admissionDeadlineAt) - 1).toISOString(),
+    ),
+    (error) => error?.code === "ADMISSION_DEADLINE_ACTIVE",
+  );
+  const probe = database.claimTaskSafeActionReplacementAdmissionProbe(
+    task.id,
+    bindingInput,
+    new Date(Date.parse(preparedReplacement.receipt.admissionDeadlineAt) + 1).toISOString(),
+  );
+  assert.equal(probe.receipt.admissionState, "admission_uncertain");
   assert.equal(probe.observationTarget.rootThreadId, "frontend-old-thread");
   assert.equal(probe.observationTarget.codexHostId, "local");
   assert.equal(probe.observationTarget.rootWorkspacePath, domainWorkspacePath);

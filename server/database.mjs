@@ -9078,12 +9078,12 @@ export class TaskboardDatabase {
 
   claimTaskSafeActionReplacementAdmissionProbe(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
-  }) {
+  }, observedAt = now()) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-      const row = this.#prepare(`
+      let row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
       `).get(admissionReceiptId, task.id, expectedResumeToken, safeActionId);
@@ -9091,11 +9091,33 @@ export class TaskboardDatabase {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Replacement admission probe does not match the current attempt");
       }
       this.#taskSafeActionReplacementRetirementEligible(row, rootRun);
-      if (row.status !== "delivering" || row.admission_state !== "admission_uncertain") {
+      if (row.status !== "delivering"
+        || !["awaiting_admission", "prepared", "admission_uncertain"].includes(row.admission_state)) {
         throw new ApiError(409, "ADMISSION_NOT_UNCERTAIN", "Only the current uncertain admission can claim a replacement probe");
       }
       if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
         throw new ApiError(409, "ADMISSION_ALREADY_CLAIMED", "An admitted or open Agent run cannot claim a replacement probe");
+      }
+      if (["awaiting_admission", "prepared"].includes(row.admission_state)) {
+        const uncertainAt = observedAt;
+        if (!Number.isFinite(Date.parse(uncertainAt))) {
+          throw new ApiError(400, "INVALID_ADMISSION_OBSERVED_AT", "Admission observation time is invalid");
+        }
+        if (!row.admission_deadline_at
+          || Date.parse(row.admission_deadline_at) > Date.parse(uncertainAt)) {
+          throw new ApiError(409, "ADMISSION_DEADLINE_ACTIVE", "Admission deadline has not expired");
+        }
+        const transitioned = this.#prepare(`
+          UPDATE task_safe_action_receipts
+          SET admission_state = 'admission_uncertain', admission_uncertain_at = ?
+          WHERE id = ? AND status = 'delivering'
+            AND admission_state IN ('awaiting_admission', 'prepared')
+            AND admission_attempt_id = ?
+        `).run(uncertainAt, row.id, admissionAttemptId);
+        if (transitioned.changes !== 1) {
+          throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Replacement admission changed before timeout was persisted");
+        }
+        row = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       }
       if (row.admission_probe_id
         && row.admission_probe_requested_at
