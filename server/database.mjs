@@ -8764,6 +8764,56 @@ export class TaskboardDatabase {
     }
   }
 
+  revalidateTaskSafeActionHostAccess(id, {
+    rootThreadId,
+    expectedResumeToken,
+    safeActionId,
+    reservationLeaseId,
+    recoveryLeaseId,
+    admissionReceiptId,
+    admissionAttemptId,
+  }) {
+    const task = this.#requireTask(id);
+    const capsule = this.getTaskCapsule(task.id);
+    const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+    if (task.workflowProfile !== "vibe") {
+      throw new ApiError(409, "TASKBOARD_HOST_ACCESS_FORBIDDEN", "Taskboard host access requires a personal vibe task");
+    }
+    if (capsule.resumeToken !== expectedResumeToken
+      || capsule.readyWork.eligible !== true
+      || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
+      throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Taskboard host access must match the current safe action");
+    }
+    const row = this.#prepare(`
+      SELECT * FROM task_safe_action_receipts
+      WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
+        AND root_thread_id = ? AND status = 'delivering'
+        AND reservation_lease_id = ? AND admission_attempt_id = ?
+    `).get(
+      admissionReceiptId,
+      task.id,
+      expectedResumeToken,
+      safeActionId,
+      rootThreadId,
+      reservationLeaseId,
+      admissionAttemptId,
+    );
+    if (!row) {
+      throw new ApiError(409, "SAFE_ACTION_RECEIPT_MISSING", "Taskboard host access requires the exact delivering receipt");
+    }
+    this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+    if (row.recovery_lease_id !== recoveryLeaseId
+      || !row.recovery_lease_expires_at
+      || Date.parse(row.recovery_lease_expires_at) <= Date.now()) {
+      throw new ApiError(409, "SAFE_ACTION_RECOVERY_LEASE_REQUIRED", "Taskboard host access requires the active recovery lease");
+    }
+    if (row.worktree_path !== task.developmentContext?.path
+      || row.worktree_branch !== task.developmentContext?.branch) {
+      throw new ApiError(409, "EXECUTION_TARGET_MISMATCH", "Taskboard host access requires the current execution worktree");
+    }
+    return { task, receipt: this.#taskSafeActionReceipt(row) };
+  }
+
   completeTaskSafeActionDelivery(id, {
     rootThreadId, expectedResumeToken, safeActionId, reservationLeaseId, recoveryLeaseId, deliveryTurnId,
   }) {

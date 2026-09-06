@@ -1634,6 +1634,53 @@ function parseSafeActionBootstrapClaim(body) {
   };
 }
 
+function parseTaskboardHostAccessRevalidation(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "rootThreadId", "expectedResumeToken", "safeActionId", "reservationLeaseId",
+    "recoveryLeaseId", "admissionReceiptId", "admissionAttemptId",
+  ]));
+  const rootThreadId = parseThreadId(body.rootThreadId);
+  if (!rootThreadId) throw new ApiError(400, "INVALID_FIELD", "'rootThreadId' is required");
+  const expectedResumeToken = stringField(body.expectedResumeToken, "expectedResumeToken", {
+    required: true,
+    maxLength: 64,
+  });
+  if (!/^[a-f0-9]{64}$/.test(expectedResumeToken)) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedResumeToken' must be a SHA-256 token");
+  }
+  return {
+    rootThreadId,
+    expectedResumeToken,
+    safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
+    reservationLeaseId: stringField(body.reservationLeaseId, "reservationLeaseId", {
+      required: true, maxLength: 64,
+    }),
+    recoveryLeaseId: stringField(body.recoveryLeaseId, "recoveryLeaseId", {
+      required: true, maxLength: 64,
+    }),
+    admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", {
+      required: true, maxLength: 128,
+    }),
+    admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", {
+      required: true, maxLength: 128,
+    }),
+  };
+}
+
+function buildTaskboardHostAccess(task, receipt, worktreePath) {
+  if (task?.workflowProfile !== "vibe") return null;
+  return {
+    mode: "dangerFullAccess",
+    authorization: "taskboard-personal-vibe",
+    taskId: receipt.taskId,
+    receiptId: receipt.id,
+    admissionAttemptId: receipt.admissionAttemptId,
+    rootThreadId: receipt.rootThreadId,
+    worktreePath,
+  };
+}
+
 function parseAgentRunCheckpoint(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["version", "agentThreadId", "summary", "nextAction", "status"]));
@@ -5723,6 +5770,7 @@ export function createTaskboardServer(options = {}) {
               repository: task.developmentContext.repository,
               verifiedAt: task.developmentContext.repositoryVerifiedAt,
               standingScope: safeAction?.standingAuthority ? safeAction.standingScope : null,
+              hostAccess: buildTaskboardHostAccess(task, result.receipt, result.recoveryRoute.worktreePath),
             },
           } : {}),
         });
@@ -5746,6 +5794,7 @@ export function createTaskboardServer(options = {}) {
             repository: task.developmentContext.repository,
             verifiedAt: task.developmentContext.repositoryVerifiedAt,
             standingScope: safeAction.standingAuthority ? safeAction.standingScope : null,
+            hostAccess: buildTaskboardHostAccess(task, result.receipt, task.developmentContext.path),
           },
         });
       }
@@ -5760,6 +5809,20 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "INVALID_FIELD", "'deliveryTurnId' is required");
         }
         return sendJson(response, 200, database.completeTaskSafeActionDelivery(id, completion));
+      }
+
+      const taskboardHostAccessRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/bootstrap-host-access$/);
+      if (taskboardHostAccessRoute) {
+        const id = decodeRouteSegment(taskboardHostAccessRoute[1], "Task id");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-host-access");
+        const revalidation = parseTaskboardHostAccessRevalidation(await readJson(request));
+        await assertStandingActionExecutionScope(id, revalidation.safeActionId);
+        const result = database.revalidateTaskSafeActionHostAccess(id, revalidation);
+        return sendJson(response, 200, {
+          validated: true,
+          hostAccess: buildTaskboardHostAccess(result.task, result.receipt, result.receipt.worktreePath),
+        });
       }
 
       const safeActionAdmissionDeferralRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-defer$/);

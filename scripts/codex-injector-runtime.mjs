@@ -2271,7 +2271,12 @@ function parseHostRequest(payload, parseAutomationRequest) {
   return { id, request: null, error: HOST_REQUEST_ERROR };
 }
 
-export async function deliverTaskboardCoordination(request, rpc, validateExecutionTarget) {
+export async function deliverTaskboardCoordination(
+  request,
+  rpc,
+  validateExecutionTarget,
+  confirmHostAccess,
+) {
   if (typeof validateExecutionTarget !== "function") {
     throw new Error("Execution worktree validator is required");
   }
@@ -2284,7 +2289,12 @@ export async function deliverTaskboardCoordination(request, rpc, validateExecuti
   const deliveryKey = `${request.codexHostId}:${request.projectId}:${request.todoId}:${request.safeActionId}:${request.expectedResumeToken}:${request.deliveryReceipt?.id}:${request.deliveryReceipt?.admissionAttemptId}:${request.rootThreadId}:${rootWorkspacePath}:${targetRoot}`;
   const existing = coordinationDeliveries.get(deliveryKey);
   if (existing) return existing.promise;
-  const delivery = deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget);
+  const delivery = deliverTaskboardCoordinationOnce(
+    request,
+    rpc,
+    validateExecutionTarget,
+    confirmHostAccess,
+  );
   const entry = { promise: delivery, expiresAt: observedAt + COORDINATION_DEDUPLICATION_MS };
   coordinationDeliveries.set(deliveryKey, entry);
   delivery.catch(() => {
@@ -3650,6 +3660,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     delivery = await deliver({
       projectId: policy.projectId,
       todoId: todo.id,
+      taskId: todo.taskId,
       rootThreadId: dispatch.rootThreadId,
       codexHostId: dispatch.codexHostId,
       rootWorkspacePath: path.resolve(dispatch.rootWorkspacePath),
@@ -3657,6 +3668,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       safeActionId: safeAction.id,
       expectedResumeToken: authorization.expectedResumeToken,
       deliveryReceipt: reservation.receipt,
+      recoveryLeaseId: authorization.recoveryLeaseId,
       observeOnly: reservation.observeOnly === true,
       executionIdentity: { ...executionIdentity, standingAuthority },
     });
@@ -3733,7 +3745,23 @@ export async function deliverTaskboardCapacityObservation(request, rpc) {
   return { delivery: "started", turnId: started.turn.id };
 }
 
-async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionTarget) {
+function matchesTaskboardHostAccess(request, hostAccess) {
+  return hostAccess?.mode === "dangerFullAccess"
+    && hostAccess.authorization === "taskboard-personal-vibe"
+    && hostAccess.taskId === request.taskId
+    && hostAccess.receiptId === request.deliveryReceipt?.id
+    && hostAccess.admissionAttemptId === request.deliveryReceipt?.admissionAttemptId
+    && hostAccess.rootThreadId === request.rootThreadId
+    && typeof hostAccess.worktreePath === "string"
+    && path.resolve(hostAccess.worktreePath) === path.resolve(request.targetRoot);
+}
+
+async function deliverTaskboardCoordinationOnce(
+  request,
+  rpc,
+  validateExecutionTarget,
+  confirmHostAccess,
+) {
   const threadResult = await rpc("thread/read", {
     threadId: request.rootThreadId,
     includeTurns: true,
@@ -3793,15 +3821,21 @@ async function deliverTaskboardCoordinationOnce(request, rpc, validateExecutionT
     return { delivery: "steered", turnId: activeTurn.id };
   }
   await rpc("thread/resume", { threadId: request.rootThreadId });
+  const hostAccess = typeof confirmHostAccess === "function"
+    ? await confirmHostAccess(request)
+    : null;
+  const sandboxPolicy = matchesTaskboardHostAccess(request, hostAccess)
+    ? { type: "dangerFullAccess" }
+    : {
+        type: "workspaceWrite",
+        writableRoots: [...new Set([rootWorkspacePath, targetRoot])],
+        networkAccess: true,
+      };
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,
     input: [{ type: "text", text: durableInstruction }],
     approvalPolicy: "never",
-    sandboxPolicy: {
-      type: "workspaceWrite",
-      writableRoots: [...new Set([rootWorkspacePath, targetRoot])],
-      networkAccess: true,
-    },
+    sandboxPolicy,
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid Root turn receipt");

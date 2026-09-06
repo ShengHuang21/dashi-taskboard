@@ -1133,6 +1133,21 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
     },
   });
   assert.equal(nextConfirmation.response.status, 200);
+  assert.equal(nextConfirmation.body.executionIdentity.hostAccess, null);
+  const formalHostAccess = await request(baseUrl, `/api/tasks/${task.identifier}/bootstrap-host-access`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      expectedResumeToken: nextReceipt.resumeToken,
+      safeActionId: nextReceipt.safeActionId,
+      reservationLeaseId: nextReceipt.reservationLeaseId,
+      recoveryLeaseId: nextReceipt.reservationLeaseId,
+      admissionReceiptId: nextReceipt.id,
+      admissionAttemptId: nextReceipt.admissionAttemptId,
+    },
+  });
+  assert.equal(formalHostAccess.response.status, 409);
+  assert.equal(formalHostAccess.body.error.code, "TASKBOARD_HOST_ACCESS_FORBIDDEN");
   const prepared = await request(baseUrl, `/api/tasks/${task.identifier}/admission-prepare`, {
     method: "POST",
     body: {
@@ -8648,6 +8663,8 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   const standingTodo = laneSnapshot.body.todos.find((todo) => todo.taskId === task.id);
   assert.equal(standingTodo?.readyWork.safeActions[0]?.standingAuthority, true);
   let validatedIdentity = null;
+  let idleTurnStart = null;
+  let repositoryProbesAfterConfirmation = null;
   const monitorResult = await runTaskboardContinuationMonitorOnce({
     policy: { enabled: true, projectId: "local" },
     readSnapshot: async () => laneSnapshot.body,
@@ -8675,20 +8692,70 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
         },
       });
       assert.equal(result.response.status, 200);
+      assert.deepEqual(result.body.executionIdentity.hostAccess, {
+        mode: "dangerFullAccess",
+        authorization: "taskboard-personal-vibe",
+        taskId: task.id,
+        receiptId: result.body.receipt.id,
+        admissionAttemptId: result.body.receipt.admissionAttemptId,
+        rootThreadId,
+        worktreePath,
+      });
+      repositoryProbesAfterConfirmation = repositoryProbeCalls;
       return result.body.executionIdentity;
     },
     deliver: (delivery) => deliverTaskboardCoordination(
       delivery,
-      async (method) => {
+      async (method, params) => {
         if (method === "thread/read") {
-          return { thread: { id: rootBinding.threadId, cwd: rootBinding.workspacePath, turns: [{ id: "active-turn", status: "inProgress" }] } };
+          return { thread: { id: rootBinding.threadId, cwd: rootBinding.workspacePath, turns: [] } };
         }
-        if (method === "turn/steer") return {};
+        if (method === "thread/resume") return {};
+        if (method === "turn/start") {
+          idleTurnStart = params;
+          return { turn: { id: "idle-vibe-turn" } };
+        }
         throw new Error(`Unexpected RPC method: ${method}`);
       },
       async (targetRoot, executionIdentity) => {
         assert.equal(targetRoot, worktreePath);
         validatedIdentity = executionIdentity;
+      },
+      async (candidate) => {
+        const body = {
+          rootThreadId: candidate.rootThreadId,
+          expectedResumeToken: candidate.expectedResumeToken,
+          safeActionId: candidate.safeActionId,
+          reservationLeaseId: candidate.deliveryReceipt.reservationLeaseId,
+          recoveryLeaseId: candidate.recoveryLeaseId,
+          admissionReceiptId: candidate.deliveryReceipt.id,
+          admissionAttemptId: candidate.deliveryReceipt.admissionAttemptId,
+        };
+        const result = await request(baseUrl, `/api/tasks/${candidate.todoId}/bootstrap-host-access`, {
+          method: "POST",
+          body,
+        });
+        assert.equal(result.response.status, 200, JSON.stringify(result.body));
+        const replay = await request(baseUrl, `/api/tasks/${candidate.todoId}/bootstrap-host-access`, {
+          method: "POST",
+          body,
+        });
+        assert.equal(replay.response.status, 200);
+        assert.deepEqual(replay.body, result.body);
+        const wrongAttempt = await request(baseUrl, `/api/tasks/${candidate.todoId}/bootstrap-host-access`, {
+          method: "POST",
+          body: { ...body, admissionAttemptId: "wrong-attempt" },
+        });
+        assert.equal(wrongAttempt.response.status, 409);
+        assert.equal(wrongAttempt.body.error.code, "SAFE_ACTION_RECEIPT_MISSING");
+        const wrongRecoveryLease = await request(baseUrl, `/api/tasks/${candidate.todoId}/bootstrap-host-access`, {
+          method: "POST",
+          body: { ...body, recoveryLeaseId: "wrong-recovery-lease" },
+        });
+        assert.equal(wrongRecoveryLease.response.status, 409);
+        assert.equal(wrongRecoveryLease.body.error.code, "SAFE_ACTION_RECOVERY_LEASE_REQUIRED");
+        assert.equal(repositoryProbeCalls, repositoryProbesAfterConfirmation);
+        return result.body.hostAccess;
       },
     ),
     completeDelivery: async (delivery, rootDelivery) => (await request(
@@ -8715,6 +8782,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   assert.equal(validatedIdentity?.standingAuthority, true);
   assert.equal(validatedIdentity?.repository, "github.com/owner/repo");
   assert.equal(validatedIdentity?.branch, "codex/standing-authority-test");
+  assert.deepEqual(idleTurnStart?.sandboxPolicy, { type: "dangerFullAccess" });
   assert.deepEqual(validatedIdentity?.standingScope, {
     kind: "ordinary_push", remote: "origin", branch: "codex/standing-authority-test", force: false,
   });
