@@ -2341,6 +2341,7 @@ export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = f
   const started = await rpc("turn/start", {
     threadId: request.route.rootThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid Root turn receipt");
@@ -2425,6 +2426,7 @@ export async function deliverTaskboardOwnerIntent(request, rpc, { readOnly = fal
   const started = await rpc("turn/start", {
     threadId: route.coordinatorThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid Coordinator turn receipt");
@@ -2963,6 +2965,7 @@ export async function deliverTaskboardCrossDomainHandoff(request, rpc, { readOnl
   const started = await rpc("turn/start", {
     threadId: route.targetThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid cross-domain handoff turn receipt");
@@ -3754,6 +3757,7 @@ export async function deliverTaskboardCapacityObservation(request, rpc) {
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid capacity observation turn receipt");
@@ -3927,6 +3931,7 @@ export async function deliverTaskboardAdmissionRecovery(
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid admission recovery turn receipt");

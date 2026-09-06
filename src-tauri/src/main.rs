@@ -15,7 +15,6 @@ use objc2::{
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSAlert, NSApplication, NSButton, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSRunningApplication,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{NSObject, NSSize, NSString};
@@ -690,60 +689,9 @@ fn find_codex_app(home_directory: &Path) -> Option<PathBuf> {
     .find(|candidate| candidate.is_dir())
 }
 
-#[cfg(target_os = "macos")]
-fn ordinary_codex_process(app_path: &Path) -> Result<Option<u32>, String> {
-    let app_name = app_path
-        .file_stem()
-        .ok_or_else(|| "无法识别 Codex App 名称".to_string())?;
-    let executable = app_path.join("Contents/MacOS").join(app_name);
-    let output = StdCommand::new("/bin/ps")
-        .args(["-ww", "-axo", "pid=,command="])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err("无法检查正在运行的 Codex".to_string());
-    }
-
-    let executable = executable.to_string_lossy();
-    let mut ordinary_pid = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let line = line.trim_start();
-        let Some(separator) = line.find(char::is_whitespace) else {
-            continue;
-        };
-        let command = line[separator..].trim_start();
-        if command != executable && !command.starts_with(&format!("{executable} ")) {
-            continue;
-        }
-        if command.contains(" --remote-debugging-port=") {
-            return Ok(None);
-        }
-        ordinary_pid = line[..separator].parse().ok();
-    }
-    Ok(ordinary_pid)
-}
-
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_is_running(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-#[cfg(target_os = "macos")]
-fn quit_codex_normally(pid: u32) -> Result<(), String> {
-    let application =
-        NSRunningApplication::runningApplicationWithProcessIdentifier(pid as libc::pid_t)
-            .ok_or_else(|| "无法找到正在运行的 Codex".to_string())?;
-    if !application.terminate() {
-        return Err("Codex 没有接受退出请求".to_string());
-    }
-    let deadline = Instant::now() + LAUNCHER_STOP_TIMEOUT;
-    while process_is_running(pid) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(100));
-    }
-    if process_is_running(pid) {
-        return Err("Codex 尚未退出，任务面板没有启动".to_string());
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1208,7 +1156,11 @@ fn watch_launcher_output<R: std::io::Read + Send + 'static>(
                 {
                     snapshot.open_request_pending = false;
                 }
-            } else if !is_stderr && line.contains("\"openedTaskboardInExistingCodex\":true") {
+            } else if !is_stderr
+                && (line.contains("\"openedTaskboardInExistingCodex\":true")
+                    || line.contains("\"openingTaskboardInExistingCodex\":true")
+                    || line.contains("\"reusedTaskboardInExistingCodex\":true"))
+            {
                 update_snapshot(&app, &state, |snapshot| {
                     if state.generation.load(Ordering::SeqCst) == generation
                         && snapshot.child_pid == Some(pid)
@@ -1260,12 +1212,11 @@ fn start_launcher_locked(
         });
     let codex_profile = state.data_directory.join("codex-profile");
     stop_recorded_child(state);
-    #[cfg(target_os = "macos")]
-    let ordinary_codex_pid = ordinary_codex_process(&codex_app)?;
     #[cfg(target_os = "windows")]
     let ordinary_codex_pid = ordinary_codex_process(&codex_app, &codex_profile)?;
     #[cfg(target_os = "linux")]
     let ordinary_codex_pid = ordinary_codex_process(&codex_app, &codex_profile)?;
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     if let Some(codex_pid) = ordinary_codex_pid {
         let restart = app
             .dialog()
@@ -1343,7 +1294,7 @@ fn start_launcher_locked(
     #[cfg(target_os = "windows")]
     command.arg(r"scripts\codex-injector.mjs");
     #[cfg(target_os = "macos")]
-    command.args(["--launch", "--watch", "--open", "--port", &codex_port]);
+    command.args(["--launch", "--watch", "--port", &codex_port]);
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     command.args(["--launch", "--watch", "--open", "--cdp-pipe"]);
     command

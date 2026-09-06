@@ -90,6 +90,7 @@ test("admission recovery replays its exact marker and rejects Root workspace dri
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       instruction = params.input[0].text;
       return { turn: { id: "turn-cap46-probe" } };
     }
@@ -146,6 +147,7 @@ test("admission recovery retries the same probe after a terminal transport failu
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       assert.match(params.input[0].text, new RegExp(marker));
       return { turn: { id: "turn-cap51-retry" } };
     }
@@ -4146,6 +4148,7 @@ test("capacity observation delivery starts one idle Root turn and replays its du
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       instruction = params.input[0].text;
       return { turn: { id: "turn-capacity-observation" } };
     }
@@ -4343,6 +4346,45 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
   assert.match(calls[1][1].input[0].text, /Do not approve it yourself/);
   assert.match(calls[1][1].input[0].text, /delivery-1/);
   assert.doesNotMatch(calls[1][1].input[0].text, /attestation token/i);
+});
+
+test("an idle Owner decision delivery cannot request interactive approval", async () => {
+  const request = {
+    requestId: "f".repeat(64),
+    expectedResumeToken: "e".repeat(64),
+    identifier: "CAP-10",
+    actionId: "push",
+    message: "Ask the Owner",
+    coordinatorEpoch: "configured:root",
+    deliveryReceipt: { id: "delivery-idle" },
+    route: {
+      rootTaskId: "root",
+      rootThreadId: coordinatorThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  const calls = [];
+  const result = await deliverTaskboardOwnerDecision(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") return {
+      thread: {
+        id: request.route.rootThreadId,
+        cwd: request.route.rootWorkspacePath,
+        turns: [],
+      },
+    };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
+      return { turn: { id: "owner-decision-turn" } };
+    }
+    return assert.fail(`unexpected RPC ${method}`);
+  });
+  assert.deepEqual(result, { delivery: "started", turnId: "owner-decision-turn" });
+  assert.deepEqual(calls.map(([method]) => method), [
+    "thread/read", "thread/resume", "turn/start",
+  ]);
 });
 
 test("queued Owner Intent never interrupts an active Coordinator turn", async () => {
@@ -4927,7 +4969,10 @@ test("queued Owner Intent is adopted exactly once at an idle Coordinator boundar
         };
       }
       if (method === "thread/resume") return {};
-      if (method === "turn/start") return { turn: { id: "turn-adopt" } };
+      if (method === "turn/start") {
+        assert.equal(params.approvalPolicy, "never");
+        return { turn: { id: "turn-adopt" } };
+      }
       throw new Error(`Unexpected method: ${method}`);
     }, options),
   });
@@ -4970,6 +5015,7 @@ test("cancel Owner Intent instruction emits an empty executable frontier", async
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       instruction = params.input[0].text;
       return { turn: { id: "cancel-turn" } };
     }
@@ -5510,7 +5556,10 @@ test("cross-domain handoff starts and confirms exactly one idle Coordinator turn
         if (method === "thread/read") return {
           thread: { id: request.route.targetThreadId, cwd: request.route.targetWorkspacePath, turns: [] },
         };
-        if (method === "turn/start") return { turn: { id: "handoff-turn" } };
+        if (method === "turn/start") {
+          assert.equal(params.approvalPolicy, "never");
+          return { turn: { id: "handoff-turn" } };
+        }
         return {};
       },
       options,

@@ -76,6 +76,13 @@ import {
   CdpPipeBrowser,
   validatedLoopbackCdpWebSocketUrl,
 } from "./codex-cdp-pipe.mjs";
+import {
+  LocalCodexThreadRpcLifecycle,
+  createLocalCodexThreadRpcTransport,
+  launchLocalCodexAppServer,
+  shouldRetireLocalCodexThreadRpcTransport,
+  shouldUseLocalCodexThreadRpc,
+} from "../server/codex-thread-rpc.mjs";
 
 const injectorPath = fileURLToPath(import.meta.url);
 const projectRoot = path.resolve(path.dirname(injectorPath), "..");
@@ -183,6 +190,25 @@ const quotaPolicyRestorePromises = new WeakMap();
 let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
+let localCodexThreadRpcEnabled = false;
+let localCodexThreadRpcLifecycle = null;
+
+async function ensureLocalCodexThreadRpcTransport() {
+  if (!localCodexThreadRpcEnabled || !localCodexThreadRpcLifecycle) {
+    throw new Error("Local Codex thread RPC is not enabled");
+  }
+  return localCodexThreadRpcLifecycle.ensure();
+}
+
+async function closeLocalCodexThreadRpcTransport() {
+  localCodexThreadRpcEnabled = false;
+  const lifecycle = localCodexThreadRpcLifecycle;
+  if (!lifecycle) return;
+  await lifecycle.close();
+  if (localCodexThreadRpcLifecycle === lifecycle) {
+    localCodexThreadRpcLifecycle = null;
+  }
+}
 
 function parseArgs(argv) {
   const options = {
@@ -1151,6 +1177,23 @@ async function requestCodexAppServerViaCdp(
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
 ) {
+  if (localCodexThreadRpcEnabled) {
+    if (method === "turn/start" && params?.approvalPolicy !== "never") {
+      throw new Error("Headless Codex turns require approvalPolicy 'never'");
+    }
+    const transport = await ensureLocalCodexThreadRpcTransport();
+    try {
+      return await transport.request(hostId, method, params, timeoutMs);
+    } catch (error) {
+      if (shouldRetireLocalCodexThreadRpcTransport(error)) {
+        await localCodexThreadRpcLifecycle?.retire(transport).catch(() => {});
+      }
+      throw error;
+    }
+  }
+  if (!cdp || typeof cdp.send !== "function") {
+    throw new Error("Codex renderer RPC is unavailable");
+  }
   const requestId = [
     "taskboard-thread",
     process.pid,
@@ -3404,6 +3447,61 @@ async function runBackgroundContinuationMonitor(cdp) {
   }
 }
 
+async function runCoordinatorIdentityHandshakeFastLaneOnce(cdp) {
+  const projects = await loadResidentCoordinatorMonitorProjects({
+    listLifecycleProjects: listResidentCoordinatorMonitorProjects,
+    readContinuationPolicyEntries: readTaskboardClientStorageEntries,
+    continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
+  });
+  await runCoordinatorIdentityHandshakeFastLane({
+    projects,
+    runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+      projectId,
+      listHandshakes: listCoordinatorIdentityHandshakes,
+      readThread: (route) => requestCodexAppServerViaCdp(
+        cdp,
+        undefined,
+        route.codexHostId,
+        "thread/read",
+        { threadId: route.threadId, includeTurns: false },
+        10_000,
+      ),
+      confirmIdentity: confirmCoordinatorIdentityHandshake,
+    }),
+  });
+}
+
+function startResidentCoordinatorMonitors(cdp, { isStopped = () => false } = {}) {
+  const schedule = (run, intervalMs, label) => createDisposableMonitorTimer(async () => {
+    if (isStopped()) return;
+    try {
+      await run(cdp);
+    } catch (error) {
+      console.error(`${label}: ${error.message}`);
+    }
+  }, intervalMs);
+  const disposeIdentity = schedule(
+    runCoordinatorIdentityHandshakeFastLaneOnce,
+    coordinatorIdentityHandshakeIntervalMs,
+    "Taskboard Coordinator identity fast lane failed",
+  );
+  const disposeFastLane = schedule(
+    runBackgroundContinuationFastLane,
+    backgroundContinuationIntervalMs,
+    "Taskboard continuation fast lane failed",
+  );
+  const disposeBackground = schedule(
+    runBackgroundContinuationMonitor,
+    backgroundContinuationIntervalMs,
+    "Taskboard background continuation check failed",
+  );
+  return () => {
+    disposeIdentity();
+    disposeFastLane();
+    disposeBackground();
+  };
+}
+
 function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   let activeContextId = null;
   let activeMainContextId = null;
@@ -3456,27 +3554,7 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
     disposeCoordinatorIdentityHandshakeTimer = createDisposableMonitorTimer(async () => {
       if (cdp.closed) return;
       try {
-        const projects = await loadResidentCoordinatorMonitorProjects({
-          listLifecycleProjects: listResidentCoordinatorMonitorProjects,
-          readContinuationPolicyEntries: readTaskboardClientStorageEntries,
-          continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
-        });
-        await runCoordinatorIdentityHandshakeFastLane({
-          projects,
-          runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
-            projectId,
-            listHandshakes: listCoordinatorIdentityHandshakes,
-            readThread: (route) => requestCodexAppServerViaCdp(
-              cdp,
-              undefined,
-              route.codexHostId,
-              "thread/read",
-              { threadId: route.threadId, includeTurns: false },
-              10_000,
-            ),
-            confirmIdentity: confirmCoordinatorIdentityHandshake,
-          }),
-        });
+        await runCoordinatorIdentityHandshakeFastLaneOnce(cdp);
       } catch (error) {
         console.error(`Taskboard Coordinator identity fast lane failed: ${error.message}`);
       }
@@ -3715,9 +3793,11 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         returnByValue: true,
       });
       await restoreQuotaPolicies(cdp);
-      scheduleCoordinatorIdentityHandshakeFastLane();
-      scheduleBackgroundContinuationFastLane();
-      scheduleBackgroundContinuation();
+      if (!localCodexThreadRpcEnabled) {
+        scheduleCoordinatorIdentityHandshakeFastLane();
+        scheduleBackgroundContinuationFastLane();
+        scheduleBackgroundContinuation();
+      }
       return activeContextId;
     })();
     try {
@@ -4083,6 +4163,32 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   options.startupToken ??= taskboardInstanceToken;
   process.env.CODEX_EXECUTABLE = resolveCodexExecutable({ appPath: options.appPath });
+  localCodexThreadRpcEnabled = shouldUseLocalCodexThreadRpc({
+    platform: process.platform,
+    watch: options.watch,
+    launch: options.launch,
+    cdpPipe: options.cdpPipe,
+  });
+  localCodexThreadRpcLifecycle = localCodexThreadRpcEnabled
+    ? new LocalCodexThreadRpcLifecycle({
+        launchTransport: async () => {
+          const appServer = await launchLocalCodexAppServer({
+            executable: process.env.CODEX_EXECUTABLE,
+            cwd: projectRoot,
+            env: withoutTaskboardLauncherEnvironment(process.env),
+            onServerRequest: (method) => {
+              console.error(JSON.stringify({
+                event: "taskboard.codex.server-request.rejected",
+                method,
+              }));
+            },
+          });
+          const transport = createLocalCodexThreadRpcTransport({ appServer });
+          console.log(JSON.stringify({ taskboardHeadlessCodexReady: true }));
+          return transport;
+        },
+      })
+    : null;
   const cdpVersionUrl = `http://127.0.0.1:${options.port}/json/version`;
 
   if (options.daemon) {
@@ -4131,6 +4237,7 @@ async function main() {
   let cdpRuntime = null;
   let codexAppPid = null;
   let nativeCodexBrowser = false;
+  let disposeResidentCoordinatorMonitors = null;
   let runtimePublishPromise = null;
   const injectedTargets = new Map();
   let idleAfterNormalExit = false;
@@ -4160,7 +4267,13 @@ async function main() {
         });
       });
     },
-    focusApp: () => activateCodexApp(codexAppPid),
+    focusApp: () => {
+      codexAppPid = codexAppProcesses(options.appPath)
+        .find((record) => !record.command.includes(
+          ` --user-data-dir=${independentCodexProfilePath} `,
+        ))?.pid ?? null;
+      if (codexAppPid) activateCodexApp(codexAppPid);
+    },
   });
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
   const resolveLaunchCoordinatorRouteForGeneration = createOpenGenerationRouteResolver(
@@ -4184,6 +4297,23 @@ async function main() {
   const requestTaskboardOpen = async (preferredConnection = null) => {
     const generation = openRequestGeneration;
     if (generation <= openedRequestGeneration) return true;
+    if (nativeCodexBrowser) {
+      try {
+        const result = await nativeTaskboardPanelOpener.openOrFocus();
+        openedRequestGeneration = Math.max(openedRequestGeneration, generation);
+        console.log(JSON.stringify(
+          result.action === "opened"
+            ? { openedTaskboardInExistingCodex: true }
+            : result.action === "opening"
+              ? { openingTaskboardInExistingCodex: true }
+              : { reusedTaskboardInExistingCodex: true },
+        ));
+        return true;
+      } catch (error) {
+        console.error(`Waiting to open Taskboard: ${error.message}`);
+        return false;
+      }
+    }
     let launchCoordinatorRoute;
     try {
       launchCoordinatorRoute = await resolveLaunchCoordinatorRouteForGeneration(generation);
@@ -4195,10 +4325,9 @@ async function main() {
     const connection = preferredConnection && !preferredConnection.closed
       ? preferredConnection
       : injectedTargets.values().next().value;
-    if (!nativeCodexBrowser && !connection) return false;
+    if (!connection) return false;
     try {
       if (launchCoordinatorRoute) {
-        if (nativeCodexBrowser) return false;
         if (!(await waitForCoordinatorThreadSelection(
           connection,
           launchCoordinatorRoute.threadId,
@@ -4209,18 +4338,6 @@ async function main() {
           () => generation === openRequestGeneration,
         ))) return false;
         if (generation !== openRequestGeneration) return false;
-      }
-      if (nativeCodexBrowser) {
-        const result = await nativeTaskboardPanelOpener.openOrFocus();
-        openedRequestGeneration = Math.max(openedRequestGeneration, generation);
-        console.log(JSON.stringify(
-          result.action === "opened"
-            ? { openedTaskboardInExistingCodex: true }
-            : result.action === "opening"
-              ? { openingTaskboardInExistingCodex: true }
-              : { reusedTaskboardInExistingCodex: true },
-        ));
-        return true;
       }
       const opened = launchCoordinatorRoute
         ? await requestPreparedTaskboardOpen(
@@ -4298,6 +4415,19 @@ async function main() {
 
   const startManagedCodex = async () => {
     if (stopping) return false;
+    if (localCodexThreadRpcEnabled) {
+      const legacyManagedCodex = managedCodexProcess(options.appPath);
+      if (legacyManagedCodex) await stopManagedCodex(legacyManagedCodex);
+      if (stopping) return false;
+      await ensureLocalCodexThreadRpcTransport();
+      codexAppPid = codexAppProcesses(options.appPath)
+        .find((record) => !record.command.includes(
+          ` --user-data-dir=${independentCodexProfilePath} `,
+        ))?.pid ?? null;
+      nativeCodexBrowser = true;
+      console.log(JSON.stringify({ singleVisibleCodexMode: true }));
+      return false;
+    }
     if (!options.cdpPipe) {
       const runningCodex = codexAppProcesses(options.appPath);
       let debuggingCodexFound = false;
@@ -4374,6 +4504,9 @@ async function main() {
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async () => {
+      disposeResidentCoordinatorMonitors?.();
+      disposeResidentCoordinatorMonitors = null;
+      await closeLocalCodexThreadRpcTransport();
       injectedTargets.forEach((connection) => {
         unregisterQuotaPolicyCdp(connection);
         connection.close();
@@ -4461,8 +4594,9 @@ async function main() {
     await publishRuntime();
     if (stopping) return;
     let initialLaunchCoordinatorRoute = null;
-    let initialLaunchCoordinatorRouteResolved = !hasOpenPending();
-    if (hasOpenPending()) {
+    let initialLaunchCoordinatorRouteResolved = !hasOpenPending()
+      || localCodexThreadRpcEnabled;
+    if (hasOpenPending() && !localCodexThreadRpcEnabled) {
       try {
         initialLaunchCoordinatorRoute = await resolveLaunchCoordinatorRouteForGeneration(
           openRequestGeneration,
@@ -4474,7 +4608,7 @@ async function main() {
       if (stopping) return;
     }
 
-    if (options.cdpPipe || !cdpReachable) {
+    if (localCodexThreadRpcEnabled || options.cdpPipe || !cdpReachable) {
       idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
     } else {
       if (options.launch) {
@@ -4497,6 +4631,12 @@ async function main() {
       cdpRuntime = tcpCdpRuntime(options.port);
     }
     if (stopping) return;
+
+    if (localCodexThreadRpcEnabled) {
+      disposeResidentCoordinatorMonitors = startResidentCoordinatorMonitors(null, {
+        isStopped: () => stopping,
+      });
+    }
 
     const { source, sourceHash } = await currentInjectionSource();
     if (stopping) return;
@@ -4569,7 +4709,12 @@ async function main() {
         } catch (_) {}
       }
       if (nativeCodexBrowser) {
-        if (codexAppProcesses(options.appPath).length === 0) {
+        const visibleCodex = codexAppProcesses(options.appPath)
+          .find((record) => !record.command.includes(
+            ` --user-data-dir=${independentCodexProfilePath} `,
+          ));
+        codexAppPid = visibleCodex?.pid ?? null;
+        if (!localCodexThreadRpcEnabled && !visibleCodex) {
           nativeCodexBrowser = false;
           idleAfterNormalExit = true;
           console.error(

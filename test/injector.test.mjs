@@ -794,15 +794,21 @@ test("the package injection command remains resident for tab-triggered recovery"
   assert.match(source, /__codexTaskboardHostStartupTokenV1/);
 });
 
-test("launch mode opens a dedicated debuggable Codex instance beside the native app", () => {
+test("resident macOS launch keeps one visible Codex and owns monitors headlessly", () => {
+  assert.match(source, /localCodexThreadRpcEnabled = shouldUseLocalCodexThreadRpc/);
+  assert.match(source, /platform: process\.platform,[\s\S]*?watch: options\.watch,[\s\S]*?launch: options\.launch,[\s\S]*?cdpPipe: options\.cdpPipe/);
   assert.match(
     source,
-    /spawn\(\s*"\/usr\/bin\/open",\s*\[\s*"-n",\s*"-a",\s*appPath/,
+    /if \(localCodexThreadRpcEnabled\) \{[\s\S]*?stopManagedCodex\(legacyManagedCodex\)[\s\S]*?ensureLocalCodexThreadRpcTransport\(\)[\s\S]*?nativeCodexBrowser = true;/,
   );
+  assert.match(source, /startResidentCoordinatorMonitors\(null/);
   assert.match(
     source,
-    /if \(runningCodex\.length > 0\) \{[\s\S]*?if \(debuggingCodexFound\) return false;[\s\S]*?if \(!options\.launch\) \{[\s\S]*?nativeCodexBrowser = true;/,
+    /shouldRetireLocalCodexThreadRpcTransport\(error\)[\s\S]*?localCodexThreadRpcLifecycle\?\.retire\(transport\)/,
   );
+  assert.match(source, /if \(!localCodexThreadRpcEnabled\) \{[\s\S]*?scheduleCoordinatorIdentityHandshakeFastLane\(\)[\s\S]*?scheduleBackgroundContinuationFastLane\(\)[\s\S]*?scheduleBackgroundContinuation\(\)/);
+  assert.match(source, /if \(nativeCodexBrowser\) \{[\s\S]*?nativeTaskboardPanelOpener\.openOrFocus\(\)[\s\S]*?let launchCoordinatorRoute/);
+  assert.match(source, /disposeResidentCoordinatorMonitors\?\.\(\);[\s\S]*?await closeLocalCodexThreadRpcTransport\(\);/);
   assert.match(source, /startupTimeoutMs: 120_000,[\s\S]*?unhealthyChildGraceMs: 120_000,/);
   assert.match(source, /Timed out publishing the Taskboard host heartbeat[\s\S]*?30_000/);
   assert.match(source, /waitForHostHeartbeat\(cdp, startupToken, timeoutMs = 30_000\)/);
