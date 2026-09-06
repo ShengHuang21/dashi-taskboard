@@ -117,6 +117,116 @@ test("admission recovery replays its exact marker and rejects Root workspace dri
   );
 });
 
+test("admission recovery retries the same probe after a terminal transport failure", async () => {
+  const request = {
+    mode: "probe",
+    rootThreadId: coordinatorThreadId,
+    rootWorkspacePath: "/tmp/taskboard/project",
+    admissionReceiptId: "receipt-cap51",
+    admissionAttemptId: "attempt-cap51",
+    admissionProbeId: "probe-cap51",
+  };
+  const marker = "Taskboard admission recovery probe id: receipt-cap51:attempt-cap51:probe-cap51";
+  const calls = [];
+  const rpc = async (method, params) => {
+    calls.push(method);
+    if (method === "thread/read") return {
+      thread: {
+        id: request.rootThreadId,
+        cwd: request.rootWorkspacePath,
+        status: { type: "systemError" },
+        turns: [{
+          id: "01a074f5-e2e3-77a1-9586-0d7505a1dc98",
+          status: "failed",
+          completedAt: "2026-09-06T05:37:23Z",
+          input: marker,
+          error: { message: "stream disconnected before completion" },
+        }],
+      },
+    };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") {
+      assert.match(params.input[0].text, new RegExp(marker));
+      return { turn: { id: "turn-cap51-retry" } };
+    }
+    return assert.fail(`unexpected RPC ${method}`);
+  };
+
+  assert.deepEqual(await deliverTaskboardAdmissionRecovery(request, rpc, {
+    now: () => Date.parse("2026-09-06T05:38:00Z"),
+  }), {
+    delivery: "started",
+    turnId: "turn-cap51-retry",
+  });
+  assert.deepEqual(calls, ["thread/read", "thread/resume", "turn/start"]);
+});
+
+test("admission recovery backs off a recent terminal retry without opening another turn", async () => {
+  const request = {
+    mode: "probe",
+    rootThreadId: coordinatorThreadId,
+    rootWorkspacePath: "/tmp/taskboard/project",
+    admissionReceiptId: "receipt-cap51-backoff",
+    admissionAttemptId: "attempt-cap51-backoff",
+    admissionProbeId: "probe-cap51-backoff",
+  };
+  const marker = "Taskboard admission recovery probe id: receipt-cap51-backoff:attempt-cap51-backoff:probe-cap51-backoff";
+  const calls = [];
+  const rpc = async (method) => {
+    calls.push(method);
+    return {
+      thread: {
+        id: request.rootThreadId,
+        cwd: request.rootWorkspacePath,
+        turns: [{
+          id: "01a074f5-e2e3-77a1-9586-0d7505a1dc98",
+          status: "failed",
+          completedAt: "2026-09-06T05:37:23Z",
+          input: marker,
+          error: { message: "stream disconnected before completion" },
+        }],
+      },
+    };
+  };
+
+  assert.deepEqual(await deliverTaskboardAdmissionRecovery(request, rpc, {
+    now: () => Date.parse("2026-09-06T05:37:28Z"),
+  }), {
+    delivery: "deferred",
+    reason: "terminal-retry-backoff",
+  });
+  assert.deepEqual(calls, ["thread/read"]);
+});
+
+test("admission recovery fails closed when a marked turn has an unknown status", async () => {
+  const request = {
+    mode: "probe",
+    rootThreadId: coordinatorThreadId,
+    rootWorkspacePath: "/tmp/taskboard/project",
+    admissionReceiptId: "receipt-cap51-unknown",
+    admissionAttemptId: "attempt-cap51-unknown",
+    admissionProbeId: "probe-cap51-unknown",
+  };
+  const marker = "Taskboard admission recovery probe id: receipt-cap51-unknown:attempt-cap51-unknown:probe-cap51-unknown";
+  const calls = [];
+  const rpc = async (method) => {
+    calls.push(method);
+    return {
+      thread: {
+        id: request.rootThreadId,
+        cwd: request.rootWorkspacePath,
+        turns: [{ id: "turn-unknown", status: "mystery", input: marker }],
+      },
+    };
+  };
+
+  assert.deepEqual(await deliverTaskboardAdmissionRecovery(request, rpc), {
+    delivery: "deferred",
+    reason: "delivery-status-unconfirmed",
+  });
+  assert.deepEqual(calls, ["thread/read"]);
+});
+
 test("Coordinator delivery verifies identity and lease before scanning only current work", () => {
   const params = buildCoordinatorProvisioningDeliveryTurnStartParams({
     attempt: {

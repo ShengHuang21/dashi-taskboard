@@ -3843,7 +3843,9 @@ async function deliverTaskboardCoordinationOnce(
   return { delivery: "started", turnId: started.turn.id };
 }
 
-export async function deliverTaskboardAdmissionRecovery(request, rpc) {
+export async function deliverTaskboardAdmissionRecovery(
+  request, rpc, { now = Date.now } = {},
+) {
   const threadResult = await rpc("thread/read", {
     threadId: request.rootThreadId,
     includeTurns: true,
@@ -3860,8 +3862,27 @@ export async function deliverTaskboardAdmissionRecovery(request, rpc) {
   }
   const marker = `Taskboard admission recovery ${request.mode} id: ${request.admissionReceiptId}:${request.admissionAttemptId}${request.mode === "probe" ? `:${request.admissionProbeId}` : ""}`;
   const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
-  const observed = turns.find((turn) => collectStringValues(turn).some((value) => value.includes(marker)));
+  const matchingTurns = turns.filter(
+    (turn) => collectStringValues(turn).some((value) => value.includes(marker)),
+  );
+  const observed = matchingTurns.find(
+    (turn) => turn?.status === "completed" || turn?.status === "inProgress",
+  );
   if (observed?.id) return { delivery: "observed", turnId: observed.id };
+  const terminalTurns = matchingTurns.filter(
+    (turn) => ["failed", "interrupted", "canceled"].includes(turn?.status),
+  );
+  if (matchingTurns.length > 0 && terminalTurns.length !== matchingTurns.length) {
+    return { delivery: "deferred", reason: "delivery-status-unconfirmed" };
+  }
+  const retry = planCoordinatorProvisioningDeliveryRetry(terminalTurns, marker, {
+    defaultModel: "same-model",
+    defaultReasoningEffort: "same-effort",
+    now: now(),
+  });
+  if (retry.retryAfterMs > 0) {
+    return { delivery: "deferred", reason: "terminal-retry-backoff" };
+  }
   const instruction = request.mode === "probe"
     ? [
         marker,
