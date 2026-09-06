@@ -20,6 +20,7 @@ import {
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
 import { createAgentLaneSnapshotProvider } from "./agent-lane-snapshot.mjs";
+import { createAgentCapabilityCatalog } from "./agent-capability-catalog.mjs";
 import { AiChatService } from "./ai-chat.mjs";
 import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
@@ -4888,6 +4889,14 @@ export function createTaskboardServer(options = {}) {
             }
             : {}),
         });
+      }
+
+      if (pathname === "/api/agent-capabilities") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/agent-capabilities does not accept query parameters");
+        }
+        return sendJson(response, 200, createAgentCapabilityCatalog({ version: resolved.version }));
       }
 
       if (pathname === "/api/local/ai/catalog") {
