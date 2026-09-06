@@ -77,7 +77,6 @@ export class LocalCodexThreadRpcTransport {
           "CODEX_THREAD_RPC_TIMEOUT",
         ));
       }, timeoutMs);
-      entry.timer.unref?.();
       this.pending.add(entry);
 
       Promise.resolve()
@@ -350,7 +349,6 @@ export class CodexAppServerJsonLineClient {
           "CODEX_APP_SERVER_REQUEST_TIMEOUT",
         ));
       }, timeoutMs);
-      timer?.unref?.();
       this.pending.set(id, { resolve, reject, timer });
       try {
         this.#write({ id, method, params });
@@ -439,7 +437,6 @@ export async function launchLocalCodexAppServer({
           "Codex app-server initialize timed out",
           "CODEX_APP_SERVER_INITIALIZE_TIMEOUT",
         )), initializeTimeoutMs);
-        initializeTimer.unref?.();
       }),
     ]);
     client.notify("initialized");
