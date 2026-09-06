@@ -2801,6 +2801,31 @@ async function confirmBackgroundContinuationDelivery(claim) {
   return result.executionIdentity;
 }
 
+async function revalidateBackgroundContinuationHostAccess(claim) {
+  const response = await fetch(
+    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-host-access`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootThreadId: claim.rootThreadId,
+        expectedResumeToken: claim.expectedResumeToken,
+        safeActionId: claim.safeActionId,
+        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+        recoveryLeaseId: claim.recoveryLeaseId,
+        admissionReceiptId: claim.deliveryReceipt.id,
+        admissionAttemptId: claim.deliveryReceipt.admissionAttemptId,
+      }),
+      cache: "no-store",
+      signal: AbortSignal.timeout(5_000),
+    },
+  );
+  if (response.status === 409) return null;
+  if (!response.ok) throw new Error(`Taskboard host access revalidation returned HTTP ${response.status}`);
+  const result = await response.json();
+  return result?.validated === true ? result.hostAccess : null;
+}
+
 async function completeBackgroundContinuationDelivery(claim, delivery) {
   const response = await fetch(
     `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-complete`,
@@ -3012,6 +3037,7 @@ function runBackgroundContinuationDispatch(cdp, projectId) {
         10_000,
       ),
       validateGitExecutionTarget,
+      revalidateBackgroundContinuationHostAccess,
     ),
   });
 }

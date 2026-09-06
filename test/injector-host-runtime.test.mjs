@@ -3000,8 +3000,13 @@ const coordinationAuthorization = {
     admissionAttemptId: "admission-attempt",
   },
 };
-const deliverCoordination = (request, rpc, validateExecutionTarget = async () => {}) => (
-  deliverTaskboardCoordination(request, rpc, validateExecutionTarget)
+const deliverCoordination = (
+  request,
+  rpc,
+  validateExecutionTarget = async () => {},
+  confirmHostAccess,
+) => (
+  deliverTaskboardCoordination(request, rpc, validateExecutionTarget, confirmHostAccess)
 );
 const confirmedIdentity = {
   worktreePath: path.resolve("/tmp/taskboard/project"),
@@ -3065,6 +3070,7 @@ test("background continuation delivers one eligible first safe action without a 
   assert.deepEqual(deliveries[0], {
     projectId: "taskboard-core",
     todoId: todo.id,
+    taskId: todo.taskId,
     rootThreadId: todo.dispatchTarget.rootThreadId,
     codexHostId: "local",
     rootWorkspacePath: coordinationAuthorization.rootWorkspacePath,
@@ -3072,6 +3078,7 @@ test("background continuation delivers one eligible first safe action without a 
     safeActionId: "safe-first",
     expectedResumeToken: "b".repeat(64),
     deliveryReceipt: { id: "receipt", reservationLeaseId: "lease" },
+    recoveryLeaseId: "lease",
     observeOnly: false,
     executionIdentity: { ...confirmedIdentity, standingAuthority: false },
   });
@@ -5773,6 +5780,81 @@ test("Agent Todo coordination starts an idle Root turn", async () => {
   });
 });
 
+test("an idle personal vibe Todo receives full host access only after exact protected revalidation", async () => {
+  const calls = [];
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local",
+    projectId: "taskboard-core",
+    todoId: "TASKBOARD-VIBE",
+    taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+    targetRoot: "/tmp/taskboard/project",
+    ...coordinationAuthorization,
+  };
+  let revalidated = null;
+  const result = await deliverCoordination(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") {
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
+    }
+    if (method === "turn/start") return { turn: { id: "turn-vibe" } };
+    return {};
+  }, async () => {}, async (candidate) => {
+    revalidated = candidate;
+    return {
+      mode: "dangerFullAccess",
+      authorization: "taskboard-personal-vibe",
+      taskId: request.taskId,
+      receiptId: request.deliveryReceipt.id,
+      admissionAttemptId: request.deliveryReceipt.admissionAttemptId,
+      rootThreadId: request.rootThreadId,
+      worktreePath: request.targetRoot,
+    };
+  });
+
+  assert.equal(revalidated, request);
+  assert.deepEqual(result, { delivery: "started", turnId: "turn-vibe" });
+  assert.deepEqual(calls[2][1].sandboxPolicy, { type: "dangerFullAccess" });
+});
+
+test("an idle Todo ignores forged or mismatched full-access identity and stays workspace-scoped", async () => {
+  const calls = [];
+  const request = {
+    rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    codexHostId: "local",
+    projectId: "taskboard-core",
+    todoId: "TASKBOARD-FORMAL",
+    taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+    targetRoot: "/tmp/taskboard/project",
+    ...coordinationAuthorization,
+    executionIdentity: {
+      hostAccess: { mode: "dangerFullAccess", authorization: "taskboard-personal-vibe" },
+    },
+  };
+  await deliverCoordination(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") {
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] } };
+    }
+    if (method === "turn/start") return { turn: { id: "turn-formal" } };
+    return {};
+  }, async () => {}, async () => ({
+    mode: "dangerFullAccess",
+    authorization: "taskboard-personal-vibe",
+    taskId: "different-task",
+    receiptId: request.deliveryReceipt.id,
+    admissionAttemptId: request.deliveryReceipt.admissionAttemptId,
+    rootThreadId: request.rootThreadId,
+    worktreePath: request.targetRoot,
+  }));
+
+  assert.deepEqual(calls[2][1].sandboxPolicy, {
+    type: "workspaceWrite",
+    writableRoots: [request.rootWorkspacePath],
+    networkAccess: true,
+  });
+});
+
 test("Agent Todo coordination observes a prior durable Root delivery after restart", async () => {
   const request = {
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
@@ -5944,7 +6026,7 @@ test("Agent Todo coordination can target a Git worktree outside the Root coordin
   assert.match(instruction, /coordination cwd may be different/);
   assert.deepEqual(turnStart?.sandboxPolicy, {
     type: "workspaceWrite",
-    writableRoots: [path.resolve(request.rootWorkspacePath), request.targetRoot],
+    writableRoots: [request.rootWorkspacePath, request.targetRoot],
     networkAccess: true,
   });
 });
