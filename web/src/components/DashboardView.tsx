@@ -49,6 +49,34 @@ const STARTED_STATUSES = new Set<Task["status"]>([
   "blocked",
 ]);
 
+const ROADMAP_ROOT_STATUS_RANK: Record<Task["status"], number> = {
+  in_progress: 0,
+  blocked: 1,
+  todo: 2,
+  backlog: 3,
+  in_review: 4,
+  done: 5,
+  canceled: 6,
+};
+
+function selectRoadmap(tasks: Task[]) {
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  const roots = tasks
+    .filter((task) => task.relations.parent === null && task.relations.subIssues.length > 0)
+    .sort((left, right) => (
+      ROADMAP_ROOT_STATUS_RANK[left.status] - ROADMAP_ROOT_STATUS_RANK[right.status]
+      || right.activityUpdatedAt.localeCompare(left.activityUpdatedAt)
+    ));
+  const root = roots[0] ?? null;
+  const features = root
+    ? root.relations.subIssues
+      .map((relation) => taskById.get(relation.id))
+      .filter((task): task is Task => task !== undefined)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+    : tasks.filter((task) => task.relations.parent === null);
+  return { root, features };
+}
+
 interface ProgressPoint {
   timestamp: number;
   scope: number;
@@ -244,6 +272,27 @@ export function DashboardView({
   const completionRate = tasks.length
     ? Math.round((completedTasks.length / tasks.length) * 100)
     : 0;
+  const roadmap = selectRoadmap(tasks);
+  const roadmapPlanned = roadmap.features.filter((task) => task.status !== "canceled");
+  const roadmapCompleted = roadmapPlanned.filter((task) => task.status === "done");
+  const roadmapCurrent = roadmapPlanned.filter((task) => task.status === "in_progress");
+  const roadmapBlocked = roadmapPlanned.filter((task) => task.status === "blocked");
+  const roadmapRemaining = roadmapPlanned.length - roadmapCompleted.length;
+  const roadmapLatest = [...roadmap.features]
+    .sort((left, right) => right.activityUpdatedAt.localeCompare(left.activityUpdatedAt))[0] ?? null;
+  const roadmapNext = roadmapCurrent[0]
+    ?? roadmapPlanned.find((task) => task.status === "todo")
+    ?? roadmapPlanned.find((task) => task.status === "backlog")
+    ?? roadmapPlanned.find((task) => task.status === "in_review")
+    ?? null;
+  const roadmapDueDate = roadmap.root?.dueDate
+    ?? roadmapPlanned
+      .map((task) => task.dueDate)
+      .filter((value): value is string => value !== null)
+      .sort()
+      .at(-1)
+    ?? null;
+  const recentlyAddedAfter = Date.now() - (7 * DAY_MS);
   const aggregateCreatedAt = isAllProjects
     ? tasks.reduce<string | null>((earliest, task) => (
         !earliest || task.createdAt < earliest ? task.createdAt : earliest
@@ -521,6 +570,73 @@ export function DashboardView({
             <img className="dashboard-codex-mark" src="codex-agent-logo.png" alt="" aria-hidden="true" />
           </section>
         </div>
+
+        {!isAllProjects && roadmap.features.length > 0 ? (
+          <section className="dashboard-roadmap" aria-label={text("项目路线图", "Project roadmap")}>
+            <header className="dashboard-roadmap-heading">
+              <div>
+                <span>{text("项目路线图", "Project roadmap")}</span>
+                <h2>{roadmap.root?.title ?? text("当前项目功能", "Current project features")}</h2>
+              </div>
+              <div className="dashboard-roadmap-progress">
+                <strong>{roadmapCompleted.length}/{roadmapPlanned.length}</strong>
+                <span>{text(
+                  `${roadmapCurrent.length} 个进行中 · ${roadmapRemaining} 个未完成`,
+                  `${roadmapCurrent.length} in progress · ${roadmapRemaining} remaining`,
+                )}</span>
+              </div>
+            </header>
+
+            <div className="dashboard-roadmap-facts">
+              <div>
+                <span>{text("现在", "Now")}</span>
+                <strong>{roadmapCurrent[0]?.title ?? text("当前没有正在开发的功能", "No feature is currently in development")}</strong>
+              </div>
+              <div>
+                <span>{text("最近进展", "Latest progress")}</span>
+                <strong>{roadmapLatest
+                  ? `${roadmapLatest.title} · ${taskStatusLabel(language, roadmapLatest.status)}`
+                  : text("暂无更新", "No recent update")}</strong>
+              </div>
+              <div>
+                <span>{text("预计完成", "Estimated completion")}</span>
+                <strong>{roadmapDueDate
+                  ? shortDate(roadmapDueDate, locale)
+                  : text("尚无法可靠估计", "Not enough evidence to estimate")}</strong>
+              </div>
+              <div>
+                <span>{text("下一步", "Next")}</span>
+                <strong>{roadmapNext?.title ?? text("所有功能均已完成", "All features are complete")}</strong>
+              </div>
+            </div>
+
+            <div className="dashboard-roadmap-list">
+              {roadmap.features.map((task, index) => {
+                const isRecent = new Date(task.createdAt).getTime() >= recentlyAddedAfter;
+                return (
+                  <button
+                    type="button"
+                    className={`dashboard-roadmap-item status-${task.status}`}
+                    onClick={() => onOpenTask(task)}
+                    key={task.id}
+                  >
+                    <span className="dashboard-roadmap-index">{text(`功能 ${index + 1}`, `Feature ${index + 1}`)}</span>
+                    <strong>{task.title}</strong>
+                    {isRecent ? <small>{text("新加入", "New")}</small> : null}
+                    <span className="dashboard-roadmap-status">{taskStatusLabel(language, task.status)}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            {roadmapBlocked.length > 0 ? (
+              <p className="dashboard-roadmap-blocker">{text(
+                `当前阻碍：${roadmapBlocked.map((task) => task.title).join("、")}`,
+                `Current blockers: ${roadmapBlocked.map((task) => task.title).join(", ")}`,
+              )}</p>
+            ) : null}
+          </section>
+        ) : null}
 
         <div className="dashboard-metrics">
           {metrics.map((metric) => {
