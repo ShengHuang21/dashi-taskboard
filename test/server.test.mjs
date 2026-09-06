@@ -200,6 +200,72 @@ test("health and the default local project are available", async () => {
   assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
 });
 
+test("agent capability catalog publishes stable supported and planned boundaries", async () => {
+  const baseUrl = await startServer(async () => ({ version: "1.2.3-test" }));
+
+  const result = await request(baseUrl, "/api/agent-capabilities");
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.catalogVersion, 1);
+  assert.deepEqual(result.body.service, {
+    id: "codex-taskboard",
+    name: "Codex Taskboard",
+    version: "1.2.3-test",
+  });
+  assert.deepEqual(result.body.protocol, {
+    id: "taskboard-control-plane",
+    version: 1,
+    transport: "http-json",
+    scope: "authenticated-local-runtime",
+  });
+
+  const capabilitiesById = new Map(
+    result.body.capabilities.map((capability) => [capability.id, capability]),
+  );
+  assert.equal(capabilitiesById.size, result.body.capabilities.length);
+  assert.deepEqual(
+    [...capabilitiesById.entries()].map(([id, capability]) => [id, capability.state]),
+    [
+      ["taskboard.task-capsule.read", "supported"],
+      ["taskboard.owner-intent.capture", "supported"],
+      ["taskboard.work.route", "supported"],
+      ["taskboard.execution.claim", "supported"],
+      ["taskboard.handoff.record", "supported"],
+      ["external.agent-card.inspect", "planned"],
+      ["external.task.dispatch", "planned"],
+    ],
+  );
+  for (const capability of capabilitiesById.values()) {
+    assert.deepEqual(capability.inputModes, ["application/json"]);
+    assert.deepEqual(capability.outputModes, ["application/json"]);
+    assert.ok(capability.prerequisites.length > 0);
+  }
+  assert.deepEqual(result.body.interoperability, {
+    a2a: { state: "not_implemented", conformant: false },
+    externalProviders: {
+      state: "not_configured",
+      inspect: false,
+      dispatch: false,
+      wait: false,
+      checkpointReceipt: false,
+    },
+  });
+});
+
+test("agent capability catalog route stays read-only and query-free", async () => {
+  const baseUrl = await startServer();
+
+  const mutation = await request(baseUrl, "/api/agent-capabilities", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(mutation.response.status, 405);
+  assert.equal(mutation.response.headers.get("allow"), "GET");
+
+  const unknownQuery = await request(baseUrl, "/api/agent-capabilities?provider=external");
+  assert.equal(unknownQuery.response.status, 400);
+  assert.equal(unknownQuery.body.error.code, "UNKNOWN_QUERY_PARAMETER");
+});
+
 test("database reuses prepared statements across repeated hot reads", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-statement-cache-test-"));
   const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"), {
