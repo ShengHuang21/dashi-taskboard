@@ -3339,13 +3339,17 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
     return { delivered: false, reason: "invalid-snapshot" };
   }
+  const replacementRecoveryObservedAt = now();
   const replacementRecoveryTodo = snapshot.todos.find((candidate) => {
     const admission = candidate?.admission;
     const target = candidate?.dispatchTarget;
     const assignment = candidate?.domainAssignment;
+    const expiredPendingAdmission = ["awaiting_admission", "prepared"].includes(admission?.state)
+      && Number.isFinite(Date.parse(admission?.deadlineAt ?? ""))
+      && Date.parse(admission.deadlineAt) <= replacementRecoveryObservedAt;
     return COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
-      && admission?.state === "admission_uncertain"
+      && (admission?.state === "admission_uncertain" || expiredPendingAdmission)
       && typeof admission?.receiptId === "string" && admission.receiptId
       && typeof admission?.attemptId === "string" && admission.attemptId
       && THREAD_ID_PATTERN.test(admission?.rootThreadId ?? "")

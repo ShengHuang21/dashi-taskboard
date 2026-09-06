@@ -3540,6 +3540,89 @@ test("background continuation retires an absent child only through the original 
   });
 });
 
+test("background continuation recovers expired pending admissions after coordinator replacement", async () => {
+  const oldRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const replacementRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  for (const admissionState of ["awaiting_admission", "prepared"]) {
+    const calls = [];
+    const result = await runTaskboardContinuationMonitorOnce({
+      policy: { enabled: true, projectId: "taskboard-core" },
+      now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+      readSnapshot: async () => ({
+        projectId: "taskboard-core",
+        todos: [{
+          id: "CAP-44",
+          taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+          dispatchTarget: {
+            rootThreadId: replacementRootThreadId,
+            codexHostId: "local",
+            rootWorkspacePath: "/tmp/taskboard",
+            worktreePath: "/tmp/taskboard/project",
+          },
+          domainAssignment: {
+            status: "active",
+            domainId: "frontend",
+            leaseId: "replacement-lease",
+            coordinatorTaskId: "frontend-coordinator",
+          },
+          admission: {
+            receiptId: "replacement-receipt",
+            attemptId: "replacement-attempt",
+            state: admissionState,
+            deadlineAt: "2026-08-31T00:01:00.000Z",
+            rootThreadId: oldRootThreadId,
+            rootHostId: "local",
+            rootWorkspacePath: "/tmp/taskboard",
+            resumeToken: "d".repeat(64),
+            safeActionId: "safe-action",
+            coordinationDomainId: "frontend",
+            domainCoordinatorLeaseId: "old-lease",
+            domainCoordinatorTaskId: "frontend-coordinator",
+            domainCoordinatorThreadId: oldRootThreadId,
+            agentPath: "/root/task_admission_1234",
+          },
+        }],
+      }),
+      claimReceipt: async () => assert.fail("replacement recovery must precede ordinary delivery"),
+      confirmDelivery: async () => assert.fail("replacement recovery must precede ordinary delivery"),
+      deliver: async () => assert.fail("replacement recovery must precede ordinary delivery"),
+      completeDelivery: async () => assert.fail("replacement recovery must precede ordinary delivery"),
+      claimReplacementAdmissionProbe: async (request) => {
+        calls.push(["probe-claim", request.rootThreadId]);
+        return {
+          receipt: {
+            admissionProbeId: "replacement-probe",
+            admissionProbeRequestedAt: "2026-08-31T00:02:00.000Z",
+          },
+          observationTarget: {
+            rootThreadId: oldRootThreadId,
+            codexHostId: "local",
+            rootWorkspacePath: "/tmp/taskboard",
+          },
+        };
+      },
+      deliverAdmissionRecovery: async (request) => {
+        calls.push([request.mode, request.rootThreadId]);
+        return { delivery: "started", turnId: "old-root-probe-turn" };
+      },
+      reconcileReplacementAdmission: async (request) => {
+        calls.push(["reconcile", request.rootThreadId]);
+        return { outcome: "absent", receipt: { admissionState: "deferred" } };
+      },
+    });
+    assert.deepEqual(calls, [
+      ["probe-claim", replacementRootThreadId],
+      ["probe", oldRootThreadId],
+      ["reconcile", replacementRootThreadId],
+    ], admissionState);
+    assert.deepEqual(result, {
+      delivered: false,
+      todoId: "CAP-44",
+      reason: "replacement-admission-deferred",
+    }, admissionState);
+  }
+});
+
 test("background continuation waits for observed Root capacity and backfills after a slot opens", async () => {
   const calls = { claim: 0, deliver: 0, complete: 0 };
   let active = 3;
