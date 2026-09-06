@@ -1556,6 +1556,38 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
     recovered.id, "attach", { threadId: "different-thread" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT");
+  const acquiredDomain = reopened.claimAgentLaneDomainCoordinator(projectId, "frontend", {
+    holderTaskId: "frontend", holderThreadId: threadId,
+    holderCodexHostId: "local", holderWorkspacePath: threadBinding.workspacePath,
+    expectedLeaseId: null, leaseDurationSeconds: 300,
+  });
+  assert.equal(acquiredDomain.lease.holderThreadId, threadId);
+  const postAcquireRevision = reopened.getAgentLaneCoordinationWindows(projectId).revision;
+  assert.notEqual(postAcquireRevision, registration.expectedRevision);
+  reopened.database.prepare(`
+    UPDATE agent_domain_coordinator_provisioning_attempts
+    SET expected_revision = ? WHERE id = ?
+  `).run(postAcquireRevision, recovered.id);
+  const replayedRegistration = reopened.registerAgentLaneCoordinationWindow(
+    projectId, registration, threadBinding,
+  );
+  assert.equal(replayedRegistration.applied, false);
+  assert.equal(replayedRegistration.receipt.id, registered.receipt.id);
+  assert.throws(() => reopened.registerAgentLaneCoordinationWindow(
+    projectId, { ...registration, expectedRevision: postAcquireRevision }, threadBinding,
+  ), (error) => error?.code === "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT");
+  assert.equal(reopened.database.prepare(`
+    SELECT COUNT(*) AS count FROM agent_coordination_window_receipts
+    WHERE project_id = ? AND idempotency_key = ?
+  `).get(projectId, registration.idempotencyKey).count, 1);
+  assert.equal(reopened.database.prepare(`
+    SELECT COUNT(*) AS count FROM agent_domain_coordinator_lease_receipts
+    WHERE project_id = ? AND domain_id = ? AND lease_id = ? AND action = 'acquired'
+  `).get(projectId, "frontend", acquiredDomain.lease.id).count, 1);
+  reopened.releaseAgentLaneDomainCoordinator(projectId, "frontend", {
+    holderTaskId: "frontend", holderThreadId: threadId,
+    expectedLeaseId: acquiredDomain.lease.id,
+  });
   assert.equal(reopened.database.prepare(`
     SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts
   `).get().count, 2);
