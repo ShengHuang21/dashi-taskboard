@@ -10,6 +10,7 @@ const detailSource = await readFile(new URL("../web/src/components/TaskDetail.ts
 const labelPickerSource = await readFile(new URL("../web/src/components/LabelPicker.tsx", import.meta.url), "utf8");
 const pendingAttachmentsSource = await readFile(new URL("../web/src/components/PendingAttachments.tsx", import.meta.url), "utf8");
 const labelsSource = await readFile(new URL("../web/src/labels.ts", import.meta.url), "utf8");
+const dashboardSource = await readFile(new URL("../web/src/components/DashboardView.tsx", import.meta.url), "utf8");
 
 test("the project switcher merges live Codex projects with persisted Taskboard projects", () => {
   assert.match(appSource, /hostContext\?\.projects \?\? \[\]/);
@@ -58,6 +59,27 @@ test("the selected project exposes the current board surfaces", () => {
   assert.match(appSource, /<GanttView/);
   assert.match(appSource, /<BoardColumn/);
   assert.match(styles, /\.workspace-header \{[\s\S]*?border-bottom: var\(--border-hairline\) solid var\(--border\)/);
+});
+
+test("ordinary projects open on the Owner roadmap by default", () => {
+  assert.match(appSource, /const PROJECT_VIEW_KEY_PREFIX = "taskboard\.project-view\.v2\."/);
+  assert.match(
+    appSource,
+    /function readProjectBoardView[\s\S]*?view === "readme" \|\| view === "dashboard"[\s\S]*?: "dashboard";/,
+  );
+});
+
+test("the Owner roadmap separates current work, next work, and meaningful progress", () => {
+  assert.match(
+    dashboardSource,
+    /const roadmapLatest = roadmapPlanned[\s\S]*?STARTED_STATUSES\.has\(task\.status\)[\s\S]*?right\.updatedAt\.localeCompare\(left\.updatedAt\)/,
+  );
+  assert.doesNotMatch(dashboardSource, /const roadmapLatest =[\s\S]*?activityUpdatedAt[\s\S]*?const roadmapNext/);
+  assert.match(
+    dashboardSource,
+    /const roadmapNext = roadmapPlanned\.find\(\(task\) => task\.status === "todo"\)[\s\S]*?task\.status === "backlog"[\s\S]*?task\.status === "in_review"/,
+  );
+  assert.doesNotMatch(dashboardSource, /const roadmapNext = roadmapCurrent\[0\]/);
 });
 
 test("new issues stage attachments in the composer and upload them after creation", () => {

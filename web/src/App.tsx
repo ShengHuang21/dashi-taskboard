@@ -313,7 +313,7 @@ const DEFAULT_USER_ACTOR: ActorIdentity = {
 const GLOBAL_PROJECT_ID = "local";
 const ALL_PROJECTS_ID = "__all_projects__";
 const RECENT_PROJECT_IDS_KEY = "taskboard.recentProjectIds.v1";
-const PROJECT_VIEW_KEY_PREFIX = "taskboard.project-view.v1.";
+const PROJECT_VIEW_KEY_PREFIX = "taskboard.project-view.v2.";
 const DEVICE_WORKSPACE_PATHS_KEY = "taskboard.deviceWorkspacePaths.v1";
 const PROJECT_CODEX_IDENTITIES_KEY = "taskboard.projectCodexIdentities.v1";
 const PROJECT_AUTOMATIONS_KEY = "taskboard.projectAutomations.v1";
@@ -338,7 +338,7 @@ function readProjectBoardView(projectId: string, agentLanesConfigured = false): 
     ? view
     : view === "readme" || view === "dashboard" || view === "list" || view === "gantt" || view === "issues"
       ? view
-      : agentLanesConfigured ? "lanes" : "issues";
+      : "dashboard";
 }
 
 function withAgentLaneConfiguration(projects: Project[], projectIds: string[]): Project[] {
