@@ -6026,7 +6026,7 @@ test("Agent Todo coordination can target a Git worktree outside the Root coordin
   assert.match(instruction, /coordination cwd may be different/);
   assert.deepEqual(turnStart?.sandboxPolicy, {
     type: "workspaceWrite",
-    writableRoots: [request.rootWorkspacePath, request.targetRoot],
+    writableRoots: [path.resolve(request.rootWorkspacePath), request.targetRoot],
     networkAccess: true,
   });
 });
