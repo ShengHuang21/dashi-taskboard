@@ -278,10 +278,10 @@ export function DashboardView({
   const roadmapCurrent = roadmapPlanned.filter((task) => task.status === "in_progress");
   const roadmapBlocked = roadmapPlanned.filter((task) => task.status === "blocked");
   const roadmapRemaining = roadmapPlanned.length - roadmapCompleted.length;
-  const roadmapLatest = [...roadmap.features]
-    .sort((left, right) => right.activityUpdatedAt.localeCompare(left.activityUpdatedAt))[0] ?? null;
-  const roadmapNext = roadmapCurrent[0]
-    ?? roadmapPlanned.find((task) => task.status === "todo")
+  const roadmapLatest = roadmapPlanned
+    .filter((task) => task.status === "done" || STARTED_STATUSES.has(task.status))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null;
+  const roadmapNext = roadmapPlanned.find((task) => task.status === "todo")
     ?? roadmapPlanned.find((task) => task.status === "backlog")
     ?? roadmapPlanned.find((task) => task.status === "in_review")
     ?? null;
@@ -606,7 +606,9 @@ export function DashboardView({
               </div>
               <div>
                 <span>{text("下一步", "Next")}</span>
-                <strong>{roadmapNext?.title ?? text("所有功能均已完成", "All features are complete")}</strong>
+                <strong>{roadmapNext?.title ?? (roadmapRemaining > 0
+                  ? text("等待当前功能完成", "Finish the current feature")
+                  : text("所有功能均已完成", "All features are complete"))}</strong>
               </div>
             </div>
 
