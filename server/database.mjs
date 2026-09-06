@@ -5818,6 +5818,31 @@ export class TaskboardDatabase {
         codexHostId: threadBinding.codexHostId,
         workspacePath: path.resolve(threadBinding.workspacePath),
       };
+      const identityHandshakeRow = this.#prepare(`
+        SELECT * FROM agent_coordination_identity_handshakes
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(projectId, input.idempotencyKey);
+      const requestFingerprint = coordinationIdentityRequestFingerprint(projectId, input);
+      const fingerprint = createHash("sha256").update(JSON.stringify({
+        role: input.role,
+        taskId: input.taskId,
+        label: input.label,
+        binding,
+      })).digest("hex");
+      const existingReceiptRow = this.#prepare(`
+        SELECT * FROM agent_coordination_window_receipts
+        WHERE project_id = ? AND idempotency_key = ?
+      `).get(projectId, input.idempotencyKey);
+      if (existingReceiptRow?.fingerprint === fingerprint
+        && (!identityHandshakeRow
+          || identityHandshakeRow.request_fingerprint === requestFingerprint)) {
+        this.database.exec("COMMIT");
+        return {
+          applied: false,
+          receipt: coordinationWindowReceiptFromRow(existingReceiptRow),
+          configuration: coordinationWindowConfiguration(projectId, row),
+        };
+      }
       const provisioningAttempt = this.#prepare(`
         SELECT * FROM agent_coordinator_provisioning_attempts
         WHERE project_id = ? AND (task_id = ? OR thread_id = ?)
@@ -5856,41 +5881,17 @@ export class TaskboardDatabase {
           "Window registration must consume the exact durable domain provisioning attempt",
         );
       }
-      const identityHandshakeRow = this.#prepare(`
-        SELECT * FROM agent_coordination_identity_handshakes
-        WHERE project_id = ? AND idempotency_key = ?
-      `).get(projectId, input.idempotencyKey);
       if (identityHandshakeRow
-        && identityHandshakeRow.request_fingerprint
-          !== coordinationIdentityRequestFingerprint(projectId, input)) {
+        && identityHandshakeRow.request_fingerprint !== requestFingerprint) {
         throw new ApiError(409, "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT", "The idempotency key is bound to a different coordination window registration");
       }
-      const fingerprint = createHash("sha256").update(JSON.stringify({
-        role: input.role,
-        taskId: input.taskId,
-        label: input.label,
-        binding,
-      })).digest("hex");
-      const existingReceiptRow = this.#prepare(`
-        SELECT * FROM agent_coordination_window_receipts
-        WHERE project_id = ? AND idempotency_key = ?
-      `).get(projectId, input.idempotencyKey);
       if (existingReceiptRow) {
-        if (existingReceiptRow.fingerprint !== fingerprint) {
-          throw new ApiError(
-            409,
-            "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT",
-            "The idempotency key is bound to a different coordination window registration",
-          );
-        }
-        this.database.exec("COMMIT");
-        return {
-          applied: false,
-          receipt: coordinationWindowReceiptFromRow(existingReceiptRow),
-          configuration: coordinationWindowConfiguration(projectId, row),
-        };
+        throw new ApiError(
+          409,
+          "COORDINATION_WINDOW_IDEMPOTENCY_CONFLICT",
+          "The idempotency key is bound to a different coordination window registration",
+        );
       }
-
       if (this.getAgentLaneCoordinatorShutdownAttempt(projectId)) {
         throw new ApiError(
           409,
