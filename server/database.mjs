@@ -3,7 +3,11 @@ import { lstatSync, mkdirSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import { DEFAULT_LABEL_NAMES, JIRA_PROJECT_ID } from "../shared/domain.mjs";
+import {
+  DEFAULT_LABEL_NAMES,
+  JIRA_PROJECT_ID,
+  isCanonicalCodexHostId,
+} from "../shared/domain.mjs";
 import { createTaskCapsule } from "./task-capsule.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
@@ -7978,23 +7982,43 @@ export class TaskboardDatabase {
     return attachTaskActivity(task, comments, activities, previewImage);
   }
 
-  recordTaskWorktreeRepository(taskId, {
+  #taskWithWorktreeRepositoryProbe(task, {
     worktreePath,
     expectedBranch,
     repository,
     verifiedAt,
   }) {
-    const task = this.#requireTask(taskId);
     if (task.developmentContext?.type !== "worktree"
       || task.developmentContext.path !== worktreePath
       || task.developmentContext.branch !== expectedBranch) {
       throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree or branch changed during repository verification");
     }
+    const developmentContext = {
+      ...task.developmentContext,
+      repositoryVerifiedAt: verifiedAt,
+    };
+    if (repository === null) delete developmentContext.repository;
+    else developmentContext.repository = repository;
+    return {
+      ...task,
+      developmentContext,
+    };
+  }
+
+  recordTaskWorktreeRepository(taskId, probe) {
+    const task = this.#requireTask(taskId);
+    const projected = this.#taskWithWorktreeRepositoryProbe(task, probe);
     const result = this.#prepare(`
       UPDATE tasks
       SET worktree_repository = ?, worktree_repository_verified_at = ?
       WHERE id = ? AND worktree_path = ? AND worktree_branch = ?
-    `).run(repository, verifiedAt, task.id, worktreePath, expectedBranch);
+    `).run(
+      projected.developmentContext.repository ?? null,
+      projected.developmentContext.repositoryVerifiedAt,
+      task.id,
+      projected.developmentContext.path,
+      projected.developmentContext.branch,
+    );
     if (result.changes !== 1) {
       throw new ApiError(409, "WORKTREE_CHANGED", "Task worktree or branch changed during repository verification");
     }
@@ -8415,9 +8439,12 @@ export class TaskboardDatabase {
     }
   }
 
-  getTaskCapsule(id) {
-    const task = this.getTask(id);
+  getTaskCapsule(id, { worktreeRepositoryProbe = null } = {}) {
+    let task = this.getTask(id);
     if (!task) return null;
+    if (worktreeRepositoryProbe) {
+      task = this.#taskWithWorktreeRepositoryProbe(task, worktreeRepositoryProbe);
+    }
     const domainAssignment = this.getAgentTaskDomainAssignment(task.id);
     const laneConfig = domainAssignment ? null : this.getAgentLaneProject(task.projectId);
     const globalLease = laneConfig?.coordinatorLease ?? null;
@@ -8449,14 +8476,37 @@ export class TaskboardDatabase {
     });
   }
 
-  claimTaskSafeAction(id, {
-    rootThreadId, expectedResumeToken, safeActionId, reservationLeaseId,
-  }) {
+  #assertTaskSafeActionHostExecutor(rootRun, ownedCodexHostId) {
+    if (!isCanonicalCodexHostId(ownedCodexHostId)
+      || ownedCodexHostId !== rootRun.rootHostId) {
+      throw new ApiError(
+        409,
+        "HOST_EXECUTOR_MISMATCH",
+        "Bootstrap claim executor does not own the current Root host route",
+      );
+    }
+  }
+
+  assertTaskSafeActionHostExecutor(id, { rootThreadId, ownedCodexHostId }) {
+    const task = this.#requireTask(id);
+    const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+    this.#assertTaskSafeActionHostExecutor(rootRun, ownedCodexHostId);
+  }
+
+  claimTaskSafeAction(
+    id,
+    { rootThreadId, ownedCodexHostId, expectedResumeToken, safeActionId, reservationLeaseId },
+    { worktreeRepositoryProbe = null } = {},
+  ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
-      const capsule = this.getTaskCapsule(task.id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#assertTaskSafeActionHostExecutor(rootRun, ownedCodexHostId);
+      if (worktreeRepositoryProbe) {
+        this.recordTaskWorktreeRepository(task.id, worktreeRepositoryProbe);
+      }
+      const capsule = this.getTaskCapsule(task.id);
       if (capsule.resumeToken !== expectedResumeToken) {
         throw new ApiError(409, "RESUME_TOKEN_MISMATCH", "Task Capsule changed before bootstrap claim");
       }

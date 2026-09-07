@@ -744,10 +744,65 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
 
   const bootstrap = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
   const capsule = bootstrap.body.capsule;
+  const missingExecutor = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: capsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "missing-executor-lease",
+    },
+  });
+  assert.equal(missingExecutor.response.status, 400);
+  assert.equal(missingExecutor.body.error.code, "INVALID_FIELD");
+
+  for (const length of [240, 241, 256]) {
+    const acceptedHostBoundary = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+      method: "POST",
+      body: {
+        rootThreadId: "root-thread",
+        ownedCodexHostId: "h".repeat(length),
+        expectedResumeToken: capsule.resumeToken,
+        safeActionId: capsule.readyWork.safeActions[0].id,
+        reservationLeaseId: `accepted-host-boundary-${length}`,
+      },
+    });
+    assert.equal(acceptedHostBoundary.response.status, 409, String(length));
+    assert.equal(acceptedHostBoundary.body.error.code, "HOST_EXECUTOR_MISMATCH", String(length));
+  }
+  for (const invalidHostId of ["h".repeat(257), "remote\ncontrol"]) {
+    const rejectedHostBoundary = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+      method: "POST",
+      body: {
+        rootThreadId: "root-thread",
+        ownedCodexHostId: invalidHostId,
+        expectedResumeToken: capsule.resumeToken,
+        safeActionId: capsule.readyWork.safeActions[0].id,
+        reservationLeaseId: "rejected-host-boundary",
+      },
+    });
+    assert.equal(rejectedHostBoundary.response.status, 400, JSON.stringify(invalidHostId));
+    assert.equal(rejectedHostBoundary.body.error.code, "INVALID_FIELD", JSON.stringify(invalidHostId));
+  }
+
+  const wrongExecutor = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      ownedCodexHostId: "remote-builder",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: capsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "wrong-executor-lease",
+    },
+  });
+  assert.equal(wrongExecutor.response.status, 409);
+  assert.equal(wrongExecutor.body.error.code, "HOST_EXECUTOR_MISMATCH");
+
   const reservation = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
     method: "POST",
     body: {
       rootThreadId: "root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: capsule.readyWork.safeActions[0].id,
       reservationLeaseId: "bootstrap-lease",
@@ -762,6 +817,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
     method: "POST",
     body: {
       rootThreadId: "root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: "test",
       reservationLeaseId: "bootstrap-lease",
@@ -775,6 +831,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
     method: "POST",
     body: {
       rootThreadId: "other-root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: "test",
       reservationLeaseId: "wrong-root-lease",
@@ -787,6 +844,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
     method: "POST",
     body: {
       rootThreadId: "root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: "0".repeat(64),
       safeActionId: "test",
       reservationLeaseId: "stale-lease",
@@ -798,6 +856,286 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
   const unchanged = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
   assert.equal(unchanged.body.capsule.task.status, "todo");
   assert.equal(unchanged.body.capsule.activeRun, null);
+  assert.ok(unchanged.body.capsule.executionTarget.repositoryVerifiedAt);
+});
+
+test("wrong-host bootstrap claims never persist successful or failed repository probes", async () => {
+  let databasePath;
+  let taskId;
+  let rootThreadId;
+  let expectedResumeToken;
+  let safeActionId;
+  let probeMode = "success";
+  let probeCalls = 0;
+  const snapshotDatabase = () => {
+    const inspection = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const tables = inspection.prepare(`
+        SELECT name FROM sqlite_schema
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+      `).all();
+      return Object.fromEntries(tables.map(({ name }) => [
+        name,
+        inspection.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all(),
+      ]));
+    } finally {
+      inspection.close();
+    }
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const worktreePath = path.join(directory, "wrong-host-worktree");
+    await mkdir(worktreePath, { recursive: true });
+    const database = new TaskboardDatabase(databasePath);
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    rootThreadId = "wrong-host-root";
+    const rootBinding = {
+      threadId: rootThreadId,
+      codexProjectId: "local",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: worktreePath,
+    };
+    const task = database.createTask({
+      projectId: "local",
+      title: "Fence repository probes behind host ownership",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor,
+      assignee: actor,
+      workflowId: null,
+      developmentContext: {
+        type: "worktree", path: worktreePath, branch: "codex/wrong-host-probe",
+      },
+      workingLog: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.recordTaskWorktreeRepository(task.id, {
+      worktreePath,
+      expectedBranch: "codex/wrong-host-probe",
+      repository: "github.com/owner/original",
+      verifiedAt: "2026-09-07T00:00:00.000Z",
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "focused tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:wrong-host-probe",
+        }],
+        actions: [{
+          id: "test", order: 10, text: "Run focused tests", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const capsule = database.getTaskCapsule(task.id);
+    taskId = task.id;
+    expectedResumeToken = capsule.resumeToken;
+    safeActionId = capsule.readyWork.safeActions[0].id;
+    database.close();
+    return {
+      worktreeRepositoryExecFile: async (_executable, args) => {
+        probeCalls += 1;
+        if (probeMode === "failure") throw new Error("repository probe failed");
+        if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+        if (args.includes("get-url")) return { stdout: "git@github.com:Owner/Probed.git\n" };
+        if (args.includes("--show-current")) return { stdout: "codex/wrong-host-probe\n" };
+        throw new Error("unexpected repository probe");
+      },
+    };
+  });
+  const claimWrongHost = () => request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      ownedCodexHostId: "remote-builder",
+      expectedResumeToken,
+      safeActionId,
+      reservationLeaseId: `wrong-host-${probeMode}`,
+    },
+  });
+
+  for (const mode of ["success", "failure"]) {
+    probeMode = mode;
+    const before = snapshotDatabase();
+    const response = await claimWrongHost();
+    assert.equal(response.response.status, 409, mode);
+    assert.equal(response.body.error.code, "HOST_EXECUTOR_MISMATCH", mode);
+    assert.deepEqual(snapshotDatabase(), before, mode);
+  }
+  assert.equal(probeCalls, 6);
+});
+
+test("non-standing repository projection keeps snapshot and exact-host claim on one frontier", async () => {
+  let databasePath;
+  let taskId;
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let probeCalls = 0;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const worktreePath = path.join(directory, "non-standing-worktree");
+    await mkdir(worktreePath, { recursive: true });
+    const database = new TaskboardDatabase(databasePath);
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const rootBinding = {
+      threadId: rootThreadId,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: worktreePath,
+    };
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{
+        id: "root", label: "Taskboard Root", owner: "Codex Root", source: "codex",
+        threadId: rootThreadId, taskType: "root_task", codexProjectId: "local-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: worktreePath,
+      }],
+      adapters: [],
+    });
+    const task = database.createTask({
+      projectId: "local",
+      title: "Project ordinary safe work without persisting a read",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      workflowProfile: "vibe",
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor,
+      assignee: actor,
+      workflowId: null,
+      developmentContext: {
+        type: "worktree", path: worktreePath, branch: "codex/non-standing-projection",
+      },
+      workingLog: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "focused tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:non-standing-projection",
+        }],
+        actions: [{
+          id: "test", order: 10, text: "Run focused tests", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    taskId = task.id;
+    database.close();
+    return {
+      worktreeRepositoryTtlMs: 60_000,
+      worktreeRepositoryExecFile: async (_executable, args) => {
+        probeCalls += 1;
+        if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+        if (args.includes("get-url")) return { stdout: "git@github.com:Owner/Projected.git\n" };
+        if (args.includes("--show-current")) return { stdout: "codex/non-standing-projection\n" };
+        throw new Error("unexpected repository probe");
+      },
+    };
+  });
+
+  const lanes = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  const todo = lanes.body.todos.find((candidate) => candidate.taskId === taskId);
+  const capsule = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
+  const afterProjection = new DatabaseSync(databasePath, { readOnly: true });
+  const taskAfterProjection = { ...afterProjection.prepare(`
+    SELECT worktree_repository, worktree_repository_verified_at FROM tasks WHERE id = ?
+  `).get(taskId) };
+  afterProjection.close();
+  const claimBody = {
+    rootThreadId,
+    ownedCodexHostId: "local",
+    expectedResumeToken: capsule.body.capsule.resumeToken,
+    safeActionId: "test",
+    reservationLeaseId: "non-standing-reservation",
+  };
+  const stale = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: { ...claimBody, expectedResumeToken: "0".repeat(64) },
+  });
+  const afterStaleClaim = new DatabaseSync(databasePath, { readOnly: true });
+  const taskAfterStaleClaim = { ...afterStaleClaim.prepare(`
+    SELECT worktree_repository, worktree_repository_verified_at FROM tasks WHERE id = ?
+  `).get(taskId) };
+  const staleReceiptCount = afterStaleClaim.prepare(`
+    SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?
+  `).get(taskId).count;
+  afterStaleClaim.close();
+  const first = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST", body: claimBody,
+  });
+  const replay = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST", body: claimBody,
+  });
+  const afterClaims = new DatabaseSync(databasePath, { readOnly: true });
+  const persisted = afterClaims.prepare(`
+    SELECT worktree_repository, worktree_repository_verified_at FROM tasks WHERE id = ?
+  `).get(taskId);
+  const receiptCount = afterClaims.prepare(`
+    SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?
+  `).get(taskId).count;
+  afterClaims.close();
+
+  assert.deepEqual({
+    snapshotToken: todo?.readyWork.resumeToken,
+    capsuleToken: capsule.body.capsule.resumeToken,
+    capsuleRepository: capsule.body.capsule.executionTarget.repository,
+    taskAfterProjection,
+    taskAfterStaleClaim,
+    claimStatuses: [stale.response.status, first.response.status, replay.response.status],
+    claimErrors: [
+      stale.body?.error?.code ?? null,
+      first.body?.error?.code ?? null,
+      replay.body?.error?.code ?? null,
+    ],
+    staleReceiptCount,
+    persistedRepository: persisted.worktree_repository,
+    persistedVerifiedAt: Boolean(persisted.worktree_repository_verified_at),
+    receiptCount,
+    probeCalls,
+  }, {
+    snapshotToken: capsule.body.capsule.resumeToken,
+    capsuleToken: capsule.body.capsule.resumeToken,
+    capsuleRepository: "github.com/owner/projected",
+    taskAfterProjection: {
+      worktree_repository: null,
+      worktree_repository_verified_at: null,
+    },
+    taskAfterStaleClaim: {
+      worktree_repository: null,
+      worktree_repository_verified_at: null,
+    },
+    claimStatuses: [409, 200, 200],
+    claimErrors: ["RESUME_TOKEN_MISMATCH", null, null],
+    staleReceiptCount: 0,
+    persistedRepository: "github.com/owner/projected",
+    persistedVerifiedAt: true,
+    receiptCount: 1,
+    probeCalls: 12,
+  });
+  assert.equal(first.body.reused, false);
+  assert.equal(replay.body.reused, true);
 });
 
 test("the default host is loopback-only", () => {
@@ -886,6 +1224,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
   let deliveryAttempts = 0;
   let firstReceipt;
   const options = {
+    hostExecutor: { ownedCodexHostId: "local" },
     policy: { enabled: true, projectId: "local" },
     now: () => 0,
     readSnapshot: async () => (await request(baseUrl, "/api/local/projects/local/agent-lanes")).body,
@@ -899,6 +1238,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
           method: "POST",
           body: {
             rootThreadId: claim.rootThreadId,
+            ownedCodexHostId: claim.ownedCodexHostId,
             expectedResumeToken: claim.expectedResumeToken,
             safeActionId: claim.safeActionId,
             reservationLeaseId: "snapshot-reservation",
@@ -1115,6 +1455,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
     method: "POST",
     body: {
       rootThreadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: driftedCapsule.body.capsule.resumeToken,
       safeActionId: firstReceipt.safeActionId,
       reservationLeaseId: "next-reservation",
@@ -8622,7 +8963,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   assert.equal(repositoryProbeCalls, 3);
   const repeatedCapsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
   assert.equal(repeatedCapsule.response.status, 200);
-  assert.equal(repositoryProbeCalls, 3);
+  assert.equal(repositoryProbeCalls, 6);
   assert.deepEqual(
     capsule.body.capsule.readyWork.safeActions.map((action) => action.id),
     ["push-branch", "delete-link", "edit-link"],
@@ -8637,6 +8978,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
     method: "POST",
     body: {
       rootThreadId: rootBinding.threadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "delete-link",
       reservationLeaseId: "escaped-delete-reservation",
@@ -8650,6 +8992,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
     method: "POST",
     body: {
       rootThreadId: rootBinding.threadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "edit-link",
       reservationLeaseId: "escaped-edit-reservation",
@@ -8666,6 +9009,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   let idleTurnStart = null;
   let repositoryProbesAfterConfirmation = null;
   const monitorResult = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: { ownedCodexHostId: "local" },
     policy: { enabled: true, projectId: "local" },
     readSnapshot: async () => laneSnapshot.body,
     claimReceipt: async (claim) => {
@@ -8673,6 +9017,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
         method: "POST",
         body: {
           rootThreadId: claim.rootThreadId,
+          ownedCodexHostId: claim.ownedCodexHostId,
           expectedResumeToken: claim.expectedResumeToken,
           safeActionId: claim.safeActionId,
           reservationLeaseId: "standing-reservation",
@@ -8829,6 +9174,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
     method: "POST",
     body: {
       rootThreadId: rootBinding.threadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: editCapsule.resumeToken,
       safeActionId: "edit-file",
       reservationLeaseId: "edit-file-reservation",

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 
+import { isCanonicalCodexHostId } from "../shared/domain.mjs";
+
 const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 const coordinationDeliveries = new Map();
@@ -36,6 +38,15 @@ const COORDINATOR_DELIVERY_MODEL_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_MODEL_
 const COORDINATOR_DELIVERY_EFFORT_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:";
 const COORDINATOR_DELIVERY_RETRY_BASE_MS = 15_000;
 const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
+function normalizeHostExecutor(value) {
+  const ownedCodexHostId = value?.ownedCodexHostId;
+  if (!isCanonicalCodexHostId(ownedCodexHostId)) return null;
+  return { ownedCodexHostId };
+}
+
+function hostExecutorOwnsRoute(hostExecutor, route) {
+  return route?.codexHostId === hostExecutor.ownedCodexHostId;
+}
 
 export function admissionRecoveryRpcTimeoutMs(method) {
   return method === "thread/resume" || method === "turn/start" ? 30_000 : 10_000;
@@ -2221,10 +2232,7 @@ function parseHostRequest(payload, parseAutomationRequest) {
     && !/[\u0000-\u001f\u007f]/.test(request.taskId)
     && typeof request.previousThreadId === "string"
     && request.previousThreadId.length <= 240
-    && typeof request.codexHostId === "string"
-    && request.codexHostId.length > 0
-    && request.codexHostId.length <= 240
-    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && isCanonicalCodexHostId(request.codexHostId)
     && typeof request.projectless === "boolean"
     && (
       request.projectless
@@ -2247,10 +2255,7 @@ function parseHostRequest(payload, parseAutomationRequest) {
     request.action === "coordinate-agent-todo"
     && typeof request.rootThreadId === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(request.rootThreadId)
-    && typeof request.codexHostId === "string"
-    && request.codexHostId.length > 0
-    && request.codexHostId.length <= 240
-    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && isCanonicalCodexHostId(request.codexHostId)
     && typeof request.projectId === "string"
     && /^[a-z0-9._-]{1,128}$/i.test(request.projectId)
     && typeof request.todoId === "string"
@@ -2574,10 +2579,13 @@ export function runTaskboardContinuationFastLane({
   projects,
   runContinuation,
   observeResult = () => {},
+  hostExecutor: hostExecutorInput,
 }) {
+  const hostExecutor = normalizeHostExecutor(hostExecutorInput);
   if (!Array.isArray(projects)
     || typeof runContinuation !== "function"
-    || typeof observeResult !== "function") {
+    || typeof observeResult !== "function"
+    || !hostExecutor) {
     throw new Error("Taskboard continuation fast lane requires exact project state");
   }
   const eligible = projects.filter((project) => (
@@ -2586,7 +2594,8 @@ export function runTaskboardContinuationFastLane({
   ));
   return eligible.map((project) => {
     const projectId = project.projectId;
-    if (continuationFastLaneRuns.has(projectId)) {
+    const runKey = `${hostExecutor.ownedCodexHostId}:${projectId}`;
+    if (continuationFastLaneRuns.has(runKey)) {
       return { projectId, state: "in_flight" };
     }
     const run = Promise.resolve()
@@ -2599,10 +2608,10 @@ export function runTaskboardContinuationFastLane({
           error: error instanceof Error ? error.message : String(error),
         }),
       );
-    continuationFastLaneRuns.set(projectId, run);
+    continuationFastLaneRuns.set(runKey, run);
     void run.then((result) => {
-      if (continuationFastLaneRuns.get(projectId) === run) {
-        continuationFastLaneRuns.delete(projectId);
+      if (continuationFastLaneRuns.get(runKey) === run) {
+        continuationFastLaneRuns.delete(runKey);
       }
       try {
         observeResult(result);
@@ -3227,19 +3236,22 @@ async function runOwnerDecisionMonitorOnceUnlocked({
 export async function runTaskboardContinuationMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
   if (!policy || !COORDINATION_ID_PATTERN.test(policy.projectId ?? "")) {
     return { delivered: false, reason: "invalid-policy" };
   }
-  const existing = continuationMonitorRuns.get(policy.projectId);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
+  const runKey = `${hostExecutor.ownedCodexHostId}:${policy.projectId}`;
+  const existing = continuationMonitorRuns.get(runKey);
   if (existing) return existing;
 
-  const run = runTaskboardContinuationMonitorOnceUnlocked(options);
-  continuationMonitorRuns.set(policy.projectId, run);
+  const run = runTaskboardContinuationMonitorOnceUnlocked({ ...options, hostExecutor });
+  continuationMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (continuationMonitorRuns.get(policy.projectId) === run) {
-      continuationMonitorRuns.delete(policy.projectId);
+    if (continuationMonitorRuns.get(runKey) === run) {
+      continuationMonitorRuns.delete(runKey);
     }
   }
 }
@@ -3325,6 +3337,7 @@ function durableModelCapacityRetry(snapshot, candidate, target, readyWork, safeA
 
 async function runTaskboardContinuationMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimReceipt,
   confirmDelivery,
@@ -3352,6 +3365,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
     return { delivered: false, reason: "invalid-snapshot" };
   }
+  let hostExecutorUnavailable = false;
   const replacementRecoveryObservedAt = now();
   const replacementRecoveryTodo = snapshot.todos.find((candidate) => {
     const admission = candidate?.admission;
@@ -3360,7 +3374,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     const expiredPendingAdmission = ["awaiting_admission", "prepared"].includes(admission?.state)
       && Number.isFinite(Date.parse(admission?.deadlineAt ?? ""))
       && Date.parse(admission.deadlineAt) <= replacementRecoveryObservedAt;
-    return COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+    const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
       && (admission?.state === "admission_uncertain" || expiredPendingAdmission)
       && typeof admission?.receiptId === "string" && admission.receiptId
@@ -3385,6 +3399,12 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && path.resolve(admission.rootWorkspacePath) === path.resolve(target.rootWorkspacePath)
       && RESUME_TOKEN_PATTERN.test(admission.resumeToken ?? "")
       && COORDINATION_ID_PATTERN.test(admission.safeActionId ?? "");
+    if (!eligible) return false;
+    if (!hostExecutorOwnsRoute(hostExecutor, target)) {
+      hostExecutorUnavailable = true;
+      return false;
+    }
+    return true;
   });
   if (replacementRecoveryTodo) {
     if (typeof claimReplacementAdmissionProbe !== "function"
@@ -3418,6 +3438,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       || !path.isAbsolute(probe.observationTarget.rootWorkspacePath)) {
       return { delivered: false, reason: "replacement-admission-probe-unavailable" };
     }
+    if (!hostExecutorOwnsRoute(hostExecutor, probe.observationTarget)) {
+      return { delivered: false, reason: "host-executor-unavailable" };
+    }
     recovery.admissionProbeId = probe.receipt.admissionProbeId;
     recovery.admissionProbeRequestedAt = probe.receipt.admissionProbeRequestedAt;
     const probeDelivery = await deliverAdmissionRecovery({
@@ -3446,7 +3469,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   }
   const recoveryTodo = snapshot.todos.find((candidate) => {
     const admission = candidate?.admission;
-    return COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+    const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
       && ["awaiting_admission", "prepared", "admission_uncertain", "recovery_confirmed"].includes(admission?.state)
       && typeof admission?.receiptId === "string" && admission.receiptId
@@ -3456,6 +3479,12 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && typeof candidate.dispatchTarget.codexHostId === "string" && candidate.dispatchTarget.codexHostId
       && RESUME_TOKEN_PATTERN.test(admission?.resumeToken ?? "")
       && COORDINATION_ID_PATTERN.test(admission?.safeActionId ?? "");
+    if (!eligible) return false;
+    if (!hostExecutorOwnsRoute(hostExecutor, candidate.dispatchTarget)) {
+      hostExecutorUnavailable = true;
+      return false;
+    }
+    return true;
   });
   if (recoveryTodo) {
     const admission = recoveryTodo.admission;
@@ -3554,16 +3583,17 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && COORDINATION_ID_PATTERN.test(safeAction?.id ?? "")
       && RESUME_TOKEN_PATTERN.test(readyWork?.resumeToken ?? "")
       && THREAD_ID_PATTERN.test(target?.rootThreadId ?? "")
-      && typeof target?.codexHostId === "string"
-      && target.codexHostId.length > 0
-      && target.codexHostId.length <= 240
-      && !/[\u0000-\u001f\u007f]/.test(target.codexHostId)
+      && isCanonicalCodexHostId(target?.codexHostId)
       && typeof target?.rootWorkspacePath === "string"
       && path.isAbsolute(target.rootWorkspacePath)
       && typeof target?.worktreePath === "string"
       && path.isAbsolute(target.worktreePath)
     );
     if (!eligible) return false;
+    if (!hostExecutorOwnsRoute(hostExecutor, target)) {
+      hostExecutorUnavailable = true;
+      return false;
+    }
     const modelRetry = durableModelCapacityRetry(
       snapshot,
       candidate,
@@ -3626,7 +3656,11 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
             : "capacity-observation-unavailable",
       };
     }
-    return { delivered: false, reason: capacityReason ?? "no-eligible-work" };
+    return {
+      delivered: false,
+      reason: capacityReason
+        ?? (hostExecutorUnavailable ? "host-executor-unavailable" : "no-eligible-work"),
+    };
   }
 
   const safeAction = todo.readyWork.safeActions[0];
@@ -3634,6 +3668,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     todoId: todo.id,
     taskId: todo.taskId,
     rootThreadId: todo.dispatchTarget.rootThreadId,
+    ownedCodexHostId: hostExecutor.ownedCodexHostId,
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
   };
@@ -3652,6 +3687,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     || typeof recoveryRoute.rootWorkspacePath !== "string" || !path.isAbsolute(recoveryRoute.rootWorkspacePath)
     || typeof recoveryRoute.worktreePath !== "string" || !path.isAbsolute(recoveryRoute.worktreePath)
   )) return { delivered: false, reason: "invalid-recovery-route" };
+  if (!hostExecutorOwnsRoute(hostExecutor, dispatch)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
+  }
   if (recoveryRoute) {
     authorization.rootThreadId = reservation.receipt.rootThreadId;
     authorization.expectedResumeToken = reservation.receipt.resumeToken;

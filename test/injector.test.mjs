@@ -59,7 +59,7 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(runtimeSource, /request\.action === "open-external"/);
   assert.match(runtimeSource, /request\.taskId/);
   assert.match(runtimeSource, /request\.previousThreadId\.length <= 240/);
-  assert.match(runtimeSource, /request\.codexHostId\.length <= 240/);
+  assert.match(runtimeSource, /isCanonicalCodexHostId\(request\.codexHostId\)/);
   assert.match(runtimeSource, /request\.targetRoot\.length <= 4_096/);
   assert.match(runtimeSource, /payload\.length > 4_194_304/);
   assert.match(runtimeSource, /request\.instruction\.length <= 4_000_000/);

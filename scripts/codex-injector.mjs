@@ -173,6 +173,7 @@ const taskConversationOperations = new Map();
 const taskConversationFailureTtlMs = 120_000;
 const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
 const backgroundContinuationIntervalMs = 15_000;
+const residentHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
 const coordinatorIdentityHandshakeIntervalMs = 2_000;
 const coordinatorLeaseRenewWindowMs = 45_000;
 const coordinatorLeaseDurationSeconds = 120;
@@ -2778,6 +2779,7 @@ async function claimBackgroundContinuationReceipt(claim) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         rootThreadId: claim.rootThreadId,
+        ownedCodexHostId: claim.ownedCodexHostId,
         expectedResumeToken: claim.expectedResumeToken,
         safeActionId: claim.safeActionId,
         reservationLeaseId,
@@ -3035,6 +3037,7 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
 
 function runBackgroundContinuationDispatch(cdp, projectId) {
   return runTaskboardContinuationMonitorOnce({
+    hostExecutor: residentHostExecutor,
     policy: {
       enabled: true,
       projectId,
@@ -3098,6 +3101,7 @@ async function runBackgroundContinuationFastLane(cdp) {
   });
   return runTaskboardContinuationFastLane({
     projects,
+    hostExecutor: residentHostExecutor,
     runContinuation: (projectId) => runBackgroundContinuationDispatch(cdp, projectId),
     observeResult: (result) => {
       if (!result.ok) {

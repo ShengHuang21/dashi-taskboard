@@ -63,6 +63,7 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+const localHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
 
 test("cold admission recovery allows bounded thread loading beyond the fast RPC budget", () => {
   assert.equal(admissionRecoveryRpcTimeoutMs("thread/read"), 10_000);
@@ -3147,6 +3148,7 @@ test("background continuation delivers one eligible first safe action without a 
     },
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo] }),
     claimReceipt: async (claim) => {
@@ -3154,6 +3156,7 @@ test("background continuation delivers one eligible first safe action without a 
         todoId: todo.id,
         taskId: todo.taskId,
         rootThreadId: todo.dispatchTarget.rootThreadId,
+        ownedCodexHostId: "local",
         safeActionId: "safe-first",
         expectedResumeToken: "b".repeat(64),
       });
@@ -3196,6 +3199,318 @@ test("background continuation delivers one eligible first safe action without a 
   });
 });
 
+test("background continuation leaves a remote Todo untouched when this executor owns only local", async () => {
+  const mutations = { claim: 0, confirm: 0, deliver: 0, complete: 0 };
+  const remoteTodo = {
+    id: "TASKBOARD-REMOTE-HOST",
+    taskId: "3b47e46d-3b02-4ea5-8134-ae7721d9a99c",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "remote-builder",
+      rootWorkspacePath: "/srv/taskboard/root",
+      worktreePath: "/srv/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: "9".repeat(64),
+    },
+  };
+
+  const result = await runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    hostExecutor: { ownedCodexHostId: "local" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [remoteTodo] }),
+    claimReceipt: async () => { mutations.claim += 1; },
+    confirmDelivery: async () => { mutations.confirm += 1; },
+    deliver: async () => { mutations.deliver += 1; },
+    completeDelivery: async () => { mutations.complete += 1; },
+  });
+
+  assert.deepEqual(result, { delivered: false, reason: "host-executor-unavailable" });
+  assert.deepEqual(mutations, { claim: 0, confirm: 0, deliver: 0, complete: 0 });
+});
+
+test("background continuation requires an explicit valid host executor", async () => {
+  const mutations = { claim: 0, confirm: 0, deliver: 0, complete: 0 };
+  const localTodo = {
+    id: "TASKBOARD-EXPLICIT-EXECUTOR",
+    taskId: "60694ad4-68e7-47a5-a3fa-91357f59f1a8",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/root",
+      worktreePath: "/tmp/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first" }],
+      deferredActions: [],
+      resumeToken: "6".repeat(64),
+    },
+  };
+  const invalidExecutors = [undefined, null, {}, { ownedCodexHostId: "" }, {
+    ownedCodexHostId: "   ",
+  }, { ownedCodexHostId: "local\nremote" }];
+
+  for (const hostExecutor of invalidExecutors) {
+    const result = await runTaskboardContinuationMonitorOnce({
+      policy: { enabled: true, projectId: "taskboard-core" },
+      ...(hostExecutor === undefined ? {} : { hostExecutor }),
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: [localTodo] }),
+      claimReceipt: async () => {
+        mutations.claim += 1;
+        return {
+          available: true,
+          completed: false,
+          receipt: { id: "invalid-executor-receipt", reservationLeaseId: "lease" },
+        };
+      },
+      confirmDelivery: async () => {
+        mutations.confirm += 1;
+        return {
+          worktreePath: localTodo.dispatchTarget.worktreePath,
+          branch: "codex/local-work",
+          repository: null,
+        };
+      },
+      deliver: async () => {
+        mutations.deliver += 1;
+        return { delivery: "started", turnId: "local-turn" };
+      },
+      completeDelivery: async () => {
+        mutations.complete += 1;
+        return { completed: true };
+      },
+    });
+    assert.deepEqual(result, { delivered: false, reason: "host-executor-unavailable" });
+  }
+  assert.deepEqual(mutations, { claim: 0, confirm: 0, deliver: 0, complete: 0 });
+});
+
+test("host executor and dispatch routes share the canonical 256 character boundary", async () => {
+  let claims = 0;
+  let reads = 0;
+  const run = (ownedCodexHostId) => runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    hostExecutor: { ownedCodexHostId },
+    readSnapshot: async () => {
+      reads += 1;
+      return {
+        projectId: "taskboard-core",
+        todos: [{
+          id: "TASKBOARD-HOST-BOUNDARY",
+          taskId: "fbf01545-8a8a-492f-a67b-f90a16bdc493",
+          run: null,
+          dispatchTarget: {
+            rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+            codexHostId: ownedCodexHostId,
+            rootWorkspacePath: "/srv/taskboard/root",
+            worktreePath: "/srv/taskboard/worktree",
+          },
+          readyWork: {
+            eligible: true,
+            safeActions: [{ id: "safe-first" }],
+            deferredActions: [],
+            resumeToken: "5".repeat(64),
+          },
+        }],
+      };
+    },
+    claimReceipt: async () => {
+      claims += 1;
+      return { available: false, completed: true, receipt: { id: "already-delivered" } };
+    },
+    confirmDelivery: async () => assert.fail("completed work must not confirm"),
+    deliver: async () => assert.fail("completed work must not deliver"),
+    completeDelivery: async () => assert.fail("completed work must not complete twice"),
+  });
+
+  for (const length of [240, 241, 256]) {
+    assert.deepEqual(await run("h".repeat(length)), {
+      delivered: false,
+      reason: "already-delivered",
+    }, String(length));
+  }
+  const readsAfterValid = reads;
+  const claimsAfterValid = claims;
+  for (const invalidHostId of ["h".repeat(257), "remote\ncontrol"]) {
+    assert.deepEqual(await run(invalidHostId), {
+      delivered: false,
+      reason: "host-executor-unavailable",
+    }, JSON.stringify(invalidHostId));
+  }
+  assert.equal(readsAfterValid, 3);
+  assert.equal(claimsAfterValid, 3);
+  assert.equal(reads, readsAfterValid);
+  assert.equal(claims, claimsAfterValid);
+});
+
+test("the exact remote host executor delivers once and replay does not redeliver", async () => {
+  const calls = { claim: 0, confirm: 0, deliver: 0, complete: 0 };
+  const rpcCalls = [];
+  let completed = false;
+  const remoteTodo = {
+    id: "TASKBOARD-REMOTE-EXECUTOR",
+    taskId: "7e42020f-ac38-4839-bc5e-4d3ce5dcb203",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "remote-builder",
+      rootWorkspacePath: "/srv/taskboard/root",
+      worktreePath: "/srv/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: "8".repeat(64),
+    },
+  };
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    hostExecutor: { ownedCodexHostId: "remote-builder" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [remoteTodo] }),
+    claimReceipt: async () => {
+      calls.claim += 1;
+      return completed
+        ? { available: false, completed: true, receipt: { id: "remote-receipt" } }
+        : {
+            available: true,
+            completed: false,
+            receipt: {
+              id: "remote-receipt",
+              reservationLeaseId: "remote-lease",
+              admissionAttemptId: "remote-attempt",
+            },
+          };
+    },
+    confirmDelivery: async () => {
+      calls.confirm += 1;
+      return {
+        worktreePath: remoteTodo.dispatchTarget.worktreePath,
+        branch: "codex/remote-work",
+        repository: null,
+      };
+    },
+    deliver: async (request) => {
+      calls.deliver += 1;
+      assert.equal(request.codexHostId, "remote-builder");
+      const hostAwareRpc = async (codexHostId, method, params) => {
+        assert.equal(codexHostId, "remote-builder");
+        rpcCalls.push(method);
+        if (method === "thread/read") return {
+          thread: {
+            id: request.rootThreadId,
+            cwd: request.rootWorkspacePath,
+            turns: [],
+          },
+        };
+        if (method === "thread/resume") return {};
+        if (method === "turn/start") {
+          assert.equal(params.approvalPolicy, "never");
+          return { turn: { id: "remote-turn" } };
+        }
+        return assert.fail(`unexpected remote RPC ${method}`);
+      };
+      return deliverCoordination(
+        request,
+        (method, params) => hostAwareRpc(request.codexHostId, method, params),
+      );
+    },
+    completeDelivery: async () => {
+      calls.complete += 1;
+      completed = true;
+      return { completed: true };
+    },
+  };
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true,
+    todoId: remoteTodo.id,
+    actionId: "safe-first",
+  });
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    reason: "already-delivered",
+  });
+  assert.deepEqual(calls, { claim: 2, confirm: 1, deliver: 1, complete: 1 });
+  assert.deepEqual(rpcCalls, ["thread/read", "thread/resume", "turn/start"]);
+});
+
+test("concurrent local and remote executors let only the exact remote host claim", async () => {
+  let releaseLocalSnapshot;
+  let localSnapshotStarted;
+  const localSnapshotGate = new Promise((resolve) => { releaseLocalSnapshot = resolve; });
+  const localSnapshotObserved = new Promise((resolve) => { localSnapshotStarted = resolve; });
+  let claims = 0;
+  const remoteTodo = {
+    id: "TASKBOARD-CONCURRENT-REMOTE",
+    taskId: "8034b761-b99f-4672-b9fc-6d8171ccf525",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "remote-builder",
+      rootWorkspacePath: "/srv/taskboard/root",
+      worktreePath: "/srv/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first" }],
+      deferredActions: [],
+      resumeToken: "7".repeat(64),
+    },
+  };
+  const shared = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    claimReceipt: async () => {
+      claims += 1;
+      return {
+        available: true,
+        completed: false,
+        receipt: { id: "concurrent-receipt", reservationLeaseId: "concurrent-lease" },
+      };
+    },
+    confirmDelivery: async () => ({
+      worktreePath: remoteTodo.dispatchTarget.worktreePath,
+      branch: "codex/remote-work",
+      repository: null,
+    }),
+    deliver: async () => ({ delivery: "started", turnId: "concurrent-turn" }),
+    completeDelivery: async () => ({ completed: true }),
+  };
+
+  const localRun = runTaskboardContinuationMonitorOnce({
+    ...shared,
+    hostExecutor: { ownedCodexHostId: "local" },
+    readSnapshot: async () => {
+      localSnapshotStarted();
+      await localSnapshotGate;
+      return { projectId: "taskboard-core", todos: [remoteTodo] };
+    },
+  });
+  await localSnapshotObserved;
+  const remoteRun = runTaskboardContinuationMonitorOnce({
+    ...shared,
+    hostExecutor: { ownedCodexHostId: "remote-builder" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [remoteTodo] }),
+  });
+  await Promise.resolve();
+  releaseLocalSnapshot();
+
+  const [localResult, remoteResult] = await Promise.all([localRun, remoteRun]);
+  assert.deepEqual(localResult, { delivered: false, reason: "host-executor-unavailable" });
+  assert.deepEqual(remoteResult, {
+    delivered: true,
+    todoId: remoteTodo.id,
+    actionId: "safe-first",
+  });
+  assert.equal(claims, 1);
+});
+
 test("background continuation durably defers explicit model capacity and retries the same route", async () => {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const todo = {
@@ -3220,6 +3535,7 @@ test("background continuation durably defers explicit model capacity and retries
   const deferred = [];
   const deliveredRoutes = [];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3376,6 +3692,7 @@ test("stale capacity markers neither starve later Todos nor block a fresh fronti
   const claimed = [];
   let todos = [staleRoute, generic];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "taskboard-core",
       maxActiveAgents: 4, capacityObservationMaxAgeMs: 60_000,
@@ -3434,6 +3751,7 @@ test("stale capacity markers neither starve later Todos nor block a fresh fronti
 test("background continuation does not reinterpret unrelated delivery failures as capacity", async () => {
   let deferred = false;
   await assert.rejects(runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -3489,6 +3807,7 @@ test("background continuation recovers an uncertain deterministic child without 
     recoveredAgentThreadId: null,
   };
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3566,6 +3885,7 @@ test("background continuation never reconciles an unconfirmed admission probe de
   ]) {
     let reconciled = false;
     const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "taskboard-core" },
       readSnapshot: async () => ({
         projectId: "taskboard-core",
@@ -3635,6 +3955,7 @@ test("background continuation retires an absent child only through the original 
     agentPath: "/root/task_admission_1234",
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -3724,6 +4045,7 @@ test("replacement recovery never reconciles an unconfirmed admission probe deliv
   ]) {
     let reconciled = false;
     const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "taskboard-core" },
       readSnapshot: async () => ({
         projectId: "taskboard-core",
@@ -3797,6 +4119,7 @@ test("background continuation recovers expired pending admissions after coordina
   for (const admissionState of ["awaiting_admission", "prepared"]) {
     const calls = [];
     const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "taskboard-core" },
       now: () => Date.parse("2026-08-31T00:02:00.000Z"),
       readSnapshot: async () => ({
@@ -3896,6 +4219,7 @@ test("background continuation waits for observed Root capacity and backfills aft
     },
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3982,6 +4306,7 @@ test("background continuation fails closed when target Root capacity is not fres
     }],
   };
   const run = (windowSubagentTrees) => runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4012,6 +4337,7 @@ test("background continuation bootstraps an idle Root capacity observation befor
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const calls = [];
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4067,6 +4393,7 @@ test("stale capacity probes are idempotent within one retry epoch and rotate aft
   let observedNow = Date.parse("2026-08-31T02:02:00.000Z");
   const probeIds = [];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4239,6 +4566,7 @@ test("fresh capacity after the bootstrap probe delivers exactly one Todo", async
     },
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -5363,6 +5691,7 @@ test("capacity-sensitive continuation runs independently of a slow project monit
     return { delivered: true };
   };
   const firstLane = runTaskboardContinuationFastLane({
+    hostExecutor: localHostExecutor,
     projects,
     runContinuation,
     observeResult: (result) => {
@@ -5385,6 +5714,7 @@ test("capacity-sensitive continuation runs independently of a slow project monit
   }]);
   await firstFastProjectCompleted;
   const secondLane = runTaskboardContinuationFastLane({
+    hostExecutor: localHostExecutor,
     projects,
     runContinuation,
     observeResult: (result) => {
@@ -5803,6 +6133,7 @@ test("a durable delivered request is recorded only from the exact Root observati
 test("background continuation fails closed for disabled, open-run, or malformed work", async () => {
   let delivered = 0;
   const base = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: false, projectId: "taskboard-core" },
     readSnapshot: async () => assert.fail("disabled monitor must not read"),
     claimReceipt: async () => assert.fail("must not claim a receipt"),
@@ -5849,6 +6180,7 @@ test("background continuation resumes an expired reservation and records exactly
   let completed = 0;
   const receipt = { id: "bootstrap-receipt", reservationLeaseId: "lease-retry" };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5899,6 +6231,7 @@ test("background continuation resumes an expired reservation and records exactly
 test("background continuation fails closed when the authoritative reservation is rejected", async () => {
   let delivered = false;
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5932,6 +6265,7 @@ test("background continuation fails closed when the authoritative reservation is
 test("background continuation does not reserve an unassigned Todo without a Global route", async () => {
   let claimed = false;
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5959,6 +6293,8 @@ test("background continuation does not reserve an unassigned Todo without a Glob
 
 test("the resident authenticated host polls durable opt-in policies without the Agent Lanes view", async () => {
   const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
+  assert.match(source, /residentHostExecutor = Object\.freeze\(\{ ownedCodexHostId: "local" \}\)/);
+  assert.match(source, /hostExecutor: residentHostExecutor/);
   assert.match(source, /taskboard:background-continuation:policy:/);
   assert.match(source, /api\/client-storage/);
   assert.match(source, /api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);

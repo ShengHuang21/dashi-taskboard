@@ -10,9 +10,11 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
+  CODEX_HOST_ID_MAX_LENGTH,
   DEFAULT_PROJECT_ID,
   JIRA_PROJECT_ID,
   TASK_STATUSES,
+  isCanonicalCodexHostId,
   isTaskPriority,
   isTaskStatus,
   isWorkingLogStatus,
@@ -1604,13 +1606,21 @@ function parseSafeActionAdmissionReconciliation(body) {
   };
 }
 
-function parseSafeActionBootstrapClaim(body) {
+function parseSafeActionBootstrapClaim(body, { requireOwnedCodexHostId = false } = {}) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
-    "rootThreadId", "expectedResumeToken", "safeActionId", "reservationLeaseId", "recoveryLeaseId", "deliveryTurnId",
+    "rootThreadId", "ownedCodexHostId", "expectedResumeToken", "safeActionId", "reservationLeaseId", "recoveryLeaseId", "deliveryTurnId",
   ]));
   const rootThreadId = parseThreadId(body.rootThreadId);
   if (!rootThreadId) throw new ApiError(400, "INVALID_FIELD", "'rootThreadId' is required");
+  const ownedCodexHostId = stringField(body.ownedCodexHostId, "ownedCodexHostId", {
+    required: requireOwnedCodexHostId,
+    maxLength: CODEX_HOST_ID_MAX_LENGTH,
+  });
+  if (ownedCodexHostId !== undefined
+    && !isCanonicalCodexHostId(body.ownedCodexHostId)) {
+    throw new ApiError(400, "INVALID_FIELD", "'ownedCodexHostId' is invalid");
+  }
   const expectedResumeToken = stringField(body.expectedResumeToken, "expectedResumeToken", {
     required: true,
     maxLength: 64,
@@ -1620,6 +1630,7 @@ function parseSafeActionBootstrapClaim(body) {
   }
   return {
     rootThreadId,
+    ...(ownedCodexHostId === undefined ? {} : { ownedCodexHostId }),
     expectedResumeToken,
     safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
     reservationLeaseId: stringField(body.reservationLeaseId, "reservationLeaseId", {
@@ -2989,9 +3000,11 @@ export function createTaskboardServer(options = {}) {
   const coordinatorRenewNonces = new Map();
   let clientStorageWrite = Promise.resolve();
 
-  async function refreshTaskWorktreeRepository(taskId, { force = false } = {}) {
+  async function probeTaskWorktreeRepository(taskId, { force = false } = {}) {
     const task = database.getTask(taskId);
-    if (!task || task.developmentContext?.type !== "worktree") return task;
+    if (!task || task.developmentContext?.type !== "worktree") {
+      return { task, probe: null };
+    }
     const worktreePath = task.developmentContext.path;
     const expectedBranch = task.developmentContext.branch;
     let resolvedPath = null;
@@ -3077,19 +3090,23 @@ export function createTaskboardServer(options = {}) {
     }
     const repository = resolution?.repository ?? null;
     const verifiedAt = resolution?.verifiedAt ?? new Date().toISOString();
-    const updated = database.recordTaskWorktreeRepository(task.id, {
-      worktreePath,
-      expectedBranch,
-      repository,
-      verifiedAt,
-    });
-    return updated;
+    return {
+      task,
+      probe: { worktreePath, expectedBranch, repository, verifiedAt },
+    };
+  }
+
+  async function refreshTaskWorktreeRepository(taskId, options = {}) {
+    const { task, probe } = await probeTaskWorktreeRepository(taskId, options);
+    if (!probe) return task;
+    return database.recordTaskWorktreeRepository(task.id, probe);
   }
 
   async function verifiedTaskCapsule(taskId, options) {
     const current = database.getTaskCapsule(taskId);
+    if (!current) return null;
     if (!options?.force) {
-      const envelope = current?.authorization?.state === "valid"
+      const envelope = current.authorization?.state === "valid"
         ? current.authorization.envelope
         : null;
       const approvalKinds = new Map((envelope?.gates ?? []).map((gate) => [gate.id, gate]));
@@ -3109,12 +3126,13 @@ export function createTaskboardServer(options = {}) {
           && Date.parse(authority.grantedAt) <= timestamp
           && (authority.expiresAt === null || Date.parse(authority.expiresAt) > timestamp)
         ));
-      // Projection only needs repository discovery while an active policy could
-      // unlock pending work. Execution endpoints still force a fresh probe.
-      if (!hasActivePolicy || current.standingAuthority.state === "matched") return current;
+      const hasSafeAction = current.readyWork.safeActions.length > 0;
+      if (!hasSafeAction && (!hasActivePolicy || current.standingAuthority.state === "matched")) {
+        return current;
+      }
     }
-    await refreshTaskWorktreeRepository(taskId, options);
-    return database.getTaskCapsule(taskId);
+    const { task, probe } = await probeTaskWorktreeRepository(taskId, options);
+    return database.getTaskCapsule(task.id, { worktreeRepositoryProbe: probe });
   }
 
   function assertInsideWorktree(worktreePath, targetPath, message) {
@@ -3148,9 +3166,13 @@ export function createTaskboardServer(options = {}) {
     }
   }
 
-  async function assertStandingActionExecutionScope(taskId, safeActionId) {
+  async function assertStandingActionExecutionScope(
+    taskId,
+    safeActionId,
+    { worktreeRepositoryProbe = null } = {},
+  ) {
     const task = database.getTask(taskId);
-    const capsule = database.getTaskCapsule(taskId);
+    const capsule = database.getTaskCapsule(taskId, { worktreeRepositoryProbe });
     const action = capsule?.readyWork.safeActions.find((candidate) => candidate.id === safeActionId);
     if (!action?.standingAuthority) return;
     const worktreePath = await realpath(task.developmentContext.path);
@@ -5753,13 +5775,23 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-claim");
-        const claim = parseSafeActionBootstrapClaim(await readJson(request));
-        const task = await refreshTaskWorktreeRepository(id, { force: true });
-        await assertStandingActionExecutionScope(id, claim.safeActionId);
+        const claim = parseSafeActionBootstrapClaim(await readJson(request), {
+          requireOwnedCodexHostId: true,
+        });
+        const { probe: worktreeRepositoryProbe } = await probeTaskWorktreeRepository(
+          id,
+          { force: true },
+        );
+        database.assertTaskSafeActionHostExecutor(id, claim);
+        await assertStandingActionExecutionScope(id, claim.safeActionId, {
+          worktreeRepositoryProbe,
+        });
         const result = database.claimTaskSafeAction(
           id,
           claim,
+          { worktreeRepositoryProbe },
         );
+        const task = database.getTask(id);
         const safeAction = database.getTaskCapsule(id).readyWork.safeActions[0];
         return sendJson(response, 200, {
           ...result,
