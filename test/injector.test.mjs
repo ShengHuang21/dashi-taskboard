@@ -43,6 +43,84 @@ test("the resident injector authenticates its launcher-managed Taskboard service
   assert.match(runtimeSource, /request\.frameCapability/);
 });
 
+test("bootstrap claim accepts only the exact unavailable coordinator-lease variant", async () => {
+  const start = source.indexOf("async function claimBackgroundContinuationReceipt");
+  const end = source.indexOf("\n\nasync function confirmBackgroundContinuationDelivery", start);
+  assert.notEqual(start, -1, "bootstrap claim helper must exist");
+  assert.notEqual(end, -1, "bootstrap claim helper source boundary must exist");
+  const taskId = "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e";
+  const currentRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const claim = {
+    todoId: "CAP-44",
+    taskId,
+    rootThreadId: currentRootThreadId,
+    expectedResumeToken: "e".repeat(64),
+    safeActionId: "safe-action",
+  };
+  const unavailable = {
+    reused: true,
+    available: false,
+    completed: false,
+    recovering: false,
+    coordinatorLeaseChanged: true,
+    receipt: {
+      taskId,
+      safeActionId: "safe-action",
+      admissionAttemptId: "global-attempt",
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      resumeToken: "d".repeat(64),
+    },
+  };
+  const invoke = async (result) => {
+    const fetch = async () => ({
+      status: 200,
+      ok: true,
+      json: async () => result,
+    });
+    const claimBackgroundContinuationReceipt = vm.runInNewContext(
+      `(() => { ${source.slice(start, end)}; return claimBackgroundContinuationReceipt; })()`,
+      {
+        fetch,
+        randomUUID: () => "current-reservation",
+        taskboardBaseUrl: "http://127.0.0.1:47823",
+        AbortSignal,
+      },
+    );
+    return claimBackgroundContinuationReceipt(claim);
+  };
+
+  assert.deepEqual(await invoke(unavailable), unavailable);
+  const withoutRecovering = { ...unavailable };
+  delete withoutRecovering.recovering;
+  const malformedRecoveringResults = await Promise.allSettled([
+    withoutRecovering,
+    { ...unavailable, recovering: null },
+    { ...unavailable, recovering: "false" },
+    { ...unavailable, recovering: 0 },
+    { ...unavailable, recovering: true },
+  ].map(invoke));
+  assert.deepEqual(
+    malformedRecoveringResults.map(({ status }) => status),
+    ["rejected", "rejected", "rejected", "rejected", "rejected"],
+  );
+  for (const result of malformedRecoveringResults) {
+    assert.match(
+      result.reason.message,
+      /Taskboard returned an invalid bootstrap reservation receipt/,
+    );
+  }
+  for (const malformed of [
+    { ...unavailable, reused: false },
+    { ...unavailable, available: true },
+    { ...unavailable, completed: true },
+  ]) {
+    await assert.rejects(
+      invoke(malformed),
+      /Taskboard returned an invalid bootstrap reservation receipt/,
+    );
+  }
+});
+
 test("the CDP bridge accepts service ensure and native task conversation start actions", () => {
   assert.match(source, /const hostBindingName = "__codexTaskboardHostV1"/);
   assert.match(source, /hostRequestQueueName/);

@@ -1183,6 +1183,9 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   }).getProjectSnapshot("domain-project");
   assert.deepEqual(snapshot.todos[0].domainAssignment, {
     domainId: "frontend", status: "active", coordinatorTaskId: "frontend", leaseId: "frontend-lease",
+    assignedByLeaseId: "global-lease",
+    assignedByTaskId: "global",
+    assignedByThreadId: "global-thread",
   });
   assert.equal(snapshot.coordination.domainCoordinators[0].durableWorkPending, true);
   assert.deepEqual(
@@ -2210,6 +2213,274 @@ test("replacement coordinator retires only an absent child observed from the ori
   assert.equal(fresh.available, true);
   assert.equal(fresh.receipt.rootThreadId, "frontend-third-thread");
   assert.equal(fresh.receipt.domainCoordinatorLeaseId, thirdEpoch.lease.id);
+  assert.notEqual(fresh.receipt.admissionAttemptId, reserved.receipt.admissionAttemptId);
+  database.close();
+});
+
+test("domain coordinator retires an absent admission inherited from the assigning Global Root", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "agent-global-domain-recovery-"));
+  directories.push(directory);
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"), {
+    admissionTtlMs: 10,
+  });
+  const projectId = "global-domain-recovery";
+  const globalWorkspacePath = path.resolve("/tmp/global-domain-global");
+  const domainWorkspacePath = path.resolve("/tmp/global-domain-frontend");
+  const productWorkspacePath = path.resolve("/tmp/global-domain-product");
+  const activeUntil = "2099-01-01T00:00:00.000Z";
+  database.createProject({ id: projectId, name: "Global domain recovery", workspacePath: null });
+  database.upsertAgentLaneProject(projectId, {
+    tasks: [
+      { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
+      { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: projectId, codexProjectKind: "local", codexHostId: "local", workspacePath: domainWorkspacePath },
+    ],
+    adapters: [],
+    coordinatorLease: {
+      id: "global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+      holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+      acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
+    },
+    coordinationDomains: [
+      { id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"] },
+    ],
+    domainCoordinatorLeases: {
+      frontend: {
+        id: "frontend-lease", holderTaskId: "frontend", holderThreadId: "frontend-thread",
+        holderCodexHostId: "local", holderWorkspacePath: domainWorkspacePath,
+        acquiredAt: "2026-08-31T00:00:00.000Z", expiresAt: activeUntil,
+      },
+    },
+  });
+  const binding = {
+    threadId: "global-thread", codexProjectId: projectId, codexProjectKind: "local",
+    codexHostId: "local", workspacePath: globalWorkspacePath,
+  };
+  const task = database.createTask({
+    projectId, title: "Global to domain recovery Todo", description: "", status: "todo",
+    priority: "high", labels: ["agent-todo"], threadId: binding.threadId, threadBinding: binding,
+    actor, assignee: actor, workflowId: null, workflowProfile: "vibe",
+    developmentContext: { type: "worktree", path: productWorkspacePath, branch: "codex/global-domain-recovery" },
+    startDate: null, dueDate: null, recurrence: null,
+  });
+  database.createComment(task.id, {
+    body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+      gates: [{
+        id: "local", kind: "test", state: "authorized", scope: "local tests",
+        approver: "Owner", approvalRequest: "同意本地测试", evidence: "Owner resumed", receipt: "turn:resume",
+      }],
+      actions: [{ id: "test", order: 10, text: "Run local acceptance", gate: "local", target: "candidate", status: "pending" }],
+    })}\n\`\`\``,
+    threadId: binding.threadId, threadBinding: binding,
+    actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+  });
+
+  const globalToken = database.getTaskCapsule(task.id).resumeToken;
+  const reserved = database.claimTaskSafeAction(task.id, {
+    rootThreadId: "global-thread", expectedResumeToken: globalToken, safeActionId: "test",
+    reservationLeaseId: "global-reservation",
+  });
+  const delivering = database.confirmTaskSafeActionDelivery(task.id, {
+    rootThreadId: "global-thread", expectedResumeToken: globalToken, safeActionId: "test",
+    reservationLeaseId: "global-reservation",
+  });
+  assert.equal(delivering.receipt.admissionState, "awaiting_admission");
+
+  const assigned = database.setAgentTaskDomain(projectId, task.id, {
+    domainId: "frontend", taskVersion: database.getTask(task.id).version,
+    holderTaskId: "global", holderThreadId: "global-thread", expectedCoordinatorLeaseId: "global-lease",
+  });
+  assert.equal(assigned.assignment.assignedByLeaseId, "global-lease");
+  assert.equal(assigned.assignment.assignedByTaskId, "global");
+  assert.equal(assigned.assignment.assignedByThreadId, "global-thread");
+  const domainToken = database.getTaskCapsule(task.id).resumeToken;
+  assert.notEqual(domainToken, globalToken);
+
+  const blocked = database.claimTaskSafeAction(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: domainToken, safeActionId: "test",
+    reservationLeaseId: "domain-reservation-before-recovery",
+  });
+  assert.equal(blocked.coordinatorLeaseChanged, true);
+  assert.equal(blocked.available, false);
+  assert.equal(blocked.receipt.id, reserved.receipt.id);
+
+  const recoveryBinding = {
+    rootThreadId: "frontend-thread",
+    expectedResumeToken: globalToken,
+    safeActionId: "test",
+    admissionReceiptId: reserved.receipt.id,
+    admissionAttemptId: reserved.receipt.admissionAttemptId,
+  };
+  for (const [column, original, drifted] of [
+    ["assigned_by_lease_id", "global-lease", "unrelated-global-lease"],
+    ["assigned_by_task_id", "global", "unrelated-global-task"],
+    ["assigned_by_thread_id", "global-thread", "unrelated-global-thread"],
+  ]) {
+    database.database.prepare(
+      `UPDATE agent_task_domain_assignments SET ${column} = ? WHERE task_id = ?`,
+    ).run(drifted, task.id);
+    assert.throws(
+      () => database.claimTaskSafeActionReplacementAdmissionProbe(
+        task.id,
+        recoveryBinding,
+        new Date(Date.parse(delivering.receipt.admissionDeadlineAt) + 1).toISOString(),
+      ),
+      (error) => error?.code === "DOMAIN_COORDINATOR_REPLACEMENT_MISMATCH",
+      column,
+    );
+    database.database.prepare(
+      `UPDATE agent_task_domain_assignments SET ${column} = ? WHERE task_id = ?`,
+    ).run(original, task.id);
+  }
+  database.createProject({ id: "unrelated-project", name: "Unrelated", workspacePath: null });
+  for (const [column, original, drifted] of [
+    ["project_id", projectId, "unrelated-project"],
+    ["root_host_id", "local", "other-host"],
+    ["worktree_path", productWorkspacePath, path.resolve("/tmp/other-product")],
+    ["worktree_branch", "codex/global-domain-recovery", "codex/other-branch"],
+  ]) {
+    database.database.prepare(
+      `UPDATE task_safe_action_receipts SET ${column} = ? WHERE id = ?`,
+    ).run(drifted, reserved.receipt.id);
+    assert.throws(
+      () => database.claimTaskSafeActionReplacementAdmissionProbe(
+        task.id,
+        recoveryBinding,
+        new Date(Date.parse(delivering.receipt.admissionDeadlineAt) + 1).toISOString(),
+      ),
+      (error) => error?.code === "DOMAIN_COORDINATOR_REPLACEMENT_MISMATCH",
+      column,
+    );
+    database.database.prepare(
+      `UPDATE task_safe_action_receipts SET ${column} = ? WHERE id = ?`,
+    ).run(original, reserved.receipt.id);
+  }
+  assert.throws(
+    () => database.claimTaskSafeActionReplacementAdmissionProbe(
+      task.id,
+      recoveryBinding,
+      new Date(Date.parse(delivering.receipt.admissionDeadlineAt) - 1).toISOString(),
+    ),
+    (error) => error?.code === "ADMISSION_DEADLINE_ACTIVE",
+  );
+  const probe = database.claimTaskSafeActionReplacementAdmissionProbe(
+    task.id,
+    recoveryBinding,
+    new Date(Date.parse(delivering.receipt.admissionDeadlineAt) + 1).toISOString(),
+  );
+  assert.equal(probe.receipt.admissionState, "admission_uncertain");
+  assert.deepEqual(probe.observationTarget, {
+    rootThreadId: "global-thread",
+    codexHostId: "local",
+    rootWorkspacePath: globalWorkspacePath,
+  });
+
+  const beforeInvalidObservation = database.getTaskSafeActionAdmission(task.id);
+  const freshObservedAt = new Date(Date.parse(probe.receipt.admissionProbeRequestedAt) + 1).toISOString();
+  for (const invalidObservation of [
+    {
+      observationRootThreadId: "frontend-thread",
+      registryObservation: { source: "list_agents", complete: true, observedAt: freshObservedAt, agents: [] },
+    },
+    {
+      observationRootThreadId: "global-thread",
+      registryObservation: {
+        source: "list_agents", complete: true,
+        observedAt: new Date(Date.parse(probe.receipt.admissionProbeRequestedAt) - 1).toISOString(),
+        agents: [],
+      },
+    },
+    {
+      observationRootThreadId: "global-thread",
+      registryObservation: { source: "list_agents", complete: false, observedAt: freshObservedAt, agents: [] },
+    },
+    {
+      observationRootThreadId: "global-thread",
+      registryObservation: { source: "cached_agents", complete: true, observedAt: freshObservedAt, agents: [] },
+    },
+    {
+      observationRootThreadId: "global-thread",
+      registryObservation: {
+        source: "list_agents", complete: true, observedAt: freshObservedAt,
+        agents: [{ agentPath: reserved.receipt.admissionAgentPath, agentThreadId: "present-child", status: "running" }],
+      },
+    },
+    {
+      observationRootThreadId: "global-thread",
+      registryObservation: {
+        source: "list_agents", complete: true, observedAt: freshObservedAt,
+        agents: [
+          { agentPath: reserved.receipt.admissionAgentPath, agentThreadId: "ambiguous-child-a", status: "running" },
+          { agentPath: reserved.receipt.admissionAgentPath, agentThreadId: "ambiguous-child-b", status: "idle" },
+        ],
+      },
+    },
+  ]) {
+    const unresolved = database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+      ...recoveryBinding,
+      admissionProbeId: probe.receipt.admissionProbeId,
+      ...invalidObservation,
+    });
+    assert.equal(unresolved.outcome, "unresolved");
+    assert.deepEqual(database.getTaskSafeActionAdmission(task.id), beforeInvalidObservation);
+  }
+
+  const activeAt = new Date().toISOString();
+  database.database.prepare(`
+    INSERT INTO agent_task_claims (
+      task_id, project_id, agent_path, agent_thread_id, status, claimed_at,
+      lease_expires_at, write_scope_json, completed_at
+    ) VALUES (?, ?, ?, ?, 'active', ?, ?, '[]', NULL)
+  `).run(
+    task.id, projectId, "/root/unexpected", "unexpected-thread", activeAt,
+    new Date(Date.now() + 60_000).toISOString(),
+  );
+  assert.throws(() => database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...recoveryBinding,
+    admissionProbeId: probe.receipt.admissionProbeId,
+    observationRootThreadId: "global-thread",
+    registryObservation: { source: "list_agents", complete: true, observedAt: freshObservedAt, agents: [] },
+  }), (error) => error?.code === "ADMISSION_ALREADY_CLAIMED");
+  database.database.prepare("DELETE FROM agent_task_claims WHERE task_id = ?").run(task.id);
+
+  database.database.prepare(`
+    INSERT INTO task_agent_runs (
+      id, task_id, project_id, role, status, version, root_thread_id, agent_path,
+      agent_thread_id, worktree_path, worktree_branch, write_scope_json,
+      started_at, updated_at, finished_at, summary, next_action
+    ) VALUES (?, ?, ?, 'sub_agent', 'blocked', 1, ?, ?, ?, ?, ?, '[]', ?, ?, NULL, NULL, NULL)
+  `).run(
+    "unexpected-open-run", task.id, projectId, "frontend-thread", "/root/unexpected",
+    "unexpected-thread", productWorkspacePath, "codex/global-domain-recovery", activeAt, activeAt,
+  );
+  assert.throws(() => database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...recoveryBinding,
+    admissionProbeId: probe.receipt.admissionProbeId,
+    observationRootThreadId: "global-thread",
+    registryObservation: { source: "list_agents", complete: true, observedAt: freshObservedAt, agents: [] },
+  }), (error) => error?.code === "ADMISSION_ALREADY_CLAIMED");
+  database.database.prepare("DELETE FROM task_agent_runs WHERE id = ?").run("unexpected-open-run");
+
+  const absent = database.reconcileTaskSafeActionReplacementAdmission(task.id, {
+    ...recoveryBinding,
+    admissionProbeId: probe.receipt.admissionProbeId,
+    observationRootThreadId: "global-thread",
+    registryObservation: {
+      source: "list_agents", complete: true,
+      observedAt: new Date(Date.parse(probe.receipt.admissionProbeRequestedAt) + 1).toISOString(),
+      agents: [],
+    },
+  });
+  assert.equal(absent.outcome, "absent");
+  assert.equal(absent.receipt.admissionState, "deferred");
+
+  const fresh = database.claimTaskSafeAction(task.id, {
+    rootThreadId: "frontend-thread", expectedResumeToken: domainToken, safeActionId: "test",
+    reservationLeaseId: "domain-reservation-after-recovery",
+  });
+  assert.equal(fresh.available, true);
+  assert.equal(fresh.receipt.rootThreadId, "frontend-thread");
+  assert.equal(fresh.receipt.resumeToken, domainToken);
+  assert.equal(fresh.receipt.domainCoordinatorLeaseId, "frontend-lease");
   assert.notEqual(fresh.receipt.admissionAttemptId, reserved.receipt.admissionAttemptId);
   database.close();
 });

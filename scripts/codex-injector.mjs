@@ -2745,6 +2745,11 @@ async function claimBackgroundContinuationReceipt(claim) {
   }
   const result = await response.json();
   const recovering = result?.recovering === true;
+  const coordinatorLeaseUnavailable = result?.coordinatorLeaseChanged === true
+    && result?.reused === true
+    && result?.available === false
+    && result?.completed === false
+    && result?.recovering === false;
   if (
     result?.receipt?.taskId !== claim.taskId
     || result.receipt.safeActionId !== claim.safeActionId
@@ -2753,9 +2758,10 @@ async function claimBackgroundContinuationReceipt(claim) {
     || typeof result.reused !== "boolean"
     || typeof result.available !== "boolean"
     || typeof result.completed !== "boolean"
-    || (!recovering && result.receipt.rootThreadId !== claim.rootThreadId)
-    || (!recovering && result.receipt.resumeToken !== claim.expectedResumeToken)
-    || (!recovering && result.available === true && result.receipt.reservationLeaseId !== reservationLeaseId)
+    || (result?.coordinatorLeaseChanged === true && !coordinatorLeaseUnavailable)
+    || (!recovering && !coordinatorLeaseUnavailable && result.receipt.rootThreadId !== claim.rootThreadId)
+    || (!recovering && !coordinatorLeaseUnavailable && result.receipt.resumeToken !== claim.expectedResumeToken)
+    || (!recovering && !coordinatorLeaseUnavailable && result.available === true && result.receipt.reservationLeaseId !== reservationLeaseId)
     || (recovering && result.available === true && (
       result.recoveryLeaseId !== reservationLeaseId
       || result.recoveryRoute?.rootThreadId !== result.receipt.rootThreadId
