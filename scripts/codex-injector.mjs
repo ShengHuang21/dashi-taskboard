@@ -69,6 +69,7 @@ import {
   runTaskboardContinuationMonitorOnce,
   selectLaunchCoordinatorRoute,
 } from "./codex-injector-runtime.mjs";
+import { createHostResourceObserver } from "./host-resource-observer.mjs";
 import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
 import { readCodexQuotaStatus } from "./codex-rate-limits.mjs";
 import { createTaskboardSupervisor } from "./taskboard-supervisor.mjs";
@@ -174,6 +175,22 @@ const configuredMaxActiveAgents = (() => {
   return Number.isSafeInteger(value) && value >= 1 && value <= 64 ? value : 4;
 })();
 const capacityObservationMaxAgeMs = 60_000;
+const GIB = 1024 ** 3;
+const hostResourceAdmissionPolicy = Object.freeze({
+  enabled: true,
+  localHostId: "local",
+  observationMaxAgeMs: 60_000,
+  targetCpuRatio: 0.8,
+  criticalCpuRatio: 1,
+  memoryReserveRatio: 0.2,
+  criticalMemoryRatio: 0.1,
+  minimumMemoryReserveBytes: 2 * GIB,
+  memoryPerAgentBytes: GIB,
+  cpuPerAgent: 1,
+});
+const readHostResourceObservation = createHostResourceObserver({
+  hostId: hostResourceAdmissionPolicy.localHostId,
+});
 const quotaPolicyTimers = new Map();
 const quotaPolicyRecords = new Map();
 const quotaPolicyQueues = new Map();
@@ -2993,8 +3010,10 @@ function runBackgroundContinuationDispatch(cdp, projectId) {
       projectId,
       maxActiveAgents: configuredMaxActiveAgents,
       capacityObservationMaxAgeMs,
+      hostResourceAdmission: hostResourceAdmissionPolicy,
     },
     readSnapshot: readTaskboardAgentLaneSnapshot,
+    readHostResourceObservation,
     claimReceipt: claimBackgroundContinuationReceipt,
     confirmDelivery: confirmBackgroundContinuationDelivery,
     completeDelivery: completeBackgroundContinuationDelivery,

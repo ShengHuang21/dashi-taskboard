@@ -3241,6 +3241,115 @@ export async function runTaskboardContinuationMonitorOnce(options) {
   }
 }
 
+export function evaluateHostResourceAdmission({
+  target,
+  policy,
+  observation,
+  observedAtMs,
+}) {
+  if (policy?.enabled !== true) return { available: true, applied: false };
+  const validPolicy = typeof policy.localHostId === "string"
+    && policy.localHostId.length > 0
+    && policy.localHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(policy.localHostId)
+    && Number.isSafeInteger(policy.observationMaxAgeMs)
+    && policy.observationMaxAgeMs >= 1
+    && policy.observationMaxAgeMs <= 15 * 60_000
+    && Number.isFinite(policy.targetCpuRatio)
+    && policy.targetCpuRatio > 0
+    && policy.targetCpuRatio < 1
+    && Number.isFinite(policy.criticalCpuRatio)
+    && policy.criticalCpuRatio >= policy.targetCpuRatio
+    && policy.criticalCpuRatio <= 1
+    && Number.isFinite(policy.memoryReserveRatio)
+    && policy.memoryReserveRatio > 0
+    && policy.memoryReserveRatio < 1
+    && Number.isFinite(policy.criticalMemoryRatio)
+    && policy.criticalMemoryRatio >= 0
+    && policy.criticalMemoryRatio < policy.memoryReserveRatio
+    && Number.isSafeInteger(policy.minimumMemoryReserveBytes)
+    && policy.minimumMemoryReserveBytes >= 0
+    && Number.isSafeInteger(policy.memoryPerAgentBytes)
+    && policy.memoryPerAgentBytes > 0
+    && Number.isFinite(policy.cpuPerAgent)
+    && policy.cpuPerAgent > 0;
+  if (!validPolicy) {
+    return { available: false, applied: true, reason: "invalid-host-resource-policy" };
+  }
+  if (target?.codexHostId !== policy.localHostId) {
+    return { available: true, applied: false };
+  }
+
+  const cpu = observation?.cpu;
+  const memory = observation?.memory;
+  const observationAt = Date.parse(observation?.observedAt ?? "");
+  const validEnvelope = observation?.schemaVersion === 1
+    && observation?.source === "resident-injector"
+    && observation?.hostId === policy.localHostId
+    && ["darwin", "linux", "win32"].includes(observation?.platform)
+    && Number.isFinite(observationAt)
+    && cpu && typeof cpu === "object"
+    && Number.isSafeInteger(cpu.capacity)
+    && cpu.capacity >= 1
+    && cpu.capacity <= 4096
+    && memory && typeof memory === "object"
+    && Number.isSafeInteger(memory.totalBytes)
+    && memory.totalBytes > 0
+    && Number.isSafeInteger(memory.availableBytes)
+    && memory.availableBytes >= 0
+    && memory.availableBytes <= memory.totalBytes
+    && Number.isFinite(memory.availableRatio)
+    && memory.availableRatio >= 0
+    && memory.availableRatio <= 1
+    && Math.abs(memory.availableRatio - (memory.availableBytes / memory.totalBytes)) <= 0.000001
+    && ["linux-meminfo", "macos-memory-pressure", "windows-os-freemem"].includes(memory.source);
+  if (!validEnvelope) {
+    return { available: false, applied: true, reason: "host-resource-observation-unavailable" };
+  }
+  if (observationAt > observedAtMs
+    || observedAtMs - observationAt > policy.observationMaxAgeMs) {
+    return { available: false, applied: true, reason: "host-resource-observation-stale" };
+  }
+  if (!Number.isFinite(cpu.busyRatio)
+    || cpu.busyRatio < 0
+    || cpu.busyRatio > 1
+    || !Number.isSafeInteger(cpu.sampleWindowMs)
+    || cpu.sampleWindowMs < 1
+    || cpu.sampleWindowMs > policy.observationMaxAgeMs) {
+    return { available: false, applied: true, reason: "host-resource-observation-warming" };
+  }
+
+  const cpuHeadroom = Math.max(
+    0,
+    (cpu.capacity * policy.targetCpuRatio) - (cpu.capacity * cpu.busyRatio),
+  );
+  const cpuHeadroomAgents = Math.floor(cpuHeadroom / policy.cpuPerAgent);
+  const memoryReserveBytes = Math.max(
+    policy.minimumMemoryReserveBytes,
+    Math.ceil(memory.totalBytes * policy.memoryReserveRatio),
+  );
+  const memoryHeadroomAgents = Math.floor(
+    Math.max(0, memory.availableBytes - memoryReserveBytes) / policy.memoryPerAgentBytes,
+  );
+  const headroomAgents = Math.min(cpuHeadroomAgents, memoryHeadroomAgents);
+  const critical = cpu.busyRatio >= policy.criticalCpuRatio
+    || memory.availableRatio <= policy.criticalMemoryRatio;
+  const warning = !critical && (
+    cpu.busyRatio >= policy.targetCpuRatio
+    || memory.availableBytes <= memoryReserveBytes
+  );
+  const result = {
+    available: headroomAgents >= 1,
+    applied: true,
+    ...(headroomAgents >= 1 ? {} : { reason: "waiting-host-resources" }),
+    pressure: critical ? "critical" : warning ? "warning" : "healthy",
+    cpuHeadroomAgents,
+    memoryHeadroomAgents,
+    headroomAgents,
+  };
+  return result;
+}
+
 function continuationCapacity(snapshot, target, policy, observedAtMs) {
   if (policy.maxActiveAgents === undefined) return { available: true };
   if (!Number.isSafeInteger(policy.maxActiveAgents)
@@ -3335,6 +3444,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   reconcileReplacementAdmission,
   deliverAdmissionRecovery,
   requestCapacityObservation,
+  readHostResourceObservation,
   now = Date.now,
 }) {
   if (
@@ -3535,6 +3645,19 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       reason: "admission-recovery-instructed",
     };
   }
+  let hostResourceObservation = null;
+  const hostResourcePolicy = policy.hostResourceAdmission;
+  const hasLocalCandidate = hostResourcePolicy?.enabled === true
+    && snapshot.todos.some((candidate) => (
+      candidate?.dispatchTarget?.codexHostId === hostResourcePolicy.localHostId
+    ));
+  if (hasLocalCandidate && typeof readHostResourceObservation === "function") {
+    try {
+      hostResourceObservation = await readHostResourceObservation();
+    } catch {
+      hostResourceObservation = null;
+    }
+  }
   let capacityReason = null;
   let capacityProbe = null;
   const capacityObservedAt = now();
@@ -3577,10 +3700,20 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       capacityReason ??= "model-capacity-backoff";
       return false;
     }
+    const hostResourceCapacity = evaluateHostResourceAdmission({
+      target,
+      policy: hostResourcePolicy,
+      observation: hostResourceObservation,
+      observedAtMs: capacityObservedAt,
+    });
     const capacity = continuationCapacity(snapshot, target, policy, capacityObservedAt);
     if (!capacity.available) {
       if (modelRetry?.due
         && ["capacity-unobserved", "capacity-observation-stale"].includes(capacity.reason)) {
+        if (!hostResourceCapacity.available) {
+          capacityReason ??= hostResourceCapacity.reason;
+          return false;
+        }
         return true;
       }
       if (!capacityProbe
@@ -3606,6 +3739,11 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
         };
       }
       capacityReason ??= capacity.reason;
+      return false;
+    }
+    // This gates only new starts. It is not a hard resource lease and never preempts existing agents.
+    if (!hostResourceCapacity.available) {
+      capacityReason ??= hostResourceCapacity.reason;
       return false;
     }
     return true;
