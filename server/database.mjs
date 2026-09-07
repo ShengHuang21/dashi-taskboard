@@ -406,6 +406,17 @@ function assertCoordinatorShutdownHostExecutor(ownedCodexHostId, holderCodexHost
   }
 }
 
+function assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, targetCodexHostId) {
+  if (!isCanonicalCodexHostId(ownedCodexHostId)
+    || ownedCodexHostId !== targetCodexHostId) {
+    throw new ApiError(
+      409,
+      "HOST_EXECUTOR_MISMATCH",
+      "Coordinator provisioning executor does not own the target host route",
+    );
+  }
+}
+
 function coordinationDomainReceiptFromRow(row) {
   return {
     id: row.id, projectId: row.project_id, domainId: row.domain_id,
@@ -3809,7 +3820,7 @@ export class TaskboardDatabase {
     };
   }
 
-  getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey) {
+  getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey, ownedCodexHostId) {
     const row = idempotencyKey
       ? this.#prepare(`
           SELECT * FROM agent_coordinator_provisioning_attempts
@@ -3819,8 +3830,9 @@ export class TaskboardDatabase {
           SELECT * FROM agent_coordinator_provisioning_attempts
           WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
           ORDER BY created_at DESC, id DESC LIMIT 1
-        `).get(projectId);
+    `).get(projectId);
     if (!row) return null;
+    assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, row.codex_host_id);
     if (["pending", "starting", "started"].includes(row.status)
       && Date.parse(row.expires_at) <= Date.now()) {
       const timestamp = now();
@@ -4348,14 +4360,30 @@ export class TaskboardDatabase {
       if (!row) {
         throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
       }
-      if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(projectId)) {
-        throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Window changes wait for authorized thread archival");
+      const config = JSON.parse(row.config_json);
+      const tasks = Array.isArray(config.tasks) ? config.tasks : [];
+      const globalRootTasks = tasks.filter((task) => task?.source === "codex"
+        && task?.taskType === "root_task");
+      const ownerRootWindows = globalRootTasks.filter(
+        (task) => task.id === config.ownerRootTaskId,
+      );
+      if (ownerRootWindows.length !== 1
+        || new Set(globalRootTasks.map((task) => task.id)).size !== globalRootTasks.length) {
+        throw new ApiError(409, "COORDINATOR_PROVISIONING_STALE_WINDOW_CONFLICT", "Global Coordinator windows must use unique task identities");
       }
-      const fingerprint = coordinatorProvisioningFingerprint(projectId, input);
+      const ownerRoot = ownerRootWindows[0];
       const existing = this.#prepare(`
         SELECT * FROM agent_coordinator_provisioning_attempts
         WHERE project_id = ? AND idempotency_key = ?
       `).get(projectId, input.idempotencyKey);
+      assertCoordinatorProvisioningHostExecutor(
+        input.ownedCodexHostId,
+        existing?.codex_host_id ?? ownerRoot?.codexHostId,
+      );
+      if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(projectId)) {
+        throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Window changes wait for authorized thread archival");
+      }
+      const fingerprint = coordinatorProvisioningFingerprint(projectId, input);
       if (existing) {
         if (existing.request_fingerprint !== fingerprint) {
           throw new ApiError(409, "COORDINATOR_PROVISIONING_IDEMPOTENCY_CONFLICT", "The provisioning key is bound to a different replacement request");
@@ -4387,9 +4415,6 @@ export class TaskboardDatabase {
       if (revision !== input.expectedRevision) {
         throw new ApiError(409, "COORDINATOR_PROVISIONING_REVISION_CONFLICT", "Agent Lane coordination windows changed since provisioning was planned", { actualRevision: revision });
       }
-      const config = JSON.parse(row.config_json);
-      const tasks = Array.isArray(config.tasks) ? config.tasks : [];
-      const ownerRoot = tasks.find((task) => task?.id === config.ownerRootTaskId) ?? null;
       const expectedWorkspace = path.resolve(input.workspacePath);
       if (!isValidCoordinatorProvisioningOwnerRoot(ownerRoot)
         || ownerRoot.id !== input.ownerRootTaskId
@@ -4422,6 +4447,10 @@ export class TaskboardDatabase {
       const retirementTaskIds = new Set();
       for (const retirement of retirements) {
         const task = coordinatorTasks.find((candidate) => candidate.id === retirement.taskId) ?? null;
+        assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, retirement.codexHostId);
+        if (task) {
+          assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, task.codexHostId);
+        }
         const exact = task
           && task.label === retirement.label
           && task.threadId === retirement.threadId
@@ -4445,6 +4474,7 @@ export class TaskboardDatabase {
         ORDER BY created_at DESC, id DESC LIMIT 1
       `).get(projectId);
       if (nonterminal) {
+        assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, nonterminal.codex_host_id);
         if (Date.parse(nonterminal.expires_at) <= Date.now()) {
           this.#prepare(`
             UPDATE agent_coordinator_provisioning_attempts
@@ -4460,6 +4490,9 @@ export class TaskboardDatabase {
         ? JSON.stringify({
             ...config,
             tasks: nextTasks,
+            ...(retirementTaskIds.has(config.rootTaskId)
+              ? { rootTaskId: config.ownerRootTaskId }
+              : {}),
           })
         : row.config_json;
       const effectiveRevision = agentLaneConfigRevision(nextConfigJson);
@@ -4504,6 +4537,7 @@ export class TaskboardDatabase {
         "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
       ).get(attemptId);
       if (!row) throw new ApiError(404, "COORDINATOR_PROVISIONING_NOT_FOUND", "The replacement provisioning attempt does not exist");
+      assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, row.codex_host_id);
       const recoverableExpiredMissing = row.status === "expired"
         && Boolean(row.thread_id)
         && ["observe-missing", "clear-missing", "reset-missing"].includes(action);

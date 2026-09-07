@@ -434,7 +434,7 @@ function parseCoordinatorProvisioningRequest(value) {
     "idempotencyKey", "taskId", "label", "threadSource", "model", "reasoningEffort",
     "expectedRevision",
     "ownerRootTaskId", "ownerRootThreadId", "codexProjectId", "codexProjectKind",
-    "codexHostId", "workspacePath", "retireCoordinatorWindows",
+    "codexHostId", "workspacePath", "retireCoordinatorWindows", "ownedCodexHostId",
   ]));
   const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
     required: true, maxLength: 64,
@@ -499,6 +499,7 @@ function parseCoordinatorProvisioningRequest(value) {
     return retirement;
   });
   return {
+    ownedCodexHostId: parseOwnedCodexHostId(value.ownedCodexHostId),
     idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
     taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
     label: stringField(value.label, "label", { required: true, maxLength: 120 }),
@@ -520,15 +521,20 @@ function parseCoordinatorProvisioningRequest(value) {
 
 function parseCoordinatorProvisioningTransition(value, action, options = {}) {
   assertPlainObject(value);
-  assertAllowedKeys(value, action === "attach"
-    ? new Set(["threadId"])
+  const fields = action === "attach"
+    ? ["threadId"]
     : action === "rebind"
-      ? new Set(options.expectedGlobalLeaseId
+      ? (options.expectedGlobalLeaseId
         ? ["expectedRevision", "expectedGlobalLeaseId"]
         : ["expectedRevision"])
-      : new Set());
+      : [];
+  if (options.requireOwnedCodexHostId) fields.push("ownedCodexHostId");
+  assertAllowedKeys(value, new Set(fields));
+  const owned = options.requireOwnedCodexHostId
+    ? { ownedCodexHostId: parseOwnedCodexHostId(value.ownedCodexHostId) }
+    : {};
   if (action === "attach") {
-    return { threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }) };
+    return { ...owned, threadId: stringField(value.threadId, "threadId", { required: true, maxLength: 256 }) };
   }
   if (action === "rebind") {
     const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
@@ -539,6 +545,7 @@ function parseCoordinatorProvisioningTransition(value, action, options = {}) {
     }
     return options.expectedGlobalLeaseId
       ? {
+        ...owned,
         expectedRevision,
         expectedGlobalLeaseId: stringField(
           value.expectedGlobalLeaseId,
@@ -546,18 +553,27 @@ function parseCoordinatorProvisioningTransition(value, action, options = {}) {
           { required: true, maxLength: 256 },
         ),
       }
-      : { expectedRevision };
+      : { ...owned, expectedRevision };
   }
-  return {};
+  return owned;
 }
 
-function parseCoordinatorProvisioningLookup(value) {
+function parseCoordinatorProvisioningLookup(value, { requireOwnedCodexHostId = false } = {}) {
   assertPlainObject(value);
-  assertAllowedKeys(value, new Set(["idempotencyKey"]));
-  if (value.idempotencyKey === undefined) return null;
-  return stringField(value.idempotencyKey, "idempotencyKey", {
+  assertAllowedKeys(value, new Set([
+    "idempotencyKey",
+    ...(requireOwnedCodexHostId ? ["ownedCodexHostId"] : []),
+  ]));
+  const idempotencyKey = value.idempotencyKey === undefined ? null : stringField(
+    value.idempotencyKey,
+    "idempotencyKey",
+    {
     required: true, maxLength: 256,
-  });
+    },
+  );
+  return requireOwnedCodexHostId
+    ? { idempotencyKey, ownedCodexHostId: parseOwnedCodexHostId(value.ownedCodexHostId) }
+    : idempotencyKey;
 }
 
 function parseDomainCoordinatorProvisioningRequest(value) {
@@ -3954,9 +3970,13 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const idempotencyKey = parseCoordinatorProvisioningLookup(body);
+        const input = parseCoordinatorProvisioningLookup(body, { requireOwnedCodexHostId: true });
         return sendJson(response, 200, {
-          attempt: database.getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey),
+          attempt: database.getAgentLaneCoordinatorProvisioningAttempt(
+            projectId,
+            input.idempotencyKey,
+            input.ownedCodexHostId,
+          ),
         });
       }
 
@@ -4196,7 +4216,11 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = parseCoordinatorProvisioningTransition(body, action);
+        const input = parseCoordinatorProvisioningTransition(
+          body,
+          action,
+          { requireOwnedCodexHostId: true },
+        );
         return sendJson(response, 200, database.transitionAgentLaneCoordinatorProvisioningAttempt(
           attemptId, action, input,
         ));

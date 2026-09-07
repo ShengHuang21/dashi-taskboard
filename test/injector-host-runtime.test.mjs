@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
@@ -2685,6 +2686,7 @@ test("Coordinator shutdown and replacement provisioning fail closed around work 
     },
   };
   const provisioning = await runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     readSnapshot: async () => unassigned,
     readWindows: async () => ({ projectId: "capstone-dev", revision: "a".repeat(64), windows: [] }),
@@ -2713,6 +2715,7 @@ test("resident Coordinator provisioning persists one attempt before starting exa
   let deliveryCalls = 0;
   let modelReads = 0;
   const runTick = () => runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "capstone-dev",
@@ -3053,17 +3056,23 @@ test("Coordinator provisioning rebinds the same active attempt after safe window
     codexHostId: "local",
     workspacePath: "/tmp/taskboard",
   };
+  const previousRevision = "a".repeat(64);
+  const previousFingerprint = createHash("sha256")
+    .update(JSON.stringify({
+      projectId: "capstone-dev", revision: previousRevision, ownerRootTaskId: owner.taskId,
+    }))
+    .digest("hex");
   const currentRevision = "b".repeat(64);
   let attempt = {
     id: "attempt-rebind",
     projectId: "capstone-dev",
-    idempotencyKey: "older-revision-key",
-    taskId: "coordinator-capstone-dev-stable",
+    idempotencyKey: `coordinator-provision-${previousFingerprint}`,
+    taskId: `coordinator-capstone-dev-${previousFingerprint.slice(0, 12)}`,
     label: "Taskboard Execution Coordinator",
-    threadSource: "taskboard-coordinator-provision-stable",
+    threadSource: `taskboard-coordinator-provision-${previousFingerprint}`,
     model: "gpt-5",
     reasoningEffort: "high",
-    expectedRevision: "a".repeat(64),
+    expectedRevision: previousRevision,
     ownerRootTaskId: owner.taskId,
     ownerRootThreadId: owner.threadId,
     codexProjectId: owner.codexProjectId,
@@ -3079,6 +3088,7 @@ test("Coordinator provisioning rebinds the same active attempt after safe window
   let starts = 0;
   let loseRebindResponse = true;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     readSnapshot: async () => ({
       projectId: "capstone-dev",
@@ -3189,6 +3199,7 @@ test("Coordinator provisioning rejects explicit model policy drift without rebin
       threadId: null,
     };
     const result = await runCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "capstone-dev", ...policyDrift },
       readSnapshot: async () => ({
         projectId: "capstone-dev",
@@ -3268,6 +3279,7 @@ test("Coordinator provisioning retries selected-model capacity on the same attem
     let resets = 0;
     let modelReads = 0;
     const options = {
+      hostExecutor: localHostExecutor,
       policy: {
         enabled: true, projectId: "capstone-dev",
       },
@@ -3359,6 +3371,7 @@ test("Coordinator provisioning safely resets a confirmed missing started thread 
   let starts = 0;
   let currentTime = Date.parse("2026-09-03T00:00:30.000Z");
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     now: () => currentTime,
     readSnapshot: async () => ({
@@ -3402,7 +3415,13 @@ test("Coordinator provisioning safely resets a confirmed missing started thread 
     resetMissingAttempt: async ({ attemptId }) => {
       assert.equal(attemptId, attempt.id);
       missingResets += 1;
-      attempt = { ...attempt, status: "pending", threadId: null, retryCount: 1 };
+      attempt = {
+        ...attempt,
+        status: "pending",
+        threadId: null,
+        retryCount: 1,
+        missingSince: null,
+      };
       return { attempt: { ...attempt } };
     },
     markStarting: async () => {
@@ -3494,6 +3513,7 @@ test("Coordinator provisioning clears a transient missing observation when the o
   let resets = 0;
   let expiredResumes = 0;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     now: () => currentTime,
     readSnapshot: async () => ({
@@ -3640,6 +3660,7 @@ test("Coordinator provisioning performs zero mutation when a lease or Coordinato
     { lease: null, windows: [{ ...owner, taskId: "coordinator", role: "coordinator" }] },
   ]) {
     const result = await runCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: {
         enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
       },
@@ -3677,7 +3698,12 @@ test("Coordinator provisioning retires only protected stale windows and starts o
   let attempt = null;
   let requests = 0;
   let starts = 0;
+  let retired = false;
+  let preflightReads = 0;
+  const beforeRevision = "d".repeat(64);
+  const afterRevision = "e".repeat(64);
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -3694,9 +3720,24 @@ test("Coordinator provisioning retires only protected stale windows and starts o
       taskLanes: [{ id: owner.taskId, ...owner }],
     }),
     readWindows: async () => ({
-      projectId: "capstone-dev", revision: "d".repeat(64), ownerRootTaskId: owner.taskId,
+      projectId: "capstone-dev", revision: beforeRevision, ownerRootTaskId: owner.taskId,
       windows: [{ ...owner, role: "owner_root" }, stale],
     }),
+    readPreflight: async () => {
+      preflightReads += 1;
+      return {
+        projectId: "capstone-dev",
+        revision: retired ? afterRevision : beforeRevision,
+        ownerRootTaskId: owner.taskId,
+        coordinatorLease: { status: "released", releasedAt: "2026-09-02T22:55:28.211Z" },
+        durableWorkPending: true,
+        ownerRootValid: true,
+        shutdownAttempt: null,
+        windows: retired
+          ? [{ ...owner, label: "Owner Root", role: "owner_root" }]
+          : [{ ...owner, label: "Owner Root", role: "owner_root" }, stale],
+      };
+    },
     inspectCoordinatorWindow: async (window) => {
       assert.deepEqual(window, stale);
       return { eligibility: "stale", reason: "archived", window };
@@ -3705,7 +3746,11 @@ test("Coordinator provisioning retires only protected stale windows and starts o
     requestAttempt: async (request) => {
       requests += 1;
       assert.deepEqual(request.retireCoordinatorWindows, [stale]);
-      attempt ??= { ...request, id: "attempt-stale", status: "pending", threadId: null };
+      retired = true;
+      attempt ??= {
+        ...request, expectedRevision: afterRevision,
+        id: "attempt-stale", status: "pending", threadId: null,
+      };
       return { attempt: { ...attempt } };
     },
     findThread: async () => null,
@@ -3729,6 +3774,7 @@ test("Coordinator provisioning retires only protected stale windows and starts o
   });
   assert.equal(requests, 1);
   assert.equal(starts, 1);
+  assert.equal(preflightReads, 2);
 });
 
 test("Coordinator provisioning reaches protected stale inspection without reading an invalid full snapshot", async () => {
@@ -3746,7 +3792,11 @@ test("Coordinator provisioning reaches protected stale inspection without readin
   let inspections = 0;
   let starts = 0;
   let attempt = null;
+  let retired = false;
+  const beforeRevision = "9".repeat(64);
+  const afterRevision = "a".repeat(64);
   const result = await runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -3757,7 +3807,8 @@ test("Coordinator provisioning reaches protected stale inspection without readin
       throw new Error("the protected preflight already contains the exact window revision");
     },
     readPreflight: async () => ({
-      projectId: "capstone-dev", revision: "9".repeat(64), ownerRootTaskId: owner.taskId,
+      projectId: "capstone-dev", revision: retired ? afterRevision : beforeRevision,
+      ownerRootTaskId: owner.taskId,
       coordinatorLease: {
         id: "released-lease", holderTaskId: "retired-coordinator",
         holderThreadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
@@ -3767,7 +3818,7 @@ test("Coordinator provisioning reaches protected stale inspection without readin
       durableWorkPending: true,
       ownerRootValid: true,
       shutdownAttempt: null,
-      windows: [{ ...owner, label: "Owner Root", role: "owner_root" }, stale],
+      windows: [{ ...owner, label: "Owner Root", role: "owner_root" }, ...(retired ? [] : [stale])],
     }),
     inspectCoordinatorWindow: async (window) => {
       inspections += 1;
@@ -3777,8 +3828,10 @@ test("Coordinator provisioning reaches protected stale inspection without readin
     requestAttempt: async (request) => {
       attempts += 1;
       assert.deepEqual(request.retireCoordinatorWindows, [stale]);
+      retired = true;
       attempt = {
-        ...request, id: "attempt-invalid-stale", status: "pending", threadId: null,
+        ...request, expectedRevision: afterRevision,
+        id: "attempt-invalid-stale", status: "pending", threadId: null,
       };
       return { attempt: { ...attempt } };
     },
@@ -3811,6 +3864,7 @@ test("Coordinator provisioning preflight rejects an invalid Owner Root before st
   let inspections = 0;
   let attempts = 0;
   const result = await runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -3862,6 +3916,7 @@ test("Coordinator provisioning recovers the same attempt after stale-window reti
   let requests = 0;
   let starts = 0;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -3942,6 +3997,7 @@ test("Coordinator provisioning fails closed for fresh busy or uncertain register
     { eligibility: "uncertain", reason: "host-unavailable", window: coordinator },
   ]) {
     const result = await runCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
       readSnapshot: async () => ({
         projectId: "capstone-dev",
@@ -8234,3 +8290,667 @@ test("refresh stops every stale resident before starting one token-verified repl
     ["ready", 9231, 9876, startupToken],
   ]);
 });
+
+function cap59Preflight(projectId, ownerHostId, coordinatorWindows = []) {
+  const owner = {
+    taskId: "owner-root",
+    label: "Owner Root",
+    role: "owner_root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "cap59-project",
+    codexProjectKind: ownerHostId === "local" ? "local" : "remote",
+    codexHostId: ownerHostId,
+    workspacePath: "/tmp/cap59-owner",
+  };
+  return {
+    projectId,
+    revision: "a".repeat(64),
+    ownerRootTaskId: owner.taskId,
+    ownerRootValid: true,
+    coordinatorLease: null,
+    durableWorkPending: true,
+    shutdownAttempt: null,
+    windows: [owner, ...coordinatorWindows],
+  };
+}
+
+function cap59ReadyProvisioningOptions({ projectId, hostExecutor, ownerHostId, callbacks }) {
+  let attempt = null;
+  const preflight = cap59Preflight(projectId, ownerHostId);
+  return {
+    policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+    ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    readPreflight: async () => {
+      callbacks.push("preflight");
+      return preflight;
+    },
+    getAttempt: async () => {
+      callbacks.push("lookup");
+      return { attempt: null };
+    },
+    requestAttempt: async (request) => {
+      callbacks.push(["request", request.ownedCodexHostId]);
+      const { ownedCodexHostId: _ownedCodexHostId, ...persistedRequest } = request;
+      attempt = {
+        ...persistedRequest,
+        id: `attempt-${projectId}`,
+        status: "pending",
+        threadId: null,
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => {
+      callbacks.push("find-thread");
+      return null;
+    },
+    markStarting: async () => {
+      callbacks.push("starting");
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      callbacks.push("start-thread");
+      return {
+        thread: {
+          id: "01a062c1-fd2b-7f61-9114-d483e695640e",
+          cwd: settings.cwd,
+          threadSource: settings.threadSource,
+        },
+      };
+    },
+    attachThread: async ({ threadId }) => {
+      callbacks.push("attach");
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => {
+      callbacks.push("deliver");
+      return { delivery: "started", turnId: "turn-cap59" };
+    },
+  };
+}
+
+test("CAP-59 Global provisioning rejects invalid host executors before every callback", async () => {
+  const cases = [
+    ["missing", undefined],
+    ["whitespace", { ownedCodexHostId: "   " }],
+    ["control", { ownedCodexHostId: "bad\nhost" }],
+    ["257 characters", { ownedCodexHostId: "h".repeat(257) }],
+  ];
+  const observed = [];
+  for (const [label, hostExecutor] of cases) {
+    const callbacks = [];
+    const result = await runCoordinatorProvisioningMonitorOnce(cap59ReadyProvisioningOptions({
+      projectId: `cap59-invalid-${label.replaceAll(" ", "-")}`,
+      hostExecutor,
+      ownerHostId: "local",
+      callbacks,
+    }));
+    observed.push([label, result, callbacks.length]);
+  }
+  assert.deepEqual(observed, cases.map(([label]) => [label, {
+    provisioned: false, reason: "host-executor-unavailable",
+  }, 0]));
+});
+
+test("CAP-59 Global provisioning accepts canonical host executors and carries ownership", async () => {
+  const observed = [];
+  for (const length of [240, 241, 256]) {
+    const hostId = `h${"x".repeat(length - 1)}`;
+    const callbacks = [];
+    const result = await runCoordinatorProvisioningMonitorOnce(cap59ReadyProvisioningOptions({
+      projectId: `cap59-canonical-${length}`,
+      hostExecutor: { ownedCodexHostId: hostId },
+      ownerHostId: hostId,
+      callbacks,
+    }));
+    observed.push([length, result.provisioned, callbacks.find((entry) => Array.isArray(entry))?.[1]]);
+  }
+  assert.deepEqual(observed, [240, 241, 256].map((length) => [
+    length,
+    true,
+    `h${"x".repeat(length - 1)}`,
+  ]));
+});
+
+test("CAP-59 Global provisioning fences foreign Owner and registered Coordinator routes before inspection", async () => {
+  const coordinator = (codexHostId) => ({
+    taskId: "coordinator-root",
+    label: "Global Coordinator",
+    role: "coordinator",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+    codexProjectId: "cap59-project",
+    codexProjectKind: codexHostId === "local" ? "local" : "remote",
+    codexHostId,
+    workspacePath: "/tmp/cap59-coordinator",
+  });
+  const cases = [
+    ["foreign-owner", "remote-builder", coordinator("local")],
+    ["foreign-window", "local", coordinator("remote-builder")],
+    ["invalid-window", "local", coordinator("bad\nhost")],
+    ["duplicate-owner", "local", null],
+    ["fresh-invalid-window-set", "local", coordinator("local")],
+  ];
+  const observed = [];
+  const fencedResults = {};
+  for (const [label, ownerHostId, window] of cases) {
+    const effects = [];
+    let duplicateAttempt = null;
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: { enabled: true, projectId: `cap59-fence-${label}`, model: "gpt-5", reasoningEffort: "high" },
+      hostExecutor: localHostExecutor,
+      readPreflight: async () => {
+        effects.push("preflight");
+        const preflight = cap59Preflight(
+          `cap59-fence-${label}`,
+          ownerHostId,
+          window ? [window] : [],
+        );
+        return label === "duplicate-owner" ? {
+          ...preflight,
+          windows: [...preflight.windows, {
+            taskId: "owner-root-shadow",
+            label: "Shadow Owner Root",
+            role: "owner_root",
+            threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+            codexProjectId: "cap59-project",
+            codexProjectKind: "local",
+            codexHostId: "local",
+            workspacePath: "/tmp/cap59-owner",
+          }],
+        } : label === "fresh-invalid-window-set" && effects.filter((effect) => effect === "preflight").length > 1 ? {
+          ...cap59Preflight(`cap59-fence-${label}`, "local"),
+          windows: [...cap59Preflight(`cap59-fence-${label}`, "local").windows, {
+            taskId: "owner-root-shadow",
+            label: "Shadow Owner Root",
+            role: "owner_root",
+            threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+            codexProjectId: "cap59-project",
+            codexProjectKind: "local",
+            codexHostId: "local",
+            workspacePath: "/tmp/cap59-owner",
+          }],
+        } : preflight;
+      },
+      inspectCoordinatorWindow: async () => {
+        effects.push("inspection");
+        return label === "fresh-invalid-window-set"
+          ? { eligibility: "stale", reason: "archived", window }
+          : { eligibility: "eligible", window };
+      },
+      getAttempt: async () => {
+        effects.push("lookup");
+        return { attempt: null };
+      },
+      requestAttempt: async (request) => {
+        effects.push("request");
+        if (!new Set(["duplicate-owner", "fresh-invalid-window-set"]).has(label)) return null;
+        duplicateAttempt = {
+          ...request,
+          id: "cap59-duplicate-owner-attempt",
+          status: "pending",
+          threadId: null,
+        };
+        return { attempt: { ...duplicateAttempt } };
+      },
+      findThread: async () => { effects.push("find-thread"); return null; },
+      markStarting: async () => {
+        effects.push("starting");
+        duplicateAttempt = { ...duplicateAttempt, status: "starting" };
+        return { attempt: { ...duplicateAttempt } };
+      },
+      startThread: async (settings) => {
+        effects.push("start-thread");
+        return {
+          thread: {
+            id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+            cwd: settings.cwd,
+            threadSource: settings.threadSource,
+          },
+        };
+      },
+      attachThread: async ({ threadId }) => {
+        effects.push("attach");
+        duplicateAttempt = { ...duplicateAttempt, status: "started", threadId };
+        return { attempt: { ...duplicateAttempt } };
+      },
+      deliverInstruction: async () => {
+        effects.push("deliver");
+        return { delivery: "started", turnId: "turn-cap59-duplicate-owner" };
+      },
+    });
+    if (["duplicate-owner", "fresh-invalid-window-set"].includes(label)) {
+      fencedResults[label] = [result, effects];
+    } else {
+      observed.push([label, result.provisioned, effects]);
+    }
+  }
+  assert.deepEqual(
+    [fencedResults["duplicate-owner"], fencedResults["fresh-invalid-window-set"]],
+    [[{
+      provisioned: false,
+      reason: "owner-root-invalid",
+    }, ["preflight"]], [{
+      provisioned: false,
+      reason: "retirement-preflight-invalid",
+      attemptId: "cap59-duplicate-owner-attempt",
+    }, ["preflight", "inspection", "lookup", "lookup", "request", "preflight"]]],
+  );
+  assert.deepEqual(observed, cases.slice(0, 3).map(([label]) => [label, false, ["preflight"]]));
+});
+
+test("CAP-59 Global provisioning single-flight is scoped by exact host and project", async () => {
+  let enterFirstPreflight;
+  const firstPreflight = new Promise((resolve) => { enterFirstPreflight = resolve; });
+  let releaseFirstPreflight;
+  const release = new Promise((resolve) => { releaseFirstPreflight = resolve; });
+  const observedHosts = [];
+  const makeOptions = (hostId, block) => {
+    const callbacks = [];
+    const options = cap59ReadyProvisioningOptions({
+      projectId: "cap59-single-flight",
+      hostExecutor: { ownedCodexHostId: hostId },
+      ownerHostId: hostId,
+      callbacks,
+    });
+    options.readPreflight = async () => {
+      observedHosts.push(hostId);
+      if (block) {
+        enterFirstPreflight();
+        await release;
+      }
+      return cap59Preflight("cap59-single-flight", hostId);
+    };
+    return options;
+  };
+  const local = runCoordinatorProvisioningMonitorOnce(makeOptions("local", true));
+  await firstPreflight;
+  const remote = runCoordinatorProvisioningMonitorOnce(makeOptions("remote-builder", false));
+  releaseFirstPreflight();
+  const results = await Promise.all([local, remote]);
+  assert.deepEqual(observedHosts, ["local", "remote-builder"]);
+  assert.deepEqual(results.map((result) => result.provisioned), [true, true]);
+});
+
+test("CAP-59 Global provisioning rejects immutable response-envelope drift before later effects", async () => {
+  const scenarios = [
+    ["request", "request"],
+    ["rebind", "rebind"],
+    ["starting", "starting"],
+    ["reset", "reset"],
+    ["attach", "attach"],
+    ["observe-missing", "observe"],
+    ["clear-missing", "clear"],
+    ["reset-missing", "reset-missing"],
+    ["resume-expired", "resume"],
+  ];
+  const observed = [];
+  for (const [label, transition] of scenarios) {
+    const projectId = `cap59-envelope-${label}`;
+    const effects = [];
+    let attempt = null;
+    let identityRequest = null;
+    const observedAt = Date.parse("2026-09-07T00:02:00.000Z");
+    const drift = (candidate) => ({
+      ...candidate,
+      ...(transition === "request"
+        ? { codexHostId: "remote-builder" }
+        : transition === "resume"
+          ? { idempotencyKey: `${candidate.idempotencyKey}-drift` }
+          : { id: `${candidate.id}-drift` }),
+    });
+    const fromLookup = (request, status, threadId = null, expectedRevision = "a".repeat(64)) => {
+      const fingerprint = request.idempotencyKey.slice("coordinator-provision-".length);
+      return {
+        id: `attempt-${label}`,
+        projectId,
+        idempotencyKey: request.idempotencyKey,
+        taskId: `coordinator-${projectId}-${fingerprint.slice(0, 12)}`,
+        label: "Taskboard Execution Coordinator",
+        threadSource: `taskboard-coordinator-provision-${fingerprint}`,
+        model: "gpt-5",
+        reasoningEffort: "high",
+        expectedRevision,
+        ownerRootTaskId: "owner-root",
+        ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        codexProjectId: "cap59-project",
+        codexProjectKind: "local",
+        codexHostId: "local",
+        workspacePath: "/tmp/cap59-owner",
+        status,
+        threadId,
+        missingSince: null,
+      };
+    };
+    const options = {
+      policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+      hostExecutor: localHostExecutor,
+      now: () => observedAt,
+      readPreflight: async () => cap59Preflight(projectId, "local"),
+      getAttempt: async (request) => {
+        if (transition === "request") return { attempt: null };
+        if (transition === "rebind" && request.idempotencyKey) {
+          identityRequest = request;
+          return { attempt: null };
+        }
+        if (!attempt) {
+          const status = transition === "attach" ? "starting"
+            : transition === "observe" || transition === "clear" || transition === "reset-missing"
+              ? "started"
+              : transition === "resume" ? "expired" : "pending";
+          const threadId = ["observe", "clear", "reset-missing", "resume"].includes(transition)
+            ? "01a062c1-fd2b-7f61-9114-d483e695640e" : null;
+          attempt = fromLookup(
+            identityRequest ?? request,
+            status,
+            threadId,
+            transition === "rebind" ? "b".repeat(64) : undefined,
+          );
+          if (transition === "clear") attempt.missingSince = "2000-01-01T00:00:00.000Z";
+        }
+        return { attempt: { ...attempt } };
+      },
+      requestAttempt: async (request) => {
+        effects.push("request");
+        attempt = drift({
+          ...fromLookup(request, "pending"),
+          id: `attempt-${label}`,
+        });
+        return { attempt: { ...attempt } };
+      },
+      rebindAttempt: async () => {
+        effects.push("rebind");
+        attempt = drift({ ...attempt, expectedRevision: "a".repeat(64) });
+        return { attempt: { ...attempt } };
+      },
+      findThread: async (candidate) => {
+        effects.push("find");
+        if (!["attach", "clear", "resume"].includes(transition)) return null;
+        return {
+          id: candidate.threadId ?? "01a062c1-fd2b-7f61-9114-d483e695640e",
+          cwd: candidate.workspacePath,
+          threadSource: candidate.threadSource,
+          turns: transition === "resume"
+            ? [{ input: `TASKBOARD_COORDINATOR_PROVISIONING_V1:${candidate.id}` }]
+            : [],
+        };
+      },
+      markStarting: async () => {
+        effects.push("starting");
+        attempt = transition === "starting"
+          ? drift({ ...attempt, status: "starting" })
+          : { ...attempt, status: "starting" };
+        return { attempt: { ...attempt } };
+      },
+      startThread: async (settings) => {
+        effects.push("rpc");
+        if (transition === "reset") {
+          throw new Error("Selected model is at capacity. Please try a different model.");
+        }
+        return {
+          thread: {
+            id: "01a062c1-fd2b-7f61-9114-d483e695640e",
+            cwd: settings.cwd,
+            threadSource: settings.threadSource,
+          },
+        };
+      },
+      resetAttempt: async () => {
+        effects.push("reset");
+        attempt = drift({ ...attempt, status: "pending", threadId: null });
+        return { attempt: { ...attempt } };
+      },
+      attachThread: async ({ threadId }) => {
+        effects.push("attach");
+        attempt = transition === "attach"
+          ? drift({ ...attempt, status: "started", threadId })
+          : { ...attempt, status: "started", threadId };
+        return { attempt: { ...attempt } };
+      },
+      observeMissingAttempt: async () => {
+        effects.push("observe");
+        attempt = transition === "observe"
+          ? drift({ ...attempt, missingSince: new Date(observedAt).toISOString() })
+          : { ...attempt, missingSince: "2000-01-01T00:00:00.000Z" };
+        return { attempt: { ...attempt } };
+      },
+      clearMissingAttempt: async () => {
+        effects.push("clear");
+        attempt = drift({ ...attempt, missingSince: null });
+        return { attempt: { ...attempt } };
+      },
+      resetMissingAttempt: async () => {
+        effects.push("reset-missing");
+        attempt = drift({ ...attempt, status: "pending", threadId: null, missingSince: null });
+        return { attempt: { ...attempt } };
+      },
+      resumeExpiredAttempt: async () => {
+        effects.push("resume");
+        attempt = drift({ ...attempt, status: "started" });
+        return { attempt: { ...attempt } };
+      },
+      deliverInstruction: async () => {
+        effects.push("delivery");
+        return { delivery: "started", turnId: "turn-cap59-envelope" };
+      },
+    };
+    const result = await runCoordinatorProvisioningMonitorOnce(options);
+    const transitionIndex = effects.indexOf(transition);
+    observed.push([
+      label,
+      result.reason,
+      transitionIndex >= 0,
+      effects.slice(transitionIndex + 1),
+    ]);
+  }
+  assert.deepEqual(observed, scenarios.map(([label]) => [
+    label,
+    "attempt-binding-mismatch",
+    true,
+    [],
+  ]));
+});
+
+test("CAP-59 Global provisioning replays an exact-host expired attempt", async () => {
+  const ownership = [];
+  let attempt;
+  const replay = await runCoordinatorProvisioningMonitorOnce({
+    policy: { enabled: true, projectId: "cap59-exact-replay", model: "gpt-5", reasoningEffort: "high" },
+    hostExecutor: localHostExecutor,
+    readPreflight: async () => cap59Preflight("cap59-exact-replay", "local"),
+    getAttempt: async (request) => {
+      ownership.push(["lookup", request.ownedCodexHostId]);
+      const fingerprint = request.idempotencyKey.slice("coordinator-provision-".length);
+      attempt = {
+        id: "cap59-replay-attempt", projectId: "cap59-exact-replay",
+        idempotencyKey: request.idempotencyKey,
+        taskId: `coordinator-cap59-exact-replay-${fingerprint.slice(0, 12)}`,
+        label: "Taskboard Execution Coordinator",
+        threadSource: `taskboard-coordinator-provision-${fingerprint}`,
+        model: "gpt-5", reasoningEffort: "high", expectedRevision: "a".repeat(64),
+        ownerRootTaskId: "owner-root",
+        ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        ownerRootCodexProjectId: "cap59-project",
+        ownerRootCodexProjectKind: "local",
+        ownerRootCodexHostId: "local",
+        ownerRootWorkspacePath: "/tmp/cap59-owner",
+        codexProjectId: "cap59-project", codexProjectKind: "local", codexHostId: "local",
+        workspacePath: "/tmp/cap59-owner", status: "expired",
+        threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      };
+      return { attempt };
+    },
+    requestAttempt: async () => assert.fail("the exact replay must reuse its attempt"),
+    readThread: async () => null,
+    findThread: async (candidate) => ({
+      id: candidate.threadId, cwd: candidate.workspacePath, threadSource: candidate.threadSource,
+      turns: [{ input: `TASKBOARD_COORDINATOR_PROVISIONING_V1:${candidate.id}` }],
+    }),
+    markStarting: async () => assert.fail("the exact replay must not start another thread"),
+    startThread: async () => assert.fail("the exact replay must not start another thread"),
+    attachThread: async () => assert.fail("the exact replay is already attached"),
+    resumeExpiredAttempt: async (request) => {
+      ownership.push(["resume", request.ownedCodexHostId]);
+      return { attempt: { ...attempt, status: "started" } };
+    },
+    deliverInstruction: async () => ({ delivery: "observed", turnId: "turn-cap59-replay" }),
+  });
+  assert.equal(replay.provisioned, true);
+  assert.deepEqual(ownership, [["lookup", "local"], ["resume", "local"]]);
+});
+
+for (const [lookupMode, lookupTrace] of [
+  ["exact-key", ["exact-lookup"]],
+  ["fallback-active", ["exact-lookup", "fallback-lookup"]],
+  ["fallback-identity-drift", ["exact-lookup", "fallback-lookup"]],
+]) {
+  const title = lookupMode === "fallback-identity-drift"
+    ? "CAP-59 Global provisioning rejects fallback-active identity drift before attempt recovery"
+    : `CAP-59 Global provisioning blocks stale retirement before ${lookupMode} attempt recovery`;
+  test(title, async () => {
+    const projectId = `cap59-stale-${lookupMode}`;
+    const staleWindow = {
+      taskId: "cap59-stale-coordinator",
+      label: "Stale Global Coordinator",
+      role: "coordinator",
+      threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      codexProjectId: "cap59-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/cap59-owner",
+    };
+    const effects = [];
+    const currentFingerprint = createHash("sha256")
+      .update(JSON.stringify({ projectId, revision: "a".repeat(64), ownerRootTaskId: "owner-root" }))
+      .digest("hex");
+    const fallbackFingerprint = createHash("sha256")
+      .update(JSON.stringify({ projectId, revision: "c".repeat(64), ownerRootTaskId: "owner-root" }))
+      .digest("hex");
+    const mismatchedThreadSourceFingerprint = createHash("sha256")
+      .update(JSON.stringify({ projectId, revision: "d".repeat(64), ownerRootTaskId: "owner-root" }))
+      .digest("hex");
+    const existingFingerprint = lookupMode === "exact-key" ? currentFingerprint : fallbackFingerprint;
+    const attemptId = `cap59-stale-attempt-${lookupMode}`;
+    const existingAttempt = () => ({
+      id: attemptId,
+      projectId,
+      idempotencyKey: `coordinator-provision-${existingFingerprint}`,
+      taskId: `coordinator-${projectId}-${existingFingerprint.slice(0, 12)}`,
+      label: "Taskboard Execution Coordinator",
+      threadSource: lookupMode === "fallback-identity-drift"
+        ? `taskboard-coordinator-provision-${mismatchedThreadSourceFingerprint}`
+        : `taskboard-coordinator-provision-${existingFingerprint}`,
+      model: "gpt-5",
+      reasoningEffort: "high",
+      expectedRevision: lookupMode === "fallback-identity-drift"
+        ? "a".repeat(64)
+        : "b".repeat(64),
+      ownerRootTaskId: "owner-root",
+      ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      codexProjectId: "cap59-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/cap59-owner",
+      status: "started",
+      threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+      retryCount: 0,
+      missingSince: null,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+      hostExecutor: localHostExecutor,
+      readPreflight: async () => {
+        effects.push("preflight");
+        return cap59Preflight(
+          projectId,
+          "local",
+          lookupMode === "fallback-identity-drift" ? [] : [staleWindow],
+        );
+      },
+      inspectCoordinatorWindow: async (window) => {
+        effects.push("inspection");
+        assert.deepEqual(window, staleWindow);
+        return { eligibility: "stale", reason: "archived", window };
+      },
+      getAttempt: async (request) => {
+        if (request.idempotencyKey) {
+          effects.push("exact-lookup");
+          assert.equal(request.idempotencyKey, `coordinator-provision-${currentFingerprint}`);
+          return { attempt: lookupMode === "exact-key" ? existingAttempt() : null };
+        }
+        effects.push("fallback-lookup");
+        return { attempt: existingAttempt() };
+      },
+      requestAttempt: async () => {
+        effects.push("request");
+        return { attempt: null };
+      },
+      readDefaultModel: async () => {
+        effects.push("model");
+        return { model: "gpt-5", reasoningEffort: "high" };
+      },
+      readThread: async (attempt) => {
+        effects.push("read-thread");
+        return {
+          id: attempt.threadId,
+          cwd: attempt.workspacePath,
+          threadSource: attempt.threadSource,
+          turns: [],
+        };
+      },
+      findThread: async () => {
+        effects.push("find-thread");
+        return null;
+      },
+      findArchivedThread: async () => {
+        effects.push("find-archived");
+        return null;
+      },
+      markStarting: async () => {
+        effects.push("starting");
+        return { attempt: existingAttempt() };
+      },
+      startThread: async () => {
+        effects.push("start-thread");
+        return null;
+      },
+      attachThread: async () => {
+        effects.push("attach");
+        return { attempt: existingAttempt() };
+      },
+      observeMissingAttempt: async () => {
+        effects.push("observe-missing");
+        return { attempt: existingAttempt() };
+      },
+      clearMissingAttempt: async () => {
+        effects.push("clear-missing");
+        return { attempt: existingAttempt() };
+      },
+      resumeExpiredAttempt: async () => {
+        effects.push("resume-expired");
+        return { attempt: existingAttempt() };
+      },
+      deliverInstruction: async () => {
+        effects.push("deliver");
+        return {
+          delivery: lookupMode === "fallback-identity-drift" ? "observed" : "started",
+          turnId: "turn-cap59-stale",
+        };
+      },
+    });
+    const identityDrift = lookupMode === "fallback-identity-drift";
+    assert.deepEqual(
+      [result, effects],
+      [{
+        provisioned: false,
+        reason: identityDrift ? "attempt-binding-mismatch" : "stale-retirement-required",
+        attemptId,
+      }, [
+        "preflight",
+        ...(identityDrift ? [] : ["inspection"]),
+        ...lookupTrace,
+      ]],
+    );
+  });
+}

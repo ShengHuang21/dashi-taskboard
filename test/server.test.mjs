@@ -4599,6 +4599,7 @@ test("resident provisioning persists one protected idempotent attempt before rep
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
+    ownedCodexHostId: "local",
     workspacePath,
   };
   const unprotected = await request(baseUrl, pathname, { method: "POST", body });
@@ -4622,7 +4623,7 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(replayed.body.applied, false);
   assert.equal(replayed.body.attempt.id, created.body.attempt.id);
   const lookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
-  const lookupBody = { idempotencyKey: body.idempotencyKey };
+  const lookupBody = { idempotencyKey: body.idempotencyKey, ownedCodexHostId: "local" };
   const lookup = await request(baseUrl, lookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "a".repeat(32), lookupPath, lookupBody),
@@ -4671,12 +4672,12 @@ test("resident provisioning persists one protected idempotent attempt before rep
     headers: { "x-taskboard-client": "taskctl" },
   });
   const rebindPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/rebind`;
-  const rebindBody = { expectedRevision: driftedWindows.body.revision };
+  const rebindBody = { expectedRevision: driftedWindows.body.revision, ownedCodexHostId: "local" };
   const unprotectedRebind = await request(baseUrl, rebindPath, {
     method: "POST", body: rebindBody,
   });
   assert.equal(unprotectedRebind.response.status, 403);
-  const staleRebindBody = { expectedRevision: windows.body.revision };
+  const staleRebindBody = { expectedRevision: windows.body.revision, ownedCodexHostId: "local" };
   const staleRebind = await request(baseUrl, rebindPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "e".repeat(32), rebindPath, staleRebindBody),
@@ -4723,8 +4724,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const startingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
   const starting = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), startingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(starting.response.status, 200, JSON.stringify(starting.body));
   assert.equal(starting.body.attempt.status, "starting");
@@ -4737,8 +4738,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const resetPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/reset`;
   const reset = await request(baseUrl, resetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), resetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), resetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(reset.response.status, 200, JSON.stringify(reset.body));
   assert.equal(reset.body.attempt.status, "pending");
@@ -4746,13 +4747,15 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.ok(Date.parse(reset.body.attempt.expiresAt) > Date.parse(shortExpiry) + 9 * 60_000);
   const restarted = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), startingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(restarted.response.status, 200, JSON.stringify(restarted.body));
   assert.equal(restarted.body.attempt.status, "starting");
   const attachPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/attach`;
-  const attachBody = { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" };
+  const attachBody = {
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", ownedCodexHostId: "local",
+  };
   const attached = await request(baseUrl, attachPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "8".repeat(32), attachPath, attachBody),
@@ -4772,8 +4775,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const resumeExpiredPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/resume-expired`;
   const activeResume = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "d1".repeat(16), resumeExpiredPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "d1".repeat(16), resumeExpiredPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(activeResume.response.status, 409);
   assert.equal(activeResume.body.error.code, "COORDINATOR_PROVISIONING_STATE_CONFLICT");
@@ -4798,9 +4801,9 @@ test("resident provisioning persists one protected idempotent attempt before rep
         instanceSecret,
         (index + 20).toString(16).padStart(2, "0").repeat(16),
         resumeExpiredPath,
-        {},
+        { ownedCodexHostId: "local" },
       ),
-      body: {},
+      body: { ownedCodexHostId: "local" },
     });
     assert.equal(rejectedResume.response.status, 409);
     const rejectedInspection = new DatabaseSync(databasePath);
@@ -4869,15 +4872,15 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const observeMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/observe-missing`;
   const observedMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b1".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b1".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(observedMissing.response.status, 200, JSON.stringify(observedMissing.body));
   assert.ok(Date.parse(observedMissing.body.attempt.missingSince));
   const observedMissingAgain = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b2".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b2".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(observedMissingAgain.response.status, 200, JSON.stringify(observedMissingAgain.body));
   assert.equal(
@@ -4887,13 +4890,13 @@ test("resident provisioning persists one protected idempotent attempt before rep
 
   const missingResetPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/reset-missing`;
   const unprotectedMissingReset = await request(baseUrl, missingResetPath, {
-    method: "POST", body: {},
+    method: "POST", body: { ownedCodexHostId: "local" },
   });
   assert.equal(unprotectedMissingReset.response.status, 403);
   const earlyMissingReset = await request(baseUrl, missingResetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b3".repeat(16), missingResetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b3".repeat(16), missingResetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(earlyMissingReset.response.status, 409);
   assert.equal(
@@ -4903,15 +4906,15 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const clearMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/clear-missing`;
   const clearedMissing = await request(baseUrl, clearMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b4".repeat(16), clearMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b4".repeat(16), clearMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(clearedMissing.response.status, 200, JSON.stringify(clearedMissing.body));
   assert.equal(clearedMissing.body.attempt.missingSince, null);
   const reobservedMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b5".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b5".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(reobservedMissing.response.status, 200, JSON.stringify(reobservedMissing.body));
   assert.notEqual(
@@ -4925,8 +4928,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   missingNoWorkInspection.close();
   const missingNoWorkReset = await request(baseUrl, missingResetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "ac".repeat(16), missingResetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ac".repeat(16), missingResetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(missingNoWorkReset.response.status, 409);
   assert.equal(
@@ -4944,8 +4947,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   restoreMissingWorkInspection.close();
   const missingReset = await request(baseUrl, missingResetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "ab".repeat(16), missingResetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ab".repeat(16), missingResetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(missingReset.response.status, 200, JSON.stringify(missingReset.body));
   assert.equal(missingReset.body.attempt.status, "pending");
@@ -4953,8 +4956,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(missingReset.body.attempt.retryCount, 2);
   const missingRestart = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "cd".repeat(16), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "cd".repeat(16), startingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(missingRestart.response.status, 200, JSON.stringify(missingRestart.body));
   const missingReattach = await request(baseUrl, attachPath, {
@@ -4974,8 +4977,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   expiredMissingInspection.close();
   const observedExpiredMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b6".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b6".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(
     observedExpiredMissing.response.status,
@@ -4986,13 +4989,13 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.ok(Date.parse(observedExpiredMissing.body.attempt.missingSince));
 
   const unprotectedExpiredResume = await request(baseUrl, resumeExpiredPath, {
-    method: "POST", body: {},
+    method: "POST", body: { ownedCodexHostId: "local" },
   });
   assert.equal(unprotectedExpiredResume.response.status, 403);
   const resumedExpiredAttempt = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b7".repeat(16), resumeExpiredPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b7".repeat(16), resumeExpiredPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(resumedExpiredAttempt.response.status, 200, JSON.stringify(resumedExpiredAttempt.body));
   assert.equal(resumedExpiredAttempt.body.attempt.status, "started");
@@ -5167,7 +5170,7 @@ test("resident provisioning atomically retires exact stale Coordinator windows",
     model: "gpt-5", reasoningEffort: "high", expectedRevision: before.body.revision,
     ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", ownedCodexHostId: "local", workspacePath: "/tmp/sbkk",
     retireCoordinatorWindows: [staleWindow],
   };
   const wrongBody = {
@@ -5211,16 +5214,20 @@ test("resident provisioning atomically retires exact stale Coordinator windows",
   const activeLookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
   const activeLookup = await request(baseUrl, activeLookupPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), activeLookupPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), activeLookupPath, { ownedCodexHostId: "local" },
+    ),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(activeLookup.response.status, 200, JSON.stringify(activeLookup.body));
   assert.equal(activeLookup.body.attempt.id, created.body.attempt.id);
   const recoveryPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
   const recovered = await request(baseUrl, recoveryPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), recoveryPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "5".repeat(32), recoveryPath, { ownedCodexHostId: "local" },
+    ),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(recovered.response.status, 200, JSON.stringify(recovered.body));
   assert.equal(recovered.body.attempt.status, "starting");
@@ -5326,7 +5333,7 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
     ownerRootTaskId: "owner-root",
     ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", ownedCodexHostId: "local", workspacePath: "/tmp/sbkk",
     retireCoordinatorWindows: [invalidOwnerPreflight.body.windows[1]],
   };
   const rejected = await request(baseUrl, rejectedPath, {
@@ -5362,7 +5369,7 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
     ownerRootTaskId: "owner-root",
     ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", ownedCodexHostId: "local", workspacePath: "/tmp/sbkk",
     retireCoordinatorWindows: [repairedPreflight.body.windows[1]],
   };
   const created = await request(baseUrl, provisioningPath, {
@@ -5381,9 +5388,9 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
   const lookup = await request(baseUrl, lookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "a".repeat(32), lookupPath, {},
+      instanceSecret, "a".repeat(32), lookupPath, { ownedCodexHostId: "local" },
     ),
-    body: {},
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(lookup.response.status, 200, JSON.stringify(lookup.body));
   assert.equal(lookup.body.attempt.id, created.body.attempt.id);
@@ -5496,6 +5503,7 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
+    ownedCodexHostId: "local",
     workspacePath: "/tmp/sbkk",
   };
   const invalidExecutorRequests = [{
@@ -5591,6 +5599,7 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
+    ownedCodexHostId: "local",
     workspacePath: "/tmp/sbkk",
   };
   const provisioningPath = "/api/local/projects/local/coordinator-provisioning-attempts";
@@ -10048,4 +10057,764 @@ test("task changes from one LAN client are broadcast to another client", async (
   assert.equal(listResult.response.status, 200);
   assert.equal(listResult.body.tasks.some((task) => task.id === createResult.body.task.id), true);
   await reader.cancel();
+});
+
+test("CAP-59 Global provisioning APIs require the exact owning host before every transition", async () => {
+  let databasePath;
+  const instanceSecret = "c".repeat(64);
+  const workspacePath = "/tmp/cap59-server-owner";
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        taskType: "root_task", codexProjectId: "cap59-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 durable work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null,
+      recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const provisionBody = {
+    idempotencyKey: "cap59-exact-attempt",
+    taskId: "cap59-coordinator",
+    label: "Taskboard Execution Coordinator",
+    threadSource: "cap59-coordinator-source",
+    model: "gpt-5",
+    reasoningEffort: "high",
+    expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "cap59-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath,
+    ownedCodexHostId: "local",
+  };
+  const setup = new TaskboardDatabase(databasePath);
+  const baseConfiguration = setup.getAgentLaneProject("local");
+  const created = setup.requestAgentLaneCoordinatorProvisioningAttempt("local", provisionBody);
+  setup.close();
+  assert.equal(created.applied, true);
+
+  const attemptId = created.attempt.id;
+  const lookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
+  const requestPath = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const { ownedCodexHostId: _ownedCodexHostId, ...provisionBodyWithoutExecutor } = provisionBody;
+  const transitionStates = {
+    starting: {
+      status: "starting", threadId: null, expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+    attach: {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: "f".repeat(64),
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    reset: {
+      status: "starting", threadId: null, expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "observe-missing": {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "clear-missing": {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: "2026-09-07T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "reset-missing": {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: "2000-01-01T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "resume-expired": {
+      status: "expired", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+    rebind: {
+      status: "pending", threadId: null, expectedRevision: "f".repeat(64),
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+  };
+  const storageSnapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const snapshot = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get(attemptId),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return snapshot;
+  };
+  const setTransitionState = (state) => {
+    const inspection = new DatabaseSync(databasePath);
+    inspection.prepare(`
+      UPDATE agent_coordinator_provisioning_attempts
+      SET status = ?, thread_id = ?, expected_revision = ?, missing_since = ?, expires_at = ?,
+          updated_at = '2000-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(
+      state.status, state.threadId, state.expectedRevision, state.missingSince, state.expiresAt, attemptId,
+    );
+    inspection.close();
+  };
+  const outcomes = [];
+  const expectedOutcomes = [];
+  const execute = async (label, pathname, body, status, code, state = null) => {
+    if (state) setTransitionState(state);
+    const before = storageSnapshot();
+    const response = await request(baseUrl, pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret,
+        `${outcomes.length + 1}`.padStart(2, "0").repeat(16),
+        pathname,
+        body,
+      ),
+      body,
+    });
+    outcomes.push([
+      label,
+      response.response.status,
+      response.body?.error?.code ?? null,
+      JSON.stringify(storageSnapshot()) === JSON.stringify(before),
+    ]);
+    expectedOutcomes.push([label, status, code, true]);
+  };
+
+  for (const [label, executorBody, status, code] of [
+    ["lookup:missing", {}, 400, "INVALID_FIELD"],
+    ["lookup:foreign", { ownedCodexHostId: "remote-builder" }, 409, "HOST_EXECUTOR_MISMATCH"],
+  ]) {
+    await execute(
+      label,
+      lookupPath,
+      executorBody,
+      status,
+      code,
+      label === "lookup:foreign" ? transitionStates.starting : null,
+    );
+  }
+  await execute(
+    "request:missing",
+    requestPath,
+    { ...provisionBodyWithoutExecutor, idempotencyKey: "cap59-missing-request" },
+    400,
+    "INVALID_FIELD",
+    { ...transitionStates.rebind, expectedRevision: windows.body.revision },
+  );
+  const staleCoordinator = {
+    id: "cap59-stale-coordinator", label: "Stale Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/cap59-stale-coordinator",
+  };
+  const staleWindow = {
+    taskId: staleCoordinator.id, label: staleCoordinator.label, role: "coordinator",
+    threadId: staleCoordinator.threadId, codexProjectId: staleCoordinator.codexProjectId,
+    codexProjectKind: staleCoordinator.codexProjectKind, codexHostId: staleCoordinator.codexHostId,
+    workspacePath: staleCoordinator.workspacePath,
+  };
+  const staleSetup = new TaskboardDatabase(databasePath);
+  staleSetup.upsertAgentLaneProject("local", {
+    ...baseConfiguration,
+    tasks: [...baseConfiguration.tasks, staleCoordinator],
+  });
+  staleSetup.close();
+  const staleWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  await execute(
+    "request:foreign",
+    requestPath,
+    {
+      ...provisionBody,
+      idempotencyKey: "cap59-foreign-request",
+      expectedRevision: staleWindows.body.revision,
+      retireCoordinatorWindows: [staleWindow],
+      ownedCodexHostId: "remote-builder",
+    },
+    409,
+    "HOST_EXECUTOR_MISMATCH",
+    transitionStates.starting,
+  );
+  const restore = new TaskboardDatabase(databasePath);
+  restore.upsertAgentLaneProject("local", baseConfiguration);
+  restore.close();
+  const restoredWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  for (const state of Object.values(transitionStates)) {
+    if (state.expectedRevision === windows.body.revision) {
+      state.expectedRevision = restoredWindows.body.revision;
+    }
+  }
+  for (const [action, state] of Object.entries(transitionStates)) {
+    const pathname = `/api/local/coordinator-provisioning-attempts/${attemptId}/${action}`;
+    const transitionBody = action === "attach"
+      ? { threadId: state.threadId }
+      : action === "rebind"
+        ? { expectedRevision: restoredWindows.body.revision }
+        : {};
+    await execute(
+      `${action}:foreign`,
+      pathname,
+      { ...transitionBody, ownedCodexHostId: "remote-builder" },
+      409,
+      "HOST_EXECUTOR_MISMATCH",
+      state,
+    );
+  }
+  await execute(
+    "starting:missing",
+    `/api/local/coordinator-provisioning-attempts/${attemptId}/starting`,
+    {},
+    400,
+    "INVALID_FIELD",
+    transitionStates.starting,
+  );
+  await execute(
+    "reset:invalid",
+    `/api/local/coordinator-provisioning-attempts/${attemptId}/reset`,
+    { ownedCodexHostId: "bad\nhost" },
+    400,
+    "INVALID_FIELD",
+    transitionStates.reset,
+  );
+  assert.deepEqual(outcomes, expectedOutcomes);
+});
+
+test("CAP-59 Global request rejects a foreign stale Coordinator before retirement", async () => {
+  let databasePath;
+  const instanceSecret = "5".repeat(64);
+  const workspacePath = "/tmp/cap59-owner-local";
+  const foreignCoordinator = {
+    id: "cap59-foreign-stale", label: "Foreign stale Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-foreign-project", codexProjectKind: "remote",
+    codexHostId: "remote-builder", workspacePath: "/tmp/cap59-foreign-stale",
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-owner-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }, foreignCoordinator],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap59-foreign-stale-lease", holderTaskId: foreignCoordinator.id,
+        holderThreadId: foreignCoordinator.threadId, holderCodexHostId: "remote-builder",
+        holderWorkspacePath: foreignCoordinator.workspacePath,
+        acquiredAt: "2026-09-07T00:00:00.000Z", expiresAt: "2026-09-07T00:05:00.000Z",
+        releasedAt: "2026-09-07T00:05:00.000Z",
+      },
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 durable work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "cap59-local-retires-foreign", taskId: "cap59-local-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-local-retires-foreign",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "cap59-owner-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath, ownedCodexHostId: "local",
+    retireCoordinatorWindows: [{
+      taskId: foreignCoordinator.id, label: foreignCoordinator.label, role: "coordinator",
+      threadId: foreignCoordinator.threadId, codexProjectId: foreignCoordinator.codexProjectId,
+      codexProjectKind: foreignCoordinator.codexProjectKind,
+      codexHostId: foreignCoordinator.codexHostId, workspacePath: foreignCoordinator.workspacePath,
+    }],
+  };
+  const snapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const state = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get("cap59-local-retires-foreign"),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return state;
+  };
+  const before = snapshot();
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), pathname, body),
+    body,
+  });
+  assert.deepEqual(
+    [response.response.status, response.body?.error?.code ?? null, snapshot()],
+    [409, "HOST_EXECUTOR_MISMATCH", before],
+  );
+  await runCap59DuplicateCoordinatorTaskIdScenario();
+});
+
+test("CAP-59 Global request fences a foreign expired nonterminal attempt before expiry", async () => {
+  let databasePath;
+  const instanceSecret = "6".repeat(64);
+  const workspacePath = "/tmp/cap59-expiry-owner";
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-expiry-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 expiry work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.database.prepare(`
+      INSERT INTO agent_coordinator_provisioning_attempts (
+        id, project_id, idempotency_key, request_fingerprint, task_id, label,
+        thread_source, model, reasoning_effort, expected_revision,
+        owner_root_task_id, owner_root_thread_id,
+        codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+        status, thread_id, retry_count, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'starting', NULL, 0, ?, ?, ?)
+    `).run(
+      "cap59-foreign-expired", "local", "cap59-foreign-old-key", "cap59-foreign-fingerprint",
+      "cap59-foreign-coordinator", "Foreign expired Coordinator", "cap59-foreign-old-source",
+      "gpt-5", "high", "cap59-foreign-revision", "owner-root", "owner-thread",
+      "cap59-foreign-project", "remote", "remote-builder", "/tmp/cap59-foreign-expired",
+      "2026-09-07T00:00:00.000Z", "2026-09-07T00:01:00.000Z", "2000-01-01T00:00:00.000Z",
+    );
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "cap59-local-new-key", taskId: "cap59-local-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-local-new-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "cap59-expiry-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath, ownedCodexHostId: "local",
+  };
+  const snapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const state = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get("cap59-foreign-expired"),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return state;
+  };
+  const before = snapshot();
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), pathname, body),
+    body,
+  });
+  assert.deepEqual(
+    [response.response.status, response.body?.error?.code ?? null, snapshot()],
+    [409, "HOST_EXECUTOR_MISMATCH", before],
+  );
+});
+
+test("CAP-59 Global stale retirement restores legacy rootTaskId to Owner Root", async () => {
+  let databasePath;
+  const instanceSecret = "7".repeat(64);
+  const workspacePath = "/tmp/cap59-legacy-owner";
+  const staleCoordinator = {
+    id: "cap59-legacy-stale", label: "Legacy stale Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-legacy-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/cap59-legacy-stale",
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: staleCoordinator.id,
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-legacy-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }, staleCoordinator],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap59-legacy-stale-lease", holderTaskId: staleCoordinator.id,
+        holderThreadId: staleCoordinator.threadId, holderCodexHostId: "local",
+        holderWorkspacePath: staleCoordinator.workspacePath,
+        acquiredAt: "2026-09-07T00:00:00.000Z", expiresAt: "2026-09-07T00:05:00.000Z",
+        releasedAt: "2026-09-07T00:05:00.000Z",
+      },
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 legacy work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "cap59-legacy-root-repair", taskId: "cap59-local-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-legacy-root-repair",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "cap59-legacy-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath, ownedCodexHostId: "local",
+    retireCoordinatorWindows: [{
+      taskId: staleCoordinator.id, label: staleCoordinator.label, role: "coordinator",
+      threadId: staleCoordinator.threadId, codexProjectId: staleCoordinator.codexProjectId,
+      codexProjectKind: staleCoordinator.codexProjectKind, codexHostId: "local",
+      workspacePath: staleCoordinator.workspacePath,
+    }],
+  };
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), pathname, body),
+    body,
+  });
+  const inspection = new DatabaseSync(databasePath);
+  const config = JSON.parse(inspection.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get().config_json);
+  inspection.close();
+  assert.deepEqual(
+    [response.response.status, response.body?.applied ?? false, config.rootTaskId,
+      config.ownerRootTaskId, config.tasks.map((task) => task.id)],
+    [200, true, "owner-root", "owner-root", ["owner-root"]],
+  );
+});
+
+async function runCap59DuplicateCoordinatorTaskIdScenario() {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "cap59-duplicate-coordinator-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const workspacePath = "/tmp/cap59-duplicate-owner";
+  const localCoordinator = {
+    id: "cap59-duplicate-coordinator", label: "Local Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-duplicate-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/cap59-duplicate-local",
+  };
+  const remoteCoordinator = {
+    ...localCoordinator,
+    label: "Remote Coordinator",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640f",
+    codexProjectId: "cap59-duplicate-remote-project",
+    codexProjectKind: "remote",
+    codexHostId: "remote-builder",
+    workspacePath: "/tmp/cap59-duplicate-remote",
+  };
+  let database;
+  try {
+    database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-duplicate-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }, localCoordinator, remoteCoordinator],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 duplicate task work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    const expectedRevision = database.getAgentLaneCoordinationWindows("local").revision;
+    const body = {
+      idempotencyKey: "cap59-duplicate-coordinator-request",
+      taskId: "cap59-duplicate-replacement",
+      label: "Taskboard Execution Coordinator",
+      threadSource: "cap59-duplicate-coordinator-source",
+      model: "gpt-5",
+      reasoningEffort: "high",
+      expectedRevision,
+      ownerRootTaskId: "owner-root",
+      ownerRootThreadId: "owner-thread",
+      codexProjectId: "cap59-duplicate-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath,
+      ownedCodexHostId: "local",
+      retireCoordinatorWindows: [{
+        taskId: localCoordinator.id,
+        label: localCoordinator.label,
+        role: "coordinator",
+        threadId: localCoordinator.threadId,
+        codexProjectId: localCoordinator.codexProjectId,
+        codexProjectKind: localCoordinator.codexProjectKind,
+        codexHostId: localCoordinator.codexHostId,
+        workspacePath: localCoordinator.workspacePath,
+      }],
+    };
+    const snapshot = () => {
+      const inspection = new DatabaseSync(databasePath);
+      const state = {
+        target: inspection.prepare(
+          "SELECT * FROM agent_coordinator_provisioning_attempts WHERE project_id = ? AND idempotency_key = ?",
+        ).get("local", body.idempotencyKey),
+        attemptCount: inspection.prepare(
+          "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+        ).get().count,
+        attempts: inspection.prepare(
+          "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+        ).all(),
+        tasks: inspection.prepare(
+          "SELECT * FROM tasks WHERE project_id = 'local' ORDER BY id",
+        ).all(),
+        configJson: inspection.prepare(
+          "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+        ).get().config_json,
+      };
+      inspection.close();
+      return state;
+    };
+    const before = snapshot();
+    let responseStatus = null;
+    let responseCode = null;
+    try {
+      database.requestAgentLaneCoordinatorProvisioningAttempt("local", body);
+      responseStatus = 200;
+    } catch (error) {
+      responseStatus = error?.status ?? null;
+      responseCode = error?.code ?? null;
+    }
+    assert.deepEqual(
+      [responseStatus, responseCode, snapshot()],
+      [409, "COORDINATOR_PROVISIONING_STALE_WINDOW_CONFLICT", before],
+    );
+  } finally {
+    database?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test("CAP-59 accepts an exact remote Global executor while preserving Domain API bodies", async () => {
+  const instanceSecret = "d".repeat(64);
+  let databasePath;
+  const remoteWorkspace = "/tmp/cap59-remote-owner";
+  const domainWorkspace = "/tmp/cap59-domain-peer";
+  const globalWorkspace = "/tmp/cap59-domain-global";
+  let domainRevision;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createProject({ id: "remote", name: "CAP-59 remote", workspacePath: null });
+    database.upsertAgentLaneProject("remote", {
+      rootTaskId: "remote-owner",
+      ownerRootTaskId: "remote-owner",
+      tasks: [{
+        id: "remote-owner", label: "Remote Owner Root", owner: "Codex", source: "codex",
+        connection: "connected", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        taskType: "root_task", codexProjectId: "cap59-remote-project", codexProjectKind: "remote",
+        codexHostId: "remote-builder", workspacePath: remoteWorkspace,
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    database.createTask({
+      projectId: "remote", title: "CAP-59 remote durable work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null,
+      recurrence: null,
+    });
+    database.createProject({ id: "domain", name: "CAP-59 Domain", workspacePath: null });
+    database.upsertAgentLaneProject("domain", {
+      rootTaskId: "global",
+      tasks: [{
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        connection: "connected", threadId: "global-thread", taskType: "root_task",
+        codexProjectId: "cap59-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspace,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        connection: "connected", threadId: "frontend-thread", taskType: "peer_task",
+        codexProjectId: "cap59-domain-project", codexProjectKind: "remote",
+        codexHostId: "domain-builder", workspacePath: domainWorkspace,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "domain-global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspace,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+    });
+    const domainTask = database.createTask({
+      projectId: "domain", title: "CAP-59 Domain compatibility", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "global-thread",
+      threadBinding: {
+        threadId: "global-thread", codexProjectId: "cap59-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspace,
+      },
+      actor, assignee: actor,
+      developmentContext: { type: "worktree", path: domainWorkspace, branch: "cap59-domain" },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("domain", domainTask.id, {
+      domainId: "frontend", taskVersion: domainTask.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "domain-global-lease",
+    });
+    domainRevision = database.getAgentLaneCoordinationWindows("domain").revision;
+    database.close();
+    return { instanceSecret };
+  });
+  const remoteWindows = await request(baseUrl, "/api/local/projects/remote/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const remotePath = "/api/local/projects/remote/coordinator-provisioning-attempts";
+  const remoteBody = {
+    idempotencyKey: "cap59-remote-exact", taskId: "cap59-remote-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-remote-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: remoteWindows.body.revision,
+    ownerRootTaskId: "remote-owner", ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "cap59-remote-project", codexProjectKind: "remote",
+    codexHostId: "remote-builder", workspacePath: remoteWorkspace,
+    ownedCodexHostId: "remote-builder",
+  };
+  const outcomes = [];
+  const remote = await request(baseUrl, remotePath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), remotePath, remoteBody),
+    body: remoteBody,
+  });
+  const remoteInspection = new DatabaseSync(databasePath);
+  const remoteRow = remoteInspection.prepare(`
+    SELECT codex_host_id AS codexHostId FROM agent_coordinator_provisioning_attempts
+    WHERE project_id = 'remote' ORDER BY created_at, id
+  `).get();
+  remoteInspection.close();
+  outcomes.push(["remote-exact", remote.response.status, remote.body?.attempt?.status ?? null, remoteRow?.codexHostId ?? null]);
+
+  const domainPath = "/api/local/projects/domain/domain-coordinator-provisioning-attempts/frontend";
+  const domainBody = {
+    idempotencyKey: "cap59-domain-compat", taskId: "frontend",
+    label: "Frontend Coordinator", threadSource: "cap59-domain-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: domainRevision,
+    expectedGlobalLeaseId: "domain-global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", codexProjectId: "cap59-domain-project",
+    codexProjectKind: "remote", codexHostId: "domain-builder", workspacePath: domainWorkspace,
+  };
+  const domainCreated = await request(baseUrl, domainPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), domainPath, domainBody),
+    body: domainBody,
+  });
+  outcomes.push(["domain-request", domainCreated.response.status, domainCreated.body?.attempt?.status ?? null]);
+  const domainLookupPath = `${domainPath}/lookup`;
+  const domainLookupBody = { idempotencyKey: domainBody.idempotencyKey };
+  const domainLookup = await request(baseUrl, domainLookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), domainLookupPath, domainLookupBody),
+    body: domainLookupBody,
+  });
+  outcomes.push(["domain-lookup", domainLookup.response.status, domainLookup.body?.attempt?.id ?? null]);
+  const domainStartingPath = `/api/local/domain-coordinator-provisioning-attempts/${domainCreated.body?.attempt?.id ?? "missing"}/starting`;
+  const domainStarting = await request(baseUrl, domainStartingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), domainStartingPath, {}),
+    body: {},
+  });
+  outcomes.push(["domain-transition", domainStarting.response.status, domainStarting.body?.attempt?.status ?? null]);
+  assert.deepEqual(outcomes, [
+    ["remote-exact", 200, "pending", "remote-builder"],
+    ["domain-request", 200, "pending"],
+    ["domain-lookup", 200, domainCreated.body?.attempt?.id ?? null],
+    ["domain-transition", 200, "starting"],
+  ]);
 });

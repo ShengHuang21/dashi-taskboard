@@ -2134,9 +2134,10 @@ async function requestCoordinatorProvisioningAttempt(request) {
 
 async function getCoordinatorProvisioningAttempt(request) {
   const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-provisioning-attempts/lookup`;
-  return mutateCoordinatorProvisioning(pathname, request.idempotencyKey
-    ? { idempotencyKey: request.idempotencyKey }
-    : {});
+  return mutateCoordinatorProvisioning(pathname, {
+    ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+    ownedCodexHostId: request.ownedCodexHostId,
+  });
 }
 
 async function requestDomainCoordinatorProvisioningAttempt(request) {
@@ -2277,9 +2278,12 @@ async function inspectCoordinatorProvisioningWindow(cdp, window) {
   }
 }
 
-async function transitionCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
+async function transitionCoordinatorProvisioningAttempt(attemptId, action, {
+  ownedCodexHostId,
+  ...body
+} = {}) {
   const pathname = `/api/local/coordinator-provisioning-attempts/${encodeURIComponent(attemptId)}/${action}`;
-  return mutateCoordinatorProvisioning(pathname, body);
+  return mutateCoordinatorProvisioning(pathname, { ...body, ownedCodexHostId });
 }
 
 async function transitionDomainCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
@@ -3238,6 +3242,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       async () => {
         const result = await runCoordinatorProvisioningMonitorOnce({
+          hostExecutor: residentHostExecutor,
           policy: {
             enabled: true,
             projectId,
@@ -3248,9 +3253,9 @@ async function runBackgroundContinuationMonitor(cdp) {
           readWindows: () => readCoordinatorProvisioningWindows(projectId),
           readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
           getAttempt: getCoordinatorProvisioningAttempt,
-          rebindAttempt: ({ attemptId, expectedRevision }) => (
+          rebindAttempt: ({ attemptId, expectedRevision, ownedCodexHostId }) => (
             transitionCoordinatorProvisioningAttempt(
-              attemptId, "rebind", { expectedRevision },
+              attemptId, "rebind", { expectedRevision, ownedCodexHostId },
             )
           ),
           inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
@@ -3264,29 +3269,29 @@ async function runBackgroundContinuationMonitor(cdp) {
           }),
           findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
           findArchivedThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt, true),
-          markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "starting",
+          markStarting: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "starting", { ownedCodexHostId },
           ),
           startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
             cdp, undefined, codexHostId, "thread/start", params, 10_000,
           ),
-          attachThread: ({ attemptId, threadId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "attach", { threadId },
+          attachThread: ({ attemptId, threadId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "attach", { threadId, ownedCodexHostId },
           ),
-          resetAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "reset",
+          resetAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "reset", { ownedCodexHostId },
           ),
-          resetMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "reset-missing",
+          resetMissingAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "reset-missing", { ownedCodexHostId },
           ),
-          observeMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "observe-missing",
+          observeMissingAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "observe-missing", { ownedCodexHostId },
           ),
-          clearMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "clear-missing",
+          clearMissingAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "clear-missing", { ownedCodexHostId },
           ),
-          resumeExpiredAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "resume-expired",
+          resumeExpiredAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "resume-expired", { ownedCodexHostId },
           ),
           deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
             cdp, attempt, threadId, projectId,

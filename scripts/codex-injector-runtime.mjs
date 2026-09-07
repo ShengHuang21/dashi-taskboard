@@ -665,6 +665,99 @@ function coordinatorProvisioningIdentity(projectId, revision, ownerRootTaskId) {
   };
 }
 
+function hasCanonicalCoordinatorProvisioningAttemptIdentity(attempt) {
+  const idempotencyMatch = /^coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.idempotencyKey ?? "",
+  );
+  const sourceMatch = /^taskboard-coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.threadSource ?? "",
+  );
+  const taskPrefix = typeof attempt?.projectId === "string"
+    ? `coordinator-${attempt.projectId}-`
+    : null;
+  const taskFingerprint = taskPrefix && typeof attempt?.taskId === "string"
+    && attempt.taskId.startsWith(taskPrefix)
+    ? attempt.taskId.slice(taskPrefix.length)
+    : null;
+  const taskIsCanonical = /^[a-f0-9]{12}$/.test(taskFingerprint ?? "");
+  if (!idempotencyMatch && !sourceMatch && !taskIsCanonical) return true;
+  return Boolean(idempotencyMatch && sourceMatch && taskIsCanonical
+    && taskFingerprint === idempotencyMatch[1].slice(0, 12)
+    && sourceMatch[1] === idempotencyMatch[1]);
+}
+
+function validateGlobalCoordinatorWindowSet(windows, ownerRootTaskId, hostExecutor) {
+  if (!Array.isArray(windows)) return { valid: false, issue: "malformed" };
+  if (!COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
+    || windows.some((window) => !COORDINATION_ID_PATTERN.test(window?.taskId ?? ""))
+    || windows.some((window) => !["owner_root", "coordinator"].includes(window?.role))) {
+    return { valid: false, issue: "malformed" };
+  }
+  const ownerWindows = windows.filter((window) => window.role === "owner_root");
+  if (ownerWindows.length !== 1 || ownerWindows[0].taskId !== ownerRootTaskId) {
+    return { valid: false, issue: "owner" };
+  }
+  if (new Set(windows.map((window) => window.taskId)).size !== windows.length) {
+    return { valid: false, issue: "malformed" };
+  }
+  const unownedWindow = windows.find(
+    (window) => !hostExecutorOwnsCanonicalRoute(hostExecutor, window),
+  );
+  if (unownedWindow) {
+    return { valid: false, issue: unownedWindow.role === "owner_root" ? "owner-host" : "coordinator-host" };
+  }
+  return {
+    valid: true,
+    ownerWindow: ownerWindows[0],
+    coordinatorWindows: windows.filter((window) => window.role === "coordinator"),
+  };
+}
+
+const COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS = [
+  "id", "idempotencyKey", "projectId", "taskId", "label", "threadSource",
+  "model", "reasoningEffort", "ownerRootTaskId", "ownerRootThreadId",
+  "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath", "createdAt",
+];
+const COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS = [
+  "expectedRevision", "status", "threadId", "retryCount", "missingSince", "expiresAt",
+];
+
+function coordinatorProvisioningAttemptEnvelope(attempt) {
+  return Object.fromEntries(COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS
+    .map((field) => [field, field === "workspacePath"
+      ? path.resolve(attempt?.[field] ?? "")
+      : attempt?.[field]]));
+}
+
+function coordinatorProvisioningAttemptMutableState(attempt) {
+  return Object.fromEntries(COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS
+    .map((field) => [field, attempt?.[field]]));
+}
+
+function retainsCoordinatorProvisioningAttemptEnvelope(candidate, envelope) {
+  return COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS.every((field) => (
+    field === "workspacePath"
+      ? path.resolve(candidate?.[field] ?? "") === envelope[field]
+      : candidate?.[field] === envelope[field]
+  ));
+}
+
+function matchesCoordinatorProvisioningTransitionResponse(candidate, envelope, before, {
+  allowedMutable = [],
+  expected = {},
+} = {}) {
+  if (!retainsCoordinatorProvisioningAttemptEnvelope(candidate, envelope)) return false;
+  for (const field of COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS) {
+    if (!allowedMutable.includes(field) && candidate?.[field] !== before[field]) return false;
+  }
+  return Object.entries(expected).every(([field, value]) => candidate?.[field] === value);
+}
+
+function coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, projectId) {
+  return attempt?.projectId === projectId
+    && hostExecutorOwnsCanonicalRoute(hostExecutor, attempt);
+}
+
 function domainCoordinatorProvisioningIdentity(
   projectId, revision, domainId, taskId, globalLeaseId,
 ) {
@@ -1219,7 +1312,7 @@ export async function runDomainCoordinatorShutdownMonitorOnce(options) {
 }
 
 async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
-  const { policy } = options;
+  const { policy, hostExecutor } = options;
   let snapshot;
   let windows;
   if (typeof options.readPreflight === "function") {
@@ -1270,13 +1363,24 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     return { provisioned: false, reason: "coordinator-shutdown-in-progress" };
   }
   const ownerRootTaskId = snapshot?.coordination?.ownerRootTaskId;
+  const windowSet = validateGlobalCoordinatorWindowSet(
+    windows?.windows, ownerRootTaskId, hostExecutor,
+  );
+  if (!windowSet.valid) {
+    if (windowSet.issue === "owner") return { provisioned: false, reason: "owner-root-invalid" };
+    if (windowSet.issue === "owner-host") {
+      return { provisioned: false, reason: "host-executor-unavailable" };
+    }
+    if (windowSet.issue === "coordinator-host") {
+      return { provisioned: false, reason: "coordinator-window-exists" };
+    }
+    return { provisioned: false, reason: "invalid-project-state" };
+  }
   const ownerRoute = snapshot?.coordination?.ownerRootRoute;
   const ownerLane = Array.isArray(snapshot?.taskLanes)
     ? snapshot.taskLanes.find((lane) => lane?.id === ownerRootTaskId) ?? null
     : null;
-  const ownerWindow = Array.isArray(windows?.windows)
-    ? windows.windows.find((window) => window?.taskId === ownerRootTaskId) ?? null
-    : null;
+  const ownerWindow = windowSet.ownerWindow;
   const ownerBindingValid = COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
     && snapshot?.coordination?.ownerRootValid !== false
     && windows.ownerRootTaskId === ownerRootTaskId
@@ -1293,6 +1397,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     && path.resolve(ownerRoute.rootWorkspacePath) === path.resolve(ownerLane?.workspacePath ?? "")
     && path.resolve(ownerRoute.rootWorkspacePath) === path.resolve(ownerWindow?.workspacePath ?? "");
   if (!ownerBindingValid) return { provisioned: false, reason: "owner-root-invalid" };
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, ownerLane)) {
+    return { provisioned: false, reason: "host-executor-unavailable" };
+  }
   if (snapshot?.coordination?.assignment !== "unassigned") {
     return { provisioned: false, reason: "coordinator-assigned" };
   }
@@ -1301,7 +1408,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   if (lease?.status === "expired" && lease.bindingValid === true && !lease.releasedAt) {
     return { provisioned: false, reason: "same-holder-recoverable" };
   }
-  const coordinatorWindows = windows.windows.filter((window) => window?.role === "coordinator");
+  const coordinatorWindows = windowSet.coordinatorWindows;
   const retireCoordinatorWindows = [];
   for (const window of coordinatorWindows) {
     if (typeof options.inspectCoordinatorWindow !== "function") {
@@ -1352,14 +1459,24 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     ? await options.getAttempt({
         projectId: policy.projectId,
         idempotencyKey: identity.idempotencyKey,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
       })
     : null;
   let attempt = result?.attempt ?? null;
   let recoveredActiveAttempt = false;
   if (!attempt && typeof options.getAttempt === "function") {
-    result = await options.getAttempt({ projectId: policy.projectId });
+    result = await options.getAttempt({
+      projectId: policy.projectId,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     attempt = result?.attempt ?? null;
     recoveredActiveAttempt = Boolean(attempt);
+  }
+  if (attempt && !hasCanonicalCoordinatorProvisioningAttemptIdentity(attempt)) {
+    return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+  }
+  if (attempt && retireCoordinatorWindows.length > 0) {
+    return { provisioned: false, reason: "stale-retirement-required", attemptId: attempt.id };
   }
   if (!attempt) {
     let selectedModel = {
@@ -1379,6 +1496,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     }
     result = await options.requestAttempt({
       ...identity,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
       model: selectedModel.model,
       reasoningEffort: selectedModel.reasoningEffort,
       projectId: policy.projectId,
@@ -1392,6 +1510,37 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       retireCoordinatorWindows,
     });
     attempt = result?.attempt ?? null;
+    if (attempt && !hasCanonicalCoordinatorProvisioningAttemptIdentity(attempt)) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
+    if (retireCoordinatorWindows.length > 0) {
+      if (typeof options.readPreflight !== "function") {
+        return { provisioned: false, reason: "retirement-preflight-unavailable", attemptId: attempt?.id };
+      }
+      const freshPreflight = await options.readPreflight();
+      const freshWindowSet = validateGlobalCoordinatorWindowSet(
+        freshPreflight?.windows, freshPreflight?.ownerRootTaskId, hostExecutor,
+      );
+      const freshOwner = freshWindowSet.ownerWindow;
+      const freshOwnerExact = freshWindowSet.valid
+        && freshPreflight?.projectId === policy.projectId
+        && RESUME_TOKEN_PATTERN.test(freshPreflight?.revision ?? "")
+        && freshPreflight.revision === attempt?.expectedRevision
+        && freshPreflight?.ownerRootValid === true
+        && freshPreflight?.ownerRootTaskId === ownerRootTaskId
+        && freshOwner?.role === "owner_root"
+        && freshOwner?.threadId === ownerRoute.rootThreadId
+        && freshOwner?.codexProjectId === ownerLane.codexProjectId
+        && freshOwner?.codexProjectKind === ownerLane.codexProjectKind
+        && freshOwner?.codexHostId === ownerLane.codexHostId
+        && path.resolve(freshOwner?.workspacePath ?? "")
+          === path.resolve(ownerRoute.rootWorkspacePath)
+        && freshWindowSet.coordinatorWindows.length === 0;
+      if (!freshOwnerExact) {
+        return { provisioned: false, reason: "retirement-preflight-invalid", attemptId: attempt?.id };
+      }
+      windows = freshPreflight;
+    }
   }
   if (!attempt?.id) return { provisioned: false, reason: "attempt-unavailable" };
   const stableAttemptBindingMismatch = attempt.projectId !== policy.projectId
@@ -1412,11 +1561,21 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     && !stableAttemptBindingMismatch
     && attempt.expectedRevision !== windows.revision;
   if (safeRecoveredRevisionDrift && typeof options.rebindAttempt === "function") {
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
     result = await options.rebindAttempt({
       attemptId: attempt.id,
       expectedRevision: windows.revision,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
     });
-    attempt = result?.attempt ?? attempt;
+    const reboundAttempt = result?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(reboundAttempt, envelope, before, {
+      allowedMutable: ["expectedRevision"],
+      expected: { expectedRevision: windows.revision },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = reboundAttempt;
   }
   if (stableAttemptBindingMismatch
     || attempt.projectId !== policy.projectId
@@ -1429,6 +1588,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || attempt.codexProjectId !== ownerLane.codexProjectId
     || attempt.codexProjectKind !== ownerLane.codexProjectKind
     || attempt.codexHostId !== ownerLane.codexHostId
+    || !coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)
     || path.resolve(attempt.workspacePath ?? "") !== path.resolve(ownerRoute.rootWorkspacePath)
     || typeof attempt.model !== "string" || !attempt.model
     || typeof attempt.reasoningEffort !== "string" || !attempt.reasoningEffort) {
@@ -1444,6 +1604,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   let archivedThreadChecked = false;
   let exactThreadArchived = false;
   if (attempt.threadId && typeof options.readThread === "function") {
+    if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
     const directThread = await options.readThread(attempt);
     if (directThread) {
       if (directThread.id !== attempt.threadId
@@ -1459,16 +1622,35 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       if (!exactThreadArchived) thread = directThread;
     }
   }
-  if (!thread && !exactThreadArchived) thread = await options.findThread(attempt);
+  if (!thread && !exactThreadArchived) {
+    if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
+    thread = await options.findThread(attempt);
+  }
   if (!thread && (attempt.status === "started" || recoverableExpiredThread)) {
     if (!archivedThreadChecked && typeof options.findArchivedThread === "function") {
+      if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+        return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+      }
       await options.findArchivedThread(attempt);
     }
     if (typeof options.observeMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
-    const observed = await options.observeMissingAttempt({ attemptId: attempt.id });
-    attempt = observed?.attempt ?? attempt;
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    const observed = await options.observeMissingAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const observedAttempt = observed?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(observedAttempt, envelope, before, {
+      allowedMutable: ["missingSince"],
+    }) || typeof observedAttempt.missingSince !== "string" || !observedAttempt.missingSince) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = observedAttempt;
     const missingSince = Date.parse(attempt.missingSince ?? "");
     const currentTime = typeof options.now === "function" ? options.now() : Date.now();
     if (!Number.isFinite(missingSince)
@@ -1476,11 +1658,22 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       || typeof options.resetMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
-    const reset = await options.resetMissingAttempt({ attemptId: attempt.id });
+    const resetEnvelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const resetBefore = coordinatorProvisioningAttemptMutableState(attempt);
+    const reset = await options.resetMissingAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     const resetAttempt = reset?.attempt ?? null;
-    if (resetAttempt?.id !== attempt.id
-      || resetAttempt.status !== "pending"
-      || resetAttempt.threadId !== null) {
+    if (!matchesCoordinatorProvisioningTransitionResponse(
+      resetAttempt,
+      resetEnvelope,
+      resetBefore,
+      {
+        allowedMutable: ["status", "threadId", "retryCount", "missingSince", "expiresAt"],
+        expected: { status: "pending", threadId: null, missingSince: null },
+      },
+    )) {
       return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
     }
     return { provisioned: false, reason: "missing-thread-reset", attemptId: attempt.id };
@@ -1489,9 +1682,24 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
   }
   if (!thread) {
-    result = await options.markStarting({ attemptId: attempt.id });
-    attempt = result?.attempt ?? attempt;
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    result = await options.markStarting({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const startingAttempt = result?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(startingAttempt, envelope, before, {
+      allowedMutable: ["status"],
+      expected: { status: "starting" },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = startingAttempt;
     try {
+      if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+        return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+      }
       const started = await options.startThread({
         codexHostId: attempt.codexHostId,
         cwd: attempt.workspacePath,
@@ -1505,7 +1713,18 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       thread = started?.thread ?? null;
     } catch (error) {
       if (isSelectedModelCapacityError(error) && typeof options.resetAttempt === "function") {
-        await options.resetAttempt({ attemptId: attempt.id });
+        const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+        const before = coordinatorProvisioningAttemptMutableState(attempt);
+        const reset = await options.resetAttempt({
+          attemptId: attempt.id,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        if (!matchesCoordinatorProvisioningTransitionResponse(reset?.attempt, envelope, before, {
+          allowedMutable: ["status", "retryCount", "expiresAt"],
+          expected: { status: "pending" },
+        })) {
+          return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+        }
         return { provisioned: false, reason: "model-capacity", attemptId: attempt.id };
       }
       return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
@@ -1520,11 +1739,20 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     if (typeof options.clearMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
-    const cleared = await options.clearMissingAttempt({ attemptId: attempt.id });
-    attempt = cleared?.attempt ?? attempt;
-    if (attempt.missingSince) {
-      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    const cleared = await options.clearMissingAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const clearedAttempt = cleared?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(clearedAttempt, envelope, before, {
+      allowedMutable: ["missingSince"],
+      expected: { missingSince: null },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
     }
+    attempt = clearedAttempt;
   }
   const exactDeliveryMarker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const recoverableExpiredDelivery = attempt.status === "expired"
@@ -1537,18 +1765,40 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     if (typeof options.resumeExpiredAttempt !== "function") {
       return { provisioned: false, reason: "attempt-expired-thread-active", attemptId: attempt.id };
     }
-    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    const resumed = await options.resumeExpiredAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     const resumedAttempt = resumed?.attempt ?? null;
-    if (resumedAttempt?.id !== attempt.id
-      || resumedAttempt.status !== "started"
-      || resumedAttempt.threadId !== thread.id) {
+    if (!matchesCoordinatorProvisioningTransitionResponse(resumedAttempt, envelope, before, {
+      allowedMutable: ["status", "expiresAt"],
+      expected: { status: "started", threadId: thread.id },
+    })) {
       return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
     }
     attempt = resumedAttempt;
   }
   if (attempt.threadId !== thread.id || !["started", "expired"].includes(attempt.status)) {
-    result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
-    attempt = result?.attempt ?? attempt;
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    result = await options.attachThread({
+      attemptId: attempt.id,
+      threadId: thread.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const attachedAttempt = result?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(attachedAttempt, envelope, before, {
+      allowedMutable: ["status", "threadId", "missingSince"],
+      expected: { status: "started", threadId: thread.id },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = attachedAttempt;
+  }
+  if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+    return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
   }
   const delivery = await options.deliverInstruction({
     attempt,
@@ -1575,6 +1825,8 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
 export async function runCoordinatorProvisioningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { provisioned: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || (typeof options?.readPreflight !== "function"
       && (typeof options?.readSnapshot !== "function" || typeof options?.readWindows !== "function"))
@@ -1586,15 +1838,16 @@ export async function runCoordinatorProvisioningMonitorOnce(options) {
     || typeof options?.deliverInstruction !== "function") {
     return { provisioned: false, reason: "invalid-monitor" };
   }
-  const existing = coordinatorProvisioningMonitorRuns.get(policy.projectId);
+  const runKey = coordinatorShutdownRunKey(hostExecutor, policy.projectId);
+  const existing = coordinatorProvisioningMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCoordinatorProvisioningMonitorOnceUnlocked(options);
-  coordinatorProvisioningMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorProvisioningMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorProvisioningMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorProvisioningMonitorRuns.get(policy.projectId) === run) {
-      coordinatorProvisioningMonitorRuns.delete(policy.projectId);
+    if (coordinatorProvisioningMonitorRuns.get(runKey) === run) {
+      coordinatorProvisioningMonitorRuns.delete(runKey);
     }
   }
 }
