@@ -337,6 +337,17 @@ function stringField(value, name, { required = false, nullable = false, maxLengt
   return normalized;
 }
 
+function parseOwnedCodexHostId(value) {
+  const ownedCodexHostId = stringField(value, "ownedCodexHostId", {
+    required: true,
+    maxLength: CODEX_HOST_ID_MAX_LENGTH,
+  });
+  if (!isCanonicalCodexHostId(value)) {
+    throw new ApiError(400, "INVALID_FIELD", "'ownedCodexHostId' is invalid");
+  }
+  return ownedCodexHostId;
+}
+
 function parseCoordinatorLeaseClaim(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
@@ -600,7 +611,7 @@ function parseDomainCoordinatorProvisioningRequest(value) {
 function parseCoordinatorShutdownRequest(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
-    "idempotencyKey", "expectedRevision", "expectedLeaseId",
+    "ownedCodexHostId", "idempotencyKey", "expectedRevision", "expectedLeaseId",
     "holderTaskId", "holderThreadId", "ownerRootTaskId", "ownerRootThreadId",
     "ownerRootCodexProjectId", "ownerRootCodexProjectKind",
     "ownerRootCodexHostId", "ownerRootWorkspacePath",
@@ -651,6 +662,7 @@ function parseCoordinatorShutdownRequest(value) {
     throw new ApiError(400, "INVALID_FIELD", "'ownerRootWorkspacePath' must be an absolute path");
   }
   return {
+    ownedCodexHostId: parseOwnedCodexHostId(value.ownedCodexHostId),
     idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
     expectedRevision,
     expectedLeaseId: stringField(value.expectedLeaseId, "expectedLeaseId", { required: true, maxLength: 256 }),
@@ -672,7 +684,7 @@ function parseCoordinatorShutdownRequest(value) {
 function parseDomainCoordinatorShutdownRequest(value) {
   assertPlainObject(value);
   assertAllowedKeys(value, new Set([
-    "idempotencyKey", "expectedRevision", "expectedLeaseId",
+    "ownedCodexHostId", "idempotencyKey", "expectedRevision", "expectedLeaseId",
     "holderTaskId", "holderThreadId", "globalHolderTaskId", "globalHolderThreadId",
     "expectedGlobalLeaseId",
     "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath",
@@ -703,6 +715,7 @@ function parseDomainCoordinatorShutdownRequest(value) {
     throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be an absolute path");
   }
   return {
+    ownedCodexHostId: parseOwnedCodexHostId(value.ownedCodexHostId),
     idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
     expectedRevision,
     expectedLeaseId: stringField(value.expectedLeaseId, "expectedLeaseId", { required: true, maxLength: 256 }),
@@ -4086,12 +4099,13 @@ export function createTaskboardServer(options = {}) {
         const attemptId = decodeRouteSegment(coordinatorShutdownTransitionRoute[1], "Attempt id");
         const body = await readJson(request);
         assertPlainObject(body);
-        assertAllowedKeys(body, new Set());
+        assertAllowedKeys(body, new Set(["ownedCodexHostId"]));
+        const ownedCodexHostId = parseOwnedCodexHostId(body.ownedCodexHostId);
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
         return sendJson(response, 200, database.transitionAgentLaneCoordinatorShutdownAttempt(
-          attemptId, coordinatorShutdownTransitionRoute[2],
+          attemptId, coordinatorShutdownTransitionRoute[2], { ownedCodexHostId },
         ));
       }
 
@@ -4144,10 +4158,11 @@ export function createTaskboardServer(options = {}) {
         const attemptId = decodeRouteSegment(domainCoordinatorShutdownTransitionRoute[1], "Attempt id");
         const body = await readJson(request);
         assertPlainObject(body);
-        assertAllowedKeys(body, new Set());
+        assertAllowedKeys(body, new Set(["ownedCodexHostId"]));
+        const ownedCodexHostId = parseOwnedCodexHostId(body.ownedCodexHostId);
         assertCoordinatorRenewProof(request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces);
         return sendJson(response, 200, database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
-          attemptId, domainCoordinatorShutdownTransitionRoute[2],
+          attemptId, domainCoordinatorShutdownTransitionRoute[2], { ownedCodexHostId },
         ));
       }
 

@@ -303,6 +303,28 @@ function coordinatorShutdownAttemptFromRow(row) {
 function coordinatorShutdownFingerprint(projectId, input) {
   return createHash("sha256").update(JSON.stringify({
     projectId,
+    ownedCodexHostId: input.ownedCodexHostId,
+    idempotencyKey: input.idempotencyKey,
+    expectedRevision: input.expectedRevision,
+    expectedLeaseId: input.expectedLeaseId,
+    holderTaskId: input.holderTaskId,
+    holderThreadId: input.holderThreadId,
+    ownerRootTaskId: input.ownerRootTaskId,
+    ownerRootThreadId: input.ownerRootThreadId,
+    ownerRootCodexProjectId: input.ownerRootCodexProjectId,
+    ownerRootCodexProjectKind: input.ownerRootCodexProjectKind,
+    ownerRootCodexHostId: input.ownerRootCodexHostId,
+    ownerRootWorkspacePath: path.resolve(input.ownerRootWorkspacePath),
+    codexProjectId: input.codexProjectId,
+    codexProjectKind: input.codexProjectKind,
+    codexHostId: input.codexHostId,
+    workspacePath: path.resolve(input.workspacePath),
+  })).digest("hex");
+}
+
+function legacyCoordinatorShutdownFingerprint(projectId, input) {
+  return createHash("sha256").update(JSON.stringify({
+    projectId,
     idempotencyKey: input.idempotencyKey,
     expectedRevision: input.expectedRevision,
     expectedLeaseId: input.expectedLeaseId,
@@ -338,7 +360,8 @@ function domainCoordinatorShutdownAttemptFromRow(row) {
 
 function domainCoordinatorShutdownFingerprint(projectId, domainId, input) {
   return createHash("sha256").update(JSON.stringify({
-    projectId, domainId, idempotencyKey: input.idempotencyKey,
+    projectId, domainId, ownedCodexHostId: input.ownedCodexHostId,
+    idempotencyKey: input.idempotencyKey,
     expectedRevision: input.expectedRevision, expectedLeaseId: input.expectedLeaseId,
     holderTaskId: input.holderTaskId, holderThreadId: input.holderThreadId,
     globalHolderTaskId: input.globalHolderTaskId,
@@ -347,6 +370,40 @@ function domainCoordinatorShutdownFingerprint(projectId, domainId, input) {
     codexProjectId: input.codexProjectId, codexProjectKind: input.codexProjectKind,
     codexHostId: input.codexHostId, workspacePath: path.resolve(input.workspacePath),
   })).digest("hex");
+}
+
+function legacyDomainCoordinatorShutdownFingerprint(projectId, domainId, input) {
+  return createHash("sha256").update(JSON.stringify({
+    projectId, domainId,
+    idempotencyKey: input.idempotencyKey,
+    expectedRevision: input.expectedRevision, expectedLeaseId: input.expectedLeaseId,
+    holderTaskId: input.holderTaskId, holderThreadId: input.holderThreadId,
+    globalHolderTaskId: input.globalHolderTaskId,
+    globalHolderThreadId: input.globalHolderThreadId,
+    expectedGlobalLeaseId: input.expectedGlobalLeaseId,
+    codexProjectId: input.codexProjectId, codexProjectKind: input.codexProjectKind,
+    codexHostId: input.codexHostId, workspacePath: path.resolve(input.workspacePath),
+  })).digest("hex");
+}
+
+function domainCoordinatorLeaseReceiptFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id, projectId: row.project_id, domainId: row.domain_id,
+    leaseId: row.lease_id, holderTaskId: row.holder_task_id,
+    holderThreadId: row.holder_thread_id, action: row.action, createdAt: row.created_at,
+  };
+}
+
+function assertCoordinatorShutdownHostExecutor(ownedCodexHostId, holderCodexHostId) {
+  if (!isCanonicalCodexHostId(ownedCodexHostId)
+    || ownedCodexHostId !== holderCodexHostId) {
+    throw new ApiError(
+      409,
+      "HOST_EXECUTOR_MISMATCH",
+      "Coordinator shutdown executor does not own the holder host route",
+    );
+  }
 }
 
 function coordinationDomainReceiptFromRow(row) {
@@ -4782,14 +4839,32 @@ export class TaskboardDatabase {
       if (!project) {
         throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
       }
-      const fingerprint = coordinatorShutdownFingerprint(projectId, input);
       const existing = this.#prepare(`
         SELECT * FROM agent_coordinator_shutdown_attempts
         WHERE project_id = ? AND idempotency_key = ?
       `).get(projectId, input.idempotencyKey);
+      const config = JSON.parse(project.config_json);
+      const holder = Array.isArray(config.tasks)
+        ? config.tasks.find((task) => task?.id === input.holderTaskId) ?? null
+        : null;
+      assertCoordinatorShutdownHostExecutor(
+        input.ownedCodexHostId,
+        existing?.codex_host_id ?? holder?.codexHostId,
+      );
+      const fingerprint = coordinatorShutdownFingerprint(projectId, input);
       if (existing) {
         if (existing.request_fingerprint !== fingerprint) {
-          throw new ApiError(409, "COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different Coordinator retirement request");
+          const legacyFingerprint = legacyCoordinatorShutdownFingerprint(projectId, input);
+          if (existing.request_fingerprint !== legacyFingerprint) {
+            throw new ApiError(409, "COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different Coordinator retirement request");
+          }
+          const upgraded = this.#prepare(`
+            UPDATE agent_coordinator_shutdown_attempts SET request_fingerprint = ?
+            WHERE id = ? AND request_fingerprint = ?
+          `).run(fingerprint, existing.id, legacyFingerprint);
+          if (upgraded.changes !== 1) {
+            throw new ApiError(409, "COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different Coordinator retirement request");
+          }
         }
         this.database.exec("COMMIT");
         return { applied: false, attempt: coordinatorShutdownAttemptFromRow(existing) };
@@ -4807,10 +4882,6 @@ export class TaskboardDatabase {
       if (agentLaneConfigRevision(project.config_json) !== input.expectedRevision) {
         throw new ApiError(409, "COORDINATOR_SHUTDOWN_REVISION_CONFLICT", "Coordinator windows changed during the idle grace period");
       }
-      const config = JSON.parse(project.config_json);
-      const holder = Array.isArray(config.tasks)
-        ? config.tasks.find((task) => task?.id === input.holderTaskId) ?? null
-        : null;
       const owner = Array.isArray(config.tasks)
         ? config.tasks.find((task) => task?.id === config.ownerRootTaskId) ?? null
         : null;
@@ -4882,13 +4953,14 @@ export class TaskboardDatabase {
     }
   }
 
-  transitionAgentLaneCoordinatorShutdownAttempt(attemptId, action) {
+  transitionAgentLaneCoordinatorShutdownAttempt(attemptId, action, { ownedCodexHostId } = {}) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const row = this.#prepare(
         "SELECT * FROM agent_coordinator_shutdown_attempts WHERE id = ?",
       ).get(attemptId);
       if (!row) throw new ApiError(404, "COORDINATOR_SHUTDOWN_NOT_FOUND", "The Coordinator shutdown attempt does not exist");
+      assertCoordinatorShutdownHostExecutor(ownedCodexHostId, row.codex_host_id);
       if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(row.project_id)) {
         throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Global shutdown waits for authorized domain thread archival");
       }
@@ -5056,15 +5128,33 @@ export class TaskboardDatabase {
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
       if (!project) throw new ApiError(404, "AGENT_LANES_NOT_CONFIGURED", `Project '${projectId}' has no Agent Lane mapping`);
-      const fingerprint = domainCoordinatorShutdownFingerprint(projectId, domainId, input);
       const existing = this.#prepare(`
         SELECT * FROM agent_domain_coordinator_shutdown_attempts
         WHERE project_id = ? AND domain_id = ? AND idempotency_key = ?
       `).get(projectId, domainId, input.idempotencyKey);
+      const config = JSON.parse(project.config_json);
+      const holder = config.tasks?.find((task) => task?.id === input.holderTaskId) ?? null;
+      assertCoordinatorShutdownHostExecutor(
+        input.ownedCodexHostId,
+        existing?.codex_host_id ?? holder?.codexHostId,
+      );
+      const fingerprint = domainCoordinatorShutdownFingerprint(projectId, domainId, input);
       let rearmCanceled = null;
       if (existing) {
         if (existing.request_fingerprint !== fingerprint) {
-          throw new ApiError(409, "DOMAIN_COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different domain retirement request");
+          const legacyFingerprint = legacyDomainCoordinatorShutdownFingerprint(
+            projectId, domainId, input,
+          );
+          if (existing.request_fingerprint !== legacyFingerprint) {
+            throw new ApiError(409, "DOMAIN_COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different domain retirement request");
+          }
+          const upgraded = this.#prepare(`
+            UPDATE agent_domain_coordinator_shutdown_attempts SET request_fingerprint = ?
+            WHERE id = ? AND request_fingerprint = ?
+          `).run(fingerprint, existing.id, legacyFingerprint);
+          if (upgraded.changes !== 1) {
+            throw new ApiError(409, "DOMAIN_COORDINATOR_SHUTDOWN_IDEMPOTENCY_CONFLICT", "The shutdown key is bound to a different domain retirement request");
+          }
         }
         if (existing.status !== "canceled") {
           this.database.exec("COMMIT");
@@ -5081,9 +5171,7 @@ export class TaskboardDatabase {
       if (agentLaneConfigRevision(project.config_json) !== input.expectedRevision) {
         throw new ApiError(409, "DOMAIN_COORDINATOR_SHUTDOWN_REVISION_CONFLICT", "Coordinator windows changed during the idle grace period");
       }
-      const config = JSON.parse(project.config_json);
       const domain = normalizeCoordinationDomains(config).find((entry) => entry.id === domainId);
-      const holder = config.tasks?.find((task) => task?.id === input.holderTaskId) ?? null;
       const global = this.#exactActiveCoordinatorLease(projectId, config, config.coordinatorLease ?? null);
       const lease = config.domainCoordinatorLeases?.[domainId] ?? null;
       const exactLease = domain
@@ -5157,13 +5245,18 @@ export class TaskboardDatabase {
     }
   }
 
-  transitionAgentLaneDomainCoordinatorShutdownAttempt(attemptId, action) {
+  transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    attemptId,
+    action,
+    { ownedCodexHostId } = {},
+  ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const row = this.#prepare(
         "SELECT * FROM agent_domain_coordinator_shutdown_attempts WHERE id = ?",
       ).get(attemptId);
       if (!row) throw new ApiError(404, "DOMAIN_COORDINATOR_SHUTDOWN_NOT_FOUND", "The domain shutdown attempt does not exist");
+      assertCoordinatorShutdownHostExecutor(ownedCodexHostId, row.codex_host_id);
       const authorizedAttempt = this.#prepare(`
         SELECT id FROM agent_domain_coordinator_shutdown_attempts
         WHERE project_id = ? AND status IN ('authorized', 'archiving') LIMIT 1
@@ -5171,12 +5264,15 @@ export class TaskboardDatabase {
       if (authorizedAttempt && authorizedAttempt.id !== row.id) {
         throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Another domain shutdown waits for authorized thread archival");
       }
-      const priorReceipt = this.#prepare(`
+      const priorReceipt = domainCoordinatorLeaseReceiptFromRow(this.#prepare(`
         SELECT * FROM agent_domain_coordinator_lease_receipts
         WHERE project_id = ? AND domain_id = ? AND lease_id = ?
           AND holder_task_id = ? AND holder_thread_id = ? AND action = 'released'
         ORDER BY created_at DESC, rowid DESC LIMIT 1
-      `).get(row.project_id, row.domain_id, row.expected_lease_id, row.holder_task_id, row.holder_thread_id);
+      `).get(
+        row.project_id, row.domain_id, row.expected_lease_id,
+        row.holder_task_id, row.holder_thread_id,
+      ));
       if (action === "release" && ["released", "authorized", "archiving", "completed"].includes(row.status)) {
         this.database.exec("COMMIT");
         return { attempt: domainCoordinatorShutdownAttemptFromRow(row), receipt: priorReceipt };

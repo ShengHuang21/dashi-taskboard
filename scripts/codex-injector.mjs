@@ -2163,9 +2163,9 @@ async function requestCoordinatorShutdownAttempt(request) {
   return mutateCoordinatorProvisioning(pathname, body);
 }
 
-async function transitionCoordinatorShutdownAttempt(attemptId, action) {
+async function transitionCoordinatorShutdownAttempt(attemptId, action, { ownedCodexHostId }) {
   const pathname = `/api/local/coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
-  return mutateCoordinatorProvisioning(pathname, {});
+  return mutateCoordinatorProvisioning(pathname, { ownedCodexHostId });
 }
 
 async function getDomainCoordinatorShutdownAttempt(request) {
@@ -2181,9 +2181,9 @@ async function requestDomainCoordinatorShutdownAttempt(request) {
   return mutateCoordinatorProvisioning(pathname, body);
 }
 
-async function transitionDomainCoordinatorShutdownAttempt(attemptId, action) {
+async function transitionDomainCoordinatorShutdownAttempt(attemptId, action, { ownedCodexHostId }) {
   const pathname = `/api/local/domain-coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
-  return mutateCoordinatorProvisioning(pathname, {});
+  return mutateCoordinatorProvisioning(pathname, { ownedCodexHostId });
 }
 
 async function findArchivedCoordinatorThread(cdp, attempt) {
@@ -3129,6 +3129,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     const monitors = [];
     if (continuationEnabled) monitors.push(
       () => runCoordinatorShutdownMonitorOnce({
+        hostExecutor: residentHostExecutor,
         policy: {
           enabled: true,
           projectId,
@@ -3147,18 +3148,19 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         getAttempt: getCoordinatorShutdownAttempt,
         requestAttempt: requestCoordinatorShutdownAttempt,
-        releaseAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
-          attemptId, "release",
+        releaseAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "release", { ownedCodexHostId },
         ),
         findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
         archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
           cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
         ),
-        completeAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
-          attemptId, "complete",
+        completeAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "complete", { ownedCodexHostId },
         ),
       }),
       () => runDomainCoordinatorShutdownMonitorOnce({
+        hostExecutor: residentHostExecutor,
         policy: {
           enabled: true,
           projectId,
@@ -3173,24 +3175,24 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         getAttempt: getDomainCoordinatorShutdownAttempt,
         requestAttempt: requestDomainCoordinatorShutdownAttempt,
-        releaseAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "release",
+        releaseAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "release", { ownedCodexHostId },
         ),
-        authorizeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "authorize",
+        authorizeAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "authorize", { ownedCodexHostId },
         ),
-        beginArchiveAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "begin-archive",
+        beginArchiveAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "begin-archive", { ownedCodexHostId },
         ),
-        cancelAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "cancel",
+        cancelAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "cancel", { ownedCodexHostId },
         ),
         findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
         archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
           cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
         ),
-        completeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "complete",
+        completeAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "complete", { ownedCodexHostId },
         ),
       }),
     );
