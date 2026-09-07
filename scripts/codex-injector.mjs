@@ -24,6 +24,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
   buildCoordinatorProvisioningDeliveryTurnStartParams,
+  coordinatorProvisioningResponseJson,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
   selectCoordinatorProvisioningFallbackModel,
@@ -2122,8 +2123,7 @@ async function mutateCoordinatorProvisioning(pathname, body) {
     cache: "no-store",
     signal: AbortSignal.timeout(5_000),
   });
-  if (!response.ok) throw new Error(`Taskboard Coordinator provisioning returned HTTP ${response.status}`);
-  return response.json();
+  return coordinatorProvisioningResponseJson(response);
 }
 
 async function requestCoordinatorProvisioningAttempt(request) {
@@ -2148,9 +2148,10 @@ async function requestDomainCoordinatorProvisioningAttempt(request) {
 
 async function getDomainCoordinatorProvisioningAttempt(request) {
   const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-provisioning-attempts/${encodeURIComponent(request.domainId)}/lookup`;
-  return mutateCoordinatorProvisioning(pathname, request.idempotencyKey
-    ? { idempotencyKey: request.idempotencyKey }
-    : {});
+  return mutateCoordinatorProvisioning(pathname, {
+    ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+    ownedCodexHostId: request.ownedCodexHostId,
+  });
 }
 
 async function getCoordinatorShutdownAttempt(request) {
@@ -3301,6 +3302,7 @@ async function runBackgroundContinuationMonitor(cdp) {
         return result;
       },
       () => runDomainCoordinatorProvisioningMonitorOnce({
+        hostExecutor: residentHostExecutor,
         policy: {
           enabled: true,
           projectId,
@@ -3312,9 +3314,13 @@ async function runBackgroundContinuationMonitor(cdp) {
         readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
         getAttempt: getDomainCoordinatorProvisioningAttempt,
         requestAttempt: requestDomainCoordinatorProvisioningAttempt,
-        rebindAttempt: ({ attemptId, expectedRevision, expectedGlobalLeaseId }) => (
+        rebindAttempt: ({
+          attemptId, expectedRevision, expectedGlobalLeaseId, ownedCodexHostId,
+        }) => (
           transitionDomainCoordinatorProvisioningAttempt(
-            attemptId, "rebind", { expectedRevision, expectedGlobalLeaseId },
+            attemptId,
+            "rebind",
+            { expectedRevision, expectedGlobalLeaseId, ownedCodexHostId },
           )
         ),
         findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
@@ -3327,22 +3333,22 @@ async function runBackgroundContinuationMonitor(cdp) {
             { threadId, includeTurns }, 10_000,
           ),
         }),
-        markStarting: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
-          attemptId, "starting",
+        markStarting: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "starting", { ownedCodexHostId },
         ),
         startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
           cdp, undefined, codexHostId, "thread/start", params, 10_000,
         ),
-        attachThread: ({ attemptId, threadId }) => (
+        attachThread: ({ attemptId, threadId, ownedCodexHostId }) => (
           transitionDomainCoordinatorProvisioningAttempt(
-            attemptId, "attach", { threadId },
+            attemptId, "attach", { threadId, ownedCodexHostId },
           )
         ),
-        resetAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
-          attemptId, "reset",
+        resetAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "reset", { ownedCodexHostId },
         ),
-        resumeExpiredAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
-          attemptId, "resume-expired",
+        resumeExpiredAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "resume-expired", { ownedCodexHostId },
         ),
         deliverInstruction: ({ attempt, threadId, domainId }) => (
           deliverDomainCoordinatorProvisioningInstruction(

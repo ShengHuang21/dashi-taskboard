@@ -1528,6 +1528,7 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
     globalHolderThreadId: "global-thread", codexProjectId: projectId,
     codexProjectKind: "local", codexHostId: "local",
     workspacePath: `/tmp/domain-provisioning-${domainId}`,
+    ownedCodexHostId: "local",
   });
 
   const frontendRequest = requestFor("frontend");
@@ -1575,34 +1576,36 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
 
   const reopened = new TaskboardDatabase(databasePath);
   const recovered = reopened.getAgentLaneDomainCoordinatorProvisioningAttempt(
-    projectId, "frontend", frontendRequest.idempotencyKey,
+    projectId, "frontend", frontendRequest.idempotencyKey, "local",
   );
   assert.equal(recovered.id, created.attempt.id);
   assert.equal(recovered.status, "pending");
   const starting = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "starting",
+    recovered.id, "starting", { ownedCodexHostId: "local" },
   );
   assert.equal(starting.attempt.status, "starting");
   assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "starting",
+    recovered.id, "starting", { ownedCodexHostId: "local" },
   ).attempt.status, "starting");
   const reset = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "reset",
+    recovered.id, "reset", { ownedCodexHostId: "local" },
   );
   assert.equal(reset.attempt.status, "pending");
   assert.equal(reset.attempt.retryCount, 1);
-  reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(recovered.id, "starting");
+  reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "starting", { ownedCodexHostId: "local" },
+  );
   const threadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
   const attached = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId },
+    recovered.id, "attach", { threadId, ownedCodexHostId: "local" },
   );
   assert.equal(attached.attempt.status, "started");
   assert.equal(attached.attempt.threadId, threadId);
   assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId },
+    recovered.id, "attach", { threadId, ownedCodexHostId: "local" },
   ).attempt.threadId, threadId);
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId: "different-thread" },
+    recovered.id, "attach", { threadId: "different-thread", ownedCodexHostId: "local" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT");
   const registration = {
     role: "coordinator", taskId: "frontend", label: "Frontend Coordinator",
@@ -1624,10 +1627,10 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
   );
   assert.equal(registered.applied, true);
   assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId },
+    recovered.id, "attach", { threadId, ownedCodexHostId: "local" },
   ).attempt.threadId, threadId);
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId: "different-thread" },
+    recovered.id, "attach", { threadId: "different-thread", ownedCodexHostId: "local" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT");
   const acquiredDomain = reopened.claimAgentLaneDomainCoordinator(projectId, "frontend", {
     holderTaskId: "frontend", holderThreadId: threadId,
@@ -1676,10 +1679,10 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
       : lane),
   });
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "resume-expired",
+    recovered.id, "resume-expired", { ownedCodexHostId: "local" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_CANCELED");
   assert.equal(reopened.getAgentLaneDomainCoordinatorProvisioningAttempt(
-    projectId, "frontend",
+    projectId, "frontend", undefined, "local",
   ), null);
   const driftedRevision = reopened.getAgentLaneCoordinationWindows(projectId).revision;
   const replacement = reopened.requestAgentLaneDomainCoordinatorProvisioningAttempt(

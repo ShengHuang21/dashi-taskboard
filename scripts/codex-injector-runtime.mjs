@@ -770,6 +770,147 @@ function domainCoordinatorProvisioningIdentity(
   };
 }
 
+function hasCanonicalDomainCoordinatorProvisioningAttemptIdentity(attempt) {
+  const idempotency = /^domain-coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.idempotencyKey ?? "",
+  );
+  const source = /^taskboard-domain-coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.threadSource ?? "",
+  );
+  if (!idempotency && !source) return true;
+  return Boolean(idempotency && source && idempotency[1] === source[1]);
+}
+
+const DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS = [
+  "id", "projectId", "domainId", "idempotencyKey", "taskId", "label", "threadSource",
+  "model", "reasoningEffort", "globalHolderTaskId", "globalHolderThreadId",
+  "globalHolderCodexProjectId", "globalHolderCodexProjectKind", "globalHolderCodexHostId",
+  "globalHolderWorkspacePath", "codexProjectId", "codexProjectKind", "codexHostId",
+  "workspacePath", "writeScope", "createdAt",
+];
+const DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS = [
+  "expectedRevision", "expectedGlobalLeaseId", "status", "threadId", "retryCount",
+  "missingSince", "expiresAt",
+];
+const DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_PATH_FIELDS = new Set([
+  "globalHolderWorkspacePath", "workspacePath",
+]);
+
+function domainCoordinatorProvisioningAttemptField(attempt, field) {
+  const value = attempt?.[field];
+  if (DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_PATH_FIELDS.has(field)) {
+    return typeof value === "string" ? path.resolve(value) : value;
+  }
+  return field === "writeScope" && Array.isArray(value) ? JSON.stringify(value) : value;
+}
+
+function domainCoordinatorProvisioningAttemptEnvelope(attempt) {
+  return Object.fromEntries(DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS
+    .map((field) => [field, domainCoordinatorProvisioningAttemptField(attempt, field)]));
+}
+
+function domainCoordinatorProvisioningAttemptMutableState(attempt) {
+  return Object.fromEntries(DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS
+    .map((field) => [field, attempt?.[field]]));
+}
+
+function retainsDomainCoordinatorProvisioningAttemptEnvelope(candidate, envelope) {
+  return DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS.every(
+    (field) => domainCoordinatorProvisioningAttemptField(candidate, field) === envelope[field],
+  );
+}
+
+function matchesDomainCoordinatorProvisioningTransitionResponse(
+  candidate,
+  envelope,
+  before,
+  { allowedMutable = [], expected = {} } = {},
+) {
+  if (!retainsDomainCoordinatorProvisioningAttemptEnvelope(candidate, envelope)) return false;
+  for (const field of DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS) {
+    if (!allowedMutable.includes(field) && candidate?.[field] !== before[field]) return false;
+  }
+  return Object.entries(expected).every(([field, value]) => candidate?.[field] === value);
+}
+
+function domainCoordinatorProvisioningAttemptOwnedByHost(
+  attempt, hostExecutor, projectId, domainId,
+) {
+  return attempt?.projectId === projectId
+    && attempt?.domainId === domainId
+    && hostExecutorOwnsCanonicalRoute(hostExecutor, attempt);
+}
+
+function hasCompleteCodexLaunchRoute(route) {
+  return typeof route?.codexProjectId === "string" && route.codexProjectId
+    && ["local", "remote"].includes(route.codexProjectKind)
+    && isCanonicalCodexHostId(route.codexHostId)
+    && ((route.codexProjectKind === "local" && route.codexHostId === "local")
+      || (route.codexProjectKind === "remote" && route.codexHostId !== "local"))
+    && typeof route.workspacePath === "string" && path.isAbsolute(route.workspacePath);
+}
+
+function hasAnyCodexLaunchRouteField(route) {
+  return ["codexProjectId", "codexProjectKind", "codexHostId", "workspacePath"]
+    .some((field) => route?.[field] !== undefined && route?.[field] !== null && route?.[field] !== "");
+}
+
+function matchesDomainCoordinatorProvisioningAttemptBinding(attempt, {
+  policy,
+  domain,
+  lane,
+  launchLane,
+  globalLease,
+  globalHolder,
+  hostExecutor,
+  identity,
+  requireCurrentIdentity,
+  requireCompleteGlobalBinding,
+}) {
+  const globalBindingValues = [
+    attempt?.globalHolderCodexProjectId,
+    attempt?.globalHolderCodexProjectKind,
+    attempt?.globalHolderCodexHostId,
+    attempt?.globalHolderWorkspacePath,
+  ];
+  const hasAnyGlobalBinding = globalBindingValues.some(
+    (value) => value !== undefined && value !== null && value !== "",
+  );
+  const completeGlobalBinding = attempt?.globalHolderCodexProjectId === globalHolder.codexProjectId
+    && attempt?.globalHolderCodexProjectKind === globalHolder.codexProjectKind
+    && attempt?.globalHolderCodexHostId === globalHolder.codexHostId
+    && typeof attempt?.globalHolderWorkspacePath === "string"
+    && path.resolve(attempt.globalHolderWorkspacePath) === path.resolve(globalHolder.workspacePath);
+  return Boolean(typeof attempt?.id === "string" && attempt.id
+    && attempt.projectId === policy.projectId
+    && attempt.domainId === domain.domainId
+    && attempt.taskId === lane.id
+    && attempt.label === lane.label
+    && typeof attempt.model === "string" && attempt.model
+    && typeof attempt.reasoningEffort === "string" && attempt.reasoningEffort
+    && (typeof policy.model !== "string" || !policy.model || attempt.model === policy.model)
+    && (typeof policy.reasoningEffort !== "string" || !policy.reasoningEffort
+      || attempt.reasoningEffort === policy.reasoningEffort)
+    && attempt.globalHolderTaskId === globalHolder.id
+    && attempt.globalHolderThreadId === globalHolder.threadId
+    && (!hasAnyGlobalBinding ? !requireCompleteGlobalBinding : completeGlobalBinding)
+    && attempt.codexProjectId === launchLane.codexProjectId
+    && attempt.codexProjectKind === launchLane.codexProjectKind
+    && attempt.codexHostId === launchLane.codexHostId
+    && typeof attempt.workspacePath === "string"
+    && path.resolve(attempt.workspacePath) === path.resolve(launchLane.workspacePath)
+    && JSON.stringify(attempt.writeScope) === JSON.stringify(domain.writeScope)
+    && typeof attempt.createdAt === "string" && attempt.createdAt
+    && hasCanonicalDomainCoordinatorProvisioningAttemptIdentity(attempt)
+    && (!requireCurrentIdentity
+      || (attempt.idempotencyKey === identity.idempotencyKey
+        && attempt.threadSource === identity.threadSource))
+    && domainCoordinatorProvisioningAttemptOwnedByHost(
+      attempt, hostExecutor, policy.projectId, domain.domainId,
+    )
+    && globalLease?.id);
+}
+
 function coordinatorShutdownIdentity(projectId, lease, lane, ownerLane) {
   const fingerprint = createHash("sha256").update(JSON.stringify({
     projectId,
@@ -1853,7 +1994,7 @@ export async function runCoordinatorProvisioningMonitorOnce(options) {
 }
 
 async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
-  const { policy } = options;
+  const { policy, hostExecutor } = options;
   const [snapshot, windows] = await Promise.all([
     options.readSnapshot(policy.projectId),
     options.readWindows(policy.projectId),
@@ -1873,52 +2014,100 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || !COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
     || !COORDINATION_ID_PATTERN.test(globalHolderTaskId ?? "")
     || !THREAD_ID_PATTERN.test(globalHolder?.threadId ?? "")
-    || typeof globalHolder?.codexProjectId !== "string" || !globalHolder.codexProjectId
-    || !["local", "remote"].includes(globalHolder?.codexProjectKind)
-    || !COORDINATION_ID_PATTERN.test(globalHolder?.codexHostId ?? "")
-    || typeof globalHolder?.workspacePath !== "string"
-    || !path.isAbsolute(globalHolder.workspacePath)) {
+    || !hasCompleteCodexLaunchRoute(globalHolder)) {
     return { provisioned: false, reason: "global-coordinator-unavailable" };
   }
-  const domain = snapshot.coordination.domainCoordinators.find((candidate) => (
+  const pendingDomains = snapshot.coordination.domainCoordinators.filter((candidate) => (
     candidate?.durableWorkPending === true
     && candidate.assignment === "unassigned"
     && COORDINATION_ID_PATTERN.test(candidate.domainId ?? "")
     && Array.isArray(candidate.eligibleTaskIds)
+    && Array.isArray(candidate.writeScope)
   ));
-  if (!domain) return { provisioned: false, reason: "no-domain-work" };
-  const lane = domain.eligibleTaskIds
-    .map((taskId) => snapshot.taskLanes.find((candidate) => candidate?.id === taskId) ?? null)
-    .find((candidate) => (
-      candidate?.source === "codex"
-      && candidate.taskType === "peer_task"
-      && typeof candidate.label === "string" && candidate.label
-    ));
-  if (!lane) {
-    return { provisioned: false, reason: "domain-route-unavailable", domainId: domain.domainId };
+  if (pendingDomains.length === 0) return { provisioned: false, reason: "no-domain-work" };
+  const selections = [];
+  let routeCandidateSeen = false;
+  let foreignRouteSeen = false;
+  for (const candidateDomain of pendingDomains) {
+    for (const taskId of candidateDomain.eligibleTaskIds) {
+      const candidateLane = snapshot.taskLanes.find(
+        (entry) => entry?.id === taskId,
+      ) ?? null;
+      if (candidateLane?.source !== "codex"
+        || candidateLane.taskType !== "peer_task"
+        || typeof candidateLane.label !== "string" || !candidateLane.label) continue;
+      routeCandidateSeen = true;
+      const completePeerRoute = hasCompleteCodexLaunchRoute(candidateLane);
+      const launchCandidate = completePeerRoute
+        ? candidateLane
+        : hasAnyCodexLaunchRouteField(candidateLane) ? null : globalHolder;
+      if (!launchCandidate || !hasCompleteCodexLaunchRoute(launchCandidate)) continue;
+      if (!hostExecutorOwnsCanonicalRoute(hostExecutor, launchCandidate)) {
+        foreignRouteSeen = true;
+        continue;
+      }
+      selections.push({
+        domain: candidateDomain,
+        lane: candidateLane,
+        launchLane: launchCandidate,
+      });
+      break;
+    }
   }
-  const launchLane = (
-    typeof lane.codexProjectId === "string" && lane.codexProjectId
-    && ["local", "remote"].includes(lane.codexProjectKind)
-    && COORDINATION_ID_PATTERN.test(lane.codexHostId ?? "")
-    && typeof lane.workspacePath === "string" && path.isAbsolute(lane.workspacePath)
-  ) ? lane : globalHolder;
-  const identity = domainCoordinatorProvisioningIdentity(
-    policy.projectId, windows.revision, domain.domainId, lane.id, globalLease.id,
-  );
-  let result = await options.getAttempt({
-    projectId: policy.projectId,
-    domainId: domain.domainId,
-    idempotencyKey: identity.idempotencyKey,
-  });
-  let attempt = result?.attempt ?? null;
-  if (!attempt) {
-    result = await options.getAttempt({
-      projectId: policy.projectId,
-      domainId: domain.domainId,
-    });
-    attempt = result?.attempt ?? null;
+  if (selections.length === 0) {
+    if (foreignRouteSeen) return { provisioned: false, reason: "host-executor-unavailable" };
+    return {
+      provisioned: false,
+      reason: "domain-route-unavailable",
+      ...(routeCandidateSeen ? { domainId: pendingDomains[0].domainId } : {}),
+    };
   }
+  let selection = null;
+  let identity = null;
+  let result = null;
+  let attempt = null;
+  let recoveredActiveAttempt = false;
+  for (const candidate of selections) {
+    const candidateIdentity = domainCoordinatorProvisioningIdentity(
+      policy.projectId,
+      windows.revision,
+      candidate.domain.domainId,
+      candidate.lane.id,
+      globalLease.id,
+    );
+    try {
+      let candidateResult = await options.getAttempt({
+        projectId: policy.projectId,
+        domainId: candidate.domain.domainId,
+        idempotencyKey: candidateIdentity.idempotencyKey,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
+      });
+      let candidateAttempt = candidateResult?.attempt ?? null;
+      let candidateRecoveredActiveAttempt = false;
+      if (!candidateAttempt) {
+        candidateResult = await options.getAttempt({
+          projectId: policy.projectId,
+          domainId: candidate.domain.domainId,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        candidateAttempt = candidateResult?.attempt ?? null;
+        candidateRecoveredActiveAttempt = Boolean(candidateAttempt);
+      }
+      selection = candidate;
+      identity = candidateIdentity;
+      result = candidateResult;
+      attempt = candidateAttempt;
+      recoveredActiveAttempt = candidateRecoveredActiveAttempt;
+      break;
+    } catch (error) {
+      if (!isCoordinatorProvisioningHostExecutorMismatch(error)) throw error;
+    }
+  }
+  if (!selection) {
+    return { provisioned: false, reason: "host-executor-unavailable" };
+  }
+  const { domain, lane, launchLane } = selection;
+  let requestedAttempt = false;
   if (!attempt) {
     let selectedModel = { model: policy.model, reasoningEffort: policy.reasoningEffort };
     if ((!selectedModel.model || !selectedModel.reasoningEffort)
@@ -1934,6 +2123,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     }
     result = await options.requestAttempt({
       ...identity,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
       projectId: policy.projectId,
       domainId: domain.domainId,
       taskId: lane.id,
@@ -1950,13 +2140,20 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       workspacePath: launchLane.workspacePath,
     });
     attempt = result?.attempt ?? null;
+    requestedAttempt = true;
   }
-  if (!attempt?.id
-    || attempt.projectId !== policy.projectId
-    || attempt.domainId !== domain.domainId
-    || attempt.taskId !== lane.id
-    || attempt.codexHostId !== launchLane.codexHostId
-    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(launchLane.workspacePath)) {
+  if (!matchesDomainCoordinatorProvisioningAttemptBinding(attempt, {
+    policy,
+    domain,
+    lane,
+    launchLane,
+    globalLease,
+    globalHolder,
+    hostExecutor,
+    identity,
+    requireCurrentIdentity: !recoveredActiveAttempt,
+    requireCompleteGlobalBinding: requestedAttempt,
+  })) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
   if ((attempt.expectedRevision !== windows.revision
@@ -1969,19 +2166,33 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
         domainId: domain.domainId, attemptId: attempt.id,
       };
     }
+    const envelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+    const before = domainCoordinatorProvisioningAttemptMutableState(attempt);
     result = await options.rebindAttempt({
       attemptId: attempt.id,
       expectedRevision: windows.revision,
       expectedGlobalLeaseId: globalLease.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
     });
-    attempt = result?.attempt ?? attempt;
-    if (attempt.expectedRevision !== windows.revision
-      || attempt.expectedGlobalLeaseId !== globalLease.id) {
+    const reboundAttempt = result?.attempt ?? null;
+    if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+      reboundAttempt,
+      envelope,
+      before,
+      {
+        allowedMutable: ["expectedRevision", "expectedGlobalLeaseId"],
+        expected: {
+          expectedRevision: windows.revision,
+          expectedGlobalLeaseId: globalLease.id,
+        },
+      },
+    )) {
       return {
-        provisioned: false, reason: "attempt-rebind-mismatch",
-        domainId: domain.domainId, attemptId: attempt.id,
+        provisioned: false, reason: "attempt-binding-mismatch",
+        domainId: domain.domainId, attemptId: envelope.id,
       };
     }
+    attempt = reboundAttempt;
   }
   if (["completed", "canceled"].includes(attempt.status)) {
     return {
@@ -1993,6 +2204,14 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
   }
   let deliveryThread = null;
   let thread = null;
+  if (!domainCoordinatorProvisioningAttemptOwnedByHost(
+    attempt, hostExecutor, policy.projectId, domain.domainId,
+  )) {
+    return {
+      provisioned: false, reason: "attempt-binding-mismatch",
+      domainId: domain.domainId, attemptId: attempt.id,
+    };
+  }
   if (attempt.status === "expired"
     && THREAD_ID_PATTERN.test(attempt.threadId ?? "")
     && typeof options.readThread === "function") {
@@ -2010,9 +2229,34 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     };
   }
   if (!thread) {
-    result = await options.markStarting({ attemptId: attempt.id });
-    attempt = result?.attempt ?? attempt;
+    const envelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+    const before = domainCoordinatorProvisioningAttemptMutableState(attempt);
+    result = await options.markStarting({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const startingAttempt = result?.attempt ?? null;
+    if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+      startingAttempt,
+      envelope,
+      before,
+      { allowedMutable: ["status"], expected: { status: "starting" } },
+    )) {
+      return {
+        provisioned: false, reason: "attempt-binding-mismatch",
+        domainId: domain.domainId, attemptId: envelope.id,
+      };
+    }
+    attempt = startingAttempt;
     try {
+      if (!domainCoordinatorProvisioningAttemptOwnedByHost(
+        attempt, hostExecutor, policy.projectId, domain.domainId,
+      )) {
+        return {
+          provisioned: false, reason: "attempt-binding-mismatch",
+          domainId: domain.domainId, attemptId: attempt.id,
+        };
+      }
       const started = await options.startThread({
         codexHostId: attempt.codexHostId,
         cwd: attempt.workspacePath,
@@ -2026,7 +2270,26 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       thread = started?.thread ?? null;
     } catch (error) {
       if (isSelectedModelCapacityError(error)) {
-        await options.resetAttempt({ attemptId: attempt.id });
+        const resetEnvelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+        const resetBefore = domainCoordinatorProvisioningAttemptMutableState(attempt);
+        const reset = await options.resetAttempt({
+          attemptId: attempt.id,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+          reset?.attempt,
+          resetEnvelope,
+          resetBefore,
+          {
+            allowedMutable: ["status", "retryCount", "missingSince", "expiresAt"],
+            expected: { status: "pending" },
+          },
+        )) {
+          return {
+            provisioned: false, reason: "attempt-binding-mismatch",
+            domainId: domain.domainId, attemptId: resetEnvelope.id,
+          };
+        }
         return {
           provisioned: false, reason: "model-capacity",
           domainId: domain.domainId, attemptId: attempt.id,
@@ -2079,11 +2342,22 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
         domainId: domain.domainId, attemptId: attempt.id,
       };
     }
-    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const envelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+    const before = domainCoordinatorProvisioningAttemptMutableState(attempt);
+    const resumed = await options.resumeExpiredAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     const resumedAttempt = resumed?.attempt ?? null;
-    if (resumedAttempt?.id !== attempt.id
-      || resumedAttempt.status !== "started"
-      || resumedAttempt.threadId !== thread.id) {
+    if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+      resumedAttempt,
+      envelope,
+      before,
+      {
+        allowedMutable: ["status", "missingSince", "expiresAt"],
+        expected: { status: "started", threadId: thread.id },
+      },
+    )) {
       return {
         provisioned: false, reason: "attempt-binding-mismatch",
         domainId: domain.domainId, attemptId: attempt.id,
@@ -2091,12 +2365,35 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     }
     attempt = resumedAttempt;
   }
-  result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
-  attempt = result?.attempt ?? null;
-  if (attempt?.status !== "started" || attempt.threadId !== thread.id) {
+  const attachEnvelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+  const attachBefore = domainCoordinatorProvisioningAttemptMutableState(attempt);
+  result = await options.attachThread({
+    attemptId: attempt.id,
+    threadId: thread.id,
+    ownedCodexHostId: hostExecutor.ownedCodexHostId,
+  });
+  const attachedAttempt = result?.attempt ?? null;
+  if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+    attachedAttempt,
+    attachEnvelope,
+    attachBefore,
+    {
+      allowedMutable: ["status", "threadId", "missingSince"],
+      expected: { status: "started", threadId: thread.id },
+    },
+  )) {
     return {
       provisioned: false, reason: "attempt-binding-mismatch",
-      domainId: domain.domainId, attemptId: attempt?.id ?? null,
+      domainId: domain.domainId, attemptId: attachEnvelope.id,
+    };
+  }
+  attempt = attachedAttempt;
+  if (!domainCoordinatorProvisioningAttemptOwnedByHost(
+    attempt, hostExecutor, policy.projectId, domain.domainId,
+  )) {
+    return {
+      provisioned: false, reason: "attempt-binding-mismatch",
+      domainId: domain.domainId, attemptId: attempt.id,
     };
   }
   const delivery = await options.deliverInstruction({
@@ -2130,6 +2427,8 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
 export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { provisioned: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.readWindows !== "function"
@@ -2143,10 +2442,10 @@ export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
     || typeof options?.deliverInstruction !== "function") {
     return { provisioned: false, reason: "invalid-monitor" };
   }
-  const key = policy.projectId;
+  const key = coordinatorShutdownRunKey(hostExecutor, policy.projectId);
   const existing = domainCoordinatorProvisioningMonitorRuns.get(key);
   if (existing) return existing;
-  const run = runDomainCoordinatorProvisioningMonitorOnceUnlocked(options);
+  const run = runDomainCoordinatorProvisioningMonitorOnceUnlocked({ ...options, hostExecutor });
   domainCoordinatorProvisioningMonitorRuns.set(key, run);
   try {
     return await run;
@@ -2175,10 +2474,30 @@ export function classifyOwnerIntentPlanHttpFailure(status, errorCode = null) {
   return null;
 }
 
+export async function coordinatorProvisioningResponseJson(response) {
+  if (response?.ok === true) return response.json();
+  const status = Number.isInteger(response?.status) ? response.status : 0;
+  let errorCode = null;
+  try {
+    const payload = await response?.json();
+    errorCode = typeof payload?.error?.code === "string" ? payload.error.code : null;
+  } catch {
+    // Keep non-JSON transport failures opaque while retaining their HTTP status.
+  }
+  const error = new Error(`Taskboard Coordinator provisioning returned HTTP ${status}`);
+  error.status = status;
+  if (errorCode) error.code = errorCode;
+  throw error;
+}
+
 function isSelectedModelCapacityError(error) {
   return SELECTED_MODEL_CAPACITY_ERROR.test(
     typeof error?.message === "string" ? error.message : String(error ?? ""),
   );
+}
+
+function isCoordinatorProvisioningHostExecutorMismatch(error) {
+  return error?.status === 409 && error?.code === "HOST_EXECUTOR_MISMATCH";
 }
 
 function collectStringValues(value, output = []) {

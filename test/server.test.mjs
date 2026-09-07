@@ -13,8 +13,10 @@ import { createTaskboardServer, resolveHost } from "../server/index.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
+  coordinatorProvisioningResponseJson,
   deliverTaskboardCoordination,
   runOwnerIntentPlanningMonitorOnce,
+  runDomainCoordinatorProvisioningMonitorOnce,
   runTaskboardContinuationMonitorOnce,
 } from "../scripts/codex-injector-runtime.mjs";
 
@@ -2899,13 +2901,16 @@ test("removing a domain retires its recoverable expired attempt before reconfigu
         globalHolderThreadId: "global-thread", codexProjectId: "global-project",
         codexProjectKind: "local", codexHostId: "local",
         workspacePath: globalWorkspacePath,
+        ownedCodexHostId: "local",
       },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      first.attempt.id, "starting",
+      first.attempt.id, "starting", { ownedCodexHostId: "local" },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      first.attempt.id, "attach", { threadId: "01a-domain-policy-reset-first" },
+      first.attempt.id, "attach", {
+        threadId: "01a-domain-policy-reset-first", ownedCodexHostId: "local",
+      },
     );
     database.database.prepare(`
       UPDATE agent_domain_coordinator_provisioning_attempts
@@ -2926,7 +2931,9 @@ test("removing a domain retires its recoverable expired attempt before reconfigu
     });
     assert.equal(removed.applied, true);
     assert.equal(
-      database.getAgentLaneDomainCoordinatorProvisioningAttempt(projectId, "probe"),
+      database.getAgentLaneDomainCoordinatorProvisioningAttempt(
+        projectId, "probe", undefined, "local",
+      ),
       null,
     );
     const retired = database.database.prepare(`
@@ -2960,6 +2967,7 @@ test("removing a domain retires its recoverable expired attempt before reconfigu
         globalHolderThreadId: "global-thread", codexProjectId: "global-project",
         codexProjectKind: "local", codexHostId: "local",
         workspacePath: globalWorkspacePath,
+        ownedCodexHostId: "local",
       },
     );
     assert.notEqual(second.attempt.id, first.attempt.id);
@@ -4022,8 +4030,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
     globalHolderThreadId: "global-thread", codexProjectId: "domain-project",
     codexProjectKind: "remote", codexHostId: "domain-host",
-    workspacePath,
+    workspacePath, ownedCodexHostId: "domain-host",
   };
+  const domainExecutorBody = { ownedCodexHostId: "domain-host" };
   const created = await request(baseUrl, requestPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), requestPath, requestBody),
@@ -4037,27 +4046,36 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   assert.equal(unprotected.response.status, 403);
   const starting = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "2".repeat(32), startingPath, domainExecutorBody,
+    ),
+    body: domainExecutorBody,
   });
   assert.equal(starting.response.status, 200, JSON.stringify(starting.body));
   assert.equal(starting.body.attempt.status, "starting");
   const resetPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/reset`;
   const reset = await request(baseUrl, resetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), resetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "3".repeat(32), resetPath, domainExecutorBody,
+    ),
+    body: domainExecutorBody,
   });
   assert.equal(reset.response.status, 200, JSON.stringify(reset.body));
   assert.equal(reset.body.attempt.status, "pending");
   assert.equal(reset.body.attempt.retryCount, 1);
   await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), startingPath, domainExecutorBody,
+    ),
+    body: domainExecutorBody,
   });
   const attachPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/attach`;
-  const attachBody = { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" };
+  const attachBody = {
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+    ownedCodexHostId: "domain-host",
+  };
   const attached = await request(baseUrl, attachPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), attachPath, attachBody),
@@ -4090,6 +4108,7 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const rebindBody = {
     expectedRevision: driftedWindows.body.revision,
     expectedGlobalLeaseId: "global-lease",
+    ownedCodexHostId: "domain-host",
   };
   const unprotectedRebind = await request(baseUrl, rebindPath, {
     method: "POST", body: rebindBody,
@@ -4156,9 +4175,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const expiredLookup = await request(baseUrl, lookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "9a".repeat(16), lookupPath, {},
+      instanceSecret, "9a".repeat(16), lookupPath, domainExecutorBody,
     ),
-    body: {},
+    body: domainExecutorBody,
   });
   assert.equal(expiredLookup.response.status, 200, JSON.stringify(expiredLookup.body));
   assert.equal(expiredLookup.body.attempt.id, created.body.attempt.id);
@@ -4170,9 +4189,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const deferredResume = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "7a".repeat(16), resumeExpiredPath, {},
+      instanceSecret, "7a".repeat(16), resumeExpiredPath, domainExecutorBody,
     ),
-    body: {},
+    body: domainExecutorBody,
   });
   assert.equal(deferredResume.response.status, 409, JSON.stringify(deferredResume.body));
   assert.equal(deferredResume.body.error.code, "DOMAIN_COORDINATOR_PROVISIONING_EXPIRED_RESUME_CONFLICT");
@@ -4215,6 +4234,7 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const epochRebindBody = {
     expectedRevision: recoveredWindows.body.revision,
     expectedGlobalLeaseId: recoveredGlobal.body.lease.id,
+    ownedCodexHostId: "domain-host",
   };
   const releasedFenceInspection = new DatabaseSync(databasePath);
   const attemptBeforeReleasedConflict = JSON.stringify(releasedFenceInspection.prepare(
@@ -4289,6 +4309,7 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
     const driftedEpochRebindBody = {
       expectedRevision: driftedEpochWindows.body.revision,
       expectedGlobalLeaseId: recoveredGlobal.body.lease.id,
+      ownedCodexHostId: "domain-host",
     };
     const rejectedDrift = await request(baseUrl, rebindPath, {
       method: "POST",
@@ -4332,9 +4353,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const resumedExpired = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "7".repeat(32), resumeExpiredPath, {},
+      instanceSecret, "7".repeat(32), resumeExpiredPath, domainExecutorBody,
     ),
-    body: {},
+    body: domainExecutorBody,
   });
   assert.equal(resumedExpired.response.status, 200, JSON.stringify(resumedExpired.body));
   assert.equal(resumedExpired.body.attempt.id, created.body.attempt.id);
@@ -4447,13 +4468,14 @@ test("legacy attempts without a Global identity fail closed after cross-host lea
         globalHolderThreadId: "global-thread", codexProjectId: "domain-project",
         codexProjectKind: "remote", codexHostId: "domain-host",
         workspacePath: domainWorkspacePath,
+        ownedCodexHostId: "domain-host",
       },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      created.attempt.id, "starting",
+      created.attempt.id, "starting", { ownedCodexHostId: "domain-host" },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      created.attempt.id, "attach", { threadId: domainThreadId },
+      created.attempt.id, "attach", { threadId: domainThreadId, ownedCodexHostId: "domain-host" },
     );
     database.database.prepare(`
       UPDATE agent_domain_coordinator_provisioning_attempts
@@ -4518,6 +4540,7 @@ test("legacy attempts without a Global identity fail closed after cross-host lea
         {
           expectedRevision: recoveredRevision,
           expectedGlobalLeaseId: recoveredGlobal.lease.id,
+          ownedCodexHostId: "domain-host",
         },
       ),
       (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
@@ -4539,6 +4562,7 @@ test("legacy attempts without a Global identity fail closed after cross-host lea
         {
           expectedRevision: recoveredRevision,
           expectedGlobalLeaseId: recoveredGlobal.lease.id,
+          ownedCodexHostId: "domain-host",
         },
       ),
       (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
@@ -10310,6 +10334,438 @@ test("CAP-59 Global provisioning APIs require the exact owning host before every
   assert.deepEqual(outcomes, expectedOutcomes);
 });
 
+test("CAP-60 Domain provisioning APIs require the exact owning host before every transition", async () => {
+  let databasePath;
+  let revision;
+  let attemptId;
+  const instanceSecret = "6".repeat(64);
+  const globalWorkspacePath = path.resolve("/tmp/cap60-domain-global");
+  const domainWorkspacePath = path.resolve("/tmp/cap60-domain-frontend");
+  const requestPath = "/api/local/projects/local/domain-coordinator-provisioning-attempts/frontend";
+  const lookupPath = `${requestPath}/lookup`;
+  let requestBody;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [{
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        threadId: "global-thread", taskType: "root_task",
+        codexProjectId: "cap60-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspacePath,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        threadId: "frontend-template-thread", taskType: "peer_task",
+        codexProjectId: "cap60-domain-project", codexProjectKind: "remote",
+        codexHostId: "domain-host", workspacePath: domainWorkspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap60-global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const task = database.createTask({
+      projectId: "local", title: "CAP-60 Domain host fence", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "global-thread",
+      threadBinding: {
+        threadId: "global-thread", codexProjectId: "cap60-global-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: domainWorkspacePath, branch: "codex/cap60-domain-host-fence",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("local", task.id, {
+      domainId: "frontend", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "cap60-global-lease",
+    });
+    revision = database.getAgentLaneCoordinationWindows("local").revision;
+    requestBody = {
+      idempotencyKey: "cap60-domain-exact-attempt", taskId: "frontend",
+      label: "Frontend Coordinator", threadSource: "cap60-domain-source",
+      model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+      expectedGlobalLeaseId: "cap60-global-lease", globalHolderTaskId: "global",
+      globalHolderThreadId: "global-thread", codexProjectId: "cap60-domain-project",
+      codexProjectKind: "remote", codexHostId: "domain-host",
+      workspacePath: domainWorkspacePath, ownedCodexHostId: "domain-host",
+    };
+    const created = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+      "local", "frontend", requestBody,
+    );
+    attemptId = created.attempt.id;
+    database.close();
+    return { instanceSecret };
+  });
+  const storageSnapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const snapshot = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+      ).get(attemptId),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return snapshot;
+  };
+  const states = {
+    starting: { status: "pending", threadId: null, expiresAt: "2000-01-01T00:00:00.000Z" },
+    reset: { status: "starting", threadId: null, expiresAt: "2099-01-01T00:00:00.000Z" },
+    attach: { status: "starting", threadId: null, expiresAt: "2099-01-01T00:00:00.000Z" },
+    rebind: {
+      status: "expired", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+    "resume-expired": {
+      status: "expired", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+  };
+  const setState = (state) => {
+    const inspection = new DatabaseSync(databasePath);
+    inspection.prepare(`
+      UPDATE agent_domain_coordinator_provisioning_attempts
+      SET status = ?, thread_id = ?, expected_revision = ?, expected_global_lease_id = ?,
+          missing_since = NULL, expires_at = ?, updated_at = '2000-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(
+      state.status, state.threadId, revision, "cap60-global-lease", state.expiresAt, attemptId,
+    );
+    inspection.close();
+  };
+  const outcomes = [];
+  const execute = async (label, pathname, body, expectedStatus, expectedCode, state) => {
+    setState(state);
+    const before = storageSnapshot();
+    const response = await request(baseUrl, pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret,
+        `${outcomes.length + 1}`.padStart(2, "0").repeat(16),
+        pathname,
+        body,
+      ),
+      body,
+    });
+    outcomes.push([
+      label,
+      response.response.status,
+      response.body?.error?.code ?? null,
+      JSON.stringify(storageSnapshot()) === JSON.stringify(before),
+    ]);
+    assert.deepEqual(outcomes.at(-1), [label, expectedStatus, expectedCode, true]);
+  };
+  const expiredState = states.starting;
+  const { ownedCodexHostId: _ownedCodexHostId, ...requestWithoutHost } = requestBody;
+  for (const [label, pathname, body, state] of [
+    ["lookup", lookupPath, { idempotencyKey: requestBody.idempotencyKey }, expiredState],
+    ["request", requestPath, requestWithoutHost, expiredState],
+  ]) {
+    await execute(`${label}:missing`, pathname, body, 400, "INVALID_FIELD", state);
+    await execute(
+      `${label}:foreign`, pathname, { ...body, ownedCodexHostId: "local" },
+      409, "HOST_EXECUTOR_MISMATCH", state,
+    );
+  }
+  for (const [action, state] of Object.entries(states)) {
+    const pathname = `/api/local/domain-coordinator-provisioning-attempts/${attemptId}/${action}`;
+    const actionBody = action === "attach"
+      ? { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" }
+      : action === "rebind"
+        ? { expectedRevision: revision, expectedGlobalLeaseId: "cap60-global-lease" }
+        : {};
+    await execute(`${action}:missing`, pathname, actionBody, 400, "INVALID_FIELD", state);
+    await execute(
+      `${action}:foreign`, pathname, { ...actionBody, ownedCodexHostId: "local" },
+      409, "HOST_EXECUTOR_MISMATCH", state,
+    );
+  }
+  await execute(
+    "reset:invalid",
+    `/api/local/domain-coordinator-provisioning-attempts/${attemptId}/reset`,
+    { ownedCodexHostId: "bad\nhost" },
+    400,
+    "INVALID_FIELD",
+    states.reset,
+  );
+  assert.equal(outcomes.length, 15);
+});
+
+test("CAP-60 runtime skips a real foreign expired attempt and provisions the later owned domain", async () => {
+  let databasePath;
+  let revision;
+  const instanceSecret = "7".repeat(64);
+  const globalThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const globalWorkspacePath = path.resolve("/tmp/cap60-expiry-global");
+  const domainWorkspacePath = path.resolve("/tmp/cap60-expiry-domain");
+  const backendWorkspacePath = path.resolve("/tmp/cap60-expiry-backend");
+  const foreignWorkspacePath = path.resolve("/tmp/cap60-expiry-foreign");
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [{
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        threadId: globalThreadId, taskType: "root_task",
+        codexProjectId: "cap60-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspacePath,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        threadId: "frontend-template-thread", taskType: "peer_task",
+        codexProjectId: "cap60-domain-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: domainWorkspacePath,
+      }, {
+        id: "backend", label: "Backend Coordinator", owner: "Codex", source: "codex",
+        threadId: "backend-template-thread", taskType: "peer_task",
+        codexProjectId: "cap60-backend-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: backendWorkspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap60-global-lease", holderTaskId: "global", holderThreadId: globalThreadId,
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }, {
+        id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["backend"],
+      }],
+    });
+    const actor = { type: "agent", id: "cap60-agent", name: "CAP-60", avatarUrl: null };
+    const task = database.createTask({
+      projectId: "local", title: "CAP-60 expiry work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: globalThreadId,
+      threadBinding: {
+        threadId: globalThreadId, codexProjectId: "cap60-global-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: domainWorkspacePath, branch: "codex/cap60-expiry-fence",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("local", task.id, {
+      domainId: "frontend", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: globalThreadId,
+      expectedCoordinatorLeaseId: "cap60-global-lease",
+    });
+    const backendTask = database.createTask({
+      projectId: "local", title: "CAP-60 backend work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: globalThreadId,
+      threadBinding: {
+        threadId: globalThreadId, codexProjectId: "cap60-global-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: backendWorkspacePath, branch: "codex/cap60-backend-fence",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("local", backendTask.id, {
+      domainId: "backend", taskVersion: backendTask.version,
+      holderTaskId: "global", holderThreadId: globalThreadId,
+      expectedCoordinatorLeaseId: "cap60-global-lease",
+    });
+    revision = database.getAgentLaneCoordinationWindows("local").revision;
+    database.database.prepare(`
+      INSERT INTO agent_domain_coordinator_provisioning_attempts (
+        id, project_id, domain_id, idempotency_key, request_fingerprint,
+        task_id, label, thread_source, model, reasoning_effort,
+        expected_revision, expected_global_lease_id,
+        global_holder_task_id, global_holder_thread_id,
+        global_holder_codex_project_id, global_holder_codex_project_kind,
+        global_holder_codex_host_id, global_holder_workspace_path,
+        codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+        write_scope_json, status, thread_id, retry_count, missing_since,
+        created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        'starting', NULL, 0, NULL, ?, ?, ?)
+    `).run(
+      "cap60-foreign-expired", "local", "frontend", "cap60-foreign-old-key",
+      "cap60-foreign-fingerprint", "frontend", "Frontend Coordinator",
+      "cap60-foreign-old-source", "gpt-5", "high", "cap60-foreign-revision",
+      "cap60-global-lease", "global", globalThreadId, "cap60-global-project",
+      "local", "local", globalWorkspacePath, "cap60-foreign-project", "remote",
+      "remote-builder", foreignWorkspacePath, JSON.stringify(["web"]),
+      "2026-09-07T00:00:00.000Z", "2026-09-07T00:01:00.000Z",
+      "2000-01-01T00:00:00.000Z",
+    );
+    database.close();
+    return { instanceSecret };
+  });
+  const pathname = "/api/local/projects/local/domain-coordinator-provisioning-attempts/frontend";
+  const body = {
+    idempotencyKey: "cap60-local-new-key", taskId: "frontend",
+    label: "Frontend Coordinator", threadSource: "cap60-local-new-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+    expectedGlobalLeaseId: "cap60-global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: globalThreadId, codexProjectId: "cap60-domain-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: domainWorkspacePath,
+    ownedCodexHostId: "local",
+  };
+  const snapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const state = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+      ).get("cap60-foreign-expired"),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return state;
+  };
+  const before = snapshot();
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "9".repeat(32), pathname, body),
+    body,
+  });
+  assert.deepEqual(
+    [response.response.status, response.body?.error?.code ?? null, snapshot()],
+    [409, "HOST_EXECUTOR_MISMATCH", before],
+  );
+  let nonce = 10;
+  const mutateProvisioning = async (requestPath, requestBody) => {
+    const apiResponse = await fetch(`${baseUrl}${requestPath}`, {
+      method: "POST",
+      headers: {
+        ...signedCoordinatorRenewHeaders(
+          instanceSecret,
+          `${nonce++}`.padStart(32, "0"),
+          requestPath,
+          requestBody,
+        ),
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+    return coordinatorProvisioningResponseJson(apiResponse);
+  };
+  const transition = (attemptId, action, transitionBody) => mutateProvisioning(
+    `/api/local/domain-coordinator-provisioning-attempts/${attemptId}/${action}`,
+    transitionBody,
+  );
+  const deliveries = [];
+  const threadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
+  const runtimeResult = await runDomainCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localShutdownExecutor,
+    policy: { enabled: true, projectId: "local", model: "gpt-5", reasoningEffort: "high" },
+    readSnapshot: async () => ({
+      projectId: "local",
+      coordination: {
+        coordinatorTaskId: "global",
+        lease: { id: "cap60-global-lease", status: "active", bindingValid: true },
+        domainCoordinators: [{
+          domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+          eligibleTaskIds: ["frontend"], writeScope: ["web"],
+        }, {
+          domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+          eligibleTaskIds: ["backend"], writeScope: ["server"],
+        }],
+      },
+      taskLanes: [{
+        id: "global", source: "codex", taskType: "root_task", threadId: globalThreadId,
+        codexProjectId: "cap60-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspacePath,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "frontend-template-thread",
+        codexProjectId: "cap60-domain-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: domainWorkspacePath,
+      }, {
+        id: "backend", label: "Backend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "backend-template-thread",
+        codexProjectId: "cap60-backend-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: backendWorkspacePath,
+      }],
+    }),
+    readWindows: async () => ({ projectId: "local", revision }),
+    getAttempt: ({ projectId, domainId, idempotencyKey, ownedCodexHostId }) => (
+      mutateProvisioning(
+        `/api/local/projects/${projectId}/domain-coordinator-provisioning-attempts/${domainId}/lookup`,
+        { ...(idempotencyKey ? { idempotencyKey } : {}), ownedCodexHostId },
+      )
+    ),
+    requestAttempt: ({ projectId, domainId, ...requestInput }) => mutateProvisioning(
+      `/api/local/projects/${projectId}/domain-coordinator-provisioning-attempts/${domainId}`,
+      requestInput,
+    ),
+    rebindAttempt: ({ attemptId, expectedRevision, expectedGlobalLeaseId, ownedCodexHostId }) => (
+      transition(attemptId, "rebind", {
+        expectedRevision, expectedGlobalLeaseId, ownedCodexHostId,
+      })
+    ),
+    findThread: async () => null,
+    readThread: async () => null,
+    markStarting: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "starting", { ownedCodexHostId })
+    ),
+    startThread: async ({ cwd, threadSource }) => ({
+      thread: { id: threadId, cwd, threadSource },
+    }),
+    attachThread: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "attach", { threadId, ownedCodexHostId })
+    ),
+    resetAttempt: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "reset", { ownedCodexHostId })
+    ),
+    resumeExpiredAttempt: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "resume-expired", { ownedCodexHostId })
+    ),
+    deliverInstruction: async ({ attempt, domainId }) => {
+      deliveries.push([attempt.id, domainId]);
+      return { delivery: "started", turnId: "cap60-backend-turn" };
+    },
+  });
+  assert.equal(runtimeResult.provisioned, true);
+  assert.equal(runtimeResult.domainId, "backend");
+  assert.equal(runtimeResult.threadId, threadId);
+  const after = snapshot();
+  assert.deepEqual(after.target, before.target);
+  assert.equal(after.configJson, before.configJson);
+  assert.equal(after.attemptCount, 2);
+  const backendAttempt = after.attempts.find((attempt) => attempt.domain_id === "backend");
+  assert.deepEqual(
+    [backendAttempt?.status, backendAttempt?.codex_host_id, backendAttempt?.thread_id],
+    ["started", "local", threadId],
+  );
+  assert.deepEqual(deliveries, [[backendAttempt.id, "backend"]]);
+});
+
 test("CAP-59 Global request rejects a foreign stale Coordinator before retirement", async () => {
   let databasePath;
   const instanceSecret = "5".repeat(64);
@@ -10789,6 +11245,7 @@ test("CAP-59 accepts an exact remote Global executor while preserving Domain API
     expectedGlobalLeaseId: "domain-global-lease", globalHolderTaskId: "global",
     globalHolderThreadId: "global-thread", codexProjectId: "cap59-domain-project",
     codexProjectKind: "remote", codexHostId: "domain-builder", workspacePath: domainWorkspace,
+    ownedCodexHostId: "domain-builder",
   };
   const domainCreated = await request(baseUrl, domainPath, {
     method: "POST",
@@ -10797,7 +11254,9 @@ test("CAP-59 accepts an exact remote Global executor while preserving Domain API
   });
   outcomes.push(["domain-request", domainCreated.response.status, domainCreated.body?.attempt?.status ?? null]);
   const domainLookupPath = `${domainPath}/lookup`;
-  const domainLookupBody = { idempotencyKey: domainBody.idempotencyKey };
+  const domainLookupBody = {
+    idempotencyKey: domainBody.idempotencyKey, ownedCodexHostId: "domain-builder",
+  };
   const domainLookup = await request(baseUrl, domainLookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), domainLookupPath, domainLookupBody),
@@ -10807,8 +11266,11 @@ test("CAP-59 accepts an exact remote Global executor while preserving Domain API
   const domainStartingPath = `/api/local/domain-coordinator-provisioning-attempts/${domainCreated.body?.attempt?.id ?? "missing"}/starting`;
   const domainStarting = await request(baseUrl, domainStartingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), domainStartingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), domainStartingPath,
+      { ownedCodexHostId: "domain-builder" },
+    ),
+    body: { ownedCodexHostId: "domain-builder" },
   });
   outcomes.push(["domain-transition", domainStarting.response.status, domainStarting.body?.attempt?.status ?? null]);
   assert.deepEqual(outcomes, [

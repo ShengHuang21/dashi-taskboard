@@ -3847,7 +3847,9 @@ export class TaskboardDatabase {
     return coordinatorProvisioningAttemptFromRow(row);
   }
 
-  getAgentLaneDomainCoordinatorProvisioningAttempt(projectId, domainId, idempotencyKey) {
+  getAgentLaneDomainCoordinatorProvisioningAttempt(
+    projectId, domainId, idempotencyKey, ownedCodexHostId,
+  ) {
     const row = idempotencyKey
       ? this.#prepare(`
           SELECT * FROM agent_domain_coordinator_provisioning_attempts
@@ -3863,6 +3865,7 @@ export class TaskboardDatabase {
           ORDER BY created_at DESC, id DESC LIMIT 1
         `).get(projectId, domainId);
     if (!row) return null;
+    assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, row.codex_host_id);
     if (["pending", "starting", "started"].includes(row.status)
       && Date.parse(row.expires_at) <= Date.now()) {
       const timestamp = now();
@@ -3892,12 +3895,16 @@ export class TaskboardDatabase {
       if (this.getAgentLaneDomainCoordinatorShutdownAttempt(projectId, domainId)) {
         throw new ApiError(409, "DOMAIN_COORDINATOR_SHUTDOWN_IN_PROGRESS", "Provisioning waits until the exact retiring domain thread is archived");
       }
-      const fingerprint = domainCoordinatorProvisioningFingerprint(projectId, domainId, input);
       const existing = this.#prepare(`
         SELECT * FROM agent_domain_coordinator_provisioning_attempts
         WHERE project_id = ? AND domain_id = ? AND idempotency_key = ?
       `).get(projectId, domainId, input.idempotencyKey);
       if (existing) {
+        assertCoordinatorProvisioningHostExecutor(
+          input.ownedCodexHostId,
+          existing.codex_host_id,
+        );
+        const fingerprint = domainCoordinatorProvisioningFingerprint(projectId, domainId, input);
         if (existing.request_fingerprint !== fingerprint) {
           throw new ApiError(
             409,
@@ -3969,6 +3976,11 @@ export class TaskboardDatabase {
         );
       }
       const launchHolder = isFullyBoundCodexPeerTask(domainHolder) ? domainHolder : globalHolder;
+      assertCoordinatorProvisioningHostExecutor(
+        input.ownedCodexHostId,
+        launchHolder?.codexHostId,
+      );
+      const fingerprint = domainCoordinatorProvisioningFingerprint(projectId, domainId, input);
       if (!hasExactCodexHostBinding(launchHolder)
         || launchHolder.codexProjectId !== input.codexProjectId
         || launchHolder.codexProjectKind !== input.codexProjectKind
@@ -4019,6 +4031,10 @@ export class TaskboardDatabase {
         ORDER BY created_at DESC, id DESC LIMIT 1
       `).get(projectId, domainId);
       if (nonterminal) {
+        assertCoordinatorProvisioningHostExecutor(
+          input.ownedCodexHostId,
+          nonterminal.codex_host_id,
+        );
         if (Date.parse(nonterminal.expires_at) <= Date.now()) {
           this.#prepare(`
             UPDATE agent_domain_coordinator_provisioning_attempts
@@ -4088,6 +4104,7 @@ export class TaskboardDatabase {
           "The domain Coordinator provisioning attempt does not exist",
         );
       }
+      assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, row.codex_host_id);
       const recoverableExpiredResume = row.status === "expired"
         && Boolean(row.thread_id)
         && action === "resume-expired";

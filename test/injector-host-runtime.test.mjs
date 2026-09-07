@@ -9,6 +9,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
   buildCoordinatorProvisioningDeliveryTurnStartParams,
+  coordinatorProvisioningResponseJson,
   admissionRecoveryRpcTimeoutMs,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
@@ -66,6 +67,29 @@ import {
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
 const localHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
 const remoteHostExecutor = Object.freeze({ ownedCodexHostId: "remote-builder" });
+
+test("Coordinator provisioning HTTP responses preserve the public status and error code", async () => {
+  const accepted = await coordinatorProvisioningResponseJson(new Response(
+    JSON.stringify({ attempt: { id: "accepted" } }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  ));
+  assert.deepEqual(accepted, { attempt: { id: "accepted" } });
+  await assert.rejects(
+    coordinatorProvisioningResponseJson(new Response(
+      JSON.stringify({ error: { code: "HOST_EXECUTOR_MISMATCH", details: "ignored" } }),
+      { status: 409, headers: { "content-type": "application/json" } },
+    )),
+    (error) => error?.status === 409
+      && error?.code === "HOST_EXECUTOR_MISMATCH"
+      && error.message === "Taskboard Coordinator provisioning returned HTTP 409",
+  );
+  await assert.rejects(
+    coordinatorProvisioningResponseJson(new Response("unavailable", { status: 503 })),
+    (error) => error?.status === 503
+      && error?.code === undefined
+      && error.message === "Taskboard Coordinator provisioning returned HTTP 503",
+  );
+});
 
 test("cold admission recovery allows bounded thread loading beyond the fast RPC budget", () => {
   assert.equal(admissionRecoveryRpcTimeoutMs("thread/read"), 10_000);
@@ -2815,6 +2839,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
         assignment: "unassigned",
         durableWorkPending: true,
         eligibleTaskIds: ["frontend"],
+        writeScope: ["web"],
       }],
     },
     taskLanes: [
@@ -2839,6 +2864,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
   let expiredResumes = 0;
   let attachedThreadVisible = true;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev",
       model: null, reasoningEffort: null,
@@ -2854,16 +2880,27 @@ test("domain provisioning retries selected-model capacity on the same durable at
     getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
     requestAttempt: async (request) => {
       requests += 1;
+      assert.equal(request.ownedCodexHostId, "local");
       assert.equal(request.taskId, "frontend");
       assert.equal(request.codexProjectId, "local-project");
       assert.equal(request.codexHostId, "local");
       assert.equal(request.workspacePath, "/tmp/taskboard");
+      const { ownedCodexHostId: _ownedCodexHostId, ...persistedRequest } = request;
       attempt = {
-        ...request,
+        ...persistedRequest,
         id: "domain-attempt",
+        globalHolderCodexProjectId: "local-project",
+        globalHolderCodexProjectKind: "local",
+        globalHolderCodexHostId: "local",
+        globalHolderWorkspacePath: "/tmp/taskboard",
+        writeScope: ["web"],
         status: "pending",
         threadId: null,
         retryCount: 0,
+        missingSince: null,
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
       };
       return { attempt: { ...attempt } };
     },
@@ -2882,7 +2919,8 @@ test("domain provisioning retries selected-model capacity on the same durable at
         input: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${readAttempt.id}`,
       }],
     }),
-    markStarting: async () => {
+    markStarting: async ({ ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       attempt = { ...attempt, status: "starting" };
       return { attempt: { ...attempt } };
     },
@@ -2900,17 +2938,20 @@ test("domain provisioning retries selected-model capacity on the same durable at
         threadSource: settings.threadSource,
       } };
     },
-    resetAttempt: async () => {
+    resetAttempt: async ({ ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       resets += 1;
       attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
       return { attempt: { ...attempt } };
     },
-    resumeExpiredAttempt: async () => {
+    resumeExpiredAttempt: async ({ ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       expiredResumes += 1;
       attempt = { ...attempt, status: "started" };
       return { attempt: { ...attempt } };
     },
-    attachThread: async ({ threadId }) => {
+    attachThread: async ({ threadId, ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       attaches += 1;
       attempt = { ...attempt, status: "started", threadId };
       return { attempt: { ...attempt } };
@@ -2976,11 +3017,17 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
     label: "Frontend Coordinator", threadSource: "taskboard-domain-rebind-frontend",
     model: "gpt-5", reasoningEffort: "high", expectedRevision: previousRevision,
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
-    globalHolderThreadId: globalThreadId, codexProjectId: "local-project",
+    globalHolderThreadId: globalThreadId,
+    globalHolderCodexProjectId: "local-project", globalHolderCodexProjectKind: "local",
+    globalHolderCodexHostId: "local", globalHolderWorkspacePath: workspacePath,
+    codexProjectId: "local-project",
     codexProjectKind: "local", codexHostId: "local", workspacePath,
-    status: "started", threadId: domainThreadId, retryCount: 0,
+    writeScope: ["web"], status: "started", threadId: domainThreadId, retryCount: 0,
+    missingSince: null, createdAt: "2026-09-08T00:00:00.000Z",
+    updatedAt: "2026-09-08T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
   };
   const result = await runDomainCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     readSnapshot: async () => ({
       projectId: "capstone-dev",
@@ -2990,6 +3037,7 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
         domainCoordinators: [{
           domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
           eligibleTaskIds: ["frontend"],
+          writeScope: ["web"],
         }],
       },
       taskLanes: [
@@ -3009,10 +3057,13 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
       idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
     ),
     requestAttempt: async () => assert.fail("revision drift must reuse the durable attempt"),
-    rebindAttempt: async ({ attemptId, expectedRevision, expectedGlobalLeaseId }) => {
+    rebindAttempt: async ({
+      attemptId, expectedRevision, expectedGlobalLeaseId, ownedCodexHostId,
+    }) => {
       assert.equal(attemptId, attempt.id);
       assert.equal(expectedRevision, currentRevision);
       assert.equal(expectedGlobalLeaseId, currentGlobalLeaseId);
+      assert.equal(ownedCodexHostId, "local");
       rebinds += 1;
       attempt = { ...attempt, expectedRevision, expectedGlobalLeaseId };
       return { attempt: { ...attempt } };
@@ -3022,8 +3073,9 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
     }),
     markStarting: async () => assert.fail("the attached attempt must not start another thread"),
     startThread: async () => assert.fail("the attached attempt must not start another thread"),
-    attachThread: async ({ threadId }) => {
+    attachThread: async ({ threadId, ownedCodexHostId }) => {
       assert.equal(threadId, domainThreadId);
+      assert.equal(ownedCodexHostId, "local");
       attaches += 1;
       return { attempt: { ...attempt } };
     },
@@ -7527,6 +7579,15 @@ const residentCoordinatorHostWiring = [{
     "completeAttempt",
   ],
 }, {
+  label: "domain provisioning monitor",
+  callee: "runDomainCoordinatorProvisioningMonitorOnce",
+  properties: [
+    "hostExecutor", "policy", "readSnapshot", "readWindows", "readDefaultModel",
+    "getAttempt", "requestAttempt", "rebindAttempt", "findThread", "readThread",
+    "markStarting", "startThread", "attachThread", "resetAttempt", "resumeExpiredAttempt",
+    "deliverInstruction",
+  ],
+}, {
   label: "domain shutdown monitor",
   callee: "runDomainCoordinatorShutdownMonitorOnce",
   properties: [
@@ -7599,6 +7660,7 @@ test("the resident authenticated host polls durable opt-in policies without the 
     /if \(continuationEnabled\) monitors\.push\(\s*\(\) => runCoordinatorShutdownMonitorOnce\(/,
   );
   assert.match(source, /coordinator-provisioning-attempts/);
+  assert.match(source, /return coordinatorProvisioningResponseJson\(response\);/);
   assert.match(source, /"thread\/list"/);
   assert.match(source, /"thread\/start"/);
   assert.match(source, /TASKBOARD_COORDINATOR_PROVISIONING_V1/);
@@ -8954,3 +9016,601 @@ for (const [lookupMode, lookupTrace] of [
     );
   });
 }
+
+function cap60DomainMonitorOptions({ projectId, hostExecutor, snapshot, effects }) {
+  let attempt = null;
+  const globalHolder = snapshot.taskLanes.find(
+    (lane) => lane.id === snapshot.coordination.coordinatorTaskId,
+  );
+  return {
+    policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+    ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    readSnapshot: async () => {
+      effects.push("snapshot");
+      return snapshot;
+    },
+    readWindows: async () => {
+      effects.push("windows");
+      return { projectId, revision: "a".repeat(64) };
+    },
+    getAttempt: async (request) => {
+      effects.push([
+        request.idempotencyKey ? "exact-lookup" : "fallback-lookup",
+        request.domainId,
+        request.ownedCodexHostId,
+      ]);
+      return { attempt: attempt ? { ...attempt } : null };
+    },
+    requestAttempt: async (request) => {
+      effects.push(["request", request.domainId, request.ownedCodexHostId]);
+      const domain = snapshot.coordination.domainCoordinators.find(
+        (candidate) => candidate.domainId === request.domainId,
+      );
+      const { ownedCodexHostId: _ownedCodexHostId, ...persistedRequest } = request;
+      attempt = {
+        ...persistedRequest,
+        id: `attempt-${projectId}`,
+        globalHolderCodexProjectId: globalHolder.codexProjectId,
+        globalHolderCodexProjectKind: globalHolder.codexProjectKind,
+        globalHolderCodexHostId: globalHolder.codexHostId,
+        globalHolderWorkspacePath: globalHolder.workspacePath,
+        writeScope: domain.writeScope,
+        status: "pending",
+        threadId: null,
+        retryCount: 0,
+        missingSince: null,
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => {
+      effects.push("find-thread");
+      return null;
+    },
+    markStarting: async ({ ownedCodexHostId }) => {
+      effects.push(["starting", ownedCodexHostId]);
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      effects.push(["start-thread", settings.codexHostId]);
+      return { thread: {
+        id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+        cwd: settings.cwd,
+        threadSource: settings.threadSource,
+      } };
+    },
+    attachThread: async ({ threadId, ownedCodexHostId }) => {
+      effects.push(["attach", ownedCodexHostId]);
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    resetAttempt: async ({ ownedCodexHostId }) => {
+      effects.push(["reset", ownedCodexHostId]);
+      attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
+      return { attempt: { ...attempt } };
+    },
+    resumeExpiredAttempt: async ({ ownedCodexHostId }) => {
+      effects.push(["resume", ownedCodexHostId]);
+      attempt = { ...attempt, status: "started" };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => {
+      effects.push("deliver");
+      return { delivery: "started", turnId: "turn-cap60" };
+    },
+  };
+}
+
+function cap60DomainSnapshot({ projectId, globalHostId, domains, lanes }) {
+  return {
+    projectId,
+    coordination: {
+      coordinatorTaskId: "global",
+      lease: { id: "global-lease", status: "active", bindingValid: true },
+      domainCoordinators: domains,
+    },
+    taskLanes: [{
+      id: "global",
+      source: "codex",
+      taskType: "root_task",
+      threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      codexProjectId: `project-${globalHostId}`,
+      codexProjectKind: globalHostId === "local" ? "local" : "remote",
+      codexHostId: globalHostId,
+      workspacePath: `/tmp/cap60-${globalHostId}`,
+    }, ...lanes],
+  };
+}
+
+function cap60DomainAttempt(snapshot, {
+  revision = "a".repeat(64),
+  expectedRevision = revision,
+  expectedGlobalLeaseId = snapshot.coordination.lease.id,
+  status = "pending",
+  threadId = null,
+} = {}) {
+  const domain = snapshot.coordination.domainCoordinators[0];
+  const lane = snapshot.taskLanes.find((candidate) => (
+    candidate.id === domain.eligibleTaskIds[0]
+  ));
+  const globalHolder = snapshot.taskLanes.find((candidate) => (
+    candidate.id === snapshot.coordination.coordinatorTaskId
+  ));
+  const launchLane = lane.codexProjectId ? lane : globalHolder;
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    projectId: snapshot.projectId,
+    revision: expectedRevision,
+    domainId: domain.domainId,
+    taskId: lane.id,
+    globalLeaseId: expectedGlobalLeaseId,
+  })).digest("hex");
+  return {
+    id: `attempt-${snapshot.projectId}`,
+    projectId: snapshot.projectId,
+    domainId: domain.domainId,
+    idempotencyKey: `domain-coordinator-provision-${fingerprint}`,
+    taskId: lane.id,
+    label: lane.label,
+    threadSource: `taskboard-domain-coordinator-provision-${fingerprint}`,
+    model: "gpt-5",
+    reasoningEffort: "high",
+    expectedRevision,
+    expectedGlobalLeaseId,
+    globalHolderTaskId: globalHolder.id,
+    globalHolderThreadId: globalHolder.threadId,
+    globalHolderCodexProjectId: globalHolder.codexProjectId,
+    globalHolderCodexProjectKind: globalHolder.codexProjectKind,
+    globalHolderCodexHostId: globalHolder.codexHostId,
+    globalHolderWorkspacePath: globalHolder.workspacePath,
+    codexProjectId: launchLane.codexProjectId,
+    codexProjectKind: launchLane.codexProjectKind,
+    codexHostId: launchLane.codexHostId,
+    workspacePath: launchLane.workspacePath,
+    writeScope: domain.writeScope,
+    status,
+    threadId,
+    retryCount: 0,
+    missingSince: null,
+    createdAt: "2026-09-08T00:00:00.000Z",
+    updatedAt: "2026-09-08T00:00:00.000Z",
+    expiresAt: status === "expired"
+      ? "2000-01-01T00:00:00.000Z"
+      : "2099-01-01T00:00:00.000Z",
+  };
+}
+
+test("CAP-60 Domain provisioning rejects invalid host executors before every callback", async () => {
+  const cases = [
+    ["missing", undefined],
+    ["null", null],
+    ["whitespace", { ownedCodexHostId: "   " }],
+    ["control", { ownedCodexHostId: "bad\nhost" }],
+    ["257 characters", { ownedCodexHostId: "h".repeat(257) }],
+  ];
+  const observed = [];
+  for (const [label, hostExecutor] of cases) {
+    const projectId = `cap60-invalid-${label.replaceAll(" ", "-")}`;
+    const effects = [];
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: "local",
+      domains: [{
+        domainId: "frontend",
+        assignment: "unassigned",
+        durableWorkPending: true,
+        eligibleTaskIds: ["frontend"],
+        writeScope: ["web"],
+      }],
+      lanes: [{
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "legacy-frontend-thread",
+      }],
+    });
+    const result = await runDomainCoordinatorProvisioningMonitorOnce(
+      cap60DomainMonitorOptions({ projectId, hostExecutor, snapshot, effects }),
+    );
+    observed.push([label, result, effects]);
+  }
+  assert.deepEqual(observed, cases.map(([label]) => [label, {
+    provisioned: false,
+    reason: "host-executor-unavailable",
+  }, []]));
+});
+
+test("CAP-60 Domain provisioning skips foreign-first routes and owns the exact peer route", async () => {
+  const projectId = "cap60-owned-route";
+  const effects = [];
+  const remoteLane = (id) => ({
+    id, label: `${id} Coordinator`, source: "codex", taskType: "peer_task",
+    threadId: `${id}-thread`, codexProjectId: `${id}-project`, codexProjectKind: "remote",
+    codexHostId: "remote-builder", workspacePath: `/tmp/${id}`,
+  });
+  const localLane = {
+    id: "backend-local", label: "Backend Local Coordinator", source: "codex",
+    taskType: "peer_task", threadId: "backend-local-thread",
+    codexProjectId: "backend-local-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/backend-local",
+  };
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "remote-global",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend-remote"], writeScope: ["web"],
+    }, {
+      domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["backend-remote", "backend-local"], writeScope: ["server"],
+    }],
+    lanes: [remoteLane("frontend-remote"), remoteLane("backend-remote"), localLane],
+  });
+  const result = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({ projectId, hostExecutor: localHostExecutor, snapshot, effects }),
+  );
+  assert.deepEqual(result, {
+    provisioned: true,
+    reason: "domain-thread-started",
+    domainId: "backend",
+    attemptId: `attempt-${projectId}`,
+    threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+  });
+  assert.deepEqual(effects.filter((effect) => Array.isArray(effect)), [
+    ["exact-lookup", "backend", "local"],
+    ["fallback-lookup", "backend", "local"],
+    ["request", "backend", "local"],
+    ["starting", "local"],
+    ["start-thread", "local"],
+    ["attach", "local"],
+  ]);
+  assert.equal(effects.filter((effect) => effect === "deliver").length, 1);
+});
+
+test("CAP-60 Domain provisioning skips a foreign persisted attempt and serves a later owned domain", async () => {
+  const projectId = "cap60-foreign-attempt";
+  const effects = [];
+  const localLane = (id) => ({
+    id, label: `${id} Coordinator`, source: "codex", taskType: "peer_task",
+    threadId: `${id}-thread`, codexProjectId: `${id}-project`, codexProjectKind: "local",
+    codexHostId: "local", workspacePath: `/tmp/${id}`,
+  });
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "local",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend"], writeScope: ["web"],
+    }, {
+      domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["backend"], writeScope: ["server"],
+    }],
+    lanes: [localLane("frontend"), localLane("backend")],
+  });
+  const foreignAttempt = {
+    ...cap60DomainAttempt(snapshot),
+    idempotencyKey: `domain-coordinator-provision-${"f".repeat(64)}`,
+    threadSource: `taskboard-domain-coordinator-provision-${"f".repeat(64)}`,
+    codexProjectId: "foreign-project",
+    codexProjectKind: "remote",
+    codexHostId: "remote-builder",
+    workspacePath: "/tmp/cap60-foreign-attempt",
+    expiresAt: "2000-01-01T00:00:00.000Z",
+  };
+  const foreignAttemptBefore = structuredClone(foreignAttempt);
+  const options = cap60DomainMonitorOptions({
+    projectId, hostExecutor: localHostExecutor, snapshot, effects,
+  });
+  const getOwnedAttempt = options.getAttempt;
+  options.getAttempt = async (request) => {
+    if (request.domainId !== "frontend") return getOwnedAttempt(request);
+    effects.push([
+      request.idempotencyKey ? "exact-lookup" : "fallback-lookup",
+      request.domainId,
+      request.ownedCodexHostId,
+    ]);
+    const persistedAttempt = request.idempotencyKey
+      && request.idempotencyKey !== foreignAttempt.idempotencyKey
+      ? null
+      : foreignAttempt;
+    if (!persistedAttempt) {
+      return coordinatorProvisioningResponseJson(new Response(
+        JSON.stringify({ attempt: null }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ));
+    }
+    const response = persistedAttempt.codexHostId === request.ownedCodexHostId
+      ? new Response(
+        JSON.stringify({ attempt: persistedAttempt }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+      : new Response(
+        JSON.stringify({ error: { code: "HOST_EXECUTOR_MISMATCH" } }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    return coordinatorProvisioningResponseJson(response);
+  };
+  const result = await runDomainCoordinatorProvisioningMonitorOnce(options);
+  assert.deepEqual(result, {
+    provisioned: true,
+    reason: "domain-thread-started",
+    domainId: "backend",
+    attemptId: `attempt-${projectId}`,
+    threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+  });
+  assert.deepEqual(foreignAttempt, foreignAttemptBefore);
+  assert.deepEqual(effects.filter((effect) => Array.isArray(effect)), [
+    ["exact-lookup", "frontend", "local"],
+    ["fallback-lookup", "frontend", "local"],
+    ["exact-lookup", "backend", "local"],
+    ["fallback-lookup", "backend", "local"],
+    ["request", "backend", "local"],
+    ["starting", "local"],
+    ["start-thread", "local"],
+    ["attach", "local"],
+  ]);
+  assert.equal(effects.filter((effect) => effect === "deliver").length, 1);
+});
+
+test("CAP-60 Domain provisioning never skips a different provisioning failure", async () => {
+  for (const [status, code] of [
+    [409, "DOMAIN_COORDINATOR_PROVISIONING_REVISION_CONFLICT"],
+    [503, "HOST_EXECUTOR_MISMATCH"],
+  ]) {
+    const projectId = `cap60-nonskippable-${status}`;
+    const effects = [];
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: "local",
+      domains: [{
+        domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+        eligibleTaskIds: ["frontend"], writeScope: ["web"],
+      }, {
+        domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+        eligibleTaskIds: ["backend"], writeScope: ["server"],
+      }],
+      lanes: ["frontend", "backend"].map((id) => ({
+        id, label: `${id} Coordinator`, source: "codex", taskType: "peer_task",
+        threadId: `${id}-thread`, codexProjectId: `${id}-project`, codexProjectKind: "local",
+        codexHostId: "local", workspacePath: `/tmp/${id}`,
+      })),
+    });
+    const options = cap60DomainMonitorOptions({
+      projectId, hostExecutor: localHostExecutor, snapshot, effects,
+    });
+    options.getAttempt = async (request) => {
+      effects.push([
+        request.idempotencyKey ? "exact-lookup" : "fallback-lookup",
+        request.domainId,
+        request.ownedCodexHostId,
+      ]);
+      if (request.idempotencyKey) return { attempt: null };
+      return coordinatorProvisioningResponseJson(new Response(
+        JSON.stringify({ error: { code } }),
+        { status, headers: { "content-type": "application/json" } },
+      ));
+    };
+    await assert.rejects(
+      runDomainCoordinatorProvisioningMonitorOnce(options),
+      (error) => error?.status === status && error?.code === code,
+    );
+    assert.deepEqual(effects, [
+      "snapshot",
+      "windows",
+      ["exact-lookup", "frontend", "local"],
+      ["fallback-lookup", "frontend", "local"],
+    ]);
+  }
+});
+
+test("CAP-60 Domain provisioning uses the Global host only for an unbound peer fallback", async () => {
+  const projectId = "cap60-fallback-route";
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "remote-builder",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend"], writeScope: ["web"],
+    }],
+    lanes: [{
+      id: "frontend", label: "Frontend Coordinator", source: "codex",
+      taskType: "peer_task", threadId: "legacy-frontend-thread",
+    }],
+  });
+  const localEffects = [];
+  const local = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({ projectId, hostExecutor: localHostExecutor, snapshot, effects: localEffects }),
+  );
+  assert.deepEqual(local, { provisioned: false, reason: "host-executor-unavailable" });
+  assert.deepEqual(localEffects, ["snapshot", "windows"]);
+
+  const remoteEffects = [];
+  const remote = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({ projectId, hostExecutor: remoteHostExecutor, snapshot, effects: remoteEffects }),
+  );
+  assert.equal(remote.provisioned, true);
+  assert.deepEqual(remoteEffects.filter((effect) => Array.isArray(effect)), [
+    ["exact-lookup", "frontend", "remote-builder"],
+    ["fallback-lookup", "frontend", "remote-builder"],
+    ["request", "frontend", "remote-builder"],
+    ["starting", "remote-builder"],
+    ["start-thread", "remote-builder"],
+    ["attach", "remote-builder"],
+  ]);
+});
+
+test("CAP-60 Domain provisioning single-flight is scoped by exact host and project", async () => {
+  let enteredLocal;
+  const localEntered = new Promise((resolve) => { enteredLocal = resolve; });
+  let releaseLocal;
+  const localRelease = new Promise((resolve) => { releaseLocal = resolve; });
+  const observedHosts = [];
+  const makeOptions = (hostExecutor, block) => {
+    const projectId = "cap60-host-flight";
+    const effects = [];
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: hostExecutor.ownedCodexHostId,
+      domains: [],
+      lanes: [],
+    });
+    const options = cap60DomainMonitorOptions({ projectId, hostExecutor, snapshot, effects });
+    options.readSnapshot = async () => {
+      observedHosts.push(hostExecutor.ownedCodexHostId);
+      if (block) {
+        enteredLocal();
+        await localRelease;
+      }
+      return snapshot;
+    };
+    return options;
+  };
+  const local = runDomainCoordinatorProvisioningMonitorOnce(makeOptions(localHostExecutor, true));
+  await localEntered;
+  const remote = runDomainCoordinatorProvisioningMonitorOnce(makeOptions(remoteHostExecutor, false));
+  releaseLocal();
+  const results = await Promise.all([local, remote]);
+  assert.deepEqual(observedHosts, ["local", "remote-builder"]);
+  assert.deepEqual(results, [
+    { provisioned: false, reason: "no-domain-work" },
+    { provisioned: false, reason: "no-domain-work" },
+  ]);
+});
+
+test("CAP-60 Domain provisioning rejects immutable drift after every durable transition", async () => {
+  const domainThreadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
+  const cases = ["request", "rebind", "starting", "reset", "attach", "resume"];
+  for (const action of cases) {
+    const projectId = `cap60-envelope-${action}`;
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: "local",
+      domains: [{
+        domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+        eligibleTaskIds: ["frontend"], writeScope: ["web"],
+      }],
+      lanes: [{
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "frontend-template-thread",
+        codexProjectId: "frontend-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/cap60-envelope-frontend",
+      }],
+    });
+    const effects = [];
+    const currentRevision = "a".repeat(64);
+    let attempt = action === "request"
+      ? null
+      : cap60DomainAttempt(snapshot, action === "rebind" ? {
+        expectedRevision: "b".repeat(64),
+        expectedGlobalLeaseId: "previous-global-lease",
+        status: "started",
+        threadId: domainThreadId,
+      } : action === "resume" ? {
+        status: "expired", threadId: domainThreadId,
+      } : {});
+    const drift = (candidate) => ({ ...candidate, label: "Drifted Coordinator" });
+    const result = await runDomainCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+      readSnapshot: async () => snapshot,
+      readWindows: async () => ({ projectId, revision: currentRevision }),
+      getAttempt: async ({ idempotencyKey }) => {
+        if (action === "request") return { attempt: null };
+        if (action === "rebind" && idempotencyKey) return { attempt: null };
+        return { attempt: { ...attempt } };
+      },
+      requestAttempt: async () => {
+        effects.push("request");
+        attempt = cap60DomainAttempt(snapshot);
+        return { attempt: drift(attempt) };
+      },
+      rebindAttempt: async ({ expectedRevision, expectedGlobalLeaseId }) => {
+        effects.push("rebind");
+        attempt = { ...attempt, expectedRevision, expectedGlobalLeaseId };
+        return { attempt: drift(attempt) };
+      },
+      findThread: async () => {
+        effects.push("find-thread");
+        return null;
+      },
+      readThread: async () => {
+        effects.push("read-thread");
+        return {
+          id: domainThreadId,
+          cwd: attempt.workspacePath,
+          threadSource: attempt.threadSource,
+          turns: [{
+            id: "cap60-envelope-turn",
+            status: "completed",
+            input: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+          }],
+        };
+      },
+      markStarting: async () => {
+        effects.push("starting");
+        attempt = { ...attempt, status: "starting" };
+        return { attempt: action === "starting" ? drift(attempt) : { ...attempt } };
+      },
+      startThread: async () => {
+        effects.push("start-thread");
+        if (action === "reset") {
+          throw new Error("Selected model is at capacity. Please try a different model.");
+        }
+        return { thread: {
+          id: domainThreadId,
+          cwd: attempt.workspacePath,
+          threadSource: attempt.threadSource,
+        } };
+      },
+      resetAttempt: async () => {
+        effects.push("reset");
+        attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
+        return { attempt: drift(attempt) };
+      },
+      attachThread: async ({ threadId }) => {
+        effects.push("attach");
+        attempt = { ...attempt, status: "started", threadId };
+        return { attempt: action === "attach" ? drift(attempt) : { ...attempt } };
+      },
+      resumeExpiredAttempt: async () => {
+        effects.push("resume");
+        attempt = { ...attempt, status: "started", expiresAt: "2099-01-01T00:00:00.000Z" };
+        return { attempt: drift(attempt) };
+      },
+      deliverInstruction: async () => {
+        effects.push("deliver");
+        return { delivery: "started", turnId: "cap60-envelope-turn" };
+      },
+    });
+    assert.equal(result.reason, "attempt-binding-mismatch", `${action}: ${JSON.stringify(result)}`);
+    assert.equal(effects.at(-1), action, `${action}: ${JSON.stringify(effects)}`);
+    assert.equal(effects.includes("deliver"), false, action);
+  }
+});
+
+test("CAP-60 Domain provisioning never falls back from a partially bound peer route", async () => {
+  const projectId = "cap60-partial-route";
+  const effects = [];
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "local",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend"], writeScope: ["web"],
+    }],
+    lanes: [{
+      id: "frontend", label: "Frontend Coordinator", source: "codex",
+      taskType: "peer_task", threadId: "frontend-template-thread",
+      codexProjectId: "partial-project",
+    }],
+  });
+  const result = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({
+      projectId, hostExecutor: localHostExecutor, snapshot, effects,
+    }),
+  );
+  assert.deepEqual(result, {
+    provisioned: false, reason: "domain-route-unavailable", domainId: "frontend",
+  });
+  assert.deepEqual(effects, ["snapshot", "windows"]);
+});

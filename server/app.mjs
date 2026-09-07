@@ -581,7 +581,7 @@ function parseDomainCoordinatorProvisioningRequest(value) {
   assertAllowedKeys(value, new Set([
     "idempotencyKey", "taskId", "label", "threadSource", "model", "reasoningEffort",
     "expectedRevision", "expectedGlobalLeaseId", "globalHolderTaskId", "globalHolderThreadId",
-    "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath",
+    "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath", "ownedCodexHostId",
   ]));
   const expectedRevision = stringField(value.expectedRevision, "expectedRevision", {
     required: true, maxLength: 64,
@@ -607,6 +607,7 @@ function parseDomainCoordinatorProvisioningRequest(value) {
     throw new ApiError(400, "INVALID_FIELD", "'workspacePath' must be an absolute path");
   }
   return {
+    ownedCodexHostId: parseOwnedCodexHostId(value.ownedCodexHostId),
     idempotencyKey: stringField(value.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
     taskId: stringField(value.taskId, "taskId", { required: true, maxLength: 256 }),
     label: stringField(value.label, "label", { required: true, maxLength: 120 }),
@@ -3996,10 +3997,13 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const idempotencyKey = parseCoordinatorProvisioningLookup(body);
+        const input = parseCoordinatorProvisioningLookup(
+          body,
+          { requireOwnedCodexHostId: true },
+        );
         return sendJson(response, 200, {
           attempt: database.getAgentLaneDomainCoordinatorProvisioningAttempt(
-            projectId, domainId, idempotencyKey,
+            projectId, domainId, input.idempotencyKey, input.ownedCodexHostId,
           ),
         });
       }
@@ -4045,7 +4049,7 @@ export function createTaskboardServer(options = {}) {
         const input = parseCoordinatorProvisioningTransition(
           body,
           action,
-          { expectedGlobalLeaseId: true },
+          { expectedGlobalLeaseId: true, requireOwnedCodexHostId: true },
         );
         return sendJson(
           response,
