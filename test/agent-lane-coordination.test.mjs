@@ -127,52 +127,60 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
 
 test("bootstrap reservation rejects a stale local executor after the authoritative route moves remote", async () => {
   const fixture = await setup();
-  fixture.database.createComment(fixture.task.id, {
-    body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
-      gates: [{
-        id: "local", kind: "test", state: "authorized", scope: "focused tests",
-        approver: "Owner", approvalRequest: "同意执行本地测试",
-        evidence: "Owner resumed", receipt: "turn:resume",
-      }],
-      actions: [{
-        id: "test", order: 10, text: "Run focused tests", gate: "local",
-        target: "candidate", status: "pending",
-      }],
-    })}\n\`\`\``,
-    threadId: fixture.rootBinding.threadId,
-    threadBinding: fixture.rootBinding,
-    actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
-  });
-  const localCapsule = fixture.database.getTaskCapsule(fixture.task.id);
-  const taskBeforeRouteChange = fixture.database.getTask(fixture.task.id);
-  const remoteBinding = {
-    threadId: fixture.rootBinding.threadId,
-    codexProjectId: "remote-project",
-    codexProjectKind: "remote",
-    codexHostId: "remote-builder",
-    workspacePath: "/srv/taskboard/root",
-  };
-  const moved = fixture.database.updateTask(
-    fixture.task.id,
-    taskBeforeRouteChange.version,
-    {},
-    remoteBinding.threadId,
-    remoteBinding,
-    actor,
-  );
+  let inspection = null;
+  try {
+    fixture.database.createComment(fixture.task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "focused tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:resume",
+        }],
+        actions: [{
+          id: "test", order: 10, text: "Run focused tests", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: fixture.rootBinding.threadId,
+      threadBinding: fixture.rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const localCapsule = fixture.database.getTaskCapsule(fixture.task.id);
+    const taskBeforeRouteChange = fixture.database.getTask(fixture.task.id);
+    const remoteBinding = {
+      threadId: fixture.rootBinding.threadId,
+      codexProjectId: "remote-project",
+      codexProjectKind: "remote",
+      codexHostId: "remote-builder",
+      workspacePath: "/srv/taskboard/root",
+    };
+    const moved = fixture.database.updateTask(
+      fixture.task.id,
+      taskBeforeRouteChange.version,
+      {},
+      remoteBinding.threadId,
+      remoteBinding,
+      actor,
+    );
 
-  assert.throws(() => fixture.database.claimTaskSafeAction(moved.id, {
-    rootThreadId: remoteBinding.threadId,
-    ownedCodexHostId: "local",
-    expectedResumeToken: localCapsule.resumeToken,
-    safeActionId: localCapsule.readyWork.safeActions[0].id,
-    reservationLeaseId: "stale-local-executor",
-  }), (error) => error?.code === "HOST_EXECUTOR_MISMATCH");
-  const inspection = new DatabaseSync(fixture.databasePath);
-  assert.equal(inspection.prepare(
-    "SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?",
-  ).get(moved.id).count, 0);
-  inspection.close();
+    assert.throws(() => fixture.database.claimTaskSafeAction(moved.id, {
+      rootThreadId: remoteBinding.threadId,
+      ownedCodexHostId: "local",
+      expectedResumeToken: localCapsule.resumeToken,
+      safeActionId: localCapsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "stale-local-executor",
+    }), (error) => error?.code === "HOST_EXECUTOR_MISMATCH");
+    inspection = new DatabaseSync(fixture.databasePath);
+    assert.equal(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?",
+    ).get(moved.id).count, 0);
+  } finally {
+    try {
+      inspection?.close();
+    } finally {
+      fixture.database.close();
+    }
+  }
 });
 
 test("legacy bootstrap receipts migrate fail-closed instead of becoming reclaimable", async () => {
