@@ -64,6 +64,7 @@ import {
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
 const localHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
+const remoteHostExecutor = Object.freeze({ ownedCodexHostId: "remote-builder" });
 
 test("cold admission recovery allows bounded thread loading beyond the fast RPC budget", () => {
   assert.equal(admissionRecoveryRpcTimeoutMs("thread/read"), 10_000);
@@ -868,6 +869,7 @@ test("background Coordinator identity handshake verifies the exact host thread w
   const workspacePath = path.resolve("/tmp/sbkk");
   const result = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
     projectId: "local",
+    hostExecutor: localHostExecutor,
     listHandshakes: async () => ({ handshakes: [{
       id: "handshake-1", role: "coordinator", threadId: coordinatorThreadId,
       registration: {
@@ -905,6 +907,7 @@ test("background Coordinator identity handshake verifies the exact host thread w
 
   const wrongWorkspace = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
     projectId: "local",
+    hostExecutor: localHostExecutor,
     listHandshakes: async () => ({ handshakes: [{
       id: "handshake-2", role: "coordinator", threadId: coordinatorThreadId,
       registration: {
@@ -921,6 +924,84 @@ test("background Coordinator identity handshake verifies the exact host thread w
     confirmIdentity: async () => { throw new Error("must not confirm"); },
   });
   assert.deepEqual(wrongWorkspace, { confirmed: 0, skipped: 1, failed: 0 });
+});
+
+test("Coordinator identity handshake reads and confirms only the exact owned host", async () => {
+  const remoteThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const workspacePath = "/tmp/taskboard/remote";
+  const remoteHandshake = {
+    id: "handshake-remote",
+    role: "coordinator",
+    threadId: remoteThreadId,
+    registration: {
+      projectId: "taskboard-core",
+      role: "coordinator",
+      taskId: "remote-coordinator",
+      label: "Remote Coordinator",
+      threadId: remoteThreadId,
+      expectedRevision: "b".repeat(64),
+      idempotencyKey: "handshake-remote",
+    },
+    expectedHostBinding: {
+      codexProjectId: "remote-project",
+      codexProjectKind: "remote",
+      codexHostId: remoteHostExecutor.ownedCodexHostId,
+      workspacePath,
+    },
+  };
+  let reads = 0;
+  let confirmations = 0;
+  const foreignResult = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "taskboard-core",
+    hostExecutor: localHostExecutor,
+    listHandshakes: async () => ({ handshakes: [remoteHandshake] }),
+    readThread: async () => { reads += 1; },
+    confirmIdentity: async () => { confirmations += 1; },
+  });
+  assert.deepEqual(foreignResult, { confirmed: 0, skipped: 1, failed: 0 });
+  assert.equal(reads, 0);
+  assert.equal(confirmations, 0);
+
+  const localThreadId = coordinatorThreadId;
+  const ownedResult = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "taskboard-core",
+    hostExecutor: remoteHostExecutor,
+    listHandshakes: async () => ({ handshakes: [{
+      ...remoteHandshake,
+      id: "handshake-local",
+      threadId: localThreadId,
+      registration: {
+        ...remoteHandshake.registration,
+        taskId: "local-coordinator",
+        threadId: localThreadId,
+        idempotencyKey: "handshake-local",
+      },
+      expectedHostBinding: {
+        ...remoteHandshake.expectedHostBinding,
+        codexProjectId: "local-project",
+        codexProjectKind: "local",
+        codexHostId: localHostExecutor.ownedCodexHostId,
+        workspacePath: "/tmp/taskboard/local",
+      },
+    }, remoteHandshake] }),
+    readThread: async (route) => {
+      reads += 1;
+      assert.deepEqual(route, {
+        threadId: remoteThreadId,
+        codexHostId: remoteHostExecutor.ownedCodexHostId,
+      });
+      return { thread: { id: remoteThreadId, cwd: workspacePath } };
+    },
+    confirmIdentity: async (handshakeId, registration, binding) => {
+      confirmations += 1;
+      assert.equal(handshakeId, remoteHandshake.id);
+      assert.equal(registration, remoteHandshake.registration);
+      assert.equal(binding.codexHostId, remoteHostExecutor.ownedCodexHostId);
+    },
+  });
+  assert.deepEqual(ownedResult, { confirmed: 1, skipped: 1, failed: 0 });
+  assert.equal(reads, 1);
+  assert.equal(confirmations, 1);
 });
 
 test("each open generation resolves one fresh Coordinator route and coalesces retries", async () => {
@@ -1099,7 +1180,12 @@ test("Owner Intent plan HTTP failures distinguish replan validation from stale s
   assert.equal(classifyOwnerIntentPlanHttpFailure(503, "SERVICE_UNAVAILABLE"), null);
 });
 
-function coordinatorKeepaliveSnapshot({ expiresAt, domainExpiresAt = expiresAt } = {}) {
+function coordinatorKeepaliveSnapshot({
+  expiresAt,
+  domainExpiresAt = expiresAt,
+  globalCodexHostId = localHostExecutor.ownedCodexHostId,
+  domainCodexHostId = localHostExecutor.ownedCodexHostId,
+} = {}) {
   return {
     projectId: "taskboard-core",
     coordination: {
@@ -1125,13 +1211,13 @@ function coordinatorKeepaliveSnapshot({ expiresAt, domainExpiresAt = expiresAt }
       {
         id: "global",
         threadId: coordinatorThreadId,
-        codexHostId: "host-global",
+        codexHostId: globalCodexHostId,
         workspacePath: "/tmp/taskboard/global",
       },
       {
         id: "frontend",
         threadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
-        codexHostId: "host-frontend",
+        codexHostId: domainCodexHostId,
         workspacePath: "/tmp/taskboard/frontend",
       },
     ],
@@ -1142,6 +1228,7 @@ test("coordinator keepalive renews exact near-expiry Global and domain leases in
   const renewed = [];
   const now = Date.parse("2026-08-31T01:00:00.000Z");
   const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -1193,6 +1280,7 @@ test("resident Coordinator lifecycle discovery keeps an idle background lease al
   let busy = true;
   const receipts = [];
   const runTick = () => runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "capstone-dev",
@@ -1252,6 +1340,264 @@ test("resident keepalive survives an unavailable continuation policy without ena
     },
   });
   assert.deepEqual(projects, [{ projectId: "capstone-dev", continuationEnabled: false }]);
+});
+
+test("Coordinator keepalive skips foreign-first routes and renews only exact owned hosts", async () => {
+  const now = Date.parse("2026-08-31T01:00:00.000Z");
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T01:00:30.000Z",
+    domainExpiresAt: "2026-08-31T01:00:35.000Z",
+    globalCodexHostId: remoteHostExecutor.ownedCodexHostId,
+    domainCodexHostId: localHostExecutor.ownedCodexHostId,
+  });
+  const reads = [];
+  const renewals = [];
+  const run = (hostExecutor) => runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor,
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => now,
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => {
+      reads.push(route.codexHostId);
+      return { thread: { id: route.threadId, cwd: route.workspacePath, turns: [] } };
+    },
+    renewLease: async (request) => {
+      renewals.push(request);
+      return { lease: { id: request.expectedLeaseId, status: "active" } };
+    },
+  });
+
+  assert.deepEqual(await run(localHostExecutor), { renewed: 1, failed: 0, skipped: 1 });
+  assert.deepEqual(reads, [localHostExecutor.ownedCodexHostId]);
+  assert.deepEqual(renewals.map(({ scope, codexHostId }) => [scope, codexHostId]), [[
+    "domain", localHostExecutor.ownedCodexHostId,
+  ]]);
+
+  reads.length = 0;
+  renewals.length = 0;
+  assert.deepEqual(await run(remoteHostExecutor), { renewed: 1, failed: 0, skipped: 1 });
+  assert.deepEqual(reads, [remoteHostExecutor.ownedCodexHostId]);
+  assert.deepEqual(renewals.map(({ scope, codexHostId }) => [scope, codexHostId]), [[
+    "global", remoteHostExecutor.ownedCodexHostId,
+  ]]);
+});
+
+async function runCoordinatorHostRouteBoundary({ routeHostId, hostExecutor }) {
+  const workspacePath = "/tmp/taskboard/host-boundary";
+  const observedAt = Date.parse("2026-08-31T01:00:00.000Z");
+  const threadReads = [];
+  const mutations = [];
+  const taskLane = {
+    id: "global",
+    threadId: coordinatorThreadId,
+    codexHostId: routeHostId,
+    workspacePath,
+  };
+  const readThread = (monitor) => async (route) => {
+    threadReads.push(monitor);
+    assert.equal(route.codexHostId, routeHostId);
+    return { thread: { id: route.threadId, cwd: route.workspacePath, turns: [] } };
+  };
+  const handshake = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "taskboard-core",
+    hostExecutor,
+    listHandshakes: async () => ({ handshakes: [{
+      id: "handshake-host-boundary",
+      role: "coordinator",
+      threadId: coordinatorThreadId,
+      registration: {
+        projectId: "taskboard-core",
+        role: "coordinator",
+        taskId: "global",
+        label: "Coordinator",
+        threadId: coordinatorThreadId,
+        expectedRevision: "d".repeat(64),
+        idempotencyKey: "handshake-host-boundary",
+      },
+      expectedHostBinding: {
+        codexProjectId: "host-boundary-project",
+        codexProjectKind: "remote",
+        codexHostId: routeHostId,
+        workspacePath,
+      },
+    }] }),
+    readThread: async (route) => {
+      threadReads.push("handshake");
+      assert.equal(route.codexHostId, routeHostId);
+      return { thread: { id: route.threadId, cwd: workspacePath } };
+    },
+    confirmIdentity: async () => { mutations.push("handshake"); },
+  });
+  const keepalive = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor,
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => observedAt,
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: {
+        coordinatorTaskId: "global",
+        lease: {
+          id: "global-lease",
+          status: "active",
+          acquiredAt: "2026-08-31T00:00:00.000Z",
+          expiresAt: "2026-08-31T01:00:30.000Z",
+        },
+        domainCoordinators: [],
+      },
+      taskLanes: [taskLane],
+    }),
+    readThread: readThread("keepalive"),
+    renewLease: async (request) => {
+      mutations.push("keepalive");
+      return { lease: { id: request.expectedLeaseId, status: "active" } };
+    },
+  });
+  const recovery = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: {
+        lease: {
+          id: "global-lease",
+          holderTaskId: "global",
+          status: "expired",
+          bindingValid: true,
+          releasedAt: null,
+        },
+        domainCoordinators: [],
+      },
+      taskLanes: [taskLane],
+    }),
+    readThread: readThread("recovery"),
+    recoverLease: async () => {
+      mutations.push("recovery");
+      return { lease: { id: "global-recovered", status: "active" } };
+    },
+  });
+  return { handshake, keepalive, recovery, threadReads, mutations };
+}
+
+test("Coordinator monitors accept exact canonical 240, 241, and 256 character host routes", async () => {
+  for (const length of [240, 241, 256]) {
+    const ownedCodexHostId = `host-${"x".repeat(length - 5)}`;
+    assert.equal(ownedCodexHostId.length, length);
+    assert.deepEqual(await runCoordinatorHostRouteBoundary({
+      routeHostId: ownedCodexHostId,
+      hostExecutor: { ownedCodexHostId },
+    }), {
+      handshake: { confirmed: 1, skipped: 0, failed: 0 },
+      keepalive: { renewed: 1, failed: 0, skipped: 0 },
+      recovery: { recovered: 1, failed: 0, skipped: 0 },
+      threadReads: ["handshake", "keepalive", "recovery"],
+      mutations: ["handshake", "keepalive", "recovery"],
+    });
+  }
+});
+
+test("Coordinator monitors reject noncanonical, missing, and mismatched route hosts before RPC", async () => {
+  const cases = [{
+    name: "257 characters",
+    routeHostId: "x".repeat(257),
+  }, {
+    name: "control character",
+    routeHostId: "local\u0000remote",
+  }, {
+    name: "missing",
+    routeHostId: undefined,
+  }, {
+    name: "mismatch",
+    routeHostId: "remote-builder",
+  }];
+  for (const candidate of cases) {
+    const result = await runCoordinatorHostRouteBoundary({
+      routeHostId: candidate.routeHostId,
+      hostExecutor: localHostExecutor,
+    });
+    assert.deepEqual(result, {
+      handshake: { confirmed: 0, skipped: 1, failed: 0 },
+      keepalive: { renewed: 0, failed: 0, skipped: 1 },
+      recovery: { recovered: 0, failed: 0, skipped: 1 },
+      threadReads: [],
+      mutations: [],
+    }, candidate.name);
+  }
+});
+
+test("Coordinator lease monitors reject missing or invalid host executors before callbacks", async () => {
+  const invalidExecutors = [
+    undefined,
+    null,
+    {},
+    { ownedCodexHostId: "" },
+    { ownedCodexHostId: "   " },
+    { ownedCodexHostId: "local\nremote" },
+    { ownedCodexHostId: "x".repeat(257) },
+  ];
+  for (const hostExecutor of invalidExecutors) {
+    let callbacks = 0;
+    const optionalHostExecutor = hostExecutor === undefined ? {} : { hostExecutor };
+    const handshakeResult = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+      projectId: "taskboard-core",
+      ...optionalHostExecutor,
+      listHandshakes: async () => { callbacks += 1; return { handshakes: [] }; },
+      readThread: async () => { callbacks += 1; },
+      confirmIdentity: async () => { callbacks += 1; },
+    });
+    const keepaliveResult = await runCoordinatorLeaseKeepaliveMonitorOnce({
+      ...optionalHostExecutor,
+      policy: {
+        enabled: true,
+        projectId: "taskboard-core",
+        renewWindowMs: 45_000,
+        leaseDurationSeconds: 120,
+      },
+      readSnapshot: async () => {
+        callbacks += 1;
+        return {
+          projectId: "taskboard-core",
+          coordination: { lease: null, domainCoordinators: [] },
+          taskLanes: [],
+        };
+      },
+      readThread: async () => { callbacks += 1; },
+      renewLease: async () => { callbacks += 1; },
+    });
+    const recoveryResult = await runCoordinatorLeaseRecoveryMonitorOnce({
+      ...optionalHostExecutor,
+      policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+      readSnapshot: async () => {
+        callbacks += 1;
+        return {
+          projectId: "taskboard-core",
+          coordination: { lease: null, domainCoordinators: [] },
+          taskLanes: [],
+        };
+      },
+      readThread: async () => { callbacks += 1; },
+      recoverLease: async () => { callbacks += 1; },
+    });
+    assert.deepEqual(handshakeResult, {
+      confirmed: 0, skipped: 0, failed: 0, reason: "host-executor-unavailable",
+    });
+    assert.deepEqual(keepaliveResult, {
+      renewed: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable",
+    });
+    assert.deepEqual(recoveryResult, {
+      recovered: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable",
+    });
+    assert.equal(callbacks, 0);
+  }
 });
 
 test("resident Coordinator shutdown waits through idle grace and recovers one exact archive", async () => {
@@ -2989,6 +3335,7 @@ test("coordinator keepalive fails closed for busy, drifted, or non-active holder
   });
   snapshot.coordination.domainCoordinators[0].lease.status = "expired";
   const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3013,6 +3360,7 @@ test("coordinator keepalive fails closed for busy, drifted, or non-active holder
 test("coordinator keepalive fails closed when thread busy state is unavailable", async () => {
   let renewed = 0;
   const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3054,6 +3402,7 @@ test("coordinator recovery restores only exact naturally expired Global and doma
   };
   const recovered = [];
   const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
     readSnapshot: async () => snapshot,
     readThread: async (route) => ({
@@ -3069,6 +3418,49 @@ test("coordinator recovery restores only exact naturally expired Global and doma
     ["domain", "frontend"],
   ]);
   assert.deepEqual(result, { recovered: 2, failed: 0, skipped: 0 });
+});
+
+test("Coordinator recovery skips foreign-first expired routes and restores only exact owned hosts", async () => {
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T00:59:00.000Z",
+    domainExpiresAt: "2026-08-31T00:59:00.000Z",
+    globalCodexHostId: remoteHostExecutor.ownedCodexHostId,
+    domainCodexHostId: localHostExecutor.ownedCodexHostId,
+  });
+  snapshot.coordination.lease = {
+    ...snapshot.coordination.lease,
+    holderTaskId: "global",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  snapshot.coordination.domainCoordinators[0].lease = {
+    ...snapshot.coordination.domainCoordinators[0].lease,
+    holderTaskId: "frontend",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  const reads = [];
+  const recoveries = [];
+  const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => {
+      reads.push(route.codexHostId);
+      return { thread: { id: route.threadId, cwd: route.workspacePath, turns: [] } };
+    },
+    recoverLease: async (request) => {
+      recoveries.push(request);
+      return { lease: { id: `${request.scope}-recovered`, status: "active" } };
+    },
+  });
+  assert.deepEqual(result, { recovered: 1, failed: 0, skipped: 1 });
+  assert.deepEqual(reads, [localHostExecutor.ownedCodexHostId]);
+  assert.deepEqual(recoveries.map(({ scope, codexHostId }) => [scope, codexHostId]), [[
+    "domain", localHostExecutor.ownedCodexHostId,
+  ]]);
 });
 
 test("coordinator recovery skips explicit release and busy holders", async () => {
@@ -3092,6 +3484,7 @@ test("coordinator recovery skips explicit release and busy holders", async () =>
   };
   let recovered = 0;
   const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
     readSnapshot: async () => snapshot,
     readThread: async (route) => ({
@@ -5753,6 +6146,7 @@ test("capacity-sensitive continuation runs independently of a slow project monit
 test("Coordinator identity handshakes run in a dedicated continuation fast lane", async () => {
   const calls = [];
   const results = await runCoordinatorIdentityHandshakeFastLane({
+    hostExecutor: localHostExecutor,
     projects: [
       { projectId: "disabled-project", continuationEnabled: false },
       { projectId: "capstone-dev", continuationEnabled: true },
@@ -5773,6 +6167,76 @@ test("Coordinator identity handshakes run in a dedicated continuation fast lane"
     },
     { projectId: "second-project", ok: false, error: "host unavailable" },
   ]);
+});
+
+test("Coordinator monitor single-flight is scoped by exact host and project", async () => {
+  let releaseHandshake;
+  const handshakeGate = new Promise((resolve) => { releaseHandshake = resolve; });
+  const handshakeRuns = [];
+  const runHandshake = (hostExecutor) => runCoordinatorIdentityHandshakeFastLane({
+    hostExecutor,
+    projects: [{ projectId: "taskboard-core", continuationEnabled: true }],
+    runHandshake: async () => {
+      handshakeRuns.push(hostExecutor.ownedCodexHostId);
+      await handshakeGate;
+      return { confirmed: 0, skipped: 0, failed: 0 };
+    },
+  });
+  const handshakeLocal = runHandshake(localHostExecutor);
+  const handshakeRemote = runHandshake(remoteHostExecutor);
+  releaseHandshake();
+  await Promise.all([handshakeLocal, handshakeRemote]);
+  assert.deepEqual(handshakeRuns.sort(), ["local", "remote-builder"]);
+
+  const emptySnapshot = {
+    projectId: "taskboard-core",
+    coordination: { lease: null, domainCoordinators: [] },
+    taskLanes: [],
+  };
+  let releaseKeepalive;
+  const keepaliveGate = new Promise((resolve) => { releaseKeepalive = resolve; });
+  const keepaliveRuns = [];
+  const runKeepalive = (hostExecutor) => runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor,
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    readSnapshot: async () => {
+      keepaliveRuns.push(hostExecutor.ownedCodexHostId);
+      await keepaliveGate;
+      return emptySnapshot;
+    },
+    readThread: async () => assert.fail("empty snapshot must not read a thread"),
+    renewLease: async () => assert.fail("empty snapshot must not renew a lease"),
+  });
+  const keepaliveLocal = runKeepalive(localHostExecutor);
+  const keepaliveRemote = runKeepalive(remoteHostExecutor);
+  releaseKeepalive();
+  await Promise.all([keepaliveLocal, keepaliveRemote]);
+  assert.deepEqual(keepaliveRuns.sort(), ["local", "remote-builder"]);
+
+  let releaseRecovery;
+  const recoveryGate = new Promise((resolve) => { releaseRecovery = resolve; });
+  const recoveryRuns = [];
+  const runRecovery = (hostExecutor) => runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => {
+      recoveryRuns.push(hostExecutor.ownedCodexHostId);
+      await recoveryGate;
+      return emptySnapshot;
+    },
+    readThread: async () => assert.fail("empty snapshot must not read a thread"),
+    recoverLease: async () => assert.fail("empty snapshot must not recover a lease"),
+  });
+  const recoveryLocal = runRecovery(localHostExecutor);
+  const recoveryRemote = runRecovery(remoteHostExecutor);
+  releaseRecovery();
+  await Promise.all([recoveryLocal, recoveryRemote]);
+  assert.deepEqual(recoveryRuns.sort(), ["local", "remote-builder"]);
 });
 
 test("disposed Coordinator fast-lane timers stop old renderer ticks", async () => {
@@ -6291,10 +6755,110 @@ test("background continuation does not reserve an unassigned Todo without a Glob
   assert.equal(claimed, false);
 });
 
+function extractExactObjectCall(source, callee) {
+  const marker = `${callee}({`;
+  const callStart = source.indexOf(marker);
+  assert.notEqual(callStart, -1, `${callee} call must exist`);
+  assert.equal(source.indexOf(marker, callStart + marker.length), -1, `${callee} call must be unique`);
+  const objectStart = callStart + marker.length - 1;
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = objectStart; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+      continue;
+    }
+    if (character === "{") depth += 1;
+    if (character !== "}") continue;
+    depth -= 1;
+    if (depth === 0) {
+      return {
+        callStart,
+        objectStart,
+        objectEnd: index + 1,
+        objectSource: source.slice(objectStart, index + 1),
+      };
+    }
+  }
+  assert.fail(`${callee} call object must be balanced`);
+}
+
+function topLevelCallPropertyRecords(objectSource) {
+  const records = objectSource.split("\n").map((line, lineIndex) => {
+    const match = /^(\s+)([A-Za-z_$][\w$]*)(?:\s*:|\s*,\s*$)/.exec(line);
+    return match ? { indent: match[1].length, name: match[2], line, lineIndex } : null;
+  }).filter(Boolean);
+  const topLevelIndent = Math.min(...records.map((record) => record.indent));
+  return records.filter((record) => record.indent === topLevelIndent);
+}
+
+const residentCoordinatorHostWiring = [{
+  label: "outer identity fast lane",
+  callee: "runCoordinatorIdentityHandshakeFastLane",
+  properties: ["projects", "hostExecutor", "runHandshake"],
+}, {
+  label: "inner identity monitor",
+  callee: "runBackgroundCoordinatorIdentityHandshakeMonitorOnce",
+  properties: ["projectId", "hostExecutor", "listHandshakes", "readThread", "confirmIdentity"],
+}, {
+  label: "lease keepalive monitor",
+  callee: "runCoordinatorLeaseKeepaliveMonitorOnce",
+  properties: ["hostExecutor", "policy", "readSnapshot", "readThread", "renewLease"],
+}, {
+  label: "lease recovery monitor",
+  callee: "runCoordinatorLeaseRecoveryMonitorOnce",
+  properties: ["hostExecutor", "policy", "readSnapshot", "readThread", "recoverLease"],
+}];
+
+function assertResidentCoordinatorHostWiring(source) {
+  for (const expected of residentCoordinatorHostWiring) {
+    const call = extractExactObjectCall(source, expected.callee);
+    const properties = topLevelCallPropertyRecords(call.objectSource);
+    assert.deepEqual(properties.map(({ name }) => name), expected.properties, expected.label);
+    assert.equal(
+      properties.find(({ name }) => name === "hostExecutor")?.line.trim(),
+      "hostExecutor: residentHostExecutor,",
+      expected.label,
+    );
+  }
+}
+
+function removeExactCallHostExecutor(source, callee) {
+  const call = extractExactObjectCall(source, callee);
+  const lines = call.objectSource.split("\n");
+  const property = topLevelCallPropertyRecords(call.objectSource)
+    .find(({ name }) => name === "hostExecutor");
+  assert.ok(property, `${callee} must expose a first-level hostExecutor`);
+  lines.splice(property.lineIndex, 1);
+  return source.slice(0, call.objectStart)
+    + lines.join("\n")
+    + source.slice(call.objectEnd);
+}
+
 test("the resident authenticated host polls durable opt-in policies without the Agent Lanes view", async () => {
   const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
   assert.match(source, /residentHostExecutor = Object\.freeze\(\{ ownedCodexHostId: "local" \}\)/);
-  assert.match(source, /hostExecutor: residentHostExecutor/);
+  assertResidentCoordinatorHostWiring(source);
+  for (const { callee } of residentCoordinatorHostWiring) {
+    const withoutExactArgument = removeExactCallHostExecutor(source, callee);
+    assert.throws(
+      () => assertResidentCoordinatorHostWiring(withoutExactArgument),
+      assert.AssertionError,
+      `${callee} must fail when its own first-level hostExecutor is absent`,
+    );
+  }
   assert.match(source, /taskboard:background-continuation:policy:/);
   assert.match(source, /api\/client-storage/);
   assert.match(source, /api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);

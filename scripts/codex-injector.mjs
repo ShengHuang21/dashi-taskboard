@@ -3196,6 +3196,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     );
     monitors.push(
       () => runCoordinatorLeaseKeepaliveMonitorOnce({
+        hostExecutor: residentHostExecutor,
         policy: {
           enabled: true,
           projectId,
@@ -3216,6 +3217,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     );
     if (continuationEnabled) monitors.push(
       () => runCoordinatorLeaseRecoveryMonitorOnce({
+        hostExecutor: residentHostExecutor,
         policy: {
           enabled: true,
           projectId,
@@ -3463,8 +3465,10 @@ async function runCoordinatorIdentityHandshakeFastLaneOnce(cdp) {
   });
   await runCoordinatorIdentityHandshakeFastLane({
     projects,
+    hostExecutor: residentHostExecutor,
     runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
       projectId,
+      hostExecutor: residentHostExecutor,
       listHandshakes: listCoordinatorIdentityHandshakes,
       readThread: (route) => requestCodexAppServerViaCdp(
         cdp,

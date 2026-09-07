@@ -2623,8 +2623,13 @@ export function runTaskboardContinuationFastLane({
   });
 }
 
-export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHandshake }) {
-  if (!Array.isArray(projects) || typeof runHandshake !== "function") {
+export async function runCoordinatorIdentityHandshakeFastLane({
+  projects,
+  runHandshake,
+  hostExecutor: hostExecutorInput,
+}) {
+  const hostExecutor = normalizeHostExecutor(hostExecutorInput);
+  if (!Array.isArray(projects) || typeof runHandshake !== "function" || !hostExecutor) {
     throw new Error("Coordinator identity handshake fast lane requires exact project state");
   }
   const results = [];
@@ -2632,10 +2637,11 @@ export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHan
     if (project?.continuationEnabled !== true
       || !COORDINATION_ID_PATTERN.test(project?.projectId ?? "")) continue;
     const projectId = project.projectId;
-    let run = coordinatorIdentityHandshakeFastLaneRuns.get(projectId);
+    const runKey = `${hostExecutor.ownedCodexHostId}:${projectId}`;
+    let run = coordinatorIdentityHandshakeFastLaneRuns.get(runKey);
     if (!run) {
       run = Promise.resolve().then(() => runHandshake(projectId));
-      coordinatorIdentityHandshakeFastLaneRuns.set(projectId, run);
+      coordinatorIdentityHandshakeFastLaneRuns.set(runKey, run);
     }
     try {
       results.push({ projectId, ok: true, result: await run });
@@ -2646,8 +2652,8 @@ export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHan
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      if (coordinatorIdentityHandshakeFastLaneRuns.get(projectId) === run) {
-        coordinatorIdentityHandshakeFastLaneRuns.delete(projectId);
+      if (coordinatorIdentityHandshakeFastLaneRuns.get(runKey) === run) {
+        coordinatorIdentityHandshakeFastLaneRuns.delete(runKey);
       }
     }
   }
@@ -2656,10 +2662,15 @@ export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHan
 
 export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
   projectId,
+  hostExecutor: hostExecutorInput,
   listHandshakes,
   readThread,
   confirmIdentity,
 }) {
+  const hostExecutor = normalizeHostExecutor(hostExecutorInput);
+  if (!hostExecutor) {
+    return { confirmed: 0, skipped: 0, failed: 0, reason: "host-executor-unavailable" };
+  }
   if (!COORDINATION_ID_PATTERN.test(projectId ?? "")) {
     return { confirmed: 0, skipped: 0, failed: 0, reason: "invalid-project" };
   }
@@ -2678,9 +2689,10 @@ export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
       || typeof expected?.codexProjectId !== "string"
       || !expected.codexProjectId
       || !["local", "remote"].includes(expected.codexProjectKind)
-      || !COORDINATION_ID_PATTERN.test(expected.codexHostId ?? "")
+      || !isCanonicalCodexHostId(expected.codexHostId)
       || typeof expected?.workspacePath !== "string"
-      || !path.isAbsolute(expected.workspacePath)) {
+      || !path.isAbsolute(expected.workspacePath)
+      || !hostExecutorOwnsRoute(hostExecutor, expected)) {
       skipped += 1;
       continue;
     }
@@ -2713,6 +2725,7 @@ export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
 
 async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   readThread,
   renewLease,
@@ -2762,11 +2775,12 @@ async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
       workspacePath: lane?.workspacePath,
     };
     if (!THREAD_ID_PATTERN.test(route.threadId ?? "")
-      || !COORDINATION_ID_PATTERN.test(route.codexHostId ?? "")
+      || !isCanonicalCodexHostId(route.codexHostId)
       || typeof route.workspacePath !== "string"
       || !path.isAbsolute(route.workspacePath)) {
       return "skipped";
     }
+    if (!hostExecutorOwnsRoute(hostExecutor, route)) return "skipped";
     try {
       const threadResult = await readThread(route);
       const thread = threadResult?.thread;
@@ -2803,6 +2817,10 @@ async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
 }
 
 export async function runCoordinatorLeaseKeepaliveMonitorOnce(options) {
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) {
+    return { renewed: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable" };
+  }
   const policy = options?.policy;
   if (policy?.enabled !== true) return { renewed: 0, failed: 0, skipped: 0, reason: "disabled" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
@@ -2817,21 +2835,23 @@ export async function runCoordinatorLeaseKeepaliveMonitorOnce(options) {
     || typeof options?.renewLease !== "function") {
     return { renewed: 0, failed: 0, skipped: 0, reason: "invalid-monitor" };
   }
-  const existing = coordinatorLeaseKeepaliveMonitorRuns.get(policy.projectId);
+  const runKey = `${hostExecutor.ownedCodexHostId}:${policy.projectId}`;
+  const existing = coordinatorLeaseKeepaliveMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCoordinatorLeaseKeepaliveMonitorOnceUnlocked(options);
-  coordinatorLeaseKeepaliveMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorLeaseKeepaliveMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorLeaseKeepaliveMonitorRuns.get(policy.projectId) === run) {
-      coordinatorLeaseKeepaliveMonitorRuns.delete(policy.projectId);
+    if (coordinatorLeaseKeepaliveMonitorRuns.get(runKey) === run) {
+      coordinatorLeaseKeepaliveMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runCoordinatorLeaseRecoveryMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   readThread,
   recoverLease,
@@ -2877,11 +2897,12 @@ async function runCoordinatorLeaseRecoveryMonitorOnceUnlocked({
       workspacePath: lane?.workspacePath,
     };
     if (!THREAD_ID_PATTERN.test(route.threadId ?? "")
-      || !COORDINATION_ID_PATTERN.test(route.codexHostId ?? "")
+      || !isCanonicalCodexHostId(route.codexHostId)
       || typeof route.workspacePath !== "string"
       || !path.isAbsolute(route.workspacePath)) {
       return "skipped";
     }
+    if (!hostExecutorOwnsRoute(hostExecutor, route)) return "skipped";
     try {
       const threadResult = await readThread(route);
       const thread = threadResult?.thread;
@@ -2919,6 +2940,10 @@ async function runCoordinatorLeaseRecoveryMonitorOnceUnlocked({
 }
 
 export async function runCoordinatorLeaseRecoveryMonitorOnce(options) {
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) {
+    return { recovered: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable" };
+  }
   const policy = options?.policy;
   if (policy?.enabled !== true) return { recovered: 0, failed: 0, skipped: 0, reason: "disabled" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
@@ -2930,15 +2955,16 @@ export async function runCoordinatorLeaseRecoveryMonitorOnce(options) {
     || typeof options?.recoverLease !== "function") {
     return { recovered: 0, failed: 0, skipped: 0, reason: "invalid-monitor" };
   }
-  const existing = coordinatorLeaseRecoveryMonitorRuns.get(policy.projectId);
+  const runKey = `${hostExecutor.ownedCodexHostId}:${policy.projectId}`;
+  const existing = coordinatorLeaseRecoveryMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCoordinatorLeaseRecoveryMonitorOnceUnlocked(options);
-  coordinatorLeaseRecoveryMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorLeaseRecoveryMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorLeaseRecoveryMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorLeaseRecoveryMonitorRuns.get(policy.projectId) === run) {
-      coordinatorLeaseRecoveryMonitorRuns.delete(policy.projectId);
+    if (coordinatorLeaseRecoveryMonitorRuns.get(runKey) === run) {
+      coordinatorLeaseRecoveryMonitorRuns.delete(runKey);
     }
   }
 }
