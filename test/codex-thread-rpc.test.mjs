@@ -9,6 +9,7 @@ import {
   LocalCodexThreadRpcLifecycle,
   createLocalCodexThreadRpcTransport,
   launchLocalCodexAppServer,
+  selectCodexThreadRpcRoute,
   shouldRetireLocalCodexThreadRpcTransport,
   shouldUseLocalCodexThreadRpc,
 } from "../server/codex-thread-rpc.mjs";
@@ -301,6 +302,28 @@ test("single-visible-app mode uses headless RPC only for the resident macOS laun
   assert.equal(shouldUseLocalCodexThreadRpc({
     platform: "linux", watch: true, launch: true, cdpPipe: true,
   }), false);
+});
+
+test("resident headless mode routes only the exact local host through local RPC", () => {
+  assert.equal(selectCodexThreadRpcRoute({
+    localEnabled: true,
+    codexHostId: "local",
+    method: "thread/read",
+  }), "local");
+
+  for (const method of [
+    "thread/read",
+    "thread/start",
+    "turn/steer",
+    "thread/resume",
+    "turn/start",
+  ]) {
+    assert.equal(selectCodexThreadRpcRoute({
+      localEnabled: true,
+      codexHostId: "remote-host",
+      method,
+    }), "renderer", method);
+  }
 });
 
 test("headless app-server initializes once and rejects server requests without approval", async () => {

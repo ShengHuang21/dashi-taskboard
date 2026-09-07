@@ -214,6 +214,15 @@ export function shouldUseLocalCodexThreadRpc({
   return platform === "darwin" && watch === true && launch === true && cdpPipe !== true;
 }
 
+export function selectCodexThreadRpcRoute({
+  localEnabled = false,
+  codexHostId,
+} = {}) {
+  return localEnabled === true && codexHostId === LOCAL_CODEX_HOST_ID
+    ? "local"
+    : "renderer";
+}
+
 export class CodexAppServerJsonLineClient {
   constructor({ child, onServerRequest } = {}) {
     if (

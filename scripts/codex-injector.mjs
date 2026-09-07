@@ -80,6 +80,7 @@ import {
   LocalCodexThreadRpcLifecycle,
   createLocalCodexThreadRpcTransport,
   launchLocalCodexAppServer,
+  selectCodexThreadRpcRoute,
   shouldRetireLocalCodexThreadRpcTransport,
   shouldUseLocalCodexThreadRpc,
 } from "../server/codex-thread-rpc.mjs";
@@ -1177,7 +1178,10 @@ async function requestCodexAppServerViaCdp(
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
 ) {
-  if (localCodexThreadRpcEnabled) {
+  if (selectCodexThreadRpcRoute({
+    localEnabled: localCodexThreadRpcEnabled,
+    codexHostId: hostId,
+  }) === "local") {
     if (method === "turn/start" && params?.approvalPolicy !== "never") {
       throw new Error("Headless Codex turns require approvalPolicy 'never'");
     }
