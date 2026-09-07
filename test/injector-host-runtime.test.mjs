@@ -1672,7 +1672,7 @@ test("resident Coordinator shutdown waits through idle grace and recovers one ex
       assert.equal(request.ownerRootCodexProjectId, owner.codexProjectId);
       assert.equal(request.ownerRootCodexProjectKind, owner.codexProjectKind);
       assert.equal(request.ownerRootCodexHostId, owner.codexHostId);
-      assert.equal(request.ownerRootWorkspacePath, owner.workspacePath);
+      assert.equal(request.ownerRootWorkspacePath, path.resolve(owner.workspacePath));
       attempt = { ...request, id: "shutdown-1", status: "pending" };
       return { applied: true, attempt };
     },
