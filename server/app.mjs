@@ -51,6 +51,27 @@ const AI_CHAT_TURN_BODY_LIMIT = 25 * 1024 * 1024;
 const AI_CHAT_ATTACHMENT_LIMIT = 10;
 const AI_CHAT_SKILL_MARKER = "\uFFFC";
 const HOST_RUNTIME_TTL_MS = 3_000;
+const HOST_EXECUTOR_RPC_CAPABILITIES = Object.freeze([
+  "model/list",
+  "thread/archive",
+  "thread/list",
+  "thread/name/set",
+  "thread/read",
+  "thread/resume",
+  "thread/start",
+  "turn/start",
+  "turn/steer",
+]);
+const HOST_EXECUTOR_ADAPTER_PROFILES = new Map([
+  ["local-codex-app-server-v1", Object.freeze({
+    hostKind: "local",
+    capabilities: HOST_EXECUTOR_RPC_CAPABILITIES,
+  })],
+  ["codex-renderer-rpc-v1", Object.freeze({
+    hostKind: "remote",
+    capabilities: HOST_EXECUTOR_RPC_CAPABILITIES,
+  })],
+]);
 const WORKTREE_REPOSITORY_TTL_MS = 30_000;
 const STANDING_AUTHORITY_ACTION_SET = new Set(STANDING_AUTHORITY_ACTIONS);
 const STANDING_AUTHORITY_CLOCK_SKEW_MS = 5 * 60 * 1_000;
@@ -346,6 +367,109 @@ function parseOwnedCodexHostId(value) {
     throw new ApiError(400, "INVALID_FIELD", "'ownedCodexHostId' is invalid");
   }
   return ownedCodexHostId;
+}
+
+function parseHostExecutorIdentifier(value, name) {
+  const parsed = stringField(value, name, { required: true, maxLength: 256 });
+  if (parsed !== value || /[\u0000-\u001f\u007f]/.test(parsed)) {
+    throw new ApiError(400, "INVALID_FIELD", `'${name}' is invalid`);
+  }
+  return parsed;
+}
+
+function parseHostExecutorRoute(value) {
+  const codexHostId = decodeRouteSegment(value, "Codex host id");
+  if (!isCanonicalCodexHostId(codexHostId)) {
+    throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+  }
+  return codexHostId;
+}
+
+function parseHostExecutorRegistration(value, codexHostId, executorInstanceId) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["adapterId", "idempotencyKey"]));
+  const adapterId = parseHostExecutorIdentifier(value.adapterId, "adapterId");
+  const profile = HOST_EXECUTOR_ADAPTER_PROFILES.get(adapterId);
+  if (!profile) {
+    throw new ApiError(
+      400,
+      "HOST_EXECUTOR_ADAPTER_NOT_ALLOWED",
+      "Host executor registrations require a server-owned allowlisted RPC adapter",
+    );
+  }
+  const hostKind = codexHostId === "local" ? "local" : "remote";
+  if (profile.hostKind !== hostKind) {
+    throw new ApiError(
+      409,
+      "HOST_EXECUTOR_ADAPTER_HOST_MISMATCH",
+      "The allowlisted RPC adapter does not support this Codex host kind",
+    );
+  }
+  return {
+    codexHostId,
+    executorInstanceId,
+    adapterId,
+    capabilities: [...profile.capabilities],
+    idempotencyKey: parseHostExecutorIdentifier(value.idempotencyKey, "idempotencyKey"),
+  };
+}
+
+function parseHostExecutorLease(value, action) {
+  assertPlainObject(value);
+  const allowed = new Set([
+    "executorInstanceId",
+    "registrationFingerprint",
+    "expectedLeaseId",
+    "idempotencyKey",
+    ...(action === "release" ? [] : ["leaseDurationSeconds"]),
+  ]);
+  assertAllowedKeys(value, allowed);
+  const expectedLeaseId = stringField(value.expectedLeaseId, "expectedLeaseId", {
+    required: true,
+    nullable: true,
+    maxLength: 256,
+  });
+  if (expectedLeaseId !== null
+    && (expectedLeaseId !== value.expectedLeaseId
+      || /[\u0000-\u001f\u007f]/.test(expectedLeaseId))) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedLeaseId' is invalid");
+  }
+  const registrationFingerprint = stringField(
+    value.registrationFingerprint,
+    "registrationFingerprint",
+    { required: true, maxLength: 64 },
+  );
+  if (!/^[a-f0-9]{64}$/.test(registrationFingerprint)) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'registrationFingerprint' must be a lowercase SHA-256 digest",
+    );
+  }
+  if (action !== "release" && (
+    !Number.isInteger(value.leaseDurationSeconds)
+    || value.leaseDurationSeconds < 30
+    || value.leaseDurationSeconds > 3600
+  )) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'leaseDurationSeconds' must be an integer from 30 through 3600",
+    );
+  }
+  if (action !== "acquire" && expectedLeaseId === null) {
+    throw new ApiError(400, "INVALID_FIELD", "'expectedLeaseId' cannot be null");
+  }
+  return {
+    executorInstanceId: parseHostExecutorIdentifier(
+      value.executorInstanceId,
+      "executorInstanceId",
+    ),
+    registrationFingerprint,
+    expectedLeaseId,
+    ...(action === "release" ? {} : { leaseDurationSeconds: value.leaseDurationSeconds }),
+    idempotencyKey: parseHostExecutorIdentifier(value.idempotencyKey, "idempotencyKey"),
+  };
 }
 
 function parseCoordinatorLeaseClaim(value) {
@@ -1373,15 +1497,12 @@ function assertInjectorProof(request, instanceSecret) {
   }
 }
 
-function assertCoordinatorRenewProof(request, instanceSecret, pathname, body, consumedNonces) {
+function requestBoundInjectorProof(request, instanceSecret, pathname, body, errorMessage) {
   const nonce = requestHeader(request, "x-codex-taskboard-injector-nonce");
   const issuedAt = requestHeader(request, "x-codex-taskboard-injector-issued-at");
   const proof = requestHeader(request, "x-codex-taskboard-injector-proof");
   const issuedAtMs = typeof issuedAt === "string" ? Number(issuedAt) : Number.NaN;
   const currentTime = Date.now();
-  for (const [key, expiresAt] of consumedNonces) {
-    if (expiresAt <= currentTime) consumedNonces.delete(key);
-  }
   const expected = typeof nonce === "string" && typeof issuedAt === "string" && instanceSecret
     ? createHmac("sha256", instanceSecret).update(JSON.stringify({
         nonce, issuedAt, method: request.method, pathname, body,
@@ -1394,11 +1515,41 @@ function assertCoordinatorRenewProof(request, instanceSecret, pathname, body, co
     || Math.abs(currentTime - issuedAtMs) > 30_000
     || typeof proof !== "string"
     || !/^[a-f0-9]{64}$/i.test(proof)
-    || expected !== proof.toLowerCase()
-    || consumedNonces.has(nonce)) {
+    || expected !== proof.toLowerCase()) {
+    throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", errorMessage);
+  }
+  return { nonce, issuedAtMs, currentTime };
+}
+
+function assertCoordinatorRenewProof(request, instanceSecret, pathname, body, consumedNonces) {
+  const { nonce, currentTime } = requestBoundInjectorProof(
+    request,
+    instanceSecret,
+    pathname,
+    body,
+    "Coordinator renewal requires a fresh request-bound host Injector proof",
+  );
+  for (const [key, expiresAt] of consumedNonces) {
+    if (expiresAt <= currentTime) consumedNonces.delete(key);
+  }
+  if (consumedNonces.has(nonce)) {
     throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", "Coordinator renewal requires a fresh request-bound host Injector proof");
   }
   consumedNonces.set(nonce, currentTime + 60_000);
+}
+
+function assertHostExecutorProof(request, instanceSecret, pathname, body, database) {
+  const errorMessage = "Host executor control requires a fresh request-bound host Injector proof";
+  const { nonce, issuedAtMs } = requestBoundInjectorProof(
+    request,
+    instanceSecret,
+    pathname,
+    body,
+    errorMessage,
+  );
+  if (!database.consumeHostExecutorProofNonce(nonce, issuedAtMs)) {
+    throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", errorMessage);
+  }
 }
 
 function actorFromRequest(request) {
@@ -3019,6 +3170,7 @@ export function createTaskboardServer(options = {}) {
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath, {
     admissionTtlMs: options.admissionTtlMs,
+    hostExecutorClock: options.hostExecutorClock,
   });
   const worktreeRepositoryExecFile = options.worktreeRepositoryExecFile ?? execFileAsync;
   const worktreeRepositoryTtlMs = options.worktreeRepositoryTtlMs ?? WORKTREE_REPOSITORY_TTL_MS;
@@ -3854,6 +4006,130 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(503, "CODEX_OPEN_FAILED", "Could not open the Codex conversation");
         }
         return sendJson(response, 200, { opened: true });
+      }
+
+      const hostExecutorRegistrationMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/registrations\/([^/]+)$/,
+      );
+      if (hostExecutorRegistrationMatch) {
+        if (request.method !== "PUT") return methodNotAllowed(response, ["PUT"]);
+        assertNoQuery(url.searchParams, "Host executor registration routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(hostExecutorRegistrationMatch[1]);
+        const executorInstanceId = parseHostExecutorIdentifier(
+          decodeRouteSegment(hostExecutorRegistrationMatch[2], "Executor instance id"),
+          "executorInstanceId",
+        );
+        return sendJson(response, 200, database.registerHostExecutor(
+          parseHostExecutorRegistration(body, codexHostId, executorInstanceId),
+        ));
+      }
+
+      const hostExecutorLeaseTransitionMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/lease\/(renew|release)$/,
+      );
+      if (hostExecutorLeaseTransitionMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Host executor lease routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(hostExecutorLeaseTransitionMatch[1]);
+        const action = hostExecutorLeaseTransitionMatch[2];
+        const input = { codexHostId, ...parseHostExecutorLease(body, action) };
+        return sendJson(
+          response,
+          200,
+          action === "renew"
+            ? database.renewHostExecutorLease(input)
+            : database.releaseHostExecutorLease(input),
+        );
+      }
+
+      const hostExecutorLeaseReceiptsMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/lease\/receipts$/,
+      );
+      if (hostExecutorLeaseReceiptsMatch) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "Host executor lease receipt routes");
+        await assertEmptyRequestBody(request, "Host executor lease receipt routes");
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          null,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(hostExecutorLeaseReceiptsMatch[1]);
+        return sendJson(response, 200, {
+          receipts: database.listHostExecutorLeaseReceipts(codexHostId),
+        });
+      }
+
+      const hostExecutorLeaseMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/lease$/,
+      );
+      if (hostExecutorLeaseMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Host executor lease routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(hostExecutorLeaseMatch[1]);
+        return sendJson(response, 200, database.acquireHostExecutorLease({
+          codexHostId,
+          ...parseHostExecutorLease(body, "acquire"),
+        }));
+      }
+
+      if (pathname === "/api/local/host-executors") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "Host executor routes");
+        await assertEmptyRequestBody(request, "Host executor list routes");
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          null,
+          database,
+        );
+        return sendJson(response, 200, { hosts: database.listHostExecutors() });
+      }
+
+      const hostExecutorMatch = pathname.match(/^\/api\/local\/host-executors\/([^/]+)$/);
+      if (hostExecutorMatch) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "Host executor routes");
+        await assertEmptyRequestBody(request, "Host executor inspection routes");
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          null,
+          database,
+        );
+        return sendJson(
+          response,
+          200,
+          database.getHostExecutor(parseHostExecutorRoute(hostExecutorMatch[1])),
+        );
       }
 
       if (pathname === "/api/local/host-runtime") {

@@ -41,6 +41,70 @@ function now() {
   return new Date().toISOString();
 }
 
+function hostExecutorIdentifier(value, field) {
+  if (
+    typeof value !== "string"
+    || value.length < 1
+    || value.length > 256
+    || value.trim() !== value
+    || /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new ApiError(400, "INVALID_FIELD", `'${field}' is invalid`);
+  }
+  return value;
+}
+
+function hostExecutorRegistrationFromRow(row) {
+  if (!row) return null;
+  return {
+    executorInstanceId: row.executor_instance_id,
+    codexHostId: row.codex_host_id,
+    adapterId: row.adapter_id,
+    capabilities: JSON.parse(row.capabilities_json),
+    fingerprint: row.registration_fingerprint,
+    registeredAt: row.registered_at,
+  };
+}
+
+function hostExecutorLeaseFromRow(row, observedAtMs) {
+  if (!row) return null;
+  const acquiredAtMs = Date.parse(row.acquired_at);
+  const expiresAtMs = Date.parse(row.expires_at);
+  const status = row.released_at
+    ? "released"
+    : Number.isFinite(acquiredAtMs)
+      && Number.isFinite(expiresAtMs)
+      && acquiredAtMs < expiresAtMs
+      && acquiredAtMs <= observedAtMs
+      && observedAtMs < expiresAtMs
+      ? "active"
+      : "expired";
+  return {
+    id: row.lease_id,
+    codexHostId: row.codex_host_id,
+    executorInstanceId: row.executor_instance_id,
+    registrationFingerprint: row.registration_fingerprint,
+    acquiredAt: row.acquired_at,
+    expiresAt: row.expires_at,
+    releasedAt: row.released_at,
+    status,
+  };
+}
+
+function hostExecutorLeaseReceiptFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    codexHostId: row.codex_host_id,
+    idempotencyKey: row.idempotency_key,
+    requestFingerprint: row.request_fingerprint,
+    action: row.action,
+    leaseId: row.lease_id,
+    executorInstanceId: row.executor_instance_id,
+    createdAt: row.created_at,
+  };
+}
+
 function agentLaneConfigRevision(configJson) {
   return createHash("sha256").update(configJson).digest("hex");
 }
@@ -1372,6 +1436,7 @@ function activationWorkflowProfileCandidate(row) {
 export class TaskboardDatabase {
   constructor(filename, {
     admissionTtlMs = TASK_SAFE_ACTION_ADMISSION_TTL_MS,
+    hostExecutorClock = Date.now,
     isPathCaseSensitive = defaultIsPathCaseSensitive,
     statementCacheMax = DATABASE_STATEMENT_CACHE_MAX,
   } = {}) {
@@ -1384,6 +1449,9 @@ export class TaskboardDatabase {
     this.admissionTtlMs = Number.isSafeInteger(admissionTtlMs) && admissionTtlMs > 0
       ? admissionTtlMs
       : TASK_SAFE_ACTION_ADMISSION_TTL_MS;
+    this.hostExecutorClock = typeof hostExecutorClock === "function"
+      ? hostExecutorClock
+      : Date.now;
     this.isPathCaseSensitive = typeof isPathCaseSensitive === "function"
       ? isPathCaseSensitive
       : defaultIsPathCaseSensitive;
@@ -1615,6 +1683,53 @@ export class TaskboardDatabase {
         config_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS host_executor_registrations (
+        executor_instance_id TEXT PRIMARY KEY,
+        codex_host_id TEXT NOT NULL,
+        adapter_id TEXT NOT NULL,
+        capabilities_json TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_fingerprint TEXT NOT NULL,
+        registration_fingerprint TEXT NOT NULL UNIQUE,
+        registered_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS host_executor_registrations_host
+        ON host_executor_registrations(codex_host_id, registered_at, executor_instance_id);
+
+      CREATE TABLE IF NOT EXISTS host_executor_leases (
+        codex_host_id TEXT PRIMARY KEY,
+        lease_id TEXT NOT NULL UNIQUE,
+        executor_instance_id TEXT NOT NULL REFERENCES host_executor_registrations(executor_instance_id),
+        registration_fingerprint TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        released_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS host_executor_lease_receipts (
+        id TEXT PRIMARY KEY,
+        codex_host_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        request_fingerprint TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('acquired', 'renewed', 'released')),
+        lease_id TEXT NOT NULL,
+        executor_instance_id TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS host_executor_lease_receipts_host_created
+        ON host_executor_lease_receipts(codex_host_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS host_executor_proof_nonces (
+        nonce TEXT PRIMARY KEY,
+        expires_at_ms INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS host_executor_proof_nonces_expiry
+        ON host_executor_proof_nonces(expires_at_ms);
 
       CREATE TABLE IF NOT EXISTS agent_coordinator_lease_receipts (
         id TEXT PRIMARY KEY,
@@ -3593,6 +3708,487 @@ export class TaskboardDatabase {
       }
       this.database.exec("COMMIT");
       return Number(result.changes);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #hostExecutorTime() {
+    const observedAtMs = Number(this.hostExecutorClock());
+    if (!Number.isFinite(observedAtMs)) {
+      throw new Error("Host executor clock must return a finite timestamp");
+    }
+    return {
+      observedAtMs,
+      timestamp: new Date(observedAtMs).toISOString(),
+    };
+  }
+
+  registerHostExecutor(input) {
+    if (!isCanonicalCodexHostId(input?.codexHostId)) {
+      throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+    }
+    const executorInstanceId = hostExecutorIdentifier(
+      input.executorInstanceId,
+      "executorInstanceId",
+    );
+    const adapterId = hostExecutorIdentifier(input.adapterId, "adapterId");
+    const idempotencyKey = hostExecutorIdentifier(input.idempotencyKey, "idempotencyKey");
+    if (!Array.isArray(input.capabilities)
+      || input.capabilities.length < 1
+      || input.capabilities.length > 64) {
+      throw new ApiError(400, "INVALID_FIELD", "'capabilities' must be a non-empty allowlisted array");
+    }
+    const capabilities = input.capabilities.map((capability) => (
+      hostExecutorIdentifier(capability, "capabilities")
+    )).sort();
+    if (new Set(capabilities).size !== capabilities.length) {
+      throw new ApiError(400, "INVALID_FIELD", "'capabilities' must be unique");
+    }
+    const requestFingerprint = createHash("sha256").update(JSON.stringify({
+      codexHostId: input.codexHostId,
+      executorInstanceId,
+      adapterId,
+      capabilities,
+    })).digest("hex");
+    const { timestamp } = this.#hostExecutorTime();
+
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const replay = this.#prepare(`
+        SELECT * FROM host_executor_registrations WHERE idempotency_key = ?
+      `).get(idempotencyKey);
+      if (replay) {
+        if (replay.request_fingerprint !== requestFingerprint) {
+          throw new ApiError(
+            409,
+            "HOST_EXECUTOR_REGISTRATION_IDEMPOTENCY_CONFLICT",
+            "The idempotency key is bound to another host executor registration",
+          );
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, registration: hostExecutorRegistrationFromRow(replay) };
+      }
+      const existing = this.#prepare(`
+        SELECT * FROM host_executor_registrations WHERE executor_instance_id = ?
+      `).get(executorInstanceId);
+      if (existing) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_REGISTRATION_CONFLICT",
+          "The executor instance is already bound to an immutable registration",
+        );
+      }
+      this.#prepare(`
+        INSERT INTO host_executor_registrations (
+          executor_instance_id, codex_host_id, adapter_id, capabilities_json,
+          idempotency_key, request_fingerprint, registration_fingerprint, registered_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        executorInstanceId,
+        input.codexHostId,
+        adapterId,
+        JSON.stringify(capabilities),
+        idempotencyKey,
+        requestFingerprint,
+        requestFingerprint,
+        timestamp,
+      );
+      const row = this.#prepare(`
+        SELECT * FROM host_executor_registrations WHERE executor_instance_id = ?
+      `).get(executorInstanceId);
+      this.database.exec("COMMIT");
+      return { applied: true, registration: hostExecutorRegistrationFromRow(row) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getHostExecutor(codexHostId) {
+    if (!isCanonicalCodexHostId(codexHostId)) {
+      throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+    }
+    const { observedAtMs } = this.#hostExecutorTime();
+    const registrations = this.#prepare(`
+      SELECT * FROM host_executor_registrations
+      WHERE codex_host_id = ?
+      ORDER BY registered_at, executor_instance_id
+    `).all(codexHostId).map(hostExecutorRegistrationFromRow);
+    const lease = hostExecutorLeaseFromRow(this.#prepare(`
+      SELECT * FROM host_executor_leases WHERE codex_host_id = ?
+    `).get(codexHostId), observedAtMs);
+    return { codexHostId, registrations, lease };
+  }
+
+  listHostExecutors() {
+    return this.#prepare(`
+      SELECT codex_host_id FROM host_executor_registrations
+      UNION
+      SELECT codex_host_id FROM host_executor_leases
+      ORDER BY codex_host_id
+    `).all().map((row) => this.getHostExecutor(row.codex_host_id));
+  }
+
+  listHostExecutorLeaseReceipts(codexHostId, limit = 50) {
+    if (!isCanonicalCodexHostId(codexHostId)) {
+      throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+    }
+    return this.#prepare(`
+      SELECT id, codex_host_id, idempotency_key, request_fingerprint, action,
+        lease_id, executor_instance_id, created_at
+      FROM host_executor_lease_receipts
+      WHERE codex_host_id = ?
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(codexHostId, limit).map(hostExecutorLeaseReceiptFromRow);
+  }
+
+  consumeHostExecutorProofNonce(nonce, issuedAtMs) {
+    if (typeof nonce !== "string"
+      || !/^[a-f0-9]{32,128}$/i.test(nonce)
+      || !Number.isSafeInteger(issuedAtMs)) {
+      return false;
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const observedAtMs = Date.now();
+      if (Math.abs(observedAtMs - issuedAtMs) > 30_000) {
+        this.database.exec("ROLLBACK");
+        return false;
+      }
+      // Proof freshness includes its 30-second endpoint, so retain a nonce through
+      // the matching inclusive 60-second replay boundary.
+      this.#prepare(`
+        DELETE FROM host_executor_proof_nonces WHERE expires_at_ms < ?
+      `).run(observedAtMs);
+      const result = this.#prepare(`
+        INSERT OR IGNORE INTO host_executor_proof_nonces (nonce, expires_at_ms)
+        VALUES (?, ?)
+      `).run(nonce.toLowerCase(), observedAtMs + 60_000);
+      this.database.exec("COMMIT");
+      return result.changes === 1;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #requireHostExecutorRegistration(input) {
+    const registration = this.#prepare(`
+      SELECT * FROM host_executor_registrations WHERE executor_instance_id = ?
+    `).get(input.executorInstanceId);
+    if (!registration
+      || registration.codex_host_id !== input.codexHostId
+      || registration.registration_fingerprint !== input.registrationFingerprint) {
+      throw new ApiError(
+        409,
+        "HOST_EXECUTOR_REGISTRATION_MISMATCH",
+        "The executor lease requires the exact immutable host registration",
+      );
+    }
+    return registration;
+  }
+
+  #hostExecutorLeaseRequest(input, action) {
+    if (!isCanonicalCodexHostId(input?.codexHostId)) {
+      throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+    }
+    const executorInstanceId = hostExecutorIdentifier(
+      input.executorInstanceId,
+      "executorInstanceId",
+    );
+    const registrationFingerprint = hostExecutorIdentifier(
+      input.registrationFingerprint,
+      "registrationFingerprint",
+    );
+    if (!/^[a-f0-9]{64}$/.test(registrationFingerprint)) {
+      throw new ApiError(400, "INVALID_FIELD", "'registrationFingerprint' must be a SHA-256 digest");
+    }
+    const idempotencyKey = hostExecutorIdentifier(input.idempotencyKey, "idempotencyKey");
+    const expectedLeaseId = input.expectedLeaseId === null
+      ? null
+      : hostExecutorIdentifier(input.expectedLeaseId, "expectedLeaseId");
+    let leaseDurationSeconds = null;
+    if (action !== "release") {
+      leaseDurationSeconds = input.leaseDurationSeconds;
+      if (!Number.isInteger(leaseDurationSeconds)
+        || leaseDurationSeconds < 30
+        || leaseDurationSeconds > 3600) {
+        throw new ApiError(
+          400,
+          "INVALID_FIELD",
+          "'leaseDurationSeconds' must be an integer from 30 through 3600",
+        );
+      }
+    }
+    if (action !== "acquire" && expectedLeaseId === null) {
+      throw new ApiError(400, "INVALID_FIELD", "'expectedLeaseId' is required");
+    }
+    const normalized = {
+      codexHostId: input.codexHostId,
+      executorInstanceId,
+      registrationFingerprint,
+      expectedLeaseId,
+      leaseDurationSeconds,
+      idempotencyKey,
+    };
+    return {
+      ...normalized,
+      requestFingerprint: createHash("sha256").update(JSON.stringify({
+        action,
+        codexHostId: normalized.codexHostId,
+        executorInstanceId,
+        registrationFingerprint,
+        expectedLeaseId,
+        leaseDurationSeconds,
+      })).digest("hex"),
+    };
+  }
+
+  #replayHostExecutorLease(input) {
+    const row = this.#prepare(`
+      SELECT * FROM host_executor_lease_receipts WHERE idempotency_key = ?
+    `).get(input.idempotencyKey);
+    if (!row) return null;
+    if (row.request_fingerprint !== input.requestFingerprint) {
+      throw new ApiError(
+        409,
+        "HOST_EXECUTOR_LEASE_IDEMPOTENCY_CONFLICT",
+        "The idempotency key is bound to another host executor lease action",
+      );
+    }
+    return {
+      applied: false,
+      lease: JSON.parse(row.result_json),
+      receipt: hostExecutorLeaseReceiptFromRow(row),
+    };
+  }
+
+  #insertHostExecutorLeaseReceipt(input, lease, action, timestamp) {
+    const row = {
+      id: randomUUID(),
+      codex_host_id: input.codexHostId,
+      idempotency_key: input.idempotencyKey,
+      request_fingerprint: input.requestFingerprint,
+      action,
+      lease_id: lease.id,
+      executor_instance_id: input.executorInstanceId,
+      result_json: JSON.stringify(lease),
+      created_at: timestamp,
+    };
+    this.#prepare(`
+      INSERT INTO host_executor_lease_receipts (
+        id, codex_host_id, idempotency_key, request_fingerprint, action,
+        lease_id, executor_instance_id, result_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(...Object.values(row));
+    return hostExecutorLeaseReceiptFromRow(row);
+  }
+
+  acquireHostExecutorLease(rawInput) {
+    const input = this.#hostExecutorLeaseRequest(rawInput, "acquire");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      const replay = this.#replayHostExecutorLease(input);
+      if (replay) {
+        this.database.exec("COMMIT");
+        return replay;
+      }
+      this.#requireHostExecutorRegistration(input);
+      const currentRow = this.#prepare(`
+        SELECT * FROM host_executor_leases WHERE codex_host_id = ?
+      `).get(input.codexHostId);
+      const actualLeaseId = currentRow?.lease_id ?? null;
+      if (actualLeaseId !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_CONFLICT",
+          "The host executor lease changed since it was read",
+          { actualLeaseId },
+        );
+      }
+      const current = hostExecutorLeaseFromRow(currentRow, observedAtMs);
+      if (current?.status === "active") {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_ACTIVE",
+          "Another executor instance holds the active host lease",
+        );
+      }
+      const lease = {
+        id: randomUUID(),
+        codexHostId: input.codexHostId,
+        executorInstanceId: input.executorInstanceId,
+        registrationFingerprint: input.registrationFingerprint,
+        acquiredAt: timestamp,
+        expiresAt: new Date(
+          observedAtMs + input.leaseDurationSeconds * 1_000,
+        ).toISOString(),
+        releasedAt: null,
+        status: "active",
+      };
+      this.#prepare(`
+        INSERT INTO host_executor_leases (
+          codex_host_id, lease_id, executor_instance_id, registration_fingerprint,
+          acquired_at, expires_at, released_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(codex_host_id) DO UPDATE SET
+          lease_id = excluded.lease_id,
+          executor_instance_id = excluded.executor_instance_id,
+          registration_fingerprint = excluded.registration_fingerprint,
+          acquired_at = excluded.acquired_at,
+          expires_at = excluded.expires_at,
+          released_at = excluded.released_at
+      `).run(
+        lease.codexHostId,
+        lease.id,
+        lease.executorInstanceId,
+        lease.registrationFingerprint,
+        lease.acquiredAt,
+        lease.expiresAt,
+        lease.releasedAt,
+      );
+      const receipt = this.#insertHostExecutorLeaseReceipt(
+        input,
+        lease,
+        "acquired",
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return { applied: true, lease, receipt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  renewHostExecutorLease(rawInput) {
+    const input = this.#hostExecutorLeaseRequest(rawInput, "renew");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      const replay = this.#replayHostExecutorLease(input);
+      if (replay) {
+        this.database.exec("COMMIT");
+        return replay;
+      }
+      this.#requireHostExecutorRegistration(input);
+      const currentRow = this.#prepare(`
+        SELECT * FROM host_executor_leases WHERE codex_host_id = ?
+      `).get(input.codexHostId);
+      const actualLeaseId = currentRow?.lease_id ?? null;
+      if (actualLeaseId !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_CONFLICT",
+          "The host executor lease changed since it was read",
+          { actualLeaseId },
+        );
+      }
+      const current = hostExecutorLeaseFromRow(currentRow, observedAtMs);
+      if (current?.status !== "active") {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_NOT_ACTIVE",
+          "The host executor lease is not active",
+        );
+      }
+      if (current.executorInstanceId !== input.executorInstanceId
+        || current.registrationFingerprint !== input.registrationFingerprint) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_BINDING_MISMATCH",
+          "Only the exact registered executor instance may renew this lease",
+        );
+      }
+      const lease = {
+        ...current,
+        expiresAt: new Date(
+          observedAtMs + input.leaseDurationSeconds * 1_000,
+        ).toISOString(),
+        releasedAt: null,
+        status: "active",
+      };
+      this.#prepare(`
+        UPDATE host_executor_leases
+        SET expires_at = ?, released_at = NULL
+        WHERE codex_host_id = ? AND lease_id = ?
+      `).run(lease.expiresAt, input.codexHostId, input.expectedLeaseId);
+      const receipt = this.#insertHostExecutorLeaseReceipt(
+        input,
+        lease,
+        "renewed",
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return { applied: true, lease, receipt };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseHostExecutorLease(rawInput) {
+    const input = this.#hostExecutorLeaseRequest(rawInput, "release");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      const replay = this.#replayHostExecutorLease(input);
+      if (replay) {
+        this.database.exec("COMMIT");
+        return replay;
+      }
+      this.#requireHostExecutorRegistration(input);
+      const currentRow = this.#prepare(`
+        SELECT * FROM host_executor_leases WHERE codex_host_id = ?
+      `).get(input.codexHostId);
+      const actualLeaseId = currentRow?.lease_id ?? null;
+      if (actualLeaseId !== input.expectedLeaseId) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_CONFLICT",
+          "The host executor lease changed since it was read",
+          { actualLeaseId },
+        );
+      }
+      const current = hostExecutorLeaseFromRow(currentRow, observedAtMs);
+      if (current?.status !== "active") {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_NOT_ACTIVE",
+          "The host executor lease is not active",
+        );
+      }
+      if (current.executorInstanceId !== input.executorInstanceId
+        || current.registrationFingerprint !== input.registrationFingerprint) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_LEASE_BINDING_MISMATCH",
+          "Only the exact registered executor instance may release this lease",
+        );
+      }
+      const lease = {
+        ...current,
+        expiresAt: timestamp,
+        releasedAt: timestamp,
+        status: "released",
+      };
+      this.#prepare(`
+        UPDATE host_executor_leases
+        SET expires_at = ?, released_at = ?
+        WHERE codex_host_id = ? AND lease_id = ?
+      `).run(timestamp, timestamp, input.codexHostId, input.expectedLeaseId);
+      const receipt = this.#insertHostExecutorLeaseReceipt(
+        input,
+        lease,
+        "released",
+        timestamp,
+      );
+      this.database.exec("COMMIT");
+      return { applied: true, lease, receipt };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
