@@ -36,6 +36,10 @@ const COORDINATOR_DELIVERY_MODEL_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_MODEL_
 const COORDINATOR_DELIVERY_EFFORT_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:";
 const COORDINATOR_DELIVERY_RETRY_BASE_MS = 15_000;
 const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
+const NO_START_COORDINATION_DELIVERY_STATUSES = new Set([
+  "observed",
+  "not-observed",
+]);
 
 export function admissionRecoveryRpcTimeoutMs(method) {
   return method === "thread/resume" || method === "turn/start" ? 30_000 : 10_000;
@@ -2582,13 +2586,14 @@ export function runTaskboardContinuationFastLane({
     project?.continuationEnabled === true
     && COORDINATION_ID_PATTERN.test(project?.projectId ?? "")
   ));
+  const hostResourceAdmissionBudget = new Map();
   return eligible.map((project) => {
     const projectId = project.projectId;
     if (continuationFastLaneRuns.has(projectId)) {
       return { projectId, state: "in_flight" };
     }
     const run = Promise.resolve()
-      .then(() => runContinuation(projectId))
+      .then(() => runContinuation(projectId, hostResourceAdmissionBudget))
       .then(
         (result) => ({ projectId, ok: true, result }),
         (error) => ({
@@ -3350,15 +3355,48 @@ export function evaluateHostResourceAdmission({
   return result;
 }
 
+function reserveHostResourceAdmissionBudget({ budget, target, headroomAgents }) {
+  if (!(budget instanceof Map)) {
+    return { available: false, reason: "host-resource-budget-unavailable" };
+  }
+  if (!Number.isSafeInteger(headroomAgents) || headroomAgents < 1) {
+    return { available: false, reason: "waiting-host-resources" };
+  }
+  const hostId = target?.codexHostId;
+  const current = budget.get(hostId);
+  const state = current ?? { limit: headroomAgents, used: 0 };
+  if (!Number.isSafeInteger(state.limit)
+    || state.limit < 1
+    || !Number.isSafeInteger(state.used)
+    || state.used < 0) {
+    return { available: false, reason: "host-resource-budget-unavailable" };
+  }
+  state.limit = Math.min(state.limit, headroomAgents);
+  budget.set(hostId, state);
+  if (state.used >= state.limit) {
+    return { available: false, reason: "waiting-host-resources" };
+  }
+  state.used += 1;
+  let released = false;
+  return {
+    available: true,
+    release() {
+      if (released) return;
+      released = true;
+      state.used = Math.max(0, state.used - 1);
+    },
+  };
+}
+
 function continuationCapacity(snapshot, target, policy, observedAtMs) {
-  if (policy.maxActiveAgents === undefined) return { available: true };
+  if (policy.maxActiveAgents === undefined) return { available: true, headroomAgents: null };
   if (!Number.isSafeInteger(policy.maxActiveAgents)
     || policy.maxActiveAgents < 1
     || policy.maxActiveAgents > 64
     || !Number.isSafeInteger(policy.capacityObservationMaxAgeMs)
     || policy.capacityObservationMaxAgeMs < 1
     || policy.capacityObservationMaxAgeMs > 15 * 60_000) {
-    return { available: false, reason: "invalid-capacity-policy" };
+    return { available: false, reason: "invalid-capacity-policy", headroomAgents: 0 };
   }
   const tree = Array.isArray(snapshot.windowSubagentTrees)
     ? snapshot.windowSubagentTrees.find((candidate) => (
@@ -3372,7 +3410,12 @@ function continuationCapacity(snapshot, target, policy, observedAtMs) {
     || !Number.isSafeInteger(active)
     || active < 0
     || !Number.isFinite(capacityObservedAt)) {
-    return { available: false, reason: "capacity-unobserved", observationId: "unobserved" };
+    return {
+      available: false,
+      reason: "capacity-unobserved",
+      observationId: "unobserved",
+      headroomAgents: 0,
+    };
   }
   if (capacityObservedAt > observedAtMs
     || observedAtMs - capacityObservedAt > policy.capacityObservationMaxAgeMs) {
@@ -3380,12 +3423,14 @@ function continuationCapacity(snapshot, target, policy, observedAtMs) {
       available: false,
       reason: "capacity-observation-stale",
       observationId: tree.capacityObservation.observedAt,
+      headroomAgents: 0,
     };
   }
   const childSlotLimit = Math.max(0, policy.maxActiveAgents - 1);
-  return active < childSlotLimit
-    ? { available: true }
-    : { available: false, reason: "waiting-capacity" };
+  const headroomAgents = Math.max(0, childSlotLimit - active);
+  return headroomAgents >= 1
+    ? { available: true, headroomAgents }
+    : { available: false, reason: "waiting-capacity", headroomAgents };
 }
 
 function durableModelCapacityRetry(snapshot, candidate, target, readyWork, safeAction, observedAtMs) {
@@ -3445,6 +3490,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   deliverAdmissionRecovery,
   requestCapacityObservation,
   readHostResourceObservation,
+  hostResourceAdmissionBudget,
   now = Date.now,
 }) {
   if (
@@ -3660,6 +3706,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   }
   let capacityReason = null;
   let capacityProbe = null;
+  let selectedHostResourceHeadroom = null;
   const capacityObservedAt = now();
   const todo = snapshot.todos.find((candidate) => {
     const target = candidate?.dispatchTarget;
@@ -3714,6 +3761,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
           capacityReason ??= hostResourceCapacity.reason;
           return false;
         }
+        if (hostResourceCapacity.applied === true) {
+          selectedHostResourceHeadroom = hostResourceCapacity.headroomAgents;
+        }
         return true;
       }
       if (!capacityProbe
@@ -3746,6 +3796,11 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       capacityReason ??= hostResourceCapacity.reason;
       return false;
     }
+    if (hostResourceCapacity.applied === true) {
+      selectedHostResourceHeadroom = Number.isSafeInteger(capacity.headroomAgents)
+        ? Math.min(hostResourceCapacity.headroomAgents, capacity.headroomAgents)
+        : hostResourceCapacity.headroomAgents;
+    }
     return true;
   });
   if (!todo) {
@@ -3764,6 +3819,17 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     return { delivered: false, reason: capacityReason ?? "no-eligible-work" };
   }
 
+  const hostResourceReservation = selectedHostResourceHeadroom == null
+    ? null
+    : reserveHostResourceAdmissionBudget({
+        budget: hostResourceAdmissionBudget,
+        target: todo.dispatchTarget,
+        headroomAgents: selectedHostResourceHeadroom,
+      });
+  if (hostResourceReservation?.available === false) {
+    return { delivered: false, reason: hostResourceReservation.reason };
+  }
+  const releaseHostResourceReservation = () => hostResourceReservation?.release();
   const safeAction = todo.readyWork.safeActions[0];
   const authorization = {
     todoId: todo.id,
@@ -3772,11 +3838,19 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
   };
-  const reservation = await claimReceipt(authorization);
+  let reservation;
+  try {
+    reservation = await claimReceipt(authorization);
+  } catch (error) {
+    releaseHostResourceReservation();
+    throw error;
+  }
   if (reservation?.completed === true) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "already-delivered" };
   }
   if (reservation?.available !== true || !reservation.receipt?.id) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "reservation-unavailable" };
   }
   const recoveryRoute = reservation.recovering === true ? reservation.recoveryRoute : null;
@@ -3786,7 +3860,10 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     || typeof recoveryRoute.codexHostId !== "string" || !recoveryRoute.codexHostId
     || typeof recoveryRoute.rootWorkspacePath !== "string" || !path.isAbsolute(recoveryRoute.rootWorkspacePath)
     || typeof recoveryRoute.worktreePath !== "string" || !path.isAbsolute(recoveryRoute.worktreePath)
-  )) return { delivered: false, reason: "invalid-recovery-route" };
+  )) {
+    releaseHostResourceReservation();
+    return { delivered: false, reason: "invalid-recovery-route" };
+  }
   if (recoveryRoute) {
     authorization.rootThreadId = reservation.receipt.rootThreadId;
     authorization.expectedResumeToken = reservation.receipt.resumeToken;
@@ -3794,9 +3871,15 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   authorization.deliveryReceipt = reservation.receipt;
   authorization.recoveryLeaseId = reservation.recoveryLeaseId
     ?? reservation.receipt.reservationLeaseId;
-  const executionIdentity = recoveryRoute
-    ? reservation.executionIdentity
-    : await confirmDelivery(authorization);
+  let executionIdentity;
+  try {
+    executionIdentity = recoveryRoute
+      ? reservation.executionIdentity
+      : await confirmDelivery(authorization);
+  } catch (error) {
+    releaseHostResourceReservation();
+    throw error;
+  }
   const standingAuthority = safeAction.standingAuthority === true;
   if (!executionIdentity
     || typeof executionIdentity.worktreePath !== "string"
@@ -3807,6 +3890,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       typeof executionIdentity.repository !== "string"
       || !/^(?:github\.com|gitlab\.com)\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(executionIdentity.repository)
     ))) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "delivery-unavailable" };
   }
   let delivery;
@@ -3827,7 +3911,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       executionIdentity: { ...executionIdentity, standingAuthority },
     });
   } catch (error) {
-    if (!isSelectedModelCapacityError(error) || typeof deferAdmission !== "function") throw error;
+    if (!isSelectedModelCapacityError(error)) throw error;
+    releaseHostResourceReservation();
+    if (typeof deferAdmission !== "function") throw error;
     const deferred = await deferAdmission({
       ...authorization,
       admissionReceiptId: reservation.receipt.id,
@@ -3843,13 +3929,25 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       reason: "model-capacity-deferred",
     };
   }
+  const definitelyDidNotStart = NO_START_COORDINATION_DELIVERY_STATUSES.has(
+    delivery?.delivery,
+  );
   if (reservation.observeOnly === true && delivery?.delivery !== "observed") {
+    if (definitelyDidNotStart) releaseHostResourceReservation();
     return { delivered: false, reason: "manual-recovery-required" };
   }
-  const completion = await completeDelivery(authorization, delivery);
+  let completion;
+  try {
+    completion = await completeDelivery(authorization, delivery);
+  } catch (error) {
+    if (definitelyDidNotStart) releaseHostResourceReservation();
+    throw error;
+  }
   if (completion?.completed !== true && completion?.awaitingAdmission !== true) {
+    if (definitelyDidNotStart) releaseHostResourceReservation();
     throw new Error("Taskboard did not record the Root coordination delivery");
   }
+  if (definitelyDidNotStart) releaseHostResourceReservation();
   return { delivered: true, todoId: todo.id, actionId: safeAction.id };
 }
 

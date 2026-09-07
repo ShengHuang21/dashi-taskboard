@@ -8,6 +8,7 @@ import {
 } from "../scripts/host-resource-observer.mjs";
 import {
   evaluateHostResourceAdmission,
+  runTaskboardContinuationFastLane,
   runTaskboardContinuationMonitorOnce,
 } from "../scripts/codex-injector-runtime.mjs";
 
@@ -69,15 +70,20 @@ function monitorFixture({
   hostObservation = observation(),
   targetHostId = "local",
   active = 0,
+  projectId = "taskboard-core",
+  todoId = "CAP-54",
+  taskId = "28cf5799-a245-4f54-b772-0aa2acf16e35",
+  fixtureRootThreadId = rootThreadId,
+  hostResourceAdmissionBudget = new Map(),
   todoOverrides = {},
 } = {}) {
   const calls = { observe: 0, claim: 0, confirm: 0, deliver: 0, complete: 0 };
   const todo = {
-    id: "CAP-54",
-    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e35",
+    id: todoId,
+    taskId,
     run: null,
     dispatchTarget: {
-      rootThreadId,
+      rootThreadId: fixtureRootThreadId,
       codexHostId: targetHostId,
       rootWorkspacePath: "/tmp/taskboard/project",
       worktreePath: "/tmp/taskboard/project",
@@ -96,17 +102,18 @@ function monitorFixture({
     options: {
       policy: {
         enabled: true,
-        projectId: "taskboard-core",
+        projectId,
         maxActiveAgents: 4,
         capacityObservationMaxAgeMs: 60_000,
         hostResourceAdmission: hostPolicy,
       },
       now: () => observedAtMs,
+      hostResourceAdmissionBudget,
       readSnapshot: async () => ({
-        projectId: "taskboard-core",
+        projectId,
         todos: [todo],
         windowSubagentTrees: [{
-          rootThreadId,
+          rootThreadId: fixtureRootThreadId,
           observed: true,
           summary: { active },
           capacityObservation: { source: "list_agents", observedAt },
@@ -261,6 +268,325 @@ test("continuation queues under CPU or memory pressure and resumes when healthy"
     reason: "waiting-host-resources",
   });
   assert.equal(cpuFixture.calls.claim, 0);
+});
+
+test("one resident tick atomically shares the final host slot across projects", async () => {
+  const sharedBudget = new Map();
+  const tightObservation = observation({ cpuRatio: 0.67 });
+  const first = monitorFixture({
+    projectId: "taskboard-project-a",
+    todoId: "CAP-54-A",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e36",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
+    hostObservation: tightObservation,
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  const second = monitorFixture({
+    projectId: "taskboard-project-b",
+    todoId: "CAP-54-B",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e37",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b0",
+    hostObservation: tightObservation,
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  let releaseFirstClaim;
+  let firstClaimStarted;
+  const firstClaimEntered = new Promise((resolve) => { firstClaimStarted = resolve; });
+  const holdFirstClaim = new Promise((resolve) => { releaseFirstClaim = resolve; });
+  first.options.claimReceipt = async () => {
+    first.calls.claim += 1;
+    firstClaimStarted();
+    await holdFirstClaim;
+    return {
+      available: true,
+      completed: false,
+      receipt: {
+        id: "receipt-cap54-a",
+        reservationLeaseId: "lease-cap54-a",
+        admissionAttemptId: "attempt-cap54-a",
+      },
+    };
+  };
+
+  const firstRun = runTaskboardContinuationMonitorOnce(first.options);
+  await firstClaimEntered;
+  const secondResult = await runTaskboardContinuationMonitorOnce(second.options);
+  releaseFirstClaim();
+  const firstResult = await firstRun;
+
+  assert.deepEqual(firstResult, {
+    delivered: true,
+    todoId: "CAP-54-A",
+    actionId: "safe-resource-admission",
+  });
+  assert.equal(first.calls.claim + second.calls.claim, 1);
+  assert.equal(first.calls.deliver + second.calls.deliver, 1);
+  assert.deepEqual(secondResult, {
+    delivered: false,
+    reason: "waiting-host-resources",
+  });
+});
+
+test("one resident tick also shares the final observed Agent slot across projects", async () => {
+  const sharedBudget = new Map();
+  const first = monitorFixture({
+    projectId: "agent-slot-project-a",
+    todoId: "CAP-54-C",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e38",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b1",
+    active: 2,
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  const second = monitorFixture({
+    projectId: "agent-slot-project-b",
+    todoId: "CAP-54-D",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e39",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b2",
+    active: 2,
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+
+  assert.equal((await runTaskboardContinuationMonitorOnce(first.options)).delivered, true);
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(second.options), {
+    delivered: false,
+    reason: "waiting-host-resources",
+  });
+  assert.equal(first.calls.claim + second.calls.claim, 1);
+});
+
+test("a successful steer keeps the final host slot reserved for the tick", async () => {
+  const sharedBudget = new Map();
+  const first = monitorFixture({
+    projectId: "steered-project-a",
+    todoId: "CAP-54-I",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3e",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b7",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  const second = monitorFixture({
+    projectId: "steered-project-b",
+    todoId: "CAP-54-J",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3f",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b8",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  first.options.deliver = async () => {
+    first.calls.deliver += 1;
+    return { delivery: "steered", turnId: "turn-cap54-steered" };
+  };
+
+  assert.equal((await runTaskboardContinuationMonitorOnce(first.options)).delivered, true);
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(second.options), {
+    delivered: false,
+    reason: "waiting-host-resources",
+  });
+  assert.equal(first.calls.claim + second.calls.claim, 1);
+  assert.equal(first.calls.deliver + second.calls.deliver, 1);
+});
+
+test("unknown or malformed delivery status conservatively holds the tick budget", async () => {
+  const cases = [
+    ["unknown", { delivery: "future-status", turnId: "turn-cap54-unknown" }],
+    ["malformed", { turnId: "turn-cap54-malformed" }],
+  ];
+  for (const [suffix, delivery] of cases) {
+    const sharedBudget = new Map();
+    const first = monitorFixture({
+      projectId: `unknown-project-${suffix}-a`,
+      todoId: `CAP-54-${suffix}-A`,
+      taskId: suffix === "unknown"
+        ? "28cf5799-a245-4f54-b772-0aa2acf16e40"
+        : "28cf5799-a245-4f54-b772-0aa2acf16e41",
+      fixtureRootThreadId: suffix === "unknown"
+        ? "01a004bd-a749-7b53-81e2-af2d477f93b9"
+        : "01a004bd-a749-7b53-81e2-af2d477f93ba",
+      hostObservation: observation({ cpuRatio: 0.67 }),
+      hostResourceAdmissionBudget: sharedBudget,
+    });
+    const second = monitorFixture({
+      projectId: `unknown-project-${suffix}-b`,
+      todoId: `CAP-54-${suffix}-B`,
+      taskId: suffix === "unknown"
+        ? "28cf5799-a245-4f54-b772-0aa2acf16e42"
+        : "28cf5799-a245-4f54-b772-0aa2acf16e43",
+      fixtureRootThreadId: suffix === "unknown"
+        ? "01a004bd-a749-7b53-81e2-af2d477f93bb"
+        : "01a004bd-a749-7b53-81e2-af2d477f93bc",
+      hostObservation: observation({ cpuRatio: 0.67 }),
+      hostResourceAdmissionBudget: sharedBudget,
+    });
+    first.options.deliver = async () => {
+      first.calls.deliver += 1;
+      return delivery;
+    };
+
+    assert.equal((await runTaskboardContinuationMonitorOnce(first.options)).delivered, true);
+    assert.deepEqual(await runTaskboardContinuationMonitorOnce(second.options), {
+      delivered: false,
+      reason: "waiting-host-resources",
+    });
+    assert.equal(second.calls.claim, 0);
+  }
+});
+
+test("definitely unstarted admissions release the shared tick budget", async () => {
+  const sharedBudget = new Map();
+  const first = monitorFixture({
+    projectId: "deferred-project-a",
+    todoId: "CAP-54-E",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3a",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b3",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  const second = monitorFixture({
+    projectId: "deferred-project-b",
+    todoId: "CAP-54-F",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3b",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b4",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  first.options.deliver = async () => {
+    first.calls.deliver += 1;
+    throw new Error("Selected model is at capacity. Please try a different model.");
+  };
+  first.options.deferAdmission = async () => ({
+    receipt: { admissionState: "deferred" },
+  });
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(first.options), {
+    delivered: false,
+    todoId: "CAP-54-E",
+    actionId: "safe-resource-admission",
+    reason: "model-capacity-deferred",
+  });
+  assert.equal((await runTaskboardContinuationMonitorOnce(second.options)).delivered, true);
+  assert.equal(second.calls.claim, 1);
+  assert.equal(second.calls.deliver, 1);
+});
+
+test("only observed and observe-only not-observed statuses release without a start", async () => {
+  for (const [suffix, deliveryStatus, observeOnly] of [
+    ["observed", "observed", false],
+    ["not-observed", "not-observed", true],
+  ]) {
+    const sharedBudget = new Map();
+    const first = monitorFixture({
+      projectId: `no-start-${suffix}-a`,
+      todoId: `CAP-54-${suffix}-A`,
+      taskId: suffix === "observed"
+        ? "28cf5799-a245-4f54-b772-0aa2acf16e44"
+        : "28cf5799-a245-4f54-b772-0aa2acf16e45",
+      fixtureRootThreadId: suffix === "observed"
+        ? "01a004bd-a749-7b53-81e2-af2d477f93bd"
+        : "01a004bd-a749-7b53-81e2-af2d477f93be",
+      hostObservation: observation({ cpuRatio: 0.67 }),
+      hostResourceAdmissionBudget: sharedBudget,
+    });
+    const second = monitorFixture({
+      projectId: `no-start-${suffix}-b`,
+      todoId: `CAP-54-${suffix}-B`,
+      taskId: suffix === "observed"
+        ? "28cf5799-a245-4f54-b772-0aa2acf16e46"
+        : "28cf5799-a245-4f54-b772-0aa2acf16e47",
+      fixtureRootThreadId: suffix === "observed"
+        ? "01a004bd-a749-7b53-81e2-af2d477f93bf"
+        : "01a004bd-a749-7b53-81e2-af2d477f93c0",
+      hostObservation: observation({ cpuRatio: 0.67 }),
+      hostResourceAdmissionBudget: sharedBudget,
+    });
+    first.options.claimReceipt = async () => {
+      first.calls.claim += 1;
+      return {
+        available: true,
+        completed: false,
+        observeOnly,
+        receipt: {
+          id: `receipt-cap54-${suffix}`,
+          reservationLeaseId: `lease-cap54-${suffix}`,
+          admissionAttemptId: `attempt-cap54-${suffix}`,
+        },
+      };
+    };
+    first.options.deliver = async () => {
+      first.calls.deliver += 1;
+      return { delivery: deliveryStatus, turnId: `turn-cap54-${suffix}` };
+    };
+
+    const firstResult = await runTaskboardContinuationMonitorOnce(first.options);
+    assert.equal(firstResult.delivered, deliveryStatus === "observed");
+    assert.equal((await runTaskboardContinuationMonitorOnce(second.options)).delivered, true);
+    assert.equal(second.calls.claim, 1);
+  }
+});
+
+test("ambiguous delivery failure holds only its tick budget", async () => {
+  const sharedBudget = new Map();
+  const first = monitorFixture({
+    projectId: "ambiguous-project-a",
+    todoId: "CAP-54-G",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3c",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b5",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  const sameTick = monitorFixture({
+    projectId: "ambiguous-project-b",
+    todoId: "CAP-54-H",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3d",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b6",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: sharedBudget,
+  });
+  first.options.deliver = async () => {
+    first.calls.deliver += 1;
+    throw new Error("transport failed after dispatch may have started");
+  };
+
+  await assert.rejects(
+    runTaskboardContinuationMonitorOnce(first.options),
+    /transport failed after dispatch may have started/,
+  );
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(sameTick.options), {
+    delivered: false,
+    reason: "waiting-host-resources",
+  });
+  assert.equal(sameTick.calls.claim, 0);
+
+  const nextTick = monitorFixture({
+    projectId: "ambiguous-project-b",
+    todoId: "CAP-54-H",
+    taskId: "28cf5799-a245-4f54-b772-0aa2acf16e3d",
+    fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93b6",
+    hostObservation: observation({ cpuRatio: 0.67 }),
+    hostResourceAdmissionBudget: new Map(),
+  });
+  assert.equal((await runTaskboardContinuationMonitorOnce(nextTick.options)).delivered, true);
+  assert.equal(nextTick.calls.claim, 1);
+});
+
+test("continuation fast lane gives every project one shared per-tick budget", async () => {
+  const observedBudgets = [];
+  let complete;
+  const completed = new Promise((resolve) => { complete = resolve; });
+  runTaskboardContinuationFastLane({
+    projects: [
+      { projectId: "budget-contract-a", continuationEnabled: true },
+      { projectId: "budget-contract-b", continuationEnabled: true },
+    ],
+    runContinuation: async (_projectId, budget) => {
+      observedBudgets.push(budget);
+      if (observedBudgets.length === 2) complete();
+      return { delivered: false };
+    },
+  });
+  await completed;
+  assert.equal(observedBudgets.length, 2);
+  assert.ok(observedBudgets[0] instanceof Map);
+  assert.equal(observedBudgets[0], observedBudgets[1]);
 });
 
 test("local continuation fails closed for missing, warming, stale, or wrong-host observations", async () => {

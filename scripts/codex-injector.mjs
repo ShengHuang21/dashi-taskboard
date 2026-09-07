@@ -3003,7 +3003,7 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
   }
 }
 
-function runBackgroundContinuationDispatch(cdp, projectId) {
+function runBackgroundContinuationDispatch(cdp, projectId, hostResourceAdmissionBudget) {
   return runTaskboardContinuationMonitorOnce({
     policy: {
       enabled: true,
@@ -3014,6 +3014,7 @@ function runBackgroundContinuationDispatch(cdp, projectId) {
     },
     readSnapshot: readTaskboardAgentLaneSnapshot,
     readHostResourceObservation,
+    hostResourceAdmissionBudget,
     claimReceipt: claimBackgroundContinuationReceipt,
     confirmDelivery: confirmBackgroundContinuationDelivery,
     completeDelivery: completeBackgroundContinuationDelivery,
@@ -3070,7 +3071,9 @@ async function runBackgroundContinuationFastLane(cdp) {
   });
   return runTaskboardContinuationFastLane({
     projects,
-    runContinuation: (projectId) => runBackgroundContinuationDispatch(cdp, projectId),
+    runContinuation: (projectId, hostResourceAdmissionBudget) => (
+      runBackgroundContinuationDispatch(cdp, projectId, hostResourceAdmissionBudget)
+    ),
     observeResult: (result) => {
       if (!result.ok) {
         console.error(`Taskboard continuation fast lane project ${result.projectId} failed: ${result.error}`);
