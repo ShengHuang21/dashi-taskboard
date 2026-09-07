@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
@@ -73,6 +74,11 @@ import {
 import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
 import { readCodexQuotaStatus } from "./codex-rate-limits.mjs";
 import { createTaskboardSupervisor } from "./taskboard-supervisor.mjs";
+import {
+  createHostExecutorApi,
+  createHostExecutorEffectKey,
+} from "./host-executor-api.mjs";
+import { createHostExecutorLeaseLifecycle } from "./host-executor-lifecycle.mjs";
 import {
   CdpPipeBrowser,
   validatedLoopbackCdpWebSocketUrl,
@@ -175,6 +181,17 @@ const taskConversationFailureTtlMs = 120_000;
 const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
 const backgroundContinuationIntervalMs = 15_000;
 const residentHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
+const residentHostExecutorAdapterId = "local-codex-app-server-v1";
+const residentHostExecutorMutatingRpcMethods = new Set([
+  "thread/archive",
+  "thread/name/set",
+  "thread/resume",
+  "thread/start",
+  "turn/start",
+  "turn/steer",
+]);
+const residentHostExecutorLeaseDurationSeconds = 120;
+const residentHostExecutorRenewIntervalMs = 30_000;
 const coordinatorIdentityHandshakeIntervalMs = 2_000;
 const coordinatorLeaseRenewWindowMs = 45_000;
 const coordinatorLeaseDurationSeconds = 120;
@@ -195,6 +212,39 @@ let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
 let localCodexThreadRpcEnabled = false;
 let localCodexThreadRpcLifecycle = null;
+let residentHostExecutorLeaseLifecycle = null;
+const residentHostExecutorContext = new AsyncLocalStorage();
+
+function residentHostExecutorExecution() {
+  const envelope = residentHostExecutorLeaseLifecycle?.executionEnvelope();
+  if (!envelope) return null;
+  return Object.freeze({ ownedCodexHostId: envelope.codexHostId, ...envelope });
+}
+
+function currentResidentHostExecutorExecution() {
+  return residentHostExecutorContext.getStore() ?? residentHostExecutorExecution();
+}
+
+function residentHostExecutorFenceHeaders(pathname, body, method = "POST") {
+  const execution = currentResidentHostExecutorExecution();
+  if (!execution) throw new Error("Taskboard resident host executor lease is unavailable");
+  const serialized = Buffer.from(JSON.stringify({
+    codexHostId: execution.codexHostId,
+    executorInstanceId: execution.executorInstanceId,
+    registrationFingerprint: execution.registrationFingerprint,
+    leaseId: execution.leaseId,
+  }), "utf8").toString("base64url");
+  return {
+    "x-codex-taskboard-host-execution": serialized,
+    "x-codex-taskboard-host-execution-proof": createHmac("sha256", taskboardInstanceSecret)
+      .update(JSON.stringify({ method, pathname, body, execution: serialized }))
+      .digest("hex"),
+  };
+}
+
+function residentHostExecutorLeaseIsActive() {
+  return residentHostExecutorLeaseLifecycle?.isActive() === true;
+}
 
 async function ensureLocalCodexThreadRpcTransport() {
   if (!localCodexThreadRpcEnabled || !localCodexThreadRpcLifecycle) {
@@ -1180,6 +1230,38 @@ async function requestCodexAppServerViaCdp(
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
 ) {
+  const residentExecution = residentHostExecutorContext.getStore();
+  if (residentExecution && residentHostExecutorMutatingRpcMethods.has(method)) {
+    if (hostId !== residentExecution.codexHostId || hostId !== "local") {
+      throw new Error("Resident host executor cannot mutate a non-local Codex host");
+    }
+    if (method === "turn/start" && params?.approvalPolicy !== "never") {
+      throw new Error("Headless Codex turns require approvalPolicy 'never'");
+    }
+    const effectKey = createHostExecutorEffectKey({
+      codexHostId: hostId,
+      method,
+      params,
+    });
+    const result = await createHostExecutorApi({
+      baseUrl: taskboardBaseUrl,
+      instanceSecret: taskboardInstanceSecret,
+      timeoutSignal: () => AbortSignal.timeout(timeoutMs),
+    }).executeEffect({
+      effectKey,
+      execution: {
+        codexHostId: residentExecution.codexHostId,
+        executorInstanceId: residentExecution.executorInstanceId,
+        registrationFingerprint: residentExecution.registrationFingerprint,
+        leaseId: residentExecution.leaseId,
+      },
+      operations: [{ method, params }],
+    });
+    if (!Array.isArray(result?.results) || result.results.length !== 1) {
+      throw new Error("Taskboard host executor dispatcher returned an invalid result");
+    }
+    return result.results[0];
+  }
   if (selectCodexThreadRpcRoute({
     localEnabled: localCodexThreadRpcEnabled,
     codexHostId: hostId,
@@ -2077,7 +2159,40 @@ function coordinatorRenewProofHeaders(pathname, body, method = "POST") {
     "x-codex-taskboard-injector-proof": createHmac("sha256", taskboardInstanceSecret)
       .update(JSON.stringify({ nonce, issuedAt, method, pathname, body }))
       .digest("hex"),
+    ...residentHostExecutorFenceHeaders(pathname, body, method),
   };
+}
+
+function createResidentHostExecutorLeaseLifecycle() {
+  const hostExecutorApi = createHostExecutorApi({
+    baseUrl: taskboardBaseUrl,
+    instanceSecret: taskboardInstanceSecret,
+  });
+  return createHostExecutorLeaseLifecycle({
+    codexHostId: residentHostExecutor.ownedCodexHostId,
+    executorInstanceId: randomUUID(),
+    adapterId: residentHostExecutorAdapterId,
+    leaseDurationSeconds: residentHostExecutorLeaseDurationSeconds,
+    renewIntervalMs: residentHostExecutorRenewIntervalMs,
+    register: hostExecutorApi.register,
+    inspect: hostExecutorApi.inspect,
+    acquire: hostExecutorApi.acquire,
+    renew: hostExecutorApi.renew,
+    release: hostExecutorApi.release,
+    createOperationId: randomUUID,
+    onStateChange: (state) => {
+      console.log(JSON.stringify({
+        event: "taskboard.host-executor.lease",
+        codexHostId: residentHostExecutor.ownedCodexHostId,
+        active: state.active,
+        reason: state.reason,
+        leaseStatus: state.lease?.status ?? null,
+      }));
+    },
+    onError: (error) => {
+      console.error(`Taskboard host executor lease unavailable: ${error.message}`);
+    },
+  });
 }
 
 async function listCoordinatorIdentityHandshakes(projectId) {
@@ -2493,12 +2608,20 @@ function injectorProofHeaders() {
   };
 }
 
+function residentInjectorProofHeaders(pathname, body) {
+  return {
+    ...injectorProofHeaders(),
+    ...residentHostExecutorFenceHeaders(pathname, body),
+  };
+}
+
 async function claimOwnerDecisionDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/claim`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2516,11 +2639,12 @@ async function claimOwnerDecisionDelivery(request, projectId) {
 }
 
 async function confirmOwnerDecisionDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/confirm`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/confirm`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2536,11 +2660,12 @@ async function confirmOwnerDecisionDelivery(request, projectId) {
 }
 
 async function claimCrossDomainHandoffDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/claim`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2559,11 +2684,12 @@ async function claimCrossDomainHandoffDelivery(request, projectId) {
 }
 
 async function confirmCrossDomainHandoffDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/confirm`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/confirm`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2579,23 +2705,25 @@ async function confirmCrossDomainHandoffDelivery(request, projectId) {
 }
 
 async function recordOwnerDecision(request) {
+  const pathname = `/api/tasks/${encodeURIComponent(request.taskId)}/owner-decisions`;
+  const body = {
+    requestId: request.requestId,
+    expectedResumeToken: request.expectedResumeToken,
+    outcome: request.outcome,
+    ownerTurnId: request.ownerTurnId,
+    rootDecisionTurnId: request.rootDecisionTurnId,
+    rootThreadId: request.rootThreadId,
+    evidence: request.evidence,
+    deliveryId: request.deliveryId,
+    receipt: `owner-decision:${request.deliveryId}:${request.rootDecisionTurnId}`,
+    decidedAt: new Date().toISOString(),
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(request.taskId)}/owner-decisions`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        requestId: request.requestId,
-        expectedResumeToken: request.expectedResumeToken,
-        outcome: request.outcome,
-        ownerTurnId: request.ownerTurnId,
-        rootDecisionTurnId: request.rootDecisionTurnId,
-        rootThreadId: request.rootThreadId,
-        evidence: request.evidence,
-        deliveryId: request.deliveryId,
-        receipt: `owner-decision:${request.deliveryId}:${request.rootDecisionTurnId}`,
-        decidedAt: new Date().toISOString(),
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2609,16 +2737,18 @@ async function recordOwnerDecision(request) {
 }
 
 async function claimOwnerIntentAdoption(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/adoption/claim`;
+  const body = {
+    coordinatorTaskId: request.route.coordinatorTaskId,
+    coordinatorThreadId: request.route.coordinatorThreadId,
+    coordinatorEpoch: request.coordinatorEpoch,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/adoption/claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        coordinatorTaskId: request.route.coordinatorTaskId,
-        coordinatorThreadId: request.route.coordinatorThreadId,
-        coordinatorEpoch: request.coordinatorEpoch,
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2654,11 +2784,12 @@ async function listOwnerIntents(projectId) {
 }
 
 async function recordOwnerIntentCapture(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2679,11 +2810,12 @@ async function recordOwnerIntentCapture(request, projectId) {
 }
 
 async function confirmOwnerIntentAdoption(request, projectId, intentId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(intentId)}/adoption/confirm`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(intentId)}/adoption/confirm`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2710,19 +2842,21 @@ async function applyOwnerIntentPlan(request, plan, projectId) {
     || markerCoordinatorEpoch !== request.adoptionReceipt.coordinatorEpoch) {
     return { applied: false, reason: "stale-plan-marker" };
   }
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-revisions`;
+  const body = {
+    ...serverPlan,
+    intentVersion: request.version,
+    adoptionId: request.adoptionReceipt.id,
+    coordinatorTaskId: request.route.coordinatorTaskId,
+    coordinatorThreadId: request.route.coordinatorThreadId,
+    coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-revisions`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        ...serverPlan,
-        intentVersion: request.version,
-        adoptionId: request.adoptionReceipt.id,
-        coordinatorTaskId: request.route.coordinatorTaskId,
-        coordinatorThreadId: request.route.coordinatorThreadId,
-        coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2752,16 +2886,18 @@ async function scheduleOwnerIntentPlanRetry(request, failure, projectId) {
     reason: failure.reason,
     revisionId: failure.revisionId ?? null,
   })).digest("hex");
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-retry`;
+  const body = {
+    adoptionId: request.adoptionReceipt.id,
+    coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+    failureKey,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-retry`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        adoptionId: request.adoptionReceipt.id,
-        coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
-        failureKey,
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2777,18 +2913,23 @@ async function scheduleOwnerIntentPlanRetry(request, failure, projectId) {
 
 async function claimBackgroundContinuationReceipt(claim) {
   const reservationLeaseId = randomUUID();
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    ownedCodexHostId: claim.ownedCodexHostId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        ownedCodexHostId: claim.ownedCodexHostId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2827,17 +2968,22 @@ async function claimBackgroundContinuationReceipt(claim) {
 }
 
 async function confirmBackgroundContinuationDelivery(claim) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-delivery`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-delivery`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2856,20 +3002,25 @@ async function confirmBackgroundContinuationDelivery(claim) {
 }
 
 async function revalidateBackgroundContinuationHostAccess(claim) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-host-access`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+    recoveryLeaseId: claim.recoveryLeaseId,
+    admissionReceiptId: claim.deliveryReceipt.id,
+    admissionAttemptId: claim.deliveryReceipt.admissionAttemptId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-host-access`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
-        recoveryLeaseId: claim.recoveryLeaseId,
-        admissionReceiptId: claim.deliveryReceipt.id,
-        admissionAttemptId: claim.deliveryReceipt.admissionAttemptId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2881,19 +3032,24 @@ async function revalidateBackgroundContinuationHostAccess(claim) {
 }
 
 async function completeBackgroundContinuationDelivery(claim, delivery) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-complete`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+    recoveryLeaseId: claim.recoveryLeaseId,
+    deliveryTurnId: delivery?.turnId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-complete`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
-        recoveryLeaseId: claim.recoveryLeaseId,
-        deliveryTurnId: delivery?.turnId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2915,19 +3071,24 @@ async function completeBackgroundContinuationDelivery(claim, delivery) {
 }
 
 async function mutateBackgroundAdmission(claim, action) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/admission-${action}`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    admissionReceiptId: claim.admissionReceiptId,
+    admissionAttemptId: claim.admissionAttemptId,
+    ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/admission-${action}`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json", ...injectorProofHeaders() },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        admissionReceiptId: claim.admissionReceiptId,
-        admissionAttemptId: claim.admissionAttemptId,
-        ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
-      }),
+      headers: {
+        ...injectorProofHeaders(),
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -3042,7 +3203,7 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
 
 function runBackgroundContinuationDispatch(cdp, projectId) {
   return runTaskboardContinuationMonitorOnce({
-    hostExecutor: residentHostExecutor,
+    hostExecutor: currentResidentHostExecutorExecution(),
     policy: {
       enabled: true,
       projectId,
@@ -3106,7 +3267,7 @@ async function runBackgroundContinuationFastLane(cdp) {
   });
   return runTaskboardContinuationFastLane({
     projects,
-    hostExecutor: residentHostExecutor,
+    hostExecutor: currentResidentHostExecutorExecution(),
     runContinuation: (projectId) => runBackgroundContinuationDispatch(cdp, projectId),
     observeResult: (result) => {
       if (!result.ok) {
@@ -3134,7 +3295,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     const monitors = [];
     if (continuationEnabled) monitors.push(
       () => runCoordinatorShutdownMonitorOnce({
-        hostExecutor: residentHostExecutor,
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3165,7 +3326,7 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
       }),
       () => runDomainCoordinatorShutdownMonitorOnce({
-        hostExecutor: residentHostExecutor,
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3203,7 +3364,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     );
     monitors.push(
       () => runCoordinatorLeaseKeepaliveMonitorOnce({
-        hostExecutor: residentHostExecutor,
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3224,7 +3385,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     );
     if (continuationEnabled) monitors.push(
       () => runCoordinatorLeaseRecoveryMonitorOnce({
-        hostExecutor: residentHostExecutor,
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3243,7 +3404,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       async () => {
         const result = await runCoordinatorProvisioningMonitorOnce({
-          hostExecutor: residentHostExecutor,
+          hostExecutor: currentResidentHostExecutorExecution(),
           policy: {
             enabled: true,
             projectId,
@@ -3302,7 +3463,7 @@ async function runBackgroundContinuationMonitor(cdp) {
         return result;
       },
       () => runDomainCoordinatorProvisioningMonitorOnce({
-        hostExecutor: residentHostExecutor,
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3478,10 +3639,10 @@ async function runCoordinatorIdentityHandshakeFastLaneOnce(cdp) {
   });
   await runCoordinatorIdentityHandshakeFastLane({
     projects,
-    hostExecutor: residentHostExecutor,
+    hostExecutor: currentResidentHostExecutorExecution(),
     runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
       projectId,
-      hostExecutor: residentHostExecutor,
+      hostExecutor: currentResidentHostExecutorExecution(),
       listHandshakes: listCoordinatorIdentityHandshakes,
       readThread: (route) => requestCodexAppServerViaCdp(
         cdp,
@@ -3498,9 +3659,11 @@ async function runCoordinatorIdentityHandshakeFastLaneOnce(cdp) {
 
 function startResidentCoordinatorMonitors(cdp, { isStopped = () => false } = {}) {
   const schedule = (run, intervalMs, label) => createDisposableMonitorTimer(async () => {
-    if (isStopped()) return;
+    if (isStopped() || !residentHostExecutorLeaseIsActive()) return;
+    const execution = residentHostExecutorExecution();
+    if (!execution) return;
     try {
-      await run(cdp);
+      await residentHostExecutorContext.run(execution, () => run(cdp));
     } catch (error) {
       console.error(`${label}: ${error.message}`);
     }
@@ -3553,9 +3716,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   const scheduleBackgroundContinuation = () => {
     if (disposeBackgroundContinuationTimer || cdp.closed) return;
     disposeBackgroundContinuationTimer = createDisposableMonitorTimer(async () => {
-      if (cdp.closed) return;
+      if (cdp.closed || !residentHostExecutorLeaseIsActive()) return;
+      const execution = residentHostExecutorExecution();
+      if (!execution) return;
       try {
-        await runBackgroundContinuationMonitor(cdp);
+        await residentHostExecutorContext.run(
+          execution,
+          () => runBackgroundContinuationMonitor(cdp),
+        );
       } catch (error) {
         console.error(`Taskboard background continuation check failed: ${error.message}`);
       }
@@ -3565,9 +3733,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   const scheduleBackgroundContinuationFastLane = () => {
     if (disposeBackgroundContinuationFastLaneTimer || cdp.closed) return;
     disposeBackgroundContinuationFastLaneTimer = createDisposableMonitorTimer(async () => {
-      if (cdp.closed) return;
+      if (cdp.closed || !residentHostExecutorLeaseIsActive()) return;
+      const execution = residentHostExecutorExecution();
+      if (!execution) return;
       try {
-        await runBackgroundContinuationFastLane(cdp);
+        await residentHostExecutorContext.run(
+          execution,
+          () => runBackgroundContinuationFastLane(cdp),
+        );
       } catch (error) {
         console.error(`Taskboard continuation fast lane failed: ${error.message}`);
       }
@@ -3577,9 +3750,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   const scheduleCoordinatorIdentityHandshakeFastLane = () => {
     if (disposeCoordinatorIdentityHandshakeTimer || cdp.closed) return;
     disposeCoordinatorIdentityHandshakeTimer = createDisposableMonitorTimer(async () => {
-      if (cdp.closed) return;
+      if (cdp.closed || !residentHostExecutorLeaseIsActive()) return;
+      const execution = residentHostExecutorExecution();
+      if (!execution) return;
       try {
-        await runCoordinatorIdentityHandshakeFastLaneOnce(cdp);
+        await residentHostExecutorContext.run(
+          execution,
+          () => runCoordinatorIdentityHandshakeFastLaneOnce(cdp),
+        );
       } catch (error) {
         console.error(`Taskboard Coordinator identity fast lane failed: ${error.message}`);
       }
@@ -4427,6 +4605,9 @@ async function main() {
     startupTimeoutMs: 120_000,
     unhealthyChildGraceMs: 120_000,
   });
+  if (options.watch) {
+    residentHostExecutorLeaseLifecycle = createResidentHostExecutorLeaseLifecycle();
+  }
 
   const publishRuntime = async () => {
     const pending = publishTaskboardRuntime();
@@ -4531,6 +4712,8 @@ async function main() {
     cleanupPromise = (async () => {
       disposeResidentCoordinatorMonitors?.();
       disposeResidentCoordinatorMonitors = null;
+      await residentHostExecutorLeaseLifecycle?.stop();
+      residentHostExecutorLeaseLifecycle = null;
       await closeLocalCodexThreadRpcTransport();
       injectedTargets.forEach((connection) => {
         unregisterQuotaPolicyCdp(connection);
@@ -4657,6 +4840,9 @@ async function main() {
     }
     if (stopping) return;
 
+    await residentHostExecutorLeaseLifecycle?.start();
+    if (stopping) return;
+
     if (localCodexThreadRpcEnabled) {
       disposeResidentCoordinatorMonitors = startResidentCoordinatorMonitors(null, {
         isStopped: () => stopping,
@@ -4723,7 +4909,10 @@ async function main() {
       if (stopping) break;
       try {
         const service = await supervisor.ensure();
-        if (service.restarted && !stopping) await publishRuntime();
+        if (service.restarted && !stopping) {
+          await publishRuntime();
+          await residentHostExecutorLeaseLifecycle?.reconcile();
+        }
       } catch (error) {
         console.error(`Waiting for Taskboard service: ${error.message}`);
       }

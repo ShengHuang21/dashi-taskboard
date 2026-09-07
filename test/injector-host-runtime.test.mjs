@@ -7613,7 +7613,7 @@ function assertResidentCoordinatorHostWiring(source) {
     assert.deepEqual(properties.map(({ name }) => name), expected.properties, expected.label);
     assert.equal(
       properties.find(({ name }) => name === "hostExecutor")?.line.trim(),
-      "hostExecutor: residentHostExecutor,",
+      "hostExecutor: currentResidentHostExecutorExecution(),",
       expected.label,
     );
   }

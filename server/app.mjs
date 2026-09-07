@@ -34,6 +34,7 @@ import {
 import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
+import { createHostExecutorDispatcher } from "./host-executor-dispatcher.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import {
   STANDING_AUTHORITY_ACTIONS,
@@ -71,6 +72,14 @@ const HOST_EXECUTOR_ADAPTER_PROFILES = new Map([
     hostKind: "remote",
     capabilities: HOST_EXECUTOR_RPC_CAPABILITIES,
   })],
+]);
+const HOST_EXECUTOR_MUTATING_RPC_CAPABILITIES = new Set([
+  "thread/archive",
+  "thread/name/set",
+  "thread/resume",
+  "thread/start",
+  "turn/start",
+  "turn/steer",
 ]);
 const WORKTREE_REPOSITORY_TTL_MS = 30_000;
 const STANDING_AUTHORITY_ACTION_SET = new Set(STANDING_AUTHORITY_ACTIONS);
@@ -469,6 +478,68 @@ function parseHostExecutorLease(value, action) {
     expectedLeaseId,
     ...(action === "release" ? {} : { leaseDurationSeconds: value.leaseDurationSeconds }),
     idempotencyKey: parseHostExecutorIdentifier(value.idempotencyKey, "idempotencyKey"),
+  };
+}
+
+function parseHostExecutorExecution(value, codexHostId) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set([
+    "codexHostId",
+    "executorInstanceId",
+    "registrationFingerprint",
+    "leaseId",
+  ]));
+  if (value.codexHostId !== codexHostId) {
+    throw new ApiError(
+      409,
+      "HOST_EXECUTOR_LEASE_STALE",
+      "The host executor envelope does not match the requested host",
+    );
+  }
+  const registrationFingerprint = parseHostExecutorIdentifier(
+    value.registrationFingerprint,
+    "registrationFingerprint",
+  );
+  if (!/^[a-f0-9]{64}$/.test(registrationFingerprint)) {
+    throw new ApiError(400, "INVALID_FIELD", "'registrationFingerprint' must be a SHA-256 digest");
+  }
+  return {
+    codexHostId,
+    executorInstanceId: parseHostExecutorIdentifier(
+      value.executorInstanceId,
+      "executorInstanceId",
+    ),
+    registrationFingerprint,
+    leaseId: parseHostExecutorIdentifier(value.leaseId, "leaseId"),
+  };
+}
+
+function parseHostExecutorEffect(value, codexHostId, effectKey) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["execution", "operations"]));
+  if (!Array.isArray(value.operations)
+    || value.operations.length < 1
+    || value.operations.length > 4) {
+    throw new ApiError(400, "INVALID_FIELD", "'operations' must contain one through four RPC operations");
+  }
+  const operations = value.operations.map((operation) => {
+    assertPlainObject(operation);
+    assertAllowedKeys(operation, new Set(["method", "params"]));
+    const method = parseHostExecutorIdentifier(operation.method, "method");
+    if (!HOST_EXECUTOR_MUTATING_RPC_CAPABILITIES.has(method)) {
+      throw new ApiError(
+        400,
+        "HOST_EXECUTOR_RPC_METHOD_NOT_ALLOWED",
+        "The fenced dispatcher accepts only mutating local Codex RPC methods",
+      );
+    }
+    assertPlainObject(operation.params);
+    return { method, params: operation.params };
+  });
+  return {
+    effectKey: parseHostExecutorIdentifier(effectKey, "effectKey"),
+    execution: parseHostExecutorExecution(value.execution, codexHostId),
+    operations,
   };
 }
 
@@ -1550,6 +1621,50 @@ function assertHostExecutorProof(request, instanceSecret, pathname, body, databa
   if (!database.consumeHostExecutorProofNonce(nonce, issuedAtMs)) {
     throw new ApiError(403, "INJECTOR_PROOF_REQUIRED", errorMessage);
   }
+}
+
+function residentHostExecutorExecutionFromRequest(request, instanceSecret, pathname, body) {
+  const serialized = requestHeader(request, "x-codex-taskboard-host-execution");
+  const proof = requestHeader(request, "x-codex-taskboard-host-execution-proof");
+  if (serialized === undefined && proof === undefined) {
+    if (requestHeader(request, "x-taskboard-client") === "taskctl") return undefined;
+    throw new ApiError(
+      403,
+      "HOST_EXECUTOR_PROOF_REQUIRED",
+      "Resident Taskboard mutation requires the authenticated execution envelope",
+    );
+  }
+  const expected = typeof serialized === "string" && instanceSecret
+    ? createHmac("sha256", instanceSecret).update(JSON.stringify({
+        method: request.method,
+        pathname,
+        body,
+        execution: serialized,
+      })).digest("hex")
+    : null;
+  if (typeof serialized !== "string"
+    || serialized.length < 1
+    || serialized.length > 4096
+    || typeof proof !== "string"
+    || !/^[a-f0-9]{64}$/i.test(proof)
+    || proof.toLowerCase() !== expected) {
+    throw new ApiError(
+      403,
+      "HOST_EXECUTOR_PROOF_REQUIRED",
+      "Resident Taskboard mutation requires the authenticated execution envelope",
+    );
+  }
+  let decoded;
+  try {
+    decoded = JSON.parse(Buffer.from(serialized, "base64url").toString("utf8"));
+  } catch {
+    throw new ApiError(
+      403,
+      "HOST_EXECUTOR_PROOF_REQUIRED",
+      "Resident Taskboard mutation requires the authenticated execution envelope",
+    );
+  }
+  return parseHostExecutorExecution(decoded, decoded?.codexHostId);
 }
 
 function actorFromRequest(request) {
@@ -3638,6 +3753,11 @@ export function createTaskboardServer(options = {}) {
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
+  const hostExecutorDispatcher = createHostExecutorDispatcher({
+    database,
+    adapter: options.hostExecutorRpcAdapter ?? aiChat.appServer,
+    hooks: options.hostExecutorDispatchHooks,
+  });
   const projectSummary = new ProjectSummaryService({
     database,
     codexExecutable: resolved.codexExecutable,
@@ -4032,6 +4152,33 @@ export function createTaskboardServer(options = {}) {
         ));
       }
 
+      const hostExecutorEffectMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/effects\/([^/]+)\/execute$/,
+      );
+      if (hostExecutorEffectMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Host executor effect routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(hostExecutorEffectMatch[1]);
+        const effectKey = decodeRouteSegment(hostExecutorEffectMatch[2], "Host executor effect key");
+        return sendJson(
+          response,
+          200,
+          await hostExecutorDispatcher.execute(parseHostExecutorEffect(
+            body,
+            codexHostId,
+            effectKey,
+          )),
+        );
+      }
+
       const hostExecutorLeaseTransitionMatch = pathname.match(
         /^\/api\/local\/host-executors\/([^/]+)\/lease\/(renew|release)$/,
       );
@@ -4253,6 +4400,9 @@ export function createTaskboardServer(options = {}) {
             projectId,
             input.idempotencyKey,
             input.ownedCodexHostId,
+            residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, body,
+            ),
           ),
         });
       }
@@ -4279,7 +4429,13 @@ export function createTaskboardServer(options = {}) {
         );
         return sendJson(response, 200, {
           attempt: database.getAgentLaneDomainCoordinatorProvisioningAttempt(
-            projectId, domainId, input.idempotencyKey, input.ownedCodexHostId,
+            projectId,
+            domainId,
+            input.idempotencyKey,
+            input.ownedCodexHostId,
+            residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, body,
+            ),
           ),
         });
       }
@@ -4300,8 +4456,14 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, body,
+        );
         return sendJson(response, 200, database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
-          projectId, domainId, parseDomainCoordinatorProvisioningRequest(body),
+          projectId, domainId, {
+            ...parseDomainCoordinatorProvisioningRequest(body),
+            hostExecutorExecution,
+          },
         ));
       }
 
@@ -4326,6 +4488,9 @@ export function createTaskboardServer(options = {}) {
           body,
           action,
           { expectedGlobalLeaseId: true, requireOwnedCodexHostId: true },
+        );
+        input.hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, body,
         );
         return sendJson(
           response,
@@ -4385,8 +4550,11 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, body,
+        );
         return sendJson(response, 200, database.requestAgentLaneCoordinatorShutdownAttempt(
-          projectId, parseCoordinatorShutdownRequest(body),
+          projectId, { ...parseCoordinatorShutdownRequest(body), hostExecutorExecution },
         ));
       }
 
@@ -4405,7 +4573,14 @@ export function createTaskboardServer(options = {}) {
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
         return sendJson(response, 200, database.transitionAgentLaneCoordinatorShutdownAttempt(
-          attemptId, coordinatorShutdownTransitionRoute[2], { ownedCodexHostId },
+          attemptId,
+          coordinatorShutdownTransitionRoute[2],
+          {
+            ownedCodexHostId,
+            hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, body,
+            ),
+          },
         ));
       }
 
@@ -4445,7 +4620,14 @@ export function createTaskboardServer(options = {}) {
         const body = await readJson(request);
         assertCoordinatorRenewProof(request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces);
         return sendJson(response, 200, database.requestAgentLaneDomainCoordinatorShutdownAttempt(
-          projectId, domainId, parseDomainCoordinatorShutdownRequest(body),
+          projectId,
+          domainId,
+          {
+            ...parseDomainCoordinatorShutdownRequest(body),
+            hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, body,
+            ),
+          },
         ));
       }
 
@@ -4462,7 +4644,14 @@ export function createTaskboardServer(options = {}) {
         const ownedCodexHostId = parseOwnedCodexHostId(body.ownedCodexHostId);
         assertCoordinatorRenewProof(request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces);
         return sendJson(response, 200, database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
-          attemptId, domainCoordinatorShutdownTransitionRoute[2], { ownedCodexHostId },
+          attemptId,
+          domainCoordinatorShutdownTransitionRoute[2],
+          {
+            ownedCodexHostId,
+            hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, body,
+            ),
+          },
         ));
       }
 
@@ -4478,7 +4667,12 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = parseCoordinatorProvisioningRequest(body);
+        const input = {
+          ...parseCoordinatorProvisioningRequest(body),
+          hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+            request, resolved.instanceSecret, pathname, body,
+          ),
+        };
         return sendJson(response, 200, database.requestAgentLaneCoordinatorProvisioningAttempt(
           projectId, input,
         ));
@@ -4501,6 +4695,9 @@ export function createTaskboardServer(options = {}) {
           action,
           { requireOwnedCodexHostId: true },
         );
+        input.hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, body,
+        );
         return sendJson(response, 200, database.transitionAgentLaneCoordinatorProvisioningAttempt(
           attemptId, action, input,
         ));
@@ -4518,7 +4715,13 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = { ...parseCoordinatorLeaseRenew(body), renewOnly: true };
+        const input = {
+          ...parseCoordinatorLeaseRenew(body),
+          renewOnly: true,
+          hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+            request, resolved.instanceSecret, pathname, body,
+          ),
+        };
         assertCurrentCoordinatorHostBinding(projectId, input);
         return sendJson(response, 200, database.claimAgentLaneCoordinator(projectId, input));
       }
@@ -4535,7 +4738,13 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = { ...parseCoordinatorLeaseRenew(body), recoverOnly: true };
+        const input = {
+          ...parseCoordinatorLeaseRenew(body),
+          recoverOnly: true,
+          hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+            request, resolved.instanceSecret, pathname, body,
+          ),
+        };
         assertCurrentCoordinatorHostBinding(projectId, input);
         return sendJson(response, 200, database.claimAgentLaneCoordinator(projectId, input));
       }
@@ -4607,8 +4816,15 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, null, coordinatorRenewNonces,
         );
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, null,
+        );
         return sendJson(response, 200, {
-          handshakes: database.listAgentLaneCoordinationIdentityHandshakes(projectId),
+          handshakes: database.listAgentLaneCoordinationIdentityHandshakes(
+            projectId,
+            "local",
+            hostExecutorExecution,
+          ),
         });
       }
 
@@ -4630,11 +4846,14 @@ export function createTaskboardServer(options = {}) {
         if (!threadBinding?.codexProjectId) {
           throw new ApiError(400, "INVALID_FIELD", "A complete protected thread identity is required");
         }
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, body,
+        );
         const handshake = database.confirmAgentLaneCoordinationIdentityHandshake(
-          handshakeId, registration, threadBinding,
+          handshakeId, registration, threadBinding, hostExecutorExecution,
         );
         const registrationResult = database.registerAgentLaneCoordinationWindow(
-          registration.projectId, registration, threadBinding,
+          registration.projectId, registration, threadBinding, hostExecutorExecution,
         );
         return sendJson(response, 200, {
           handshake: database.getAgentLaneCoordinationIdentityHandshake(
@@ -4689,7 +4908,13 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = { ...parseCoordinatorLeaseRenew(body), renewOnly: true };
+        const input = {
+          ...parseCoordinatorLeaseRenew(body),
+          renewOnly: true,
+          hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+            request, resolved.instanceSecret, pathname, body,
+          ),
+        };
         assertCurrentCoordinatorHostBinding(projectId, input, "DOMAIN_COORDINATOR_BINDING_MISMATCH");
         return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(projectId, domainId, input));
       }
@@ -4707,7 +4932,13 @@ export function createTaskboardServer(options = {}) {
         assertCoordinatorRenewProof(
           request, resolved.instanceSecret, pathname, body, coordinatorRenewNonces,
         );
-        const input = { ...parseCoordinatorLeaseRenew(body), recoverOnly: true };
+        const input = {
+          ...parseCoordinatorLeaseRenew(body),
+          recoverOnly: true,
+          hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+            request, resolved.instanceSecret, pathname, body,
+          ),
+        };
         assertCurrentCoordinatorHostBinding(projectId, input, "DOMAIN_COORDINATOR_BINDING_MISMATCH");
         return sendJson(response, 200, database.claimAgentLaneDomainCoordinator(projectId, domainId, input));
       }
@@ -4773,13 +5004,23 @@ export function createTaskboardServer(options = {}) {
         assertInjectorProof(request, resolved.instanceSecret);
         const projectId = decodeRouteSegment(crossDomainHandoffDeliveryRoute[1], "Project id");
         validateProjectId(projectId);
+        const rawDelivery = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawDelivery,
+        );
         if (crossDomainHandoffDeliveryRoute[2] === "confirm") {
           return sendJson(response, 200, database.confirmCrossDomainHandoffDelivery(
             projectId,
-            parseCrossDomainHandoffDeliveryConfirmation(await readJson(request)),
+            {
+              ...parseCrossDomainHandoffDeliveryConfirmation(rawDelivery),
+              hostExecutorExecution,
+            },
           ));
         }
-        const deliveryRequest = parseCrossDomainHandoffDeliveryClaim(await readJson(request));
+        const deliveryRequest = {
+          ...parseCrossDomainHandoffDeliveryClaim(rawDelivery),
+          hostExecutorExecution,
+        };
         let snapshot;
         try {
           snapshot = await agentLanes.getProjectSnapshot(projectId);
@@ -4929,13 +5170,23 @@ export function createTaskboardServer(options = {}) {
         assertInjectorProof(request, resolved.instanceSecret);
         const projectId = decodeRouteSegment(ownerDecisionDeliveryRoute[1], "Project id");
         validateProjectId(projectId);
+        const rawDelivery = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawDelivery,
+        );
         if (ownerDecisionDeliveryRoute[2] === "confirm") {
           return sendJson(response, 200, database.confirmOwnerDecisionDelivery(
             projectId,
-            parseOwnerDecisionDeliveryConfirmation(await readJson(request)),
+            {
+              ...parseOwnerDecisionDeliveryConfirmation(rawDelivery),
+              hostExecutorExecution,
+            },
           ));
         }
-        const deliveryRequest = parseOwnerDecisionDeliveryClaim(await readJson(request));
+        const deliveryRequest = {
+          ...parseOwnerDecisionDeliveryClaim(rawDelivery),
+          hostExecutorExecution,
+        };
         let snapshot;
         try {
           snapshot = await agentLanes.getProjectSnapshot(projectId);
@@ -4966,7 +5217,13 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "POST") {
           assertNoQuery(url.searchParams, "POST /api/local/projects/:id/owner-intents");
           assertInjectorProof(request, resolved.instanceSecret);
-          const input = parseOwnerIntent(await readJson(request));
+          const rawInput = await readJson(request);
+          const input = {
+            ...parseOwnerIntent(rawInput),
+            hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, rawInput,
+            ),
+          };
           const sourceThreadBinding = currentHostThreadIdentity(input.ownerRootThreadId);
           if (!sourceThreadBinding) {
             throw new ApiError(
@@ -4999,17 +5256,24 @@ export function createTaskboardServer(options = {}) {
         const projectId = decodeRouteSegment(ownerIntentAdoptionRoute[1], "Project id");
         const intentId = decodeRouteSegment(ownerIntentAdoptionRoute[2], "Owner Intent id");
         validateProjectId(projectId);
+        const rawAdoption = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawAdoption,
+        );
         if (ownerIntentAdoptionRoute[3] === "confirm") {
           return sendJson(response, 200, database.confirmProjectOwnerIntentAdoption(
             projectId,
             intentId,
-            parseOwnerIntentAdoptionConfirmation(await readJson(request)),
+            {
+              ...parseOwnerIntentAdoptionConfirmation(rawAdoption),
+              hostExecutorExecution,
+            },
           ));
         }
         const result = database.claimProjectOwnerIntentAdoption(
           projectId,
           intentId,
-          parseOwnerIntentAdoptionClaim(await readJson(request)),
+          { ...parseOwnerIntentAdoptionClaim(rawAdoption), hostExecutorExecution },
         );
         return sendJson(response, result.claimed ? 201 : 200, result);
       }
@@ -5027,10 +5291,16 @@ export function createTaskboardServer(options = {}) {
         const projectId = decodeRouteSegment(ownerIntentPlanRetryRoute[1], "Project id");
         const intentId = decodeRouteSegment(ownerIntentPlanRetryRoute[2], "Owner Intent id");
         validateProjectId(projectId);
+        const rawRetry = await readJson(request);
         const result = database.retryProjectOwnerIntentPlan(
           projectId,
           intentId,
-          parseOwnerIntentPlanRetry(await readJson(request)),
+          {
+            ...parseOwnerIntentPlanRetry(rawRetry),
+            hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, rawRetry,
+            ),
+          },
         );
         return sendJson(response, result.applied ? 201 : 200, result);
       }
@@ -5048,10 +5318,16 @@ export function createTaskboardServer(options = {}) {
         if (request.method === "POST") {
           assertNoQuery(url.searchParams, "POST /api/local/projects/:projectId/owner-intents/:intentId/plan-revisions");
           assertInjectorProof(request, resolved.instanceSecret);
+          const rawPlan = await readJson(request);
           const result = database.applyProjectOwnerIntentPlan(
             projectId,
             intentId,
-            parseOwnerIntentPlan(await readJson(request)),
+            {
+              ...parseOwnerIntentPlan(rawPlan),
+              hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+                request, resolved.instanceSecret, pathname, rawPlan,
+              ),
+            },
           );
           return sendJson(response, result.applied ? 201 : 200, result);
         }
@@ -6094,7 +6370,11 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-claim");
-        const claim = parseSafeActionBootstrapClaim(await readJson(request), {
+        const rawClaim = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawClaim,
+        );
+        const claim = parseSafeActionBootstrapClaim(rawClaim, {
           requireOwnedCodexHostId: true,
         });
         const { probe: worktreeRepositoryProbe } = await probeTaskWorktreeRepository(
@@ -6107,7 +6387,7 @@ export function createTaskboardServer(options = {}) {
         });
         const result = database.claimTaskSafeAction(
           id,
-          claim,
+          { ...claim, hostExecutorExecution },
           { worktreeRepositoryProbe },
         );
         const task = database.getTask(id);
@@ -6132,10 +6412,25 @@ export function createTaskboardServer(options = {}) {
         const id = decodeRouteSegment(safeActionBootstrapDeliveryRoute[1], "Task id");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-delivery");
-        const delivery = parseSafeActionBootstrapClaim(await readJson(request));
-        const task = await refreshTaskWorktreeRepository(id, { force: true });
-        await assertStandingActionExecutionScope(id, delivery.safeActionId);
-        const result = database.confirmTaskSafeActionDelivery(id, delivery);
+        const rawDelivery = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawDelivery,
+        );
+        const delivery = parseSafeActionBootstrapClaim(rawDelivery);
+        const { probe: worktreeRepositoryProbe } = await probeTaskWorktreeRepository(
+          id,
+          { force: true },
+        );
+        await assertStandingActionExecutionScope(id, delivery.safeActionId, {
+          worktreeRepositoryProbe,
+        });
+        const result = database.confirmTaskSafeActionDelivery(id, {
+          ...delivery,
+          hostExecutorExecution,
+        }, {
+          worktreeRepositoryProbe,
+        });
+        const task = database.getTask(id);
         const safeAction = database.getTaskCapsule(id).readyWork.safeActions[0];
         return sendJson(response, 200, {
           ...result,
@@ -6155,11 +6450,18 @@ export function createTaskboardServer(options = {}) {
         const id = decodeRouteSegment(safeActionBootstrapCompleteRoute[1], "Task id");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-complete");
-        const completion = parseSafeActionBootstrapClaim(await readJson(request));
+        const rawCompletion = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawCompletion,
+        );
+        const completion = parseSafeActionBootstrapClaim(rawCompletion);
         if (!completion.deliveryTurnId) {
           throw new ApiError(400, "INVALID_FIELD", "'deliveryTurnId' is required");
         }
-        return sendJson(response, 200, database.completeTaskSafeActionDelivery(id, completion));
+        return sendJson(response, 200, database.completeTaskSafeActionDelivery(id, {
+          ...completion,
+          hostExecutorExecution,
+        }));
       }
 
       const taskboardHostAccessRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/bootstrap-host-access$/);
@@ -6167,9 +6469,16 @@ export function createTaskboardServer(options = {}) {
         const id = decodeRouteSegment(taskboardHostAccessRoute[1], "Task id");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/bootstrap-host-access");
-        const revalidation = parseTaskboardHostAccessRevalidation(await readJson(request));
+        const rawRevalidation = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawRevalidation,
+        );
+        const revalidation = parseTaskboardHostAccessRevalidation(rawRevalidation);
         await assertStandingActionExecutionScope(id, revalidation.safeActionId);
-        const result = database.revalidateTaskSafeActionHostAccess(id, revalidation);
+        const result = database.revalidateTaskSafeActionHostAccess(id, {
+          ...revalidation,
+          hostExecutorExecution,
+        });
         return sendJson(response, 200, {
           validated: true,
           hostAccess: buildTaskboardHostAccess(result.task, result.receipt, result.receipt.worktreePath),
@@ -6181,8 +6490,15 @@ export function createTaskboardServer(options = {}) {
         const id = decodeRouteSegment(safeActionAdmissionDeferralRoute[1], "Task id");
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-defer");
-        const deferral = parseSafeActionAdmissionDeferral(await readJson(request));
-        return sendJson(response, 200, database.deferTaskSafeActionAdmission(id, deferral));
+        const rawDeferral = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawDeferral,
+        );
+        const deferral = parseSafeActionAdmissionDeferral(rawDeferral);
+        return sendJson(response, 200, database.deferTaskSafeActionAdmission(id, {
+          ...deferral,
+          hostExecutorExecution,
+        }));
       }
 
       const safeActionAdmissionPreparationRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-prepare$/);
@@ -6200,8 +6516,15 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-uncertain");
         assertInjectorProof(request, resolved.instanceSecret);
-        const binding = parseSafeActionAdmissionDeferral(await readJson(request));
-        return sendJson(response, 200, database.markTaskSafeActionAdmissionUncertain(id, binding));
+        const rawBinding = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawBinding,
+        );
+        const binding = parseSafeActionAdmissionDeferral(rawBinding);
+        return sendJson(response, 200, database.markTaskSafeActionAdmissionUncertain(id, {
+          ...binding,
+          hostExecutorExecution,
+        }));
       }
 
       const safeActionAdmissionReconcileRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-reconcile$/);
@@ -6210,7 +6533,11 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-reconcile");
         assertInjectorProof(request, resolved.instanceSecret);
-        const binding = parseSafeActionAdmissionReconciliation(await readJson(request));
+        const rawBinding = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawBinding,
+        );
+        const binding = parseSafeActionAdmissionReconciliation(rawBinding);
         const task = database.getTask(id);
         if (!task) throw new ApiError(404, "TASK_NOT_FOUND", "Task not found");
         const snapshot = await agentLanes.getProjectSnapshot(task.projectId);
@@ -6219,6 +6546,7 @@ export function createTaskboardServer(options = {}) {
         ));
         return sendJson(response, 200, database.reconcileTaskSafeActionAdmission(id, {
           ...binding,
+          hostExecutorExecution,
           registryObservation: tree?.registryObservation ?? null,
         }));
       }
@@ -6229,8 +6557,15 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-probe");
         assertInjectorProof(request, resolved.instanceSecret);
-        const binding = parseSafeActionAdmissionDeferral(await readJson(request));
-        return sendJson(response, 200, database.claimTaskSafeActionAdmissionProbe(id, binding));
+        const rawBinding = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawBinding,
+        );
+        const binding = parseSafeActionAdmissionDeferral(rawBinding);
+        return sendJson(response, 200, database.claimTaskSafeActionAdmissionProbe(id, {
+          ...binding,
+          hostExecutorExecution,
+        }));
       }
 
       const safeActionReplacementAdmissionProbeRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-replacement-probe$/);
@@ -6239,8 +6574,15 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-replacement-probe");
         assertInjectorProof(request, resolved.instanceSecret);
-        const binding = parseSafeActionAdmissionDeferral(await readJson(request));
-        return sendJson(response, 200, database.claimTaskSafeActionReplacementAdmissionProbe(id, binding));
+        const rawBinding = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawBinding,
+        );
+        const binding = parseSafeActionAdmissionDeferral(rawBinding);
+        return sendJson(response, 200, database.claimTaskSafeActionReplacementAdmissionProbe(id, {
+          ...binding,
+          hostExecutorExecution,
+        }));
       }
 
       const safeActionReplacementAdmissionReconcileRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/admission-replacement-reconcile$/);
@@ -6249,11 +6591,16 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/admission-replacement-reconcile");
         assertInjectorProof(request, resolved.instanceSecret);
-        const binding = parseSafeActionAdmissionReconciliation(await readJson(request));
+        const rawBinding = await readJson(request);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
+          request, resolved.instanceSecret, pathname, rawBinding,
+        );
+        const binding = parseSafeActionAdmissionReconciliation(rawBinding);
         const observationTarget = database.getTaskSafeActionReplacementAdmissionObservationTarget(id, binding);
         const tree = await agentLanes.getWindowSubagentTree(observationTarget.rootThreadId);
         return sendJson(response, 200, database.reconcileTaskSafeActionReplacementAdmission(id, {
           ...binding,
+          hostExecutorExecution,
           observationRootThreadId: observationTarget.rootThreadId,
           registryObservation: tree?.registryObservation ?? null,
         }));
@@ -6265,9 +6612,15 @@ export function createTaskboardServer(options = {}) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
         assertNoQuery(url.searchParams, "POST /api/tasks/:id/owner-decisions");
         assertInjectorProof(request, resolved.instanceSecret);
+        const rawDecision = await readJson(request);
         const result = database.recordTaskOwnerDecision(
           id,
-          parseOwnerDecision(await readJson(request)),
+          {
+            ...parseOwnerDecision(rawDecision),
+            hostExecutorExecution: residentHostExecutorExecutionFromRequest(
+              request, resolved.instanceSecret, pathname, rawDecision,
+            ),
+          },
           CODEX_AGENT_ACTOR,
         );
         if (result.applied) events.emit("task.updated", { task: database.getTask(id) });
@@ -6508,6 +6861,7 @@ export function createTaskboardServer(options = {}) {
     refreshTaskWorktreeRepository,
     aiChat,
     agentLanes,
+    hostExecutorDispatcher,
     reconcileAgentLanes,
     server,
     options: resolved,

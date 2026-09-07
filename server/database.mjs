@@ -105,6 +105,25 @@ function hostExecutorLeaseReceiptFromRow(row) {
   };
 }
 
+function hostExecutorEffectFromRow(row) {
+  if (!row) return null;
+  return {
+    effectKey: row.effect_key,
+    codexHostId: row.codex_host_id,
+    executorInstanceId: row.executor_instance_id,
+    registrationFingerprint: row.registration_fingerprint,
+    leaseId: row.lease_id,
+    adapterId: row.adapter_id,
+    requestFingerprint: row.request_fingerprint,
+    operations: JSON.parse(row.operations_json),
+    status: row.status,
+    dispatchToken: row.dispatch_token,
+    result: row.result_json ? JSON.parse(row.result_json) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function agentLaneConfigRevision(configJson) {
   return createHash("sha256").update(configJson).digest("hex");
 }
@@ -1722,6 +1741,25 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS host_executor_lease_receipts_host_created
         ON host_executor_lease_receipts(codex_host_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS host_executor_effects (
+        effect_key TEXT PRIMARY KEY,
+        codex_host_id TEXT NOT NULL,
+        executor_instance_id TEXT NOT NULL REFERENCES host_executor_registrations(executor_instance_id),
+        registration_fingerprint TEXT NOT NULL,
+        lease_id TEXT NOT NULL,
+        adapter_id TEXT NOT NULL,
+        request_fingerprint TEXT NOT NULL,
+        operations_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('reserved', 'dispatched', 'completed', 'uncertain')),
+        dispatch_token TEXT,
+        result_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS host_executor_effects_host_status
+        ON host_executor_effects(codex_host_id, status, updated_at, effect_key);
 
       CREATE TABLE IF NOT EXISTS host_executor_proof_nonces (
         nonce TEXT PRIMARY KEY,
@@ -3891,6 +3929,364 @@ export class TaskboardDatabase {
     return registration;
   }
 
+  #hostExecutorExecution(input) {
+    if (!isCanonicalCodexHostId(input?.codexHostId)) {
+      throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+    }
+    const execution = {
+      codexHostId: input.codexHostId,
+      executorInstanceId: hostExecutorIdentifier(
+        input.executorInstanceId,
+        "executorInstanceId",
+      ),
+      registrationFingerprint: hostExecutorIdentifier(
+        input.registrationFingerprint,
+        "registrationFingerprint",
+      ),
+      leaseId: hostExecutorIdentifier(input.leaseId, "leaseId"),
+    };
+    if (!/^[a-f0-9]{64}$/.test(execution.registrationFingerprint)) {
+      throw new ApiError(
+        400,
+        "INVALID_FIELD",
+        "'registrationFingerprint' must be a SHA-256 digest",
+      );
+    }
+    return execution;
+  }
+
+  #requireActiveHostExecutorFence(rawExecution) {
+    const execution = this.#hostExecutorExecution(rawExecution);
+    const { observedAtMs } = this.#hostExecutorTime();
+    const registration = this.#prepare(`
+      SELECT * FROM host_executor_registrations WHERE executor_instance_id = ?
+    `).get(execution.executorInstanceId);
+    const current = hostExecutorLeaseFromRow(this.#prepare(`
+      SELECT * FROM host_executor_leases WHERE codex_host_id = ?
+    `).get(execution.codexHostId), observedAtMs);
+    if (!registration
+      || registration.codex_host_id !== execution.codexHostId
+      || registration.registration_fingerprint !== execution.registrationFingerprint
+      || current?.status !== "active"
+      || current.id !== execution.leaseId
+      || current.executorInstanceId !== execution.executorInstanceId
+      || current.registrationFingerprint !== execution.registrationFingerprint) {
+      throw new ApiError(
+        409,
+        "HOST_EXECUTOR_LEASE_STALE",
+        "The exact host executor lease epoch is no longer active",
+      );
+    }
+    return { execution, registration, observedAtMs };
+  }
+
+  #requireResidentMutationHostExecutorFence(rawExecution, expectedCodexHostId) {
+    if (rawExecution === undefined) return null;
+    if (!isCanonicalCodexHostId(expectedCodexHostId)) {
+      throw new ApiError(409, "HOST_EXECUTOR_LEASE_STALE", "The resident mutation host route is invalid");
+    }
+    if (rawExecution === null) {
+      throw new ApiError(
+        409,
+        "HOST_EXECUTOR_LEASE_STALE",
+        "The resident mutation is missing its exact host executor lease epoch",
+      );
+    }
+    const { execution } = this.#requireActiveHostExecutorFence(rawExecution);
+    if (execution.codexHostId !== expectedCodexHostId) {
+      throw new ApiError(
+        409,
+        "HOST_EXECUTOR_LEASE_STALE",
+        "The exact host executor lease does not own the resident mutation route",
+      );
+    }
+    return execution;
+  }
+
+  #hostExecutorEffectRequest(rawInput) {
+    const effectKey = hostExecutorIdentifier(rawInput?.effectKey, "effectKey");
+    const execution = this.#hostExecutorExecution(rawInput?.execution);
+    if (!Array.isArray(rawInput?.operations)
+      || rawInput.operations.length < 1
+      || rawInput.operations.length > 4) {
+      throw new ApiError(400, "INVALID_FIELD", "'operations' must contain one through four RPC operations");
+    }
+    const operations = rawInput.operations.map((operation) => {
+      if (!operation || typeof operation !== "object" || Array.isArray(operation)) {
+        throw new ApiError(400, "INVALID_FIELD", "Every host executor operation must be an object");
+      }
+      const method = hostExecutorIdentifier(operation.method, "method");
+      const params = operation.params;
+      if (!params || typeof params !== "object" || Array.isArray(params)) {
+        throw new ApiError(400, "INVALID_FIELD", "Every host executor operation requires object params");
+      }
+      return { method, params };
+    });
+    const operationsJson = JSON.stringify(operations);
+    return {
+      effectKey,
+      execution,
+      operations,
+      operationsJson,
+      requestFingerprint: createHash("sha256").update(JSON.stringify({
+        codexHostId: execution.codexHostId,
+        operations,
+      })).digest("hex"),
+    };
+  }
+
+  reserveHostExecutorEffect(rawInput) {
+    const input = this.#hostExecutorEffectRequest(rawInput);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { execution, registration } = this.#requireActiveHostExecutorFence(input.execution);
+      const { timestamp } = this.#hostExecutorTime();
+      if (registration.adapter_id !== "local-codex-app-server-v1") {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_ADAPTER_MISMATCH",
+          "The active host executor is not registered for the local Codex adapter",
+        );
+      }
+      const capabilities = new Set(JSON.parse(registration.capabilities_json));
+      if (input.operations.some((operation) => !capabilities.has(operation.method))) {
+        throw new ApiError(
+          403,
+          "HOST_EXECUTOR_CAPABILITY_REQUIRED",
+          "The registered host executor does not allow one or more requested RPC methods",
+        );
+      }
+      const existing = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(input.effectKey);
+      if (existing) {
+        if (existing.request_fingerprint !== input.requestFingerprint) {
+          throw new ApiError(
+            409,
+            "HOST_EXECUTOR_EFFECT_IDEMPOTENCY_CONFLICT",
+            "The effect key is bound to another Codex RPC payload",
+          );
+        }
+        if (existing.status === "completed") {
+          this.database.exec("COMMIT");
+          return { applied: false, replayed: true, effect: hostExecutorEffectFromRow(existing) };
+        }
+        if (["dispatched", "uncertain"].includes(existing.status)) {
+          throw new ApiError(
+            409,
+            "HOST_EXECUTOR_EFFECT_UNCERTAIN",
+            "The Codex RPC effect was already dispatched and requires observation",
+          );
+        }
+        if (existing.executor_instance_id !== execution.executorInstanceId
+          || existing.registration_fingerprint !== execution.registrationFingerprint
+          || existing.lease_id !== execution.leaseId) {
+          this.#prepare(`
+            UPDATE host_executor_effects
+            SET executor_instance_id = ?, registration_fingerprint = ?, lease_id = ?,
+                adapter_id = ?, updated_at = ?
+            WHERE effect_key = ? AND status = 'reserved'
+          `).run(
+            execution.executorInstanceId,
+            execution.registrationFingerprint,
+            execution.leaseId,
+            registration.adapter_id,
+            timestamp,
+            input.effectKey,
+          );
+        }
+        const rebound = this.#prepare(`
+          SELECT * FROM host_executor_effects WHERE effect_key = ?
+        `).get(input.effectKey);
+        this.database.exec("COMMIT");
+        return { applied: false, replayed: false, effect: hostExecutorEffectFromRow(rebound) };
+      }
+      this.#prepare(`
+        INSERT INTO host_executor_effects (
+          effect_key, codex_host_id, executor_instance_id, registration_fingerprint,
+          lease_id, adapter_id, request_fingerprint, operations_json, status,
+          dispatch_token, result_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, NULL, ?, ?)
+      `).run(
+        input.effectKey,
+        execution.codexHostId,
+        execution.executorInstanceId,
+        execution.registrationFingerprint,
+        execution.leaseId,
+        registration.adapter_id,
+        input.requestFingerprint,
+        input.operationsJson,
+        timestamp,
+        timestamp,
+      );
+      const row = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(input.effectKey);
+      this.database.exec("COMMIT");
+      return { applied: true, replayed: false, effect: hostExecutorEffectFromRow(row) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  beginHostExecutorEffectDispatch(rawInput) {
+    const input = this.#hostExecutorEffectRequest(rawInput);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { execution } = this.#requireActiveHostExecutorFence(input.execution);
+      const { timestamp } = this.#hostExecutorTime();
+      const row = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(input.effectKey);
+      if (!row || row.request_fingerprint !== input.requestFingerprint) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_EFFECT_RESERVATION_STALE",
+          "The exact host executor effect reservation is unavailable",
+        );
+      }
+      if (row.status === "completed") {
+        this.database.exec("COMMIT");
+        return { dispatch: false, replayed: true, effect: hostExecutorEffectFromRow(row) };
+      }
+      if (row.status !== "reserved"
+        || row.executor_instance_id !== execution.executorInstanceId
+        || row.registration_fingerprint !== execution.registrationFingerprint
+        || row.lease_id !== execution.leaseId) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_EFFECT_RESERVATION_STALE",
+          "The exact host executor effect reservation is unavailable",
+        );
+      }
+      const dispatchToken = randomUUID();
+      this.#prepare(`
+        UPDATE host_executor_effects
+        SET status = 'dispatched', dispatch_token = ?, updated_at = ?
+        WHERE effect_key = ? AND status = 'reserved'
+      `).run(dispatchToken, timestamp, input.effectKey);
+      const dispatched = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(input.effectKey);
+      this.database.exec("COMMIT");
+      return {
+        dispatch: true,
+        replayed: false,
+        dispatchToken,
+        effect: hostExecutorEffectFromRow(dispatched),
+      };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  completeHostExecutorEffect(effectKeyInput, dispatchTokenInput, result) {
+    const effectKey = hostExecutorIdentifier(effectKeyInput, "effectKey");
+    const dispatchToken = hostExecutorIdentifier(dispatchTokenInput, "dispatchToken");
+    const resultJson = JSON.stringify(result);
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { timestamp } = this.#hostExecutorTime();
+      const row = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(effectKey);
+      if (!row || row.dispatch_token !== dispatchToken
+        || !["dispatched", "completed"].includes(row.status)) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_EFFECT_COMPLETION_STALE",
+          "The exact dispatched Codex RPC effect is unavailable",
+        );
+      }
+      if (row.status === "dispatched") {
+        this.#prepare(`
+          UPDATE host_executor_effects
+          SET status = 'completed', result_json = ?, updated_at = ?
+          WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
+        `).run(resultJson, timestamp, effectKey, dispatchToken);
+      } else if (row.result_json !== resultJson) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_EFFECT_COMPLETION_CONFLICT",
+          "The Codex RPC effect already has another result",
+        );
+      }
+      const completed = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(effectKey);
+      this.database.exec("COMMIT");
+      return hostExecutorEffectFromRow(completed);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markHostExecutorEffectUncertain(effectKeyInput, dispatchTokenInput) {
+    const effectKey = hostExecutorIdentifier(effectKeyInput, "effectKey");
+    const dispatchToken = hostExecutorIdentifier(dispatchTokenInput, "dispatchToken");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { timestamp } = this.#hostExecutorTime();
+      const row = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(effectKey);
+      if (!row || row.dispatch_token !== dispatchToken || row.status !== "dispatched") {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_EFFECT_COMPLETION_STALE",
+          "The exact dispatched Codex RPC effect is unavailable",
+        );
+      }
+      this.#prepare(`
+        UPDATE host_executor_effects SET status = 'uncertain', updated_at = ?
+        WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
+      `).run(timestamp, effectKey, dispatchToken);
+      const uncertain = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(effectKey);
+      this.database.exec("COMMIT");
+      return hostExecutorEffectFromRow(uncertain);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  releaseHostExecutorEffectAfterRejection(effectKeyInput, dispatchTokenInput) {
+    const effectKey = hostExecutorIdentifier(effectKeyInput, "effectKey");
+    const dispatchToken = hostExecutorIdentifier(dispatchTokenInput, "dispatchToken");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { timestamp } = this.#hostExecutorTime();
+      const row = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(effectKey);
+      if (!row || row.dispatch_token !== dispatchToken || row.status !== "dispatched") {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_EFFECT_COMPLETION_STALE",
+          "The exact dispatched Codex RPC effect is unavailable",
+        );
+      }
+      this.#prepare(`
+        UPDATE host_executor_effects
+        SET status = 'reserved', dispatch_token = NULL, updated_at = ?
+        WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
+      `).run(timestamp, effectKey, dispatchToken);
+      const reserved = this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(effectKey);
+      this.database.exec("COMMIT");
+      return hostExecutorEffectFromRow(reserved);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   #hostExecutorLeaseRequest(input, action) {
     if (!isCanonicalCodexHostId(input?.codexHostId)) {
       throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
@@ -4416,69 +4812,105 @@ export class TaskboardDatabase {
     };
   }
 
-  getAgentLaneCoordinatorProvisioningAttempt(projectId, idempotencyKey, ownedCodexHostId) {
-    const row = idempotencyKey
-      ? this.#prepare(`
-          SELECT * FROM agent_coordinator_provisioning_attempts
-          WHERE project_id = ? AND idempotency_key = ?
-        `).get(projectId, idempotencyKey)
-      : this.#prepare(`
-          SELECT * FROM agent_coordinator_provisioning_attempts
-          WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
-          ORDER BY created_at DESC, id DESC LIMIT 1
-    `).get(projectId);
-    if (!row) return null;
-    assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, row.codex_host_id);
-    if (["pending", "starting", "started"].includes(row.status)
-      && Date.parse(row.expires_at) <= Date.now()) {
-      const timestamp = now();
-      this.#prepare(`
-        UPDATE agent_coordinator_provisioning_attempts
-        SET status = 'expired', updated_at = ? WHERE id = ?
-      `).run(timestamp, row.id);
-      return coordinatorProvisioningAttemptFromRow({
-        ...row, status: "expired", updated_at: timestamp,
-      });
+  getAgentLaneCoordinatorProvisioningAttempt(
+    projectId,
+    idempotencyKey,
+    ownedCodexHostId,
+    hostExecutorExecution = undefined,
+  ) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#requireResidentMutationHostExecutorFence(
+        hostExecutorExecution,
+        ownedCodexHostId,
+      );
+      const row = idempotencyKey
+        ? this.#prepare(`
+            SELECT * FROM agent_coordinator_provisioning_attempts
+            WHERE project_id = ? AND idempotency_key = ?
+          `).get(projectId, idempotencyKey)
+        : this.#prepare(`
+            SELECT * FROM agent_coordinator_provisioning_attempts
+            WHERE project_id = ? AND status IN ('pending', 'starting', 'started')
+            ORDER BY created_at DESC, id DESC LIMIT 1
+      `).get(projectId);
+      if (!row) {
+        this.database.exec("COMMIT");
+        return null;
+      }
+      assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, row.codex_host_id);
+      let result = row;
+      if (["pending", "starting", "started"].includes(row.status)
+        && Date.parse(row.expires_at) <= Date.now()) {
+        const timestamp = now();
+        this.#prepare(`
+          UPDATE agent_coordinator_provisioning_attempts
+          SET status = 'expired', updated_at = ? WHERE id = ?
+        `).run(timestamp, row.id);
+        result = { ...row, status: "expired", updated_at: timestamp };
+      }
+      this.database.exec("COMMIT");
+      return coordinatorProvisioningAttemptFromRow(result);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
-    return coordinatorProvisioningAttemptFromRow(row);
   }
 
   getAgentLaneDomainCoordinatorProvisioningAttempt(
     projectId, domainId, idempotencyKey, ownedCodexHostId,
+    hostExecutorExecution = undefined,
   ) {
-    const row = idempotencyKey
-      ? this.#prepare(`
-          SELECT * FROM agent_domain_coordinator_provisioning_attempts
-          WHERE project_id = ? AND domain_id = ? AND idempotency_key = ?
-        `).get(projectId, domainId, idempotencyKey)
-      : this.#prepare(`
-          SELECT * FROM agent_domain_coordinator_provisioning_attempts
-          WHERE project_id = ? AND domain_id = ?
-            AND (
-              status IN ('pending', 'starting', 'started')
-              OR (status = 'expired' AND thread_id IS NOT NULL)
-            )
-          ORDER BY created_at DESC, id DESC LIMIT 1
-        `).get(projectId, domainId);
-    if (!row) return null;
-    assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, row.codex_host_id);
-    if (["pending", "starting", "started"].includes(row.status)
-      && Date.parse(row.expires_at) <= Date.now()) {
-      const timestamp = now();
-      this.#prepare(`
-        UPDATE agent_domain_coordinator_provisioning_attempts
-        SET status = 'expired', updated_at = ? WHERE id = ?
-      `).run(timestamp, row.id);
-      return domainCoordinatorProvisioningAttemptFromRow({
-        ...row, status: "expired", updated_at: timestamp,
-      });
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.#requireResidentMutationHostExecutorFence(
+        hostExecutorExecution,
+        ownedCodexHostId,
+      );
+      const row = idempotencyKey
+        ? this.#prepare(`
+            SELECT * FROM agent_domain_coordinator_provisioning_attempts
+            WHERE project_id = ? AND domain_id = ? AND idempotency_key = ?
+          `).get(projectId, domainId, idempotencyKey)
+        : this.#prepare(`
+            SELECT * FROM agent_domain_coordinator_provisioning_attempts
+            WHERE project_id = ? AND domain_id = ?
+              AND (
+                status IN ('pending', 'starting', 'started')
+                OR (status = 'expired' AND thread_id IS NOT NULL)
+              )
+            ORDER BY created_at DESC, id DESC LIMIT 1
+          `).get(projectId, domainId);
+      if (!row) {
+        this.database.exec("COMMIT");
+        return null;
+      }
+      assertCoordinatorProvisioningHostExecutor(ownedCodexHostId, row.codex_host_id);
+      let result = row;
+      if (["pending", "starting", "started"].includes(row.status)
+        && Date.parse(row.expires_at) <= Date.now()) {
+        const timestamp = now();
+        this.#prepare(`
+          UPDATE agent_domain_coordinator_provisioning_attempts
+          SET status = 'expired', updated_at = ? WHERE id = ?
+        `).run(timestamp, row.id);
+        result = { ...row, status: "expired", updated_at: timestamp };
+      }
+      this.database.exec("COMMIT");
+      return domainCoordinatorProvisioningAttemptFromRow(result);
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
-    return domainCoordinatorProvisioningAttemptFromRow(row);
   }
 
   requestAgentLaneDomainCoordinatorProvisioningAttempt(projectId, domainId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.ownedCodexHostId,
+      );
       const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
@@ -4701,6 +5133,10 @@ export class TaskboardDatabase {
         );
       }
       assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, row.codex_host_id);
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        row.codex_host_id,
+      );
       const recoverableExpiredResume = row.status === "expired"
         && Boolean(row.thread_id)
         && action === "resume-expired";
@@ -4967,6 +5403,10 @@ export class TaskboardDatabase {
   requestAgentLaneCoordinatorProvisioningAttempt(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.ownedCodexHostId,
+      );
       const row = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
@@ -5151,6 +5591,10 @@ export class TaskboardDatabase {
       ).get(attemptId);
       if (!row) throw new ApiError(404, "COORDINATOR_PROVISIONING_NOT_FOUND", "The replacement provisioning attempt does not exist");
       assertCoordinatorProvisioningHostExecutor(input.ownedCodexHostId, row.codex_host_id);
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        row.codex_host_id,
+      );
       const recoverableExpiredMissing = row.status === "expired"
         && Boolean(row.thread_id)
         && ["observe-missing", "clear-missing", "reset-missing"].includes(action);
@@ -5480,6 +5924,10 @@ export class TaskboardDatabase {
   requestAgentLaneCoordinatorShutdownAttempt(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.ownedCodexHostId,
+      );
       const project = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
@@ -5600,7 +6048,11 @@ export class TaskboardDatabase {
     }
   }
 
-  transitionAgentLaneCoordinatorShutdownAttempt(attemptId, action, { ownedCodexHostId } = {}) {
+  transitionAgentLaneCoordinatorShutdownAttempt(
+    attemptId,
+    action,
+    { ownedCodexHostId, hostExecutorExecution = undefined } = {},
+  ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const row = this.#prepare(
@@ -5608,6 +6060,7 @@ export class TaskboardDatabase {
       ).get(attemptId);
       if (!row) throw new ApiError(404, "COORDINATOR_SHUTDOWN_NOT_FOUND", "The Coordinator shutdown attempt does not exist");
       assertCoordinatorShutdownHostExecutor(ownedCodexHostId, row.codex_host_id);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, row.codex_host_id);
       if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(row.project_id)) {
         throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Global shutdown waits for authorized domain thread archival");
       }
@@ -5771,6 +6224,10 @@ export class TaskboardDatabase {
   requestAgentLaneDomainCoordinatorShutdownAttempt(projectId, domainId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.ownedCodexHostId,
+      );
       const project = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
@@ -5895,7 +6352,7 @@ export class TaskboardDatabase {
   transitionAgentLaneDomainCoordinatorShutdownAttempt(
     attemptId,
     action,
-    { ownedCodexHostId } = {},
+    { ownedCodexHostId, hostExecutorExecution = undefined } = {},
   ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -5904,6 +6361,7 @@ export class TaskboardDatabase {
       ).get(attemptId);
       if (!row) throw new ApiError(404, "DOMAIN_COORDINATOR_SHUTDOWN_NOT_FOUND", "The domain shutdown attempt does not exist");
       assertCoordinatorShutdownHostExecutor(ownedCodexHostId, row.codex_host_id);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, row.codex_host_id);
       const authorizedAttempt = this.#prepare(`
         SELECT id FROM agent_domain_coordinator_shutdown_attempts
         WHERE project_id = ? AND status IN ('authorized', 'archiving') LIMIT 1
@@ -6260,9 +6718,19 @@ export class TaskboardDatabase {
     }
   }
 
-  listAgentLaneCoordinationIdentityHandshakes(projectId) {
+  listAgentLaneCoordinationIdentityHandshakes(
+    projectId,
+    ownedCodexHostId = undefined,
+    hostExecutorExecution = undefined,
+  ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (hostExecutorExecution !== undefined) {
+        this.#requireResidentMutationHostExecutorFence(
+          hostExecutorExecution,
+          ownedCodexHostId,
+        );
+      }
       const project = this.#prepare(
         "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
       ).get(projectId);
@@ -6313,57 +6781,71 @@ export class TaskboardDatabase {
     `).get(projectId, idempotencyKey));
   }
 
-  confirmAgentLaneCoordinationIdentityHandshake(handshakeId, registration, threadBinding) {
-    const preliminary = this.#prepare(
-      "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
-    ).get(handshakeId);
-    if (!preliminary) throw new ApiError(404, "COORDINATION_IDENTITY_HANDSHAKE_NOT_FOUND", "The protected identity handshake does not exist");
-    if (preliminary.request_fingerprint !== coordinationIdentityRequestFingerprint(
-      registration.projectId, registration,
-    )) {
-      throw new ApiError(409, "COORDINATION_IDENTITY_REQUEST_MISMATCH", "The authenticated proof does not match the complete original Coordinator registration");
-    }
-    if (preliminary.status === "completed") {
-      const expected = JSON.parse(preliminary.expected_host_binding_json);
-      const binding = {
-        threadId: threadBinding.threadId,
-        codexProjectId: threadBinding.codexProjectId,
-        codexProjectKind: threadBinding.codexProjectKind,
-        codexHostId: threadBinding.codexHostId,
-        workspacePath: path.resolve(threadBinding.workspacePath),
-      };
-      if (binding.threadId !== preliminary.thread_id
-        || binding.codexProjectId !== expected.codexProjectId
-        || binding.codexProjectKind !== expected.codexProjectKind
-        || binding.codexHostId !== expected.codexHostId
-        || binding.workspacePath !== path.resolve(expected.workspacePath)
-        || preliminary.thread_binding_json !== JSON.stringify(binding)) {
-        throw new ApiError(409, "COORDINATION_IDENTITY_MISMATCH", "The authenticated host identity does not match the completed handshake");
-      }
-      return coordinationIdentityHandshakeFromRow(preliminary);
-    }
-    const timestamp = now();
-    if (["expired", "canceled"].includes(preliminary.status)
-      || (["pending", "confirmed"].includes(preliminary.status)
-        && Date.parse(preliminary.expires_at) <= Date.parse(timestamp))) {
-      this.#prepare(`
-        UPDATE agent_coordination_identity_handshakes SET status = 'expired', updated_at = ?
-        WHERE id = ? AND status IN ('pending', 'confirmed')
-      `).run(timestamp, handshakeId);
-      throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake has expired");
-    }
-    const preliminaryProject = this.#prepare(
-      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
-    ).get(preliminary.project_id);
-    if (!preliminaryProject
-      || agentLaneConfigRevision(preliminaryProject.config_json) !== preliminary.expected_revision) {
-      this.#prepare(
-        "UPDATE agent_coordination_identity_handshakes SET status = 'canceled', updated_at = ? WHERE id = ?",
-      ).run(timestamp, handshakeId);
-      throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_CANCELED", "The Agent Lane configuration changed before identity confirmation");
-    }
+  confirmAgentLaneCoordinationIdentityHandshake(
+    handshakeId,
+    registration,
+    threadBinding,
+    hostExecutorExecution = undefined,
+  ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (hostExecutorExecution !== undefined) {
+        this.#requireResidentMutationHostExecutorFence(
+          hostExecutorExecution,
+          threadBinding.codexHostId,
+        );
+      }
+      const preliminary = this.#prepare(
+        "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
+      ).get(handshakeId);
+      if (!preliminary) throw new ApiError(404, "COORDINATION_IDENTITY_HANDSHAKE_NOT_FOUND", "The protected identity handshake does not exist");
+      if (preliminary.request_fingerprint !== coordinationIdentityRequestFingerprint(
+        registration.projectId, registration,
+      )) {
+        throw new ApiError(409, "COORDINATION_IDENTITY_REQUEST_MISMATCH", "The authenticated proof does not match the complete original Coordinator registration");
+      }
+      if (preliminary.status === "completed") {
+        const expected = JSON.parse(preliminary.expected_host_binding_json);
+        const binding = {
+          threadId: threadBinding.threadId,
+          codexProjectId: threadBinding.codexProjectId,
+          codexProjectKind: threadBinding.codexProjectKind,
+          codexHostId: threadBinding.codexHostId,
+          workspacePath: path.resolve(threadBinding.workspacePath),
+        };
+        if (binding.threadId !== preliminary.thread_id
+          || binding.codexProjectId !== expected.codexProjectId
+          || binding.codexProjectKind !== expected.codexProjectKind
+          || binding.codexHostId !== expected.codexHostId
+          || binding.workspacePath !== path.resolve(expected.workspacePath)
+          || preliminary.thread_binding_json !== JSON.stringify(binding)) {
+          throw new ApiError(409, "COORDINATION_IDENTITY_MISMATCH", "The authenticated host identity does not match the completed handshake");
+        }
+        this.database.exec("COMMIT");
+        return coordinationIdentityHandshakeFromRow(preliminary);
+      }
+      const timestamp = now();
+      if (["expired", "canceled"].includes(preliminary.status)
+        || (["pending", "confirmed"].includes(preliminary.status)
+          && Date.parse(preliminary.expires_at) <= Date.parse(timestamp))) {
+        this.#prepare(`
+          UPDATE agent_coordination_identity_handshakes SET status = 'expired', updated_at = ?
+          WHERE id = ? AND status IN ('pending', 'confirmed')
+        `).run(timestamp, handshakeId);
+        this.database.exec("COMMIT");
+        throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_EXPIRED", "The protected identity handshake has expired");
+      }
+      const preliminaryProject = this.#prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+      ).get(preliminary.project_id);
+      if (!preliminaryProject
+        || agentLaneConfigRevision(preliminaryProject.config_json) !== preliminary.expected_revision) {
+        this.#prepare(
+          "UPDATE agent_coordination_identity_handshakes SET status = 'canceled', updated_at = ? WHERE id = ?",
+        ).run(timestamp, handshakeId);
+        this.database.exec("COMMIT");
+        throw new ApiError(409, "COORDINATION_IDENTITY_HANDSHAKE_CANCELED", "The Agent Lane configuration changed before identity confirmation");
+      }
       const row = this.#prepare(
         "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
       ).get(handshakeId);
@@ -6399,7 +6881,7 @@ export class TaskboardDatabase {
         ...row, status: "confirmed", thread_binding_json: JSON.stringify(binding), updated_at: timestamp,
       });
     } catch (error) {
-      this.database.exec("ROLLBACK");
+      if (this.database.isTransaction) this.database.exec("ROLLBACK");
       throw error;
     }
   }
@@ -6543,9 +7025,20 @@ export class TaskboardDatabase {
     }
   }
 
-  registerAgentLaneCoordinationWindow(projectId, input, threadBinding) {
+  registerAgentLaneCoordinationWindow(
+    projectId,
+    input,
+    threadBinding,
+    hostExecutorExecution = undefined,
+  ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (hostExecutorExecution !== undefined) {
+        this.#requireResidentMutationHostExecutorFence(
+          hostExecutorExecution,
+          threadBinding.codexHostId,
+        );
+      }
       if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(projectId)) {
         throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Window changes wait for authorized thread archival");
       }
@@ -7188,6 +7681,10 @@ export class TaskboardDatabase {
   claimCrossDomainHandoffDelivery(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.route?.codexHostId,
+      );
       const frontier = this.listCrossDomainDependencyClearances(input.targetTaskId)
         .find((item) => item.sourceTaskId === input.sourceTaskId);
       if (!frontier
@@ -7268,6 +7765,10 @@ export class TaskboardDatabase {
         SELECT * FROM cross_domain_handoff_deliveries WHERE id = ? AND project_id = ?
       `).get(input.deliveryId, projectId);
       if (!row) throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_DELIVERY_MISMATCH", "Cross-domain handoff delivery does not exist");
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        row.target_codex_host_id,
+      );
       if (row.state !== "delivered" && Date.parse(row.reservation_expires_at) <= Date.now()) {
         throw new ApiError(409, "CROSS_DOMAIN_HANDOFF_DELIVERY_EXPIRED", "Cross-domain handoff reservation expired before confirmation");
       }
@@ -7507,6 +8008,10 @@ export class TaskboardDatabase {
       const holder = Array.isArray(config.tasks)
         ? config.tasks.find((task) => task?.id === input.holderTaskId)
         : null;
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.holderCodexHostId,
+      );
       if (!isFullyBoundCodexPeerTask(holder)
         || holder.threadId !== input.holderThreadId
         || !domain.eligibleTaskIds.includes(input.holderTaskId)) {
@@ -7728,6 +8233,10 @@ export class TaskboardDatabase {
       const holder = Array.isArray(config.tasks)
         ? config.tasks.find((task) => task?.id === input.holderTaskId)
         : null;
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.holderCodexHostId,
+      );
       if (config.ownerRootTaskId && input.holderTaskId === config.ownerRootTaskId) {
         throw new ApiError(
           409,
@@ -8877,6 +9386,10 @@ export class TaskboardDatabase {
   claimOwnerDecisionDelivery(projectId, input) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        input.route?.codexHostId,
+      );
       const task = this.#requireTask(input.taskId);
       if (task.projectId !== projectId) {
         throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision task is not in this project");
@@ -8978,6 +9491,10 @@ export class TaskboardDatabase {
         SELECT * FROM owner_decision_deliveries WHERE id = ? AND project_id = ?
       `).get(input.deliveryId, projectId);
       if (!row) throw new ApiError(409, "OWNER_DECISION_DELIVERY_MISMATCH", "Owner decision delivery does not exist");
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        row.codex_host_id,
+      );
       if (row.state === "delivered") {
         if (row.delivery_turn_id !== input.deliveryTurnId) {
           throw new ApiError(409, "OWNER_DECISION_DELIVERY_CONFLICT", "Owner decision delivery is already bound to another Root turn");
@@ -9109,6 +9626,10 @@ export class TaskboardDatabase {
         || delivery.root_thread_id !== input.rootThreadId) {
         throw new ApiError(409, "OWNER_DECISION_DELIVERY_REQUIRED", "Decision requires a host-observed exact Root delivery and Owner turn");
       }
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        delivery.codex_host_id,
+      );
       const existingRow = this.#prepare(`
         SELECT * FROM task_owner_decision_receipts WHERE request_id = ? OR receipt = ?
       `).get(input.requestId, input.receipt);
@@ -9238,7 +9759,10 @@ export class TaskboardDatabase {
 
   claimTaskSafeAction(
     id,
-    { rootThreadId, ownedCodexHostId, expectedResumeToken, safeActionId, reservationLeaseId },
+    {
+      rootThreadId, ownedCodexHostId, expectedResumeToken, safeActionId, reservationLeaseId,
+      hostExecutorExecution = undefined,
+    },
     { worktreeRepositoryProbe = null } = {},
   ) {
     this.database.exec("BEGIN IMMEDIATE");
@@ -9246,6 +9770,7 @@ export class TaskboardDatabase {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
       this.#assertTaskSafeActionHostExecutor(rootRun, ownedCodexHostId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       if (worktreeRepositoryProbe) {
         this.recordTaskWorktreeRepository(task.id, worktreeRepositoryProbe);
       }
@@ -9516,12 +10041,17 @@ export class TaskboardDatabase {
 
   confirmTaskSafeActionDelivery(id, {
     rootThreadId, expectedResumeToken, safeActionId, reservationLeaseId,
-  }) {
+    hostExecutorExecution = undefined,
+  }, { worktreeRepositoryProbe = null } = {}) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
-      const capsule = this.getTaskCapsule(task.id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
+      if (worktreeRepositoryProbe) {
+        this.recordTaskWorktreeRepository(task.id, worktreeRepositoryProbe);
+      }
+      const capsule = this.getTaskCapsule(task.id);
       if (capsule.resumeToken !== expectedResumeToken) {
         throw new ApiError(409, "RESUME_TOKEN_MISMATCH", "Task Capsule changed before bootstrap delivery");
       }
@@ -9565,55 +10095,66 @@ export class TaskboardDatabase {
     recoveryLeaseId,
     admissionReceiptId,
     admissionAttemptId,
+    hostExecutorExecution = undefined,
   }) {
-    const task = this.#requireTask(id);
-    const capsule = this.getTaskCapsule(task.id);
-    const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
-    if (task.workflowProfile !== "vibe") {
-      throw new ApiError(409, "TASKBOARD_HOST_ACCESS_FORBIDDEN", "Taskboard host access requires a personal vibe task");
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(id);
+      const capsule = this.getTaskCapsule(task.id);
+      const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
+      if (task.workflowProfile !== "vibe") {
+        throw new ApiError(409, "TASKBOARD_HOST_ACCESS_FORBIDDEN", "Taskboard host access requires a personal vibe task");
+      }
+      if (capsule.resumeToken !== expectedResumeToken
+        || capsule.readyWork.eligible !== true
+        || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
+        throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Taskboard host access must match the current safe action");
+      }
+      const row = this.#prepare(`
+        SELECT * FROM task_safe_action_receipts
+        WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
+          AND root_thread_id = ? AND status = 'delivering'
+          AND reservation_lease_id = ? AND admission_attempt_id = ?
+      `).get(
+        admissionReceiptId,
+        task.id,
+        expectedResumeToken,
+        safeActionId,
+        rootThreadId,
+        reservationLeaseId,
+        admissionAttemptId,
+      );
+      if (!row) {
+        throw new ApiError(409, "SAFE_ACTION_RECEIPT_MISSING", "Taskboard host access requires the exact delivering receipt");
+      }
+      this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+      if (row.recovery_lease_id !== recoveryLeaseId
+        || !row.recovery_lease_expires_at
+        || Date.parse(row.recovery_lease_expires_at) <= Date.now()) {
+        throw new ApiError(409, "SAFE_ACTION_RECOVERY_LEASE_REQUIRED", "Taskboard host access requires the active recovery lease");
+      }
+      if (row.worktree_path !== task.developmentContext?.path
+        || row.worktree_branch !== task.developmentContext?.branch) {
+        throw new ApiError(409, "EXECUTION_TARGET_MISMATCH", "Taskboard host access requires the current execution worktree");
+      }
+      this.database.exec("COMMIT");
+      return { task, receipt: this.#taskSafeActionReceipt(row) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
     }
-    if (capsule.resumeToken !== expectedResumeToken
-      || capsule.readyWork.eligible !== true
-      || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
-      throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Taskboard host access must match the current safe action");
-    }
-    const row = this.#prepare(`
-      SELECT * FROM task_safe_action_receipts
-      WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
-        AND root_thread_id = ? AND status = 'delivering'
-        AND reservation_lease_id = ? AND admission_attempt_id = ?
-    `).get(
-      admissionReceiptId,
-      task.id,
-      expectedResumeToken,
-      safeActionId,
-      rootThreadId,
-      reservationLeaseId,
-      admissionAttemptId,
-    );
-    if (!row) {
-      throw new ApiError(409, "SAFE_ACTION_RECEIPT_MISSING", "Taskboard host access requires the exact delivering receipt");
-    }
-    this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
-    if (row.recovery_lease_id !== recoveryLeaseId
-      || !row.recovery_lease_expires_at
-      || Date.parse(row.recovery_lease_expires_at) <= Date.now()) {
-      throw new ApiError(409, "SAFE_ACTION_RECOVERY_LEASE_REQUIRED", "Taskboard host access requires the active recovery lease");
-    }
-    if (row.worktree_path !== task.developmentContext?.path
-      || row.worktree_branch !== task.developmentContext?.branch) {
-      throw new ApiError(409, "EXECUTION_TARGET_MISMATCH", "Taskboard host access requires the current execution worktree");
-    }
-    return { task, receipt: this.#taskSafeActionReceipt(row) };
   }
 
   completeTaskSafeActionDelivery(id, {
     rootThreadId, expectedResumeToken, safeActionId, reservationLeaseId, recoveryLeaseId, deliveryTurnId,
+    hostExecutorExecution = undefined,
   }) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE task_id = ? AND resume_token = ? AND safe_action_id = ? AND root_thread_id = ?
@@ -9820,11 +10361,13 @@ export class TaskboardDatabase {
 
   markTaskSafeActionAdmissionUncertain(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    hostExecutorExecution = undefined,
   }, observedAt = now()) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
@@ -9871,11 +10414,13 @@ export class TaskboardDatabase {
 
   claimTaskSafeActionAdmissionProbe(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    hostExecutorExecution = undefined,
   }) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
@@ -9921,11 +10466,13 @@ export class TaskboardDatabase {
 
   claimTaskSafeActionReplacementAdmissionProbe(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    hostExecutorExecution = undefined,
   }, observedAt = now()) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       let row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
@@ -10049,12 +10596,13 @@ export class TaskboardDatabase {
 
   reconcileTaskSafeActionReplacementAdmission(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
-    admissionProbeId, observationRootThreadId, registryObservation,
+    admissionProbeId, observationRootThreadId, registryObservation, hostExecutorExecution = undefined,
   }) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
@@ -10119,12 +10667,13 @@ export class TaskboardDatabase {
 
   reconcileTaskSafeActionAdmission(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
-    admissionProbeId, registryObservation,
+    admissionProbeId, registryObservation, hostExecutorExecution = undefined,
   }) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
@@ -10222,11 +10771,13 @@ export class TaskboardDatabase {
 
   deferTaskSafeActionAdmission(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    hostExecutorExecution = undefined,
   }) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
       const rootRun = this.#rootAgentRunBinding(task, rootThreadId);
+      this.#requireResidentMutationHostExecutorFence(hostExecutorExecution, rootRun.rootHostId);
       const row = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
         WHERE id = ? AND task_id = ? AND resume_token = ? AND safe_action_id = ?
@@ -11245,6 +11796,10 @@ export class TaskboardDatabase {
   recordProjectOwnerIntent(projectId, input, sourceThreadBinding, actor) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        sourceThreadBinding.codexHostId,
+      );
       if (!this.getProject(projectId)) {
         throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' does not exist`);
       }
@@ -11465,6 +12020,7 @@ export class TaskboardDatabase {
     return {
       taskId: coordinatorTaskId,
       threadId: coordinator.threadId,
+      codexHostId: coordinator.codexHostId,
       epoch: activeLease ? `lease:${lease.id}` : `configured:${coordinatorTaskId}`,
     };
   }
@@ -11482,6 +12038,10 @@ export class TaskboardDatabase {
         throw new ApiError(404, "OWNER_INTENT_NOT_FOUND", `Owner Intent '${intentId}' does not exist`);
       }
       const coordinator = this.#currentCoordinatorIdentity(projectId);
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        coordinator.codexHostId,
+      );
       if (
         input.coordinatorTaskId !== coordinator.taskId
         || input.coordinatorThreadId !== coordinator.threadId
@@ -11578,6 +12138,10 @@ export class TaskboardDatabase {
       }
       const adoption = ownerIntentAdoptionFromRow(row);
       const coordinator = this.#currentCoordinatorIdentity(projectId);
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        coordinator.codexHostId,
+      );
       if (
         adoption.coordinatorTaskId !== coordinator.taskId
         || adoption.coordinatorThreadId !== coordinator.threadId
@@ -11645,6 +12209,10 @@ export class TaskboardDatabase {
         throw new ApiError(409, "OWNER_INTENT_PLAN_RETRY_STALE", "Plan retry requires the current adopted intent receipt");
       }
       const coordinator = this.#currentCoordinatorIdentity(projectId);
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        coordinator.codexHostId,
+      );
       if (adoption.coordinator_epoch !== input.coordinatorEpoch
         || adoption.coordinator_task_id !== coordinator.taskId
         || adoption.coordinator_thread_id !== coordinator.threadId
@@ -11713,7 +12281,8 @@ export class TaskboardDatabase {
   }
 
   applyProjectOwnerIntentPlan(projectId, intentId, input) {
-    const serializedRequest = JSON.stringify(input);
+    const { hostExecutorExecution: _hostExecutorExecution, ...semanticInput } = input;
+    const serializedRequest = JSON.stringify(semanticInput);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.#prepare(
@@ -11754,6 +12323,10 @@ export class TaskboardDatabase {
       `).get(input.adoptionId, intentId, projectId);
       if (!adoption) throw new ApiError(409, "OWNER_INTENT_ADOPTION_STALE", "Plan requires the adopted intent receipt");
       const coordinator = this.#currentCoordinatorIdentity(projectId);
+      this.#requireResidentMutationHostExecutorFence(
+        input.hostExecutorExecution,
+        coordinator.codexHostId,
+      );
       if (input.coordinatorTaskId !== coordinator.taskId
         || input.coordinatorThreadId !== coordinator.threadId
         || input.coordinatorEpoch !== coordinator.epoch

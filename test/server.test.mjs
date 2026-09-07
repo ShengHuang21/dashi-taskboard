@@ -42,16 +42,26 @@ async function startServer(configure, listenOptions = {}) {
 }
 
 async function request(baseUrl, pathname, options = {}) {
-  const headers = new Headers(options.headers);
-  if (options.body !== undefined && !headers.has("content-type")) {
+  const { residentTaskctlCompat = true, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers);
+  if (fetchOptions.body !== undefined && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
+  const manualResidentMutation = (
+    /^\/api\/tasks\/[^/]+\/(?:bootstrap-(?:claim|delivery|complete|host-access)|admission-(?:defer|uncertain|reconcile|probe|replacement-probe|replacement-reconcile)|owner-decisions)$/.test(pathname)
+    || /^\/api\/local\/(?:projects\/[^/]+\/(?:coordinator-|domain-coordinator-|coordination-identity-|cross-domain-|owner-decision-|owner-intents)|coordinator-|domain-coordinator-|coordination-identity-)/.test(pathname)
+  );
+  if (residentTaskctlCompat && manualResidentMutation
+    && !headers.has("x-codex-taskboard-host-execution")
+    && !headers.has("x-taskboard-client")) {
+    headers.set("x-taskboard-client", "taskctl");
+  }
   const response = await fetch(`${baseUrl}${pathname}`, {
-    ...options,
+    ...fetchOptions,
     headers,
-    body: options.body === undefined || typeof options.body === "string"
-      ? options.body
-      : JSON.stringify(options.body),
+    body: fetchOptions.body === undefined || typeof fetchOptions.body === "string"
+      ? fetchOptions.body
+      : JSON.stringify(fetchOptions.body),
   });
   const text = await response.text();
   return {
@@ -3698,6 +3708,7 @@ test("protected cross-domain clearance binds the exact target coordinator fronti
   assert.equal(afterDelivery.body.clearances[0].delivery.state, "delivered");
   const unprotected = await request(baseUrl, route, {
     method: "POST",
+    residentTaskctlCompat: false,
     body: {
       sourceTaskId: source.identifier, idempotencyKey: "api-clearance-1",
       holderTaskId: "backend", holderThreadId: "backend-thread",
@@ -10670,6 +10681,7 @@ test("CAP-60 runtime skips a real foreign expired attempt and provisions the lat
           requestBody,
         ),
         "content-type": "application/json",
+        "x-taskboard-client": "taskctl",
       },
       body: JSON.stringify(requestBody),
     });

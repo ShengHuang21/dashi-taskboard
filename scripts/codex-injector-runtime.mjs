@@ -41,7 +41,28 @@ const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
 function normalizeHostExecutor(value) {
   const ownedCodexHostId = value?.ownedCodexHostId;
   if (!isCanonicalCodexHostId(ownedCodexHostId)) return null;
-  return { ownedCodexHostId };
+  const fenceValues = [
+    value?.codexHostId,
+    value?.executorInstanceId,
+    value?.registrationFingerprint,
+    value?.leaseId,
+  ];
+  if (fenceValues.every((candidate) => candidate === undefined)) {
+    return { ownedCodexHostId };
+  }
+  if (value.codexHostId !== ownedCodexHostId
+    || typeof value.executorInstanceId !== "string" || !value.executorInstanceId
+    || !RESUME_TOKEN_PATTERN.test(value.registrationFingerprint ?? "")
+    || typeof value.leaseId !== "string" || !value.leaseId) {
+    return null;
+  }
+  return Object.freeze({
+    ownedCodexHostId,
+    codexHostId: value.codexHostId,
+    executorInstanceId: value.executorInstanceId,
+    registrationFingerprint: value.registrationFingerprint,
+    leaseId: value.leaseId,
+  });
 }
 
 function hostExecutorOwnsRoute(hostExecutor, route) {
