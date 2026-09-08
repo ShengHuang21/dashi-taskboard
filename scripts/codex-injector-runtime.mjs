@@ -984,16 +984,26 @@ function coordinatorShutdownIdentity(projectId, lease, lane, ownerLane) {
   };
 }
 
-function domainCoordinatorShutdownIdentity(projectId, domainId, revision, lease, lane, globalLane) {
+function domainCoordinatorShutdownIdentity(projectId, domain, lease, lane, globalLane) {
   const fingerprint = createHash("sha256").update(JSON.stringify({
-    projectId, domainId, revision, leaseId: lease.id, holderTaskId: lease.holderTaskId,
+    projectId, domainId: domain.domainId, label: domain.label,
+    writeScope: [...domain.writeScope].sort(),
+    eligibleTaskIds: [...domain.eligibleTaskIds].sort(),
+    leaseId: lease.id, holderTaskId: lease.holderTaskId,
     holderThreadId: lane.threadId, codexProjectId: lane.codexProjectId,
     codexProjectKind: lane.codexProjectKind, codexHostId: lane.codexHostId,
     workspacePath: path.resolve(lane.workspacePath),
     globalHolderTaskId: globalLane.id, globalHolderThreadId: globalLane.threadId,
     expectedGlobalLeaseId: globalLane.leaseId,
   })).digest("hex");
-  return { idempotencyKey: `domain-coordinator-shutdown-${fingerprint}`, fingerprint };
+  return { fingerprint };
+}
+
+function domainCoordinatorShutdownRequestIdentity(observationFingerprint, revision) {
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    observationFingerprint, revision,
+  })).digest("hex");
+  return { idempotencyKey: `domain-coordinator-shutdown-${fingerprint}` };
 }
 
 async function continueCoordinatorShutdownAttempt(options, attempt, expected) {
@@ -1384,21 +1394,22 @@ async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
       domainCoordinatorShutdownIdleObservations.delete(candidateObservationKey);
       continue;
     }
-    const holderWindow = windows.windows?.find(
-      (window) => window?.taskId === candidateLane.id,
-    ) ?? null;
     const exact = globalLease?.status === "active" && globalLease.bindingValid === true
       && COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
       && THREAD_ID_PATTERN.test(globalLane?.threadId ?? "")
       && COORDINATION_ID_PATTERN.test(candidate.lease?.id ?? "")
       && THREAD_ID_PATTERN.test(candidateLane.threadId ?? "")
       && candidateLane.source === "codex" && candidateLane.taskType === "peer_task"
-      && typeof candidateLane.workspacePath === "string"
-      && path.isAbsolute(candidateLane.workspacePath)
-      && holderWindow?.threadId === candidateLane.threadId
-      && holderWindow.codexHostId === candidateLane.codexHostId
-      && path.resolve(holderWindow.workspacePath ?? "")
-        === path.resolve(candidateLane.workspacePath);
+      && hasCompleteCodexLaunchRoute(candidateLane)
+      && candidate.lease.holderTaskId === candidateLane.id
+      && typeof candidate.label === "string" && candidate.label.trim()
+      && Array.isArray(candidate.writeScope)
+      && candidate.writeScope.every((entry) => typeof entry === "string" && entry.trim())
+      && Array.isArray(candidate.eligibleTaskIds)
+      && candidate.eligibleTaskIds.includes(candidateLane.id)
+      && candidate.eligibleTaskIds.every(
+        (entry) => typeof entry === "string" && entry.trim(),
+      );
     if (!exact) {
       domainCoordinatorShutdownIdleObservations.delete(candidateObservationKey);
       continue;
@@ -1429,7 +1440,7 @@ async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
     return { shutdown: false, reason: "thread-busy-or-drifted", domainId: domain.domainId };
   }
   const identity = domainCoordinatorShutdownIdentity(
-    policy.projectId, domain.domainId, windows.revision, domain.lease, lane,
+    policy.projectId, domain, domain.lease, lane,
     { ...globalLane, leaseId: globalLease.id },
   );
   const observedAt = options.now();
@@ -1443,8 +1454,11 @@ async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
   if (observedAt - observation.firstObservedAt < policy.idleGraceMs) {
     return { shutdown: false, reason: "idle-grace", domainId: domain.domainId };
   }
+  const requestIdentity = domainCoordinatorShutdownRequestIdentity(
+    identity.fingerprint, windows.revision,
+  );
   const requestAttempt = {
-    idempotencyKey: identity.idempotencyKey,
+    idempotencyKey: requestIdentity.idempotencyKey,
     projectId: policy.projectId, domainId: domain.domainId,
     ownedCodexHostId: hostExecutor.ownedCodexHostId,
     expectedRevision: windows.revision, expectedLeaseId: domain.lease.id,
