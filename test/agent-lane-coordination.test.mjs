@@ -34,6 +34,8 @@ async function setup() {
     tasks: [{
       id: "root", label: "Capstone Root", owner: "Codex", source: "codex",
       threadId: "root-thread", taskType: "root_task",
+      codexProjectId: "capstone-dev", codexProjectKind: "local", codexHostId: "local",
+      workspacePath: path.resolve("/tmp/agent-coordination-worktree"),
     }],
     adapters: [],
   });
@@ -125,6 +127,64 @@ test("uses durable Taskboard To-Dos and persists one complete Sub-Agent handoff"
   reopened.close();
 });
 
+test("bootstrap reservation rejects a stale local executor after the authoritative route moves remote", async () => {
+  const fixture = await setup();
+  let inspection = null;
+  try {
+    fixture.database.createComment(fixture.task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "focused tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:resume",
+        }],
+        actions: [{
+          id: "test", order: 10, text: "Run focused tests", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: fixture.rootBinding.threadId,
+      threadBinding: fixture.rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const localCapsule = fixture.database.getTaskCapsule(fixture.task.id);
+    const taskBeforeRouteChange = fixture.database.getTask(fixture.task.id);
+    const remoteBinding = {
+      threadId: fixture.rootBinding.threadId,
+      codexProjectId: "remote-project",
+      codexProjectKind: "remote",
+      codexHostId: "remote-builder",
+      workspacePath: "/srv/taskboard/root",
+    };
+    const moved = fixture.database.updateTask(
+      fixture.task.id,
+      taskBeforeRouteChange.version,
+      {},
+      remoteBinding.threadId,
+      remoteBinding,
+      actor,
+    );
+
+    assert.throws(() => fixture.database.claimTaskSafeAction(moved.id, {
+      rootThreadId: remoteBinding.threadId,
+      ownedCodexHostId: "local",
+      expectedResumeToken: localCapsule.resumeToken,
+      safeActionId: localCapsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "stale-local-executor",
+    }), (error) => error?.code === "HOST_EXECUTOR_MISMATCH");
+    inspection = new DatabaseSync(fixture.databasePath);
+    assert.equal(inspection.prepare(
+      "SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?",
+    ).get(moved.id).count, 0);
+  } finally {
+    try {
+      inspection?.close();
+    } finally {
+      fixture.database.close();
+    }
+  }
+});
+
 test("legacy bootstrap receipts migrate fail-closed instead of becoming reclaimable", async () => {
   const fixture = await setup();
   const token = "9".repeat(64);
@@ -182,7 +242,8 @@ test("legacy fixed-root receipt cannot cross into a later same-thread Global lea
   });
   const capsule = fixture.database.getTaskCapsule(legacyTask.id);
   const reservation = fixture.database.claimTaskSafeAction(legacyTask.id, {
-    rootThreadId: fixture.rootBinding.threadId, expectedResumeToken: capsule.resumeToken,
+    rootThreadId: fixture.rootBinding.threadId, ownedCodexHostId: "local",
+    expectedResumeToken: capsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "legacy-reservation",
   });
   assert.equal(reservation.receipt.globalCoordinatorLeaseId, null);
@@ -210,7 +271,8 @@ test("legacy fixed-root receipt cannot cross into a later same-thread Global lea
     safeActionId: "execute", reservationLeaseId: "legacy-reservation",
   }), (error) => error?.code === "RESUME_TOKEN_MISMATCH");
   assert.throws(() => fixture.database.claimTaskSafeAction(legacyTask.id, {
-    rootThreadId: fixture.rootBinding.threadId, expectedResumeToken: capsule.resumeToken,
+    rootThreadId: fixture.rootBinding.threadId, ownedCodexHostId: "local",
+    expectedResumeToken: capsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "global-reservation",
   }), (error) => error?.code === "RESUME_TOKEN_MISMATCH");
   assert.deepEqual(fixture.database.database.prepare(`
@@ -237,7 +299,7 @@ test("active Global and domain leases fail closed after their configured window 
     rootTaskId: "global",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/route-drift-owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "route-drift", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/route-drift-owner" },
       { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/route-drift-global" },
       { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "route-drift", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/route-drift-frontend" },
     ],
@@ -371,7 +433,8 @@ test("active Global and domain leases fail closed after their configured window 
   const capsule = database.getTaskCapsule(unassignedTodo.id);
   assert.notEqual(capsule.resumeToken, exactLeaseCapsule.resumeToken);
   assert.throws(() => database.claimTaskSafeAction(unassignedTodo.id, {
-    rootThreadId: "global-drifted", expectedResumeToken: capsule.resumeToken,
+    rootThreadId: "global-drifted", ownedCodexHostId: "local",
+    expectedResumeToken: capsule.resumeToken,
     safeActionId: "test", reservationLeaseId: "drifted-reservation",
   }), (error) => error?.code === "GLOBAL_COORDINATOR_BINDING_REQUIRED");
   assert.equal(database.database.prepare(
@@ -465,7 +528,8 @@ test("Global Coordinator arbitrates unassigned Todo scope before any Sub-Agent s
   const reserve = (task, suffix) => {
     const capsule = database.getTaskCapsule(task.id);
     const reservation = database.claimTaskSafeAction(task.id, {
-      rootThreadId: "global-thread", expectedResumeToken: capsule.resumeToken,
+      rootThreadId: "global-thread", ownedCodexHostId: "local",
+      expectedResumeToken: capsule.resumeToken,
       safeActionId: "execute", reservationLeaseId: `lease-${suffix}`,
     });
     database.confirmTaskSafeActionDelivery(task.id, {
@@ -524,7 +588,8 @@ test("Global Coordinator arbitrates unassigned Todo scope before any Sub-Agent s
   const nextCapsule = database.getTaskCapsule(frontendTask.id);
   assert.notEqual(nextCapsule.resumeToken, first.capsule.resumeToken);
   const nextAttempt = database.claimTaskSafeAction(frontendTask.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: nextCapsule.resumeToken,
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: nextCapsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "lease-frontend-next",
   });
   assert.notEqual(
@@ -630,11 +695,13 @@ test("Global Coordinator arbitrates unassigned Todo scope before any Sub-Agent s
     },
   }), (error) => error?.code === "GLOBAL_COORDINATOR_LEASE_MISMATCH");
   assert.throws(() => database.claimTaskSafeAction(deferredTask.id, {
-    rootThreadId: "global-thread", expectedResumeToken: deferred.capsule.resumeToken,
+    rootThreadId: "global-thread", ownedCodexHostId: "local",
+    expectedResumeToken: deferred.capsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "lease-b-deferred",
   }), (error) => error?.code === "RESUME_TOKEN_MISMATCH");
   assert.throws(() => database.claimTaskSafeAction(crossDomainTask.id, {
-    rootThreadId: "global-thread", expectedResumeToken: crossDomain.capsule.resumeToken,
+    rootThreadId: "global-thread", ownedCodexHostId: "local",
+    expectedResumeToken: crossDomain.capsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "lease-b-recovery",
   }), (error) => error?.code === "RESUME_TOKEN_MISMATCH");
   assert.equal(database.getTask(crossDomainTask.id).version, crossDomainVersionBeforeEpochChange);
@@ -719,7 +786,8 @@ test("Global Coordinator arbitrates unassigned Todo scope before any Sub-Agent s
     null,
   );
   assert.throws(() => database.claimTaskSafeAction(noGlobalTask.id, {
-    rootThreadId: ownerBinding.threadId, expectedResumeToken: noGlobalCapsule.resumeToken,
+    rootThreadId: ownerBinding.threadId, ownedCodexHostId: "local",
+    expectedResumeToken: noGlobalCapsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "owner-bypass",
   }), (error) => error?.code === "GLOBAL_COORDINATOR_LEASE_REQUIRED");
   assert.equal(database.database.prepare(`
@@ -745,7 +813,8 @@ test("Global Coordinator arbitrates unassigned Todo scope before any Sub-Agent s
     null,
   );
   assert.throws(() => database.claimTaskSafeAction(incompleteTask.id, {
-    rootThreadId: "global-thread", expectedResumeToken: incompleteCapsule.resumeToken,
+    rootThreadId: "global-thread", ownedCodexHostId: "local",
+    expectedResumeToken: incompleteCapsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "incomplete-bypass",
   }), (error) => error?.code === "GLOBAL_COORDINATOR_BINDING_REQUIRED");
   assert.equal(database.database.prepare(`
@@ -859,7 +928,12 @@ test("Owner Intent replay is bound to its Taskboard project", async () => {
     rootTaskId: "coordinator",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      {
+        id: "owner", label: "Owner", owner: "Codex", source: "codex",
+        threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "shared-codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/owner",
+      },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -878,6 +952,10 @@ test("Owner Intent replay is bound to its Taskboard project", async () => {
     ownerRootTaskId: "owner", ownerRootThreadId: "owner-thread",
     ownerTurnId: "shared-owner-turn", rootCaptureTurnId: "shared-capture-turn", evidence: "synthetic",
   };
+  assert.throws(() => database.recordProjectOwnerIntent(
+    "intent-project-a", input, { ...sourceBinding, codexProjectKind: "remote" }, actor,
+  ), (error) => error?.code === "OWNER_ROOT_ROUTE_STALE");
+  assert.equal(database.listProjectOwnerIntents("intent-project-a").length, 0);
   database.recordProjectOwnerIntent("intent-project-a", input, sourceBinding, actor);
   assert.throws(() => database.recordProjectOwnerIntent(
     "intent-project-b", input, sourceBinding, actor,
@@ -916,7 +994,7 @@ test("Owner Root lease, cancel plans, and plan-owned task moves fail closed", as
   database.upsertAgentLaneProject("authority-a", {
     rootTaskId: "coordinator", ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "authority", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -1056,12 +1134,14 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   assert.equal(replayed.task.version, assigned.task.version);
   const firstToken = database.getTaskCapsule(task.id).resumeToken;
   const firstReservation = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: firstToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: firstToken, safeActionId: "test",
     reservationLeaseId: "frontend-reservation",
   });
   assert.equal(firstReservation.reused, false);
   const competingReservation = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: firstToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: firstToken, safeActionId: "test",
     reservationLeaseId: "competing-reservation",
   });
   assert.equal(competingReservation.available, false);
@@ -1069,7 +1149,8 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
     UPDATE task_safe_action_receipts SET lease_expires_at = ? WHERE id = ?
   `).run("2000-01-01T00:00:00.000Z", firstReservation.receipt.id);
   const reclaimedReservation = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: firstToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: firstToken, safeActionId: "test",
     reservationLeaseId: "reclaimed-reservation",
   });
   assert.equal(reclaimedReservation.available, true);
@@ -1079,7 +1160,8 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
     reservationLeaseId: "reclaimed-reservation",
   }).receipt.status, "delivering");
   const concurrentRecovery = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: firstToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: firstToken, safeActionId: "test",
     reservationLeaseId: "concurrent-recovery",
   });
   assert.equal(concurrentRecovery.available, false);
@@ -1104,7 +1186,8 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
     holderTaskId: "frontend-next", holderThreadId: "frontend-next-thread", status: "active",
   });
   const blockedDuringDelivery = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-next-thread", expectedResumeToken: takeoverCapsule.resumeToken, safeActionId: "test",
+    rootThreadId: "frontend-next-thread", ownedCodexHostId: "local",
+    expectedResumeToken: takeoverCapsule.resumeToken, safeActionId: "test",
     reservationLeaseId: "frontend-next-reservation",
   });
   assert.equal(blockedDuringDelivery.available, false);
@@ -1161,7 +1244,8 @@ test("domain-assigned Todo routes and claims only inside the active domain scope
   const reopened = new TaskboardDatabase(databasePath, databaseOptions);
   assert.equal(reopened.getAgentTaskDomainAssignment(task.id).domainId, "frontend");
   const persistedAdmission = reopened.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: firstToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: firstToken, safeActionId: "test",
     reservationLeaseId: "after-reopen-reservation",
   });
   assert.equal(persistedAdmission.available, false);
@@ -1458,6 +1542,7 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
     globalHolderThreadId: "global-thread", codexProjectId: projectId,
     codexProjectKind: "local", codexHostId: "local",
     workspacePath: `/tmp/domain-provisioning-${domainId}`,
+    ownedCodexHostId: "local",
   });
 
   const frontendRequest = requestFor("frontend");
@@ -1505,34 +1590,36 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
 
   const reopened = new TaskboardDatabase(databasePath);
   const recovered = reopened.getAgentLaneDomainCoordinatorProvisioningAttempt(
-    projectId, "frontend", frontendRequest.idempotencyKey,
+    projectId, "frontend", frontendRequest.idempotencyKey, "local",
   );
   assert.equal(recovered.id, created.attempt.id);
   assert.equal(recovered.status, "pending");
   const starting = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "starting",
+    recovered.id, "starting", { ownedCodexHostId: "local" },
   );
   assert.equal(starting.attempt.status, "starting");
   assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "starting",
+    recovered.id, "starting", { ownedCodexHostId: "local" },
   ).attempt.status, "starting");
   const reset = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "reset",
+    recovered.id, "reset", { ownedCodexHostId: "local" },
   );
   assert.equal(reset.attempt.status, "pending");
   assert.equal(reset.attempt.retryCount, 1);
-  reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(recovered.id, "starting");
+  reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
+    recovered.id, "starting", { ownedCodexHostId: "local" },
+  );
   const threadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
   const attached = reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId },
+    recovered.id, "attach", { threadId, ownedCodexHostId: "local" },
   );
   assert.equal(attached.attempt.status, "started");
   assert.equal(attached.attempt.threadId, threadId);
   assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId },
+    recovered.id, "attach", { threadId, ownedCodexHostId: "local" },
   ).attempt.threadId, threadId);
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId: "different-thread" },
+    recovered.id, "attach", { threadId: "different-thread", ownedCodexHostId: "local" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT");
   const registration = {
     role: "coordinator", taskId: "frontend", label: "Frontend Coordinator",
@@ -1554,10 +1641,10 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
   );
   assert.equal(registered.applied, true);
   assert.equal(reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId },
+    recovered.id, "attach", { threadId, ownedCodexHostId: "local" },
   ).attempt.threadId, threadId);
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "attach", { threadId: "different-thread" },
+    recovered.id, "attach", { threadId: "different-thread", ownedCodexHostId: "local" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_THREAD_CONFLICT");
   const acquiredDomain = reopened.claimAgentLaneDomainCoordinator(projectId, "frontend", {
     holderTaskId: "frontend", holderThreadId: threadId,
@@ -1606,10 +1693,10 @@ test("domain Coordinator provisioning persists one idempotent attempt per domain
       : lane),
   });
   assert.throws(() => reopened.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-    recovered.id, "resume-expired",
+    recovered.id, "resume-expired", { ownedCodexHostId: "local" },
   ), (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_CANCELED");
   assert.equal(reopened.getAgentLaneDomainCoordinatorProvisioningAttempt(
-    projectId, "frontend",
+    projectId, "frontend", undefined, "local",
   ), null);
   const driftedRevision = reopened.getAgentLaneCoordinationWindows(projectId).revision;
   const replacement = reopened.requestAgentLaneDomainCoordinatorProvisioningAttempt(
@@ -1764,7 +1851,8 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   });
   const tokenA = database.getTaskCapsule(task.id).resumeToken;
   const reservationA = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: tokenA, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: tokenA, safeActionId: "test",
     reservationLeaseId: "reservation-a",
   });
   assert.equal(reservationA.receipt.domainCoordinatorLeaseId, "frontend-lease-a");
@@ -1800,7 +1888,8 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
   const tokenB = database.getTaskCapsule(task.id).resumeToken;
   assert.notEqual(tokenB, tokenA);
   const fenced = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: tokenB, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: tokenB, safeActionId: "test",
     reservationLeaseId: "reservation-b",
   });
   assert.equal(fenced.available, false);
@@ -1852,7 +1941,8 @@ test("domain safe-action receipts are fenced across same-holder lease recovery",
 
   const tokenC = database.getTaskCapsule(task.id).resumeToken;
   const rotated = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: tokenC, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: tokenC, safeActionId: "test",
     reservationLeaseId: "reservation-c",
   });
   assert.equal(rotated.available, true);
@@ -1987,7 +2077,8 @@ test("replacement coordinator retires only an absent child observed from the ori
   });
   const oldToken = database.getTaskCapsule(task.id).resumeToken;
   const reserved = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-old-thread", expectedResumeToken: oldToken, safeActionId: "test",
+    rootThreadId: "frontend-old-thread", ownedCodexHostId: "local",
+    expectedResumeToken: oldToken, safeActionId: "test",
     reservationLeaseId: "old-reservation",
   });
   const delivering = database.confirmTaskSafeActionDelivery(task.id, {
@@ -2207,7 +2298,8 @@ test("replacement coordinator retires only an absent child observed from the ori
   const currentToken = database.getTaskCapsule(task.id).resumeToken;
   assert.notEqual(currentToken, oldToken);
   const fresh = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-third-thread", expectedResumeToken: currentToken, safeActionId: "test",
+    rootThreadId: "frontend-third-thread", ownedCodexHostId: "local",
+    expectedResumeToken: currentToken, safeActionId: "test",
     reservationLeaseId: "new-reservation",
   });
   assert.equal(fresh.available, true);
@@ -2276,7 +2368,8 @@ test("domain coordinator retires an absent admission inherited from the assignin
 
   const globalToken = database.getTaskCapsule(task.id).resumeToken;
   const reserved = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "global-thread", expectedResumeToken: globalToken, safeActionId: "test",
+    rootThreadId: "global-thread", ownedCodexHostId: "local",
+    expectedResumeToken: globalToken, safeActionId: "test",
     reservationLeaseId: "global-reservation",
   });
   const delivering = database.confirmTaskSafeActionDelivery(task.id, {
@@ -2296,7 +2389,8 @@ test("domain coordinator retires an absent admission inherited from the assignin
   assert.notEqual(domainToken, globalToken);
 
   const blocked = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: domainToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: domainToken, safeActionId: "test",
     reservationLeaseId: "domain-reservation-before-recovery",
   });
   assert.equal(blocked.coordinatorLeaseChanged, true);
@@ -2474,7 +2568,8 @@ test("domain coordinator retires an absent admission inherited from the assignin
   assert.equal(absent.receipt.admissionState, "deferred");
 
   const fresh = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: domainToken, safeActionId: "test",
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: domainToken, safeActionId: "test",
     reservationLeaseId: "domain-reservation-after-recovery",
   });
   assert.equal(fresh.available, true);
@@ -2494,7 +2589,7 @@ test("Owner Intent supersede reopens outcomes and reconciles plan-owned dependen
     rootTaskId: "coordinator",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "plan-revision", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -2639,7 +2734,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   database.upsertAgentLaneProject("control-plane", {
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: ownerWorkspacePath },
+      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "control-plane", codexProjectKind: "local", codexHostId: "local", workspacePath: ownerWorkspacePath },
       { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
       { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "control-plane", codexProjectKind: "local", codexHostId: "local", workspacePath: frontendWorkspacePath },
     ],
@@ -2719,7 +2814,8 @@ test("headless control plane survives capacity defer and coordinator recovery wi
 
   const globalCapsule = database.getTaskCapsule(task.id);
   const globalReservation = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "global-thread", expectedResumeToken: globalCapsule.resumeToken,
+    rootThreadId: "global-thread", ownedCodexHostId: "local",
+    expectedResumeToken: globalCapsule.resumeToken,
     safeActionId: "execute", reservationLeaseId: "global-reservation",
   });
   database.confirmTaskSafeActionDelivery(task.id, {
@@ -2810,7 +2906,8 @@ test("headless control plane survives capacity defer and coordinator recovery wi
 
   const domainCapsuleA = database.getTaskCapsule(task.id);
   const domainReservationA = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: domainCapsuleA.resumeToken,
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: domainCapsuleA.resumeToken,
     safeActionId: "execute", reservationLeaseId: "domain-reservation-a",
   });
   database.confirmTaskSafeActionDelivery(task.id, {
@@ -2839,7 +2936,8 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   assert.equal(deferredReplay.receipt.admissionRetryCount, 1);
   assert.equal(deferredReplay.receipt.admissionRetryAfter, deferred.receipt.admissionRetryAfter);
   const retryReservation = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: domainCapsuleA.resumeToken,
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: domainCapsuleA.resumeToken,
     safeActionId: "execute", reservationLeaseId: "domain-capacity-retry",
   });
   assert.equal(retryReservation.available, true);
@@ -2883,7 +2981,8 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   assert.notEqual(recoveredCapsule.resumeToken, domainCapsuleA.resumeToken);
   assert.equal(database.getTaskSafeActionAdmission(task.id), null);
   assert.throws(() => database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: domainCapsuleA.resumeToken,
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: domainCapsuleA.resumeToken,
     safeActionId: "execute", reservationLeaseId: "stale-retry",
   }), (error) => error?.code === "RESUME_TOKEN_MISMATCH");
   assert.deepEqual(database.database.prepare(
@@ -2892,7 +2991,8 @@ test("headless control plane survives capacity defer and coordinator recovery wi
 
   const domainCapsuleB = database.getTaskCapsule(task.id);
   const domainReservationB = database.claimTaskSafeAction(task.id, {
-    rootThreadId: "frontend-thread", expectedResumeToken: domainCapsuleB.resumeToken,
+    rootThreadId: "frontend-thread", ownedCodexHostId: "local",
+    expectedResumeToken: domainCapsuleB.resumeToken,
     safeActionId: "execute", reservationLeaseId: "domain-reservation-b",
   });
   database.confirmTaskSafeActionDelivery(task.id, {
@@ -2938,7 +3038,7 @@ test("Owner Intent replanning is durably bounded after three invalid coordinator
     rootTaskId: "coordinator",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "retry-limit", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -2978,6 +3078,7 @@ test("Owner Intent replanning is durably bounded after three invalid coordinator
     const terminalStatus = attempt === 2 ? "interrupted" : "failed";
     let retried;
     const monitorResult = await runOwnerIntentPlanningMonitorOnce({
+      hostExecutor: { ownedCodexHostId: "local" },
       policy: { enabled: true, projectId: "retry-limit" },
       readSnapshot: async () => ({
         projectId: "retry-limit",
@@ -3055,7 +3156,8 @@ test("Agent Lane snapshot stays readable while an adopted Owner Intent waits for
     tasks: [
       {
         id: "owner", label: "Owner", owner: "Codex", source: "codex",
-        threadId: "owner-thread", taskType: "root_task", codexHostId: "local",
+        threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "intent-recovery", codexProjectKind: "local", codexHostId: "local",
         workspacePath: "/tmp/intent-recovery-owner",
       },
       {
@@ -3631,6 +3733,8 @@ test("projects safe continuation and one exact authorization gate into Agent Tod
   assert.equal(snapshot.coordination.ownerDecisionRequest.identifier, urgentTask.identifier);
   assert.equal(snapshot.coordination.ownerDecisionRequest.message, "同意 exact deployment");
   assert.equal(snapshot.coordination.ownerDecisionRequest.route.rootThreadId, fixture.rootBinding.threadId);
+  assert.equal(snapshot.coordination.ownerDecisionRequest.route.codexProjectId, fixture.rootBinding.codexProjectId);
+  assert.equal(snapshot.coordination.ownerDecisionRequest.route.codexProjectKind, fixture.rootBinding.codexProjectKind);
   fixture.database.close();
 });
 
@@ -3829,10 +3933,12 @@ test("reopened Todos ignore completed or interrupted historical next actions and
     let deliveries = 0;
     const reservationLeaseId = `retry-reservation-${finalState}`;
     const monitorOptions = {
+      hostExecutor: { ownedCodexHostId: "local" },
       policy: { enabled: true, projectId: "capstone-dev" },
       readSnapshot: async () => snapshot,
       claimReceipt: async (authorization) => fixture.database.claimTaskSafeAction(readyTask.id, {
         rootThreadId: authorization.rootThreadId,
+        ownedCodexHostId: authorization.ownedCodexHostId,
         expectedResumeToken: authorization.expectedResumeToken,
         safeActionId: authorization.safeActionId,
         reservationLeaseId,
