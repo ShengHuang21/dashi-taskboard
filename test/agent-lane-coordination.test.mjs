@@ -34,6 +34,8 @@ async function setup() {
     tasks: [{
       id: "root", label: "Capstone Root", owner: "Codex", source: "codex",
       threadId: "root-thread", taskType: "root_task",
+      codexProjectId: "capstone-dev", codexProjectKind: "local", codexHostId: "local",
+      workspacePath: path.resolve("/tmp/agent-coordination-worktree"),
     }],
     adapters: [],
   });
@@ -3457,6 +3459,8 @@ test("projects safe continuation and one exact authorization gate into Agent Tod
   assert.equal(snapshot.coordination.ownerDecisionRequest.identifier, urgentTask.identifier);
   assert.equal(snapshot.coordination.ownerDecisionRequest.message, "同意 exact deployment");
   assert.equal(snapshot.coordination.ownerDecisionRequest.route.rootThreadId, fixture.rootBinding.threadId);
+  assert.equal(snapshot.coordination.ownerDecisionRequest.route.codexProjectId, fixture.rootBinding.codexProjectId);
+  assert.equal(snapshot.coordination.ownerDecisionRequest.route.codexProjectKind, fixture.rootBinding.codexProjectKind);
   fixture.database.close();
 });
 

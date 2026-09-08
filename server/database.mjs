@@ -799,6 +799,17 @@ function sameThreadBinding(left, right) {
     && left.workspacePath === right.workspacePath;
 }
 
+function sameOwnerDecisionRouteBinding(route, binding) {
+  return Boolean(route && binding
+    && route.rootThreadId === binding.threadId
+    && route.codexProjectId === binding.codexProjectId
+    && route.codexProjectKind === binding.codexProjectKind
+    && route.codexHostId === binding.codexHostId
+    && typeof route.rootWorkspacePath === "string"
+    && typeof binding.workspacePath === "string"
+    && path.resolve(route.rootWorkspacePath) === path.resolve(binding.workspacePath));
+}
+
 function sameDevelopmentContext(left, right) {
   if (left === right) return true;
   if (!left || !right) return false;
@@ -1621,6 +1632,8 @@ export class TaskboardDatabase {
         coordinator_epoch TEXT NOT NULL,
         root_task_id TEXT NOT NULL,
         root_thread_id TEXT NOT NULL,
+        codex_project_id TEXT NOT NULL,
+        codex_project_kind TEXT NOT NULL CHECK (codex_project_kind IN ('local', 'remote')),
         codex_host_id TEXT NOT NULL,
         root_workspace_path TEXT NOT NULL,
         route_key TEXT NOT NULL UNIQUE,
@@ -2420,6 +2433,77 @@ export class TaskboardDatabase {
     ).all();
     if (!ownerDecisionDeliveryColumns.some((column) => column.name === "decision_expires_at")) {
       this.database.exec("ALTER TABLE owner_decision_deliveries ADD COLUMN decision_expires_at TEXT");
+    }
+    if (!ownerDecisionDeliveryColumns.some((column) => column.name === "codex_project_id")) {
+      this.database.exec("ALTER TABLE owner_decision_deliveries ADD COLUMN codex_project_id TEXT");
+    }
+    if (!ownerDecisionDeliveryColumns.some((column) => column.name === "codex_project_kind")) {
+      this.database.exec("ALTER TABLE owner_decision_deliveries ADD COLUMN codex_project_kind TEXT CHECK (codex_project_kind IN ('local', 'remote'))");
+    }
+    const recordedLegacyOwnerDecisionDeliveries = this.#prepare(`
+      SELECT
+        delivery.id,
+        delivery.codex_project_id,
+        delivery.codex_project_kind,
+        delivery.root_task_id,
+        delivery.root_thread_id,
+        delivery.codex_host_id,
+        delivery.root_workspace_path,
+        lane.config_json
+      FROM owner_decision_deliveries AS delivery
+      JOIN task_owner_decision_receipts AS receipt
+        ON receipt.delivery_id = delivery.id
+        AND receipt.request_id = delivery.request_id
+        AND receipt.task_id = delivery.task_id
+        AND receipt.project_id = delivery.project_id
+        AND receipt.expected_resume_token = delivery.expected_resume_token
+        AND receipt.root_task_id = delivery.root_task_id
+        AND receipt.root_thread_id = delivery.root_thread_id
+        AND receipt.coordinator_epoch = delivery.coordinator_epoch
+      JOIN agent_lane_projects AS lane ON lane.project_id = delivery.project_id
+      WHERE delivery.state = 'delivered'
+        AND (delivery.codex_project_id IS NULL OR delivery.codex_project_kind IS NULL)
+    `).all();
+    if (recordedLegacyOwnerDecisionDeliveries.length > 0) {
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        for (const delivery of recordedLegacyOwnerDecisionDeliveries) {
+          let config;
+          try {
+            config = JSON.parse(delivery.config_json);
+          } catch {
+            continue;
+          }
+          const matchingRootLanes = Array.isArray(config?.tasks)
+            ? config.tasks.filter((lane) => (
+                lane?.id === delivery.root_task_id
+                && lane.threadId === delivery.root_thread_id
+                && hasExactCodexHostBinding(lane)
+                && lane.codexHostId === delivery.codex_host_id
+                && typeof delivery.root_workspace_path === "string"
+                && path.isAbsolute(delivery.root_workspace_path)
+                && path.resolve(lane.workspacePath) === path.resolve(delivery.root_workspace_path)
+                && (delivery.codex_project_id === null
+                  || delivery.codex_project_id === lane.codexProjectId)
+                && (delivery.codex_project_kind === null
+                  || delivery.codex_project_kind === lane.codexProjectKind)
+              ))
+            : [];
+          if (matchingRootLanes.length !== 1) continue;
+          const [rootLane] = matchingRootLanes;
+          this.#prepare(`
+            UPDATE owner_decision_deliveries
+            SET codex_project_id = COALESCE(codex_project_id, ?),
+                codex_project_kind = COALESCE(codex_project_kind, ?)
+            WHERE id = ?
+              AND (codex_project_id IS NULL OR codex_project_kind IS NULL)
+          `).run(rootLane.codexProjectId, rootLane.codexProjectKind, delivery.id);
+        }
+        this.database.exec("COMMIT");
+      } catch (error) {
+        this.database.exec("ROLLBACK");
+        throw error;
+      }
     }
 
     const ownerIntentColumns = this.#prepare(
@@ -3780,31 +3864,25 @@ export class TaskboardDatabase {
       && timestampMs < observedAtMs - HOST_EXECUTOR_REPLAY_TTL_MS;
   }
 
-  #pruneHostExecutorHistoryInTransaction(observedAtMs, codexHostId = null) {
+  #pruneHostExecutorHistoryInTransaction(observedAtMs) {
     const cutoff = new Date(observedAtMs - HOST_EXECUTOR_REPLAY_TTL_MS).toISOString();
-    const hostPredicate = codexHostId === null ? "" : "AND codex_host_id = ?";
-    const parameters = (limit) => codexHostId === null
-      ? [cutoff, limit]
-      : [cutoff, codexHostId, limit];
     const receipts = this.#prepare(`
       DELETE FROM host_executor_lease_receipts WHERE rowid IN (
         SELECT rowid FROM host_executor_lease_receipts
         WHERE created_at < ? AND julianday(created_at) IS NOT NULL
-          ${hostPredicate}
         ORDER BY created_at, rowid
         LIMIT ?
       )
-    `).run(...parameters(HOST_EXECUTOR_RETENTION_BATCH_SIZE));
+    `).run(cutoff, HOST_EXECUTOR_RETENTION_BATCH_SIZE);
     const resolvedEffects = this.#prepare(`
       DELETE FROM host_executor_effects WHERE rowid IN (
         SELECT rowid FROM host_executor_effects
         WHERE status IN ('reserved', 'completed')
           AND updated_at < ? AND julianday(updated_at) IS NOT NULL
-          ${hostPredicate}
         ORDER BY updated_at, rowid
         LIMIT ?
       )
-    `).run(...parameters(HOST_EXECUTOR_RETENTION_BATCH_SIZE));
+    `).run(cutoff, HOST_EXECUTOR_RETENTION_BATCH_SIZE);
     const scrubbedEffects = this.#prepare(`
       UPDATE host_executor_effects
       SET operations_json = '[]', result_json = NULL
@@ -3813,11 +3891,10 @@ export class TaskboardDatabase {
         WHERE status IN ('dispatched', 'uncertain')
           AND updated_at < ? AND julianday(updated_at) IS NOT NULL
           AND (operations_json <> '[]' OR result_json IS NOT NULL)
-          ${hostPredicate}
         ORDER BY updated_at, rowid
         LIMIT ?
       )
-    `).run(...parameters(HOST_EXECUTOR_RETENTION_BATCH_SIZE));
+    `).run(cutoff, HOST_EXECUTOR_RETENTION_BATCH_SIZE);
     return {
       receipts: Number(receipts.changes),
       resolvedEffects: Number(resolvedEffects.changes),
@@ -4145,7 +4222,7 @@ export class TaskboardDatabase {
         observedAtMs,
       } = this.#requireActiveHostExecutorFence(input.execution);
       const timestamp = new Date(observedAtMs).toISOString();
-      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, execution.codexHostId);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const expectedAdapterId = execution.codexHostId === "local"
         ? LOCAL_HOST_EXECUTOR_ADAPTER_ID
         : REMOTE_HOST_EXECUTOR_ADAPTER_ID;
@@ -4267,7 +4344,7 @@ export class TaskboardDatabase {
     try {
       const { execution, observedAtMs } = this.#requireActiveHostExecutorFence(input.execution);
       const timestamp = new Date(observedAtMs).toISOString();
-      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, execution.codexHostId);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const row = this.#retainHostExecutorEffectRow(this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(input.effectKey), observedAtMs);
@@ -4325,7 +4402,7 @@ export class TaskboardDatabase {
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
       if (row) {
-        this.#pruneHostExecutorHistoryInTransaction(observedAtMs, row.codex_host_id);
+        this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
         row = this.#retainHostExecutorEffectRow(this.#prepare(`
           SELECT * FROM host_executor_effects WHERE effect_key = ?
         `).get(effectKey), observedAtMs);
@@ -4372,7 +4449,7 @@ export class TaskboardDatabase {
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
       if (row) {
-        this.#pruneHostExecutorHistoryInTransaction(observedAtMs, row.codex_host_id);
+        this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
         row = this.#retainHostExecutorEffectRow(this.#prepare(`
           SELECT * FROM host_executor_effects WHERE effect_key = ?
         `).get(effectKey), observedAtMs);
@@ -4409,7 +4486,7 @@ export class TaskboardDatabase {
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
       if (row) {
-        this.#pruneHostExecutorHistoryInTransaction(observedAtMs, row.codex_host_id);
+        this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
         row = this.#retainHostExecutorEffectRow(this.#prepare(`
           SELECT * FROM host_executor_effects WHERE effect_key = ?
         `).get(effectKey), observedAtMs);
@@ -4544,7 +4621,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { observedAtMs, timestamp } = this.#hostExecutorTime();
-      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, input.codexHostId);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const replay = this.#replayHostExecutorLease(input, observedAtMs);
       if (replay) {
         this.database.exec("COMMIT");
@@ -4623,7 +4700,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { observedAtMs, timestamp } = this.#hostExecutorTime();
-      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, input.codexHostId);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const replay = this.#replayHostExecutorLease(input, observedAtMs);
       if (replay) {
         this.database.exec("COMMIT");
@@ -4690,7 +4767,7 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { observedAtMs, timestamp } = this.#hostExecutorTime();
-      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, input.codexHostId);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const replay = this.#replayHostExecutorLease(input, observedAtMs);
       if (replay) {
         this.database.exec("COMMIT");
@@ -9588,8 +9665,11 @@ export class TaskboardDatabase {
       if (route.coordinatorEpoch !== input.coordinatorEpoch
         || route.rootTaskId !== input.route.rootTaskId
         || route.rootThreadId !== input.route.rootThreadId
+        || route.codexProjectId !== input.route.codexProjectId
+        || route.codexProjectKind !== input.route.codexProjectKind
         || route.codexHostId !== input.route.codexHostId
-        || path.resolve(route.rootWorkspacePath) !== path.resolve(input.route.rootWorkspacePath)) {
+        || path.resolve(route.rootWorkspacePath) !== path.resolve(input.route.rootWorkspacePath)
+        || !sameOwnerDecisionRouteBinding(input.route, input.observedRootBinding)) {
         throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before delivery");
       }
       const routeKey = createHash("sha256").update(JSON.stringify([
@@ -9599,13 +9679,52 @@ export class TaskboardDatabase {
         input.coordinatorEpoch,
         input.route.rootTaskId,
         input.route.rootThreadId,
+        input.route.codexProjectId,
+        input.route.codexProjectKind,
         input.route.codexHostId,
-        input.route.rootWorkspacePath,
+        path.resolve(input.route.rootWorkspacePath),
       ])).digest("hex");
+      const observedAt = now();
+      const routeConflict = this.#prepare(`
+        SELECT * FROM owner_decision_deliveries
+        WHERE project_id = ? AND task_id = ? AND request_id = ?
+          AND expected_resume_token = ? AND route_key <> ?
+        ORDER BY claimed_at DESC, rowid DESC
+        LIMIT 1
+      `).get(projectId, task.id, input.requestId, input.expectedResumeToken, routeKey);
+      if (routeConflict) {
+        const reservationExpiresAt = Date.parse(routeConflict.reservation_expires_at ?? "");
+        const persistedDecisionExpiry = Date.parse(routeConflict.decision_expires_at ?? "");
+        const deliveredAt = Date.parse(routeConflict.delivered_at ?? "");
+        const derivedDecisionExpiry = Number.isFinite(deliveredAt)
+          ? deliveredAt + OWNER_DECISION_RESPONSE_TTL_MS
+          : Number.NaN;
+        const active = routeConflict.state === "reserved"
+          ? !Number.isFinite(reservationExpiresAt) || reservationExpiresAt > Date.now()
+          : !Number.isFinite(persistedDecisionExpiry)
+            ? !Number.isFinite(derivedDecisionExpiry) || derivedDecisionExpiry > Date.now()
+            : persistedDecisionExpiry > Date.now();
+        if (active) {
+          throw new ApiError(
+            409,
+            "OWNER_DECISION_ROUTE_STALE",
+            "An earlier Owner decision route remains active for this request",
+          );
+        }
+      }
       const existing = this.#prepare(`
         SELECT * FROM owner_decision_deliveries WHERE route_key = ?
       `).get(routeKey);
-      const observedAt = now();
+      if (existing && (
+        existing.root_task_id !== input.route.rootTaskId
+        || existing.root_thread_id !== input.route.rootThreadId
+        || existing.codex_project_id !== input.route.codexProjectId
+        || existing.codex_project_kind !== input.route.codexProjectKind
+        || existing.codex_host_id !== input.route.codexHostId
+        || path.resolve(existing.root_workspace_path) !== path.resolve(input.route.rootWorkspacePath)
+      )) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision delivery route identity is not reusable");
+      }
       if (existing?.state === "delivered") {
         if (!existing.decision_expires_at) {
           const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
@@ -9645,12 +9764,14 @@ export class TaskboardDatabase {
         this.#prepare(`
           INSERT INTO owner_decision_deliveries (
             id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
-            root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+            root_task_id, root_thread_id, codex_project_id, codex_project_kind,
+            codex_host_id, root_workspace_path, route_key,
             state, reservation_expires_at, claimed_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)
         `).run(
           id, input.requestId, task.id, projectId, input.expectedResumeToken,
           input.coordinatorEpoch, input.route.rootTaskId, input.route.rootThreadId,
+          input.route.codexProjectId, input.route.codexProjectKind,
           input.route.codexHostId, input.route.rootWorkspacePath, routeKey,
           reservationExpiresAt, observedAt,
         );
@@ -9677,19 +9798,21 @@ export class TaskboardDatabase {
         input.hostExecutorExecution,
         row.codex_host_id,
       );
+      const route = this.#currentOwnerDecisionRoute(projectId);
+      if (route.coordinatorEpoch !== row.coordinator_epoch
+        || route.rootTaskId !== row.root_task_id
+        || route.rootThreadId !== row.root_thread_id
+        || route.codexProjectId !== row.codex_project_id
+        || route.codexProjectKind !== row.codex_project_kind
+        || route.codexHostId !== row.codex_host_id
+        || path.resolve(route.rootWorkspacePath) !== path.resolve(row.root_workspace_path)) {
+        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before confirmation");
+      }
       if (row.state === "delivered") {
         if (row.delivery_turn_id !== input.deliveryTurnId) {
           throw new ApiError(409, "OWNER_DECISION_DELIVERY_CONFLICT", "Owner decision delivery is already bound to another Root turn");
         }
         if (!row.decision_expires_at) {
-          const route = this.#currentOwnerDecisionRoute(projectId);
-          if (route.coordinatorEpoch !== row.coordinator_epoch
-            || route.rootTaskId !== row.root_task_id
-            || route.rootThreadId !== row.root_thread_id
-            || route.codexHostId !== row.codex_host_id
-            || path.resolve(route.rootWorkspacePath) !== path.resolve(row.root_workspace_path)) {
-            throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision Root route changed before confirmation replay");
-          }
           const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
           this.#extendCoordinatorLeaseForOwnerDecision(projectId, route, decisionExpiresAt);
           this.#prepare(`
@@ -9701,14 +9824,6 @@ export class TaskboardDatabase {
       }
       if (Date.parse(row.reservation_expires_at) <= Date.now()) {
         throw new ApiError(409, "OWNER_DECISION_DELIVERY_EXPIRED", "Owner decision delivery reservation expired before confirmation");
-      }
-      const route = this.#currentOwnerDecisionRoute(projectId);
-      if (route.coordinatorEpoch !== row.coordinator_epoch
-        || route.rootTaskId !== row.root_task_id
-        || route.rootThreadId !== row.root_thread_id
-        || route.codexHostId !== row.codex_host_id
-        || path.resolve(route.rootWorkspacePath) !== path.resolve(row.root_workspace_path)) {
-        throw new ApiError(409, "OWNER_DECISION_ROUTE_STALE", "Owner decision coordinator route changed before confirmation");
       }
       const timestamp = now();
       const decisionExpiresAt = new Date(Date.now() + OWNER_DECISION_RESPONSE_TTL_MS).toISOString();
@@ -9747,16 +9862,15 @@ export class TaskboardDatabase {
     const rootLane = Array.isArray(config.tasks)
       ? config.tasks.find((candidate) => candidate.id === rootTaskId)
       : null;
-    if (!rootLane?.threadId
-      || !rootLane.codexHostId
-      || typeof rootLane.workspacePath !== "string"
-      || !path.isAbsolute(rootLane.workspacePath)) {
+    if (!rootLane?.threadId || !hasExactCodexHostBinding(rootLane)) {
       throw new ApiError(409, "OWNER_DECISION_ROUTE_NOT_READY", "Owner Root has no confirmed thread route");
     }
     return {
       coordinatorTaskId,
       rootTaskId,
       rootThreadId: rootLane.threadId,
+      codexProjectId: rootLane.codexProjectId,
+      codexProjectKind: rootLane.codexProjectKind,
       codexHostId: rootLane.codexHostId,
       rootWorkspacePath: path.resolve(rootLane.workspacePath),
       coordinatorEpoch,
@@ -9790,13 +9904,62 @@ export class TaskboardDatabase {
     });
   }
 
-  recordTaskOwnerDecision(taskId, input, actor) {
+  recordTaskOwnerDecision(taskId, input, observedRootBinding, actor) {
     if (actor.type !== "agent") {
       throw new ApiError(403, "OWNER_DECISION_ROOT_REQUIRED", "Only the confirmed Codex Root may attest an Owner decision");
     }
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(taskId);
+      const existingRow = this.#prepare(`
+        SELECT * FROM task_owner_decision_receipts WHERE request_id = ? OR receipt = ?
+      `).get(input.requestId, input.receipt);
+      if (existingRow) {
+        const existing = ownerDecisionReceiptFromRow(existingRow);
+        const replayDelivery = this.#prepare(`
+          SELECT * FROM owner_decision_deliveries WHERE id = ?
+        `).get(existing.deliveryId);
+        const exactReplay = replayDelivery
+          && replayDelivery.state === "delivered"
+          && replayDelivery.id === input.deliveryId
+          && replayDelivery.task_id === task.id
+          && replayDelivery.project_id === task.projectId
+          && replayDelivery.request_id === existing.requestId
+          && replayDelivery.expected_resume_token === existing.expectedResumeToken
+          && replayDelivery.root_task_id === existing.rootTaskId
+          && replayDelivery.root_thread_id === existing.rootThreadId
+          && replayDelivery.coordinator_epoch === existing.coordinatorEpoch
+          && replayDelivery.root_thread_id === input.rootThreadId
+          && replayDelivery.codex_host_id === input.rootCodexHostId
+          && typeof replayDelivery.root_workspace_path === "string"
+          && path.resolve(replayDelivery.root_workspace_path) === path.resolve(input.rootWorkspacePath)
+          && replayDelivery.codex_project_id === input.rootCodexProjectId
+          && replayDelivery.codex_project_kind === input.rootCodexProjectKind
+          && existing.requestId === input.requestId
+          && existing.taskId === task.id
+          && existing.projectId === task.projectId
+          && existing.expectedResumeToken === input.expectedResumeToken
+          && existing.outcome === input.outcome
+          && existing.deliveryId === input.deliveryId
+          && existing.rootThreadId === input.rootThreadId
+          && existing.ownerTurnId === input.ownerTurnId
+          && existing.rootDecisionTurnId === input.rootDecisionTurnId
+          && existing.evidence === input.evidence
+          && existing.receipt === input.receipt
+          && existing.decidedAt === input.decidedAt;
+        if (!exactReplay) {
+          throw new ApiError(409, "OWNER_DECISION_CONFLICT", "Decision request or receipt is already bound to different evidence");
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, receipt: existing, capsule: this.getTaskCapsule(task.id) };
+      }
+      if (!observedRootBinding) {
+        throw new ApiError(
+          409,
+          "HOST_IDENTITY_UNAVAILABLE",
+          "Owner decision must come from the fresh protected Owner Root host identity",
+        );
+      }
       const delivery = this.#prepare(`
         SELECT * FROM owner_decision_deliveries WHERE id = ?
       `).get(input.deliveryId);
@@ -9805,41 +9968,35 @@ export class TaskboardDatabase {
         || delivery.task_id !== task.id
         || delivery.request_id !== input.requestId
         || delivery.expected_resume_token !== input.expectedResumeToken
-        || delivery.root_thread_id !== input.rootThreadId) {
+        || delivery.root_thread_id !== input.rootThreadId
+        || delivery.codex_project_id !== input.rootCodexProjectId
+        || delivery.codex_project_kind !== input.rootCodexProjectKind
+        || delivery.codex_host_id !== input.rootCodexHostId
+        || typeof delivery.root_workspace_path !== "string"
+        || path.resolve(delivery.root_workspace_path) !== path.resolve(input.rootWorkspacePath)) {
         throw new ApiError(409, "OWNER_DECISION_DELIVERY_REQUIRED", "Decision requires a host-observed exact Root delivery and Owner turn");
+      }
+      if (!sameOwnerDecisionRouteBinding({
+          rootThreadId: delivery.root_thread_id,
+          codexProjectId: delivery.codex_project_id,
+          codexProjectKind: delivery.codex_project_kind,
+          codexHostId: delivery.codex_host_id,
+          rootWorkspacePath: delivery.root_workspace_path,
+        }, observedRootBinding)) {
+        throw new ApiError(409, "OWNER_DECISION_ROOT_MISMATCH", "Decision delivery no longer matches the fresh protected Owner Root host identity");
       }
       this.#requireResidentMutationHostExecutorFence(
         input.hostExecutorExecution,
         delivery.codex_host_id,
       );
-      const existingRow = this.#prepare(`
-        SELECT * FROM task_owner_decision_receipts WHERE request_id = ? OR receipt = ?
-      `).get(input.requestId, input.receipt);
-      if (existingRow) {
-        const existing = ownerDecisionReceiptFromRow(existingRow);
-        if (existing.requestId === input.requestId
-          && existing.taskId === task.id
-          && existing.expectedResumeToken === input.expectedResumeToken
-          && existing.outcome === input.outcome
-          && existing.deliveryId === input.deliveryId
-          && existing.rootThreadId === delivery.root_thread_id
-          && existing.coordinatorEpoch === delivery.coordinator_epoch
-          && existing.ownerTurnId === input.ownerTurnId
-          && existing.rootDecisionTurnId === input.rootDecisionTurnId
-          && existing.evidence === input.evidence
-          && existing.receipt === input.receipt
-          && existing.decidedAt === input.decidedAt) {
-          this.database.exec("COMMIT");
-          return { applied: false, receipt: existing, capsule: this.getTaskCapsule(task.id) };
-        }
-        throw new ApiError(409, "OWNER_DECISION_CONFLICT", "Decision request or receipt is already bound to different evidence");
-      }
       if (!delivery.decision_expires_at || Date.parse(delivery.decision_expires_at) <= Date.now()) {
         throw new ApiError(409, "OWNER_DECISION_DELIVERY_EXPIRED", "Owner decision response window has expired");
       }
       const currentRoute = this.#currentOwnerDecisionRoute(task.projectId);
       if (currentRoute.rootTaskId !== delivery.root_task_id
         || currentRoute.rootThreadId !== delivery.root_thread_id
+        || currentRoute.codexProjectId !== delivery.codex_project_id
+        || currentRoute.codexProjectKind !== delivery.codex_project_kind
         || currentRoute.codexHostId !== delivery.codex_host_id
         || path.resolve(currentRoute.rootWorkspacePath) !== path.resolve(delivery.root_workspace_path)
         || currentRoute.coordinatorEpoch !== delivery.coordinator_epoch) {

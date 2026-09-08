@@ -74,6 +74,31 @@ function hostExecutorOwnsCanonicalRoute(hostExecutor, route) {
     && hostExecutorOwnsRoute(hostExecutor, route);
 }
 
+function hasCompleteOwnerDecisionRoute(route) {
+  return Boolean(
+    COORDINATION_ID_PATTERN.test(route?.rootTaskId ?? "")
+    && THREAD_ID_PATTERN.test(route?.rootThreadId ?? "")
+    && hasCompleteCodexLaunchRoute({
+      codexProjectId: route?.codexProjectId,
+      codexProjectKind: route?.codexProjectKind,
+      codexHostId: route?.codexHostId,
+      workspacePath: route?.rootWorkspacePath,
+    }),
+  );
+}
+
+function ownerDecisionRouteMatchesLane(route, lane) {
+  return Boolean(hasCompleteOwnerDecisionRoute(route)
+    && lane?.id === route.rootTaskId
+    && lane.threadId === route.rootThreadId
+    && lane.codexProjectId === route.codexProjectId
+    && lane.codexProjectKind === route.codexProjectKind
+    && lane.codexHostId === route.codexHostId
+    && typeof lane.workspacePath === "string"
+    && path.isAbsolute(lane.workspacePath)
+    && path.resolve(lane.workspacePath) === path.resolve(route.rootWorkspacePath));
+}
+
 function hostProjectMonitorRunKey(hostExecutor, projectId) {
   return JSON.stringify([hostExecutor.ownedCodexHostId, projectId]);
 }
@@ -3078,6 +3103,9 @@ export async function deliverTaskboardCoordination(
 }
 
 export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = false } = {}) {
+  if (!hasCompleteOwnerDecisionRoute(request?.route)) {
+    throw new Error("Owner decision delivery requires one complete protected Root identity");
+  }
   const threadResult = await rpc("thread/read", {
     threadId: request.route.rootThreadId,
     includeTurns: true,
@@ -3124,6 +3152,9 @@ export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = f
 }
 
 export async function observeTaskboardOwnerDecision(request, receipt, rpc) {
+  if (!hasCompleteOwnerDecisionRoute(request?.route)) {
+    throw new Error("Owner decision observation requires one complete protected Root identity");
+  }
   const threadResult = await rpc("thread/read", {
     threadId: request.route.rootThreadId,
     includeTurns: true,
@@ -3983,6 +4014,9 @@ async function runOwnerDecisionMonitorOnceUnlocked({
 }) {
   const snapshot = await readSnapshot(policy.projectId);
   const request = snapshot?.coordination?.ownerDecisionRequest;
+  const ownerLane = Array.isArray(snapshot?.taskLanes)
+    ? snapshot.taskLanes.find((lane) => lane?.id === request?.route?.rootTaskId) ?? null
+    : null;
   if (snapshot?.projectId !== policy.projectId
     || !request
     || !RESUME_TOKEN_PATTERN.test(request.requestId ?? "")
@@ -3993,9 +4027,7 @@ async function runOwnerDecisionMonitorOnceUnlocked({
     || !request.message.trim()
     || typeof request.coordinatorEpoch !== "string"
     || !request.coordinatorEpoch
-    || !THREAD_ID_PATTERN.test(request.route?.rootThreadId ?? "")
-    || typeof request.route?.rootWorkspacePath !== "string"
-    || !path.isAbsolute(request.route.rootWorkspacePath)) {
+    || !ownerDecisionRouteMatchesLane(request.route, ownerLane)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
   }
   if (!hostExecutorOwnsCanonicalRoute(hostExecutor, request.route)) {
@@ -4031,11 +4063,16 @@ async function runOwnerDecisionMonitorOnceUnlocked({
   const decision = await observeDecision(request, deliveryReceipt);
   if (decision) {
     const recorded = await recordDecision({
+      ...decision,
       taskId: request.identifier,
       requestId: request.requestId,
       expectedResumeToken: request.expectedResumeToken,
       deliveryId: deliveryReceipt.id,
-      ...decision,
+      rootThreadId: request.route.rootThreadId,
+      rootCodexProjectId: request.route.codexProjectId,
+      rootCodexProjectKind: request.route.codexProjectKind,
+      rootCodexHostId: request.route.codexHostId,
+      rootWorkspacePath: request.route.rootWorkspacePath,
     });
     if (recorded?.applied !== true && recorded?.applied !== false) {
       return { delivered: false, reason: "decision-not-recorded" };

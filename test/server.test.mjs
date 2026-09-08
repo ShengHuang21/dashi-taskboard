@@ -1818,11 +1818,13 @@ test("Root records one immutable Owner decision receipt from the project-level r
       ownerRootTaskId: "owner-root",
       tasks: [{
         id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
-        threadId: rootThreadId, taskType: "root_task", codexHostId: "local",
+        threadId: rootThreadId, taskType: "root_task",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
         workspacePath: ownerWorkspacePath,
       }, {
         id: "coordinator", label: "Coordinator", owner: "Codex Root", source: "codex",
-        threadId: coordinatorThreadId, taskType: "root_task", codexHostId: "local",
+        threadId: coordinatorThreadId, taskType: "root_task",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
         workspacePath: coordinatorWorkspacePath,
       }],
       adapters: [],
@@ -1875,6 +1877,8 @@ test("Root records one immutable Owner decision receipt from the project-level r
   const pending = lanes.body.coordination.ownerDecisionRequest;
   assert.equal(pending.identifier, task.identifier);
   assert.equal(pending.route.rootThreadId, rootThreadId);
+  assert.equal(pending.route.codexProjectId, "local-project");
+  assert.equal(pending.route.codexProjectKind, "local");
   assert.equal(pending.coordinatorEpoch, "lease:owner-decision-lease");
   assert.equal(lanes.body.todos.filter((todo) => todo.readyWork.approvalRequest).length, 1);
 
@@ -1885,6 +1889,10 @@ test("Root records one immutable Owner decision receipt from the project-level r
     ownerTurnId: "owner-turn-1",
     rootDecisionTurnId: "root-decision-turn-1",
     rootThreadId,
+    rootCodexProjectId: pending.route.codexProjectId,
+    rootCodexProjectKind: pending.route.codexProjectKind,
+    rootCodexHostId: pending.route.codexHostId,
+    rootWorkspacePath: pending.route.rootWorkspacePath,
     evidence: "Owner approved in the confirmed Root window",
     receipt: "owner-turn:decision-1",
     decidedAt: new Date().toISOString(),
@@ -1904,13 +1912,56 @@ test("Root records one immutable Owner decision receipt from the project-level r
     "x-codex-taskboard-injector-nonce": nonce,
     "x-codex-taskboard-injector-proof": createHmac("sha256", instanceSecret).update(nonce).digest("hex"),
   });
+  const publishRootRuntime = (nonce, overrides = {}) => request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, nonce),
+    body: {
+      threadId: rootThreadId,
+      threadRunning: true,
+      threadTodoProgress: null,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: ownerWorkspacePath,
+      ...overrides,
+    },
+  });
   const unsignedDelivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     body: pending,
   });
   assert.equal(unsignedDelivery.response.status, 403);
+  assert.equal((await publishRootRuntime("8".repeat(32), {
+    codexProjectId: "drifted-project",
+  })).response.status, 200);
+  const projectDriftDelivery = await request(
+    baseUrl,
+    "/api/local/projects/local/owner-decision-delivery/claim",
+    {
+      method: "POST",
+      headers: injectorHeaders("b".repeat(32)),
+      body: pending,
+    },
+  );
+  assert.equal(projectDriftDelivery.response.status, 409);
+  assert.equal(projectDriftDelivery.body.error.code, "OWNER_DECISION_ROUTE_STALE");
+  assert.equal((await publishRootRuntime("ab".repeat(16))).response.status, 200);
+  const kindDriftDelivery = await request(
+    baseUrl,
+    "/api/local/projects/local/owner-decision-delivery/claim",
+    {
+      method: "POST",
+      headers: injectorHeaders("bc".repeat(16)),
+      body: {
+        ...pending,
+        route: { ...pending.route, codexProjectKind: "remote" },
+      },
+    },
+  );
+  assert.equal(kindDriftDelivery.response.status, 400);
+  assert.equal(kindDriftDelivery.body.error.code, "INVALID_FIELD");
   for (const [nonce, route] of [
-    ["a".repeat(32), { ...pending.route, codexHostId: "wrong-host" }],
+    ["a".repeat(32), { ...pending.route, codexProjectKind: "remote", codexHostId: "wrong-host" }],
     ["9".repeat(32), { ...pending.route, rootWorkspacePath: "/tmp/wrong-owner-decision" }],
   ]) {
     const mismatchedDelivery = await request(
@@ -1984,6 +2035,15 @@ test("Root records one immutable Owner decision receipt from the project-level r
   assert.equal(delivery.body.claimed, true);
   assert.equal("attestationToken" in delivery.body.receipt, false);
   const fixtureDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.deepEqual({ ...fixtureDatabase.prepare(`
+    SELECT codex_project_id, codex_project_kind, codex_host_id, root_workspace_path
+    FROM owner_decision_deliveries WHERE id = ?
+  `).get(delivery.body.receipt.id) }, {
+    codex_project_id: pending.route.codexProjectId,
+    codex_project_kind: pending.route.codexProjectKind,
+    codex_host_id: pending.route.codexHostId,
+    root_workspace_path: pending.route.rootWorkspacePath,
+  });
   const protectedConfig = JSON.parse(fixtureDatabase.prepare(`
     SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'
   `).get().config_json);
@@ -2079,6 +2139,7 @@ test("Root records one immutable Owner decision receipt from the project-level r
   const restartedAddress = await restartedApp.listen({ port: 0 });
   runningApps.push({ app: restartedApp, directory: firstServer.directory });
   baseUrl = `http://127.0.0.1:${restartedAddress.port}`;
+  assert.equal((await publishRootRuntime("cd".repeat(16))).response.status, 200);
   const durableReplay = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     headers: injectorHeaders("f".repeat(32)),
@@ -2108,6 +2169,40 @@ test("Root records one immutable Owner decision receipt from the project-level r
   `).get(retriedDelivery.body.receipt.id).decision_expires_at, backfilledDecision.decision_expires_at);
   stableBackfillDatabase.close();
 
+  const kindDriftDecision = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("de".repeat(16)),
+    body: {
+      ...decisionBody,
+      rootCodexProjectKind: "remote",
+      deliveryId: retriedDelivery.body.receipt.id,
+    },
+  });
+  assert.equal(kindDriftDecision.response.status, 400);
+  assert.equal(kindDriftDecision.body.error.code, "INVALID_FIELD");
+  assert.equal((await publishRootRuntime("ef".repeat(16), {
+    codexProjectId: "drifted-project",
+  })).response.status, 200);
+  const projectDriftDecision = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("12".repeat(16)),
+    body: {
+      ...decisionBody,
+      deliveryId: retriedDelivery.body.receipt.id,
+    },
+  });
+  assert.equal(projectDriftDecision.response.status, 409);
+  assert.equal(projectDriftDecision.body.error.code, "OWNER_DECISION_ROOT_MISMATCH");
+  const unchangedDecisionDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.equal(unchangedDecisionDatabase.prepare(
+    "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+  ).get().count, 0);
+  unchangedDecisionDatabase.close();
+  const unchangedCapsule = await request(baseUrl, `/api/tasks/${task.identifier}/capsule`);
+  assert.equal(unchangedCapsule.body.capsule.readyWork.ownerDecisionRequest.requestId, pending.requestId);
+  assert.deepEqual(unchangedCapsule.body.capsule.readyWork.safeActions, []);
+  assert.equal((await publishRootRuntime("23".repeat(16))).response.status, 200);
+
   const recorded = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
     method: "POST",
     headers: injectorHeaders("1".repeat(32)),
@@ -2122,6 +2217,40 @@ test("Root records one immutable Owner decision receipt from the project-level r
   assert.deepEqual(recorded.body.capsule.readyWork.safeActions.map((action) => action.id), ["push"]);
   assert.equal(recorded.body.capsule.readyWork.ownerDecisionRequest, null);
 
+  await new Promise((resolve) => setTimeout(resolve, 3_100));
+  const expiredObservationReplay = await request(
+    baseUrl,
+    `/api/tasks/${task.identifier}/owner-decisions`,
+    {
+      method: "POST",
+      headers: injectorHeaders("24".repeat(16)),
+      body: {
+        ...decisionBody,
+        deliveryId: retriedDelivery.body.receipt.id,
+      },
+    },
+  );
+  assert.equal(expiredObservationReplay.response.status, 200, JSON.stringify(expiredObservationReplay.body));
+  assert.equal(expiredObservationReplay.body.applied, false);
+  const expiredObservationConflict = await request(
+    baseUrl,
+    `/api/tasks/${task.identifier}/owner-decisions`,
+    {
+      method: "POST",
+      headers: injectorHeaders("25".repeat(16)),
+      body: {
+        ...decisionBody,
+        deliveryId: retriedDelivery.body.receipt.id,
+        outcome: "denied",
+      },
+    },
+  );
+  assert.equal(expiredObservationConflict.response.status, 409);
+  assert.equal(expiredObservationConflict.body.error.code, "OWNER_DECISION_CONFLICT");
+
+  const recordedServer = runningApps.pop();
+  await recordedServer.app.close();
+
   const releasedRouteDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
   assert.doesNotThrow(() => releasedRouteDatabase.upsertAgentLaneProject("local", {
     rootTaskId: "replacement",
@@ -2132,6 +2261,11 @@ test("Root records one immutable Owner decision receipt from the project-level r
     adapters: [],
   }));
   releasedRouteDatabase.close();
+
+  const replayApp = createTaskboardServer({ dataDirectory: recordedServer.directory, instanceSecret });
+  const replayAddress = await replayApp.listen({ port: 0 });
+  runningApps.push({ app: replayApp, directory: recordedServer.directory });
+  baseUrl = `http://127.0.0.1:${replayAddress.port}`;
 
   const replay = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
     method: "POST",
@@ -2154,8 +2288,368 @@ test("Root records one immutable Owner decision receipt from the project-level r
     },
   });
   assert.equal(conflict.response.status, 409);
+  assert.equal(conflict.body.error.code, "OWNER_DECISION_CONFLICT");
   const after = await request(baseUrl, `/api/tasks/${task.identifier}/capsule`);
   assert.deepEqual(after.body.capsule.readyWork.safeActions.map((action) => action.id), ["push"]);
+});
+
+test("legacy Owner decision deliveries remain fail-closed after project identity migration", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-owner-decision-legacy-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const rootBinding = {
+    threadId: "legacy-owner-root-thread",
+    codexProjectId: "legacy-owner-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: path.resolve("/tmp/legacy-owner-decision-root"),
+  };
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  let database = new TaskboardDatabase(databasePath);
+  try {
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-owner-root",
+      ownerRootTaskId: "legacy-owner-root",
+      tasks: [{
+        id: "legacy-owner-root", label: "Legacy Owner Root", owner: "Codex Root", source: "codex",
+        threadId: rootBinding.threadId, taskType: "root_task",
+        codexProjectId: rootBinding.codexProjectId,
+        codexProjectKind: rootBinding.codexProjectKind,
+        codexHostId: rootBinding.codexHostId,
+        workspacePath: rootBinding.workspacePath,
+      }],
+      adapters: [],
+    });
+    const task = database.createTask({
+      projectId: "local", title: "Legacy Owner decision", description: "", status: "todo",
+      priority: "urgent", labels: [], workflowProfile: "vibe",
+      threadId: rootBinding.threadId, threadBinding: rootBinding, actor, assignee: actor,
+      developmentContext: { type: "worktree", path: rootBinding.workspacePath, branch: "codex/legacy-owner-decision" },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "push", kind: "push", state: "approval_required", scope: "exact commit",
+          approver: "Owner", approvalRequest: "同意 legacy exact push",
+        }],
+        actions: [{
+          id: "push", order: 10, text: "Push exact commit", gate: "push",
+          target: "origin", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const ownerRequest = database.getTaskCapsule(task.id).readyWork.ownerDecisionRequest;
+    assert.ok(ownerRequest);
+    database.close();
+
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec("PRAGMA foreign_keys = OFF");
+    legacy.exec("DROP TABLE owner_decision_deliveries");
+    legacy.exec(`
+      CREATE TABLE owner_decision_deliveries (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        expected_resume_token TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        codex_host_id TEXT NOT NULL,
+        root_workspace_path TEXT NOT NULL,
+        route_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'delivered')),
+        reservation_expires_at TEXT NOT NULL,
+        decision_expires_at TEXT,
+        claimed_at TEXT NOT NULL,
+        delivered_at TEXT,
+        delivery_turn_id TEXT
+      )
+    `);
+    legacy.prepare(`
+      INSERT INTO owner_decision_deliveries (
+        id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
+        root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+        state, reservation_expires_at, claimed_at
+      ) VALUES (?, ?, ?, 'local', ?, 'configured:legacy-owner-root', ?, ?, ?, ?, ?, 'reserved', ?, ?)
+    `).run(
+      "legacy-owner-delivery",
+      ownerRequest.requestId,
+      task.id,
+      ownerRequest.expectedResumeToken,
+      "legacy-owner-root",
+      rootBinding.threadId,
+      rootBinding.codexHostId,
+      rootBinding.workspacePath,
+      "legacy-route-key-without-project-identity",
+      new Date(Date.now() + 30_000).toISOString(),
+      new Date().toISOString(),
+    );
+    legacy.close();
+
+    database = new TaskboardDatabase(databasePath);
+    const migratedColumns = database.database.prepare(
+      "PRAGMA table_info(owner_decision_deliveries)",
+    ).all().map((column) => column.name);
+    assert.equal(migratedColumns.includes("codex_project_id"), true);
+    assert.equal(migratedColumns.includes("codex_project_kind"), true);
+    const route = {
+      rootTaskId: "legacy-owner-root",
+      rootThreadId: rootBinding.threadId,
+      codexProjectId: rootBinding.codexProjectId,
+      codexProjectKind: rootBinding.codexProjectKind,
+      codexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+    };
+    assert.throws(() => database.claimOwnerDecisionDelivery("local", {
+      taskId: task.id,
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      actionId: ownerRequest.actionId,
+      coordinatorEpoch: "configured:legacy-owner-root",
+      route,
+      observedRootBinding: rootBinding,
+    }), (error) => error?.code === "OWNER_DECISION_ROUTE_STALE");
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM owner_decision_deliveries",
+    ).get().count, 1);
+    assert.throws(() => database.confirmOwnerDecisionDelivery("local", {
+      deliveryId: "legacy-owner-delivery",
+      deliveryTurnId: "legacy-owner-turn",
+    }), (error) => error?.code === "OWNER_DECISION_ROUTE_STALE");
+
+    database.database.prepare(`
+      UPDATE owner_decision_deliveries
+      SET state = 'delivered', delivered_at = ?, delivery_turn_id = ?, decision_expires_at = ?
+      WHERE id = 'legacy-owner-delivery'
+    `).run(
+      new Date().toISOString(),
+      "legacy-owner-turn",
+      new Date(Date.now() + 30_000).toISOString(),
+    );
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      outcome: "authorized",
+      ownerTurnId: "legacy-owner-answer",
+      rootDecisionTurnId: "legacy-root-decision",
+      rootThreadId: rootBinding.threadId,
+      rootCodexProjectId: rootBinding.codexProjectId,
+      rootCodexProjectKind: rootBinding.codexProjectKind,
+      rootCodexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+      evidence: "Legacy delivery must not grant authority after migration",
+      deliveryId: "legacy-owner-delivery",
+      receipt: "legacy-owner-decision-receipt",
+      decidedAt: new Date().toISOString(),
+    }, rootBinding, actor), (error) => error?.code === "OWNER_DECISION_DELIVERY_REQUIRED");
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count, 0);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy recorded Owner decision receipts remain exactly replayable after identity migration", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-owner-decision-recorded-legacy-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const rootBinding = {
+    threadId: "legacy-recorded-owner-root-thread",
+    codexProjectId: "legacy-recorded-owner-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: path.resolve("/tmp/legacy-recorded-owner-decision-root"),
+  };
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  let database = new TaskboardDatabase(databasePath);
+  try {
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-recorded-owner-root",
+      ownerRootTaskId: "legacy-recorded-owner-root",
+      tasks: [{
+        id: "legacy-recorded-owner-root", label: "Legacy Recorded Owner Root",
+        owner: "Codex Root", source: "codex", threadId: rootBinding.threadId,
+        taskType: "root_task", codexProjectId: rootBinding.codexProjectId,
+        codexProjectKind: rootBinding.codexProjectKind, codexHostId: rootBinding.codexHostId,
+        workspacePath: rootBinding.workspacePath,
+      }],
+      adapters: [],
+    });
+    const task = database.createTask({
+      projectId: "local", title: "Legacy recorded Owner decision", description: "", status: "todo",
+      priority: "urgent", labels: [], workflowProfile: "vibe",
+      threadId: rootBinding.threadId, threadBinding: rootBinding, actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: rootBinding.workspacePath, branch: "codex/legacy-recorded-owner-decision",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "push", kind: "push", state: "approval_required", scope: "exact commit",
+          approver: "Owner", approvalRequest: "同意 recorded legacy exact push",
+        }],
+        actions: [{
+          id: "push", order: 10, text: "Push exact commit", gate: "push",
+          target: "origin", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const ownerRequest = database.getTaskCapsule(task.id).readyWork.ownerDecisionRequest;
+    assert.ok(ownerRequest);
+    const route = {
+      rootTaskId: "legacy-recorded-owner-root",
+      rootThreadId: rootBinding.threadId,
+      codexProjectId: rootBinding.codexProjectId,
+      codexProjectKind: rootBinding.codexProjectKind,
+      codexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+    };
+    const claimed = database.claimOwnerDecisionDelivery("local", {
+      taskId: task.id,
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      actionId: ownerRequest.actionId,
+      coordinatorEpoch: "configured:legacy-recorded-owner-root",
+      route,
+      observedRootBinding: rootBinding,
+    });
+    assert.equal(claimed.claimed, true);
+    database.confirmOwnerDecisionDelivery("local", {
+      deliveryId: claimed.receipt.id,
+      deliveryTurnId: "legacy-recorded-delivery-turn",
+    });
+    const decision = {
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      outcome: "authorized",
+      ownerTurnId: "legacy-recorded-owner-turn",
+      rootDecisionTurnId: "legacy-recorded-root-turn",
+      rootThreadId: rootBinding.threadId,
+      rootCodexProjectId: rootBinding.codexProjectId,
+      rootCodexProjectKind: rootBinding.codexProjectKind,
+      rootCodexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+      evidence: "Owner approved before delivery identity columns were introduced",
+      deliveryId: claimed.receipt.id,
+      receipt: "legacy-recorded-owner-receipt",
+      decidedAt: new Date().toISOString(),
+    };
+    const recorded = database.recordTaskOwnerDecision(task.id, decision, rootBinding, actor);
+    assert.equal(recorded.applied, true);
+    database.close();
+
+    const legacy = new DatabaseSync(databasePath);
+    const persistedDelivery = legacy.prepare(`
+      SELECT * FROM owner_decision_deliveries WHERE id = ?
+    `).get(claimed.receipt.id);
+    legacy.exec("PRAGMA foreign_keys = OFF");
+    legacy.exec("DROP TABLE owner_decision_deliveries");
+    legacy.exec(`
+      CREATE TABLE owner_decision_deliveries (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        expected_resume_token TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        codex_host_id TEXT NOT NULL,
+        root_workspace_path TEXT NOT NULL,
+        route_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'delivered')),
+        reservation_expires_at TEXT NOT NULL,
+        decision_expires_at TEXT,
+        claimed_at TEXT NOT NULL,
+        delivered_at TEXT,
+        delivery_turn_id TEXT
+      )
+    `);
+    legacy.prepare(`
+      INSERT INTO owner_decision_deliveries (
+        id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
+        root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+        state, reservation_expires_at, decision_expires_at, claimed_at, delivered_at,
+        delivery_turn_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      persistedDelivery.id,
+      persistedDelivery.request_id,
+      persistedDelivery.task_id,
+      persistedDelivery.project_id,
+      persistedDelivery.expected_resume_token,
+      persistedDelivery.coordinator_epoch,
+      persistedDelivery.root_task_id,
+      persistedDelivery.root_thread_id,
+      persistedDelivery.codex_host_id,
+      persistedDelivery.root_workspace_path,
+      persistedDelivery.route_key,
+      persistedDelivery.state,
+      persistedDelivery.reservation_expires_at,
+      persistedDelivery.decision_expires_at,
+      persistedDelivery.claimed_at,
+      persistedDelivery.delivered_at,
+      persistedDelivery.delivery_turn_id,
+    );
+    legacy.close();
+
+    database = new TaskboardDatabase(databasePath);
+    assert.deepEqual({ ...database.database.prepare(`
+      SELECT codex_project_id, codex_project_kind
+      FROM owner_decision_deliveries WHERE id = ?
+    `).get(claimed.receipt.id) }, {
+      codex_project_id: rootBinding.codexProjectId,
+      codex_project_kind: rootBinding.codexProjectKind,
+    });
+    const beforeCount = database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count;
+    const replay = database.recordTaskOwnerDecision(task.id, decision, null, actor);
+    assert.equal(replay.applied, false);
+    assert.equal(replay.receipt.id, recorded.receipt.id);
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count, beforeCount);
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      ...decision,
+      rootCodexProjectId: "drifted-legacy-recorded-project",
+    }, null, actor), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      ...decision,
+      rootCodexProjectKind: "remote",
+    }, null, actor), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      ...decision,
+      outcome: "denied",
+    }, null, actor), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    database.database.prepare(`
+      UPDATE owner_decision_deliveries
+      SET codex_project_id = NULL, codex_project_kind = NULL
+      WHERE id = ?
+    `).run(claimed.receipt.id);
+    assert.throws(() => database.recordTaskOwnerDecision(
+      task.id,
+      decision,
+      null,
+      actor,
+    ), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count, beforeCount);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("project coordinator leases acquire and renew atomically without granting execution ownership", async () => {
@@ -7640,6 +8134,8 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
   assert.deepEqual(snapshot.body.coordination.ownerRootRoute, {
     rootTaskId: "owner-root",
     rootThreadId: ownerThreadId,
+    codexProjectId: hostBinding.codexProjectId,
+    codexProjectKind: hostBinding.codexProjectKind,
     codexHostId: hostBinding.codexHostId,
     rootWorkspacePath: hostBinding.workspacePath,
   });

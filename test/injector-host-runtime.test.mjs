@@ -68,6 +68,22 @@ const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
 const localHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
 const remoteHostExecutor = Object.freeze({ ownedCodexHostId: "remote-builder" });
 
+function ownerDecisionMonitorSnapshot(request, laneOverrides = {}) {
+  return {
+    projectId: "taskboard-core",
+    coordination: { ownerDecisionRequest: request },
+    taskLanes: [{
+      id: request.route.rootTaskId,
+      threadId: request.route.rootThreadId,
+      codexProjectId: request.route.codexProjectId,
+      codexProjectKind: request.route.codexProjectKind,
+      codexHostId: request.route.codexHostId,
+      workspacePath: request.route.rootWorkspacePath,
+      ...laneOverrides,
+    }],
+  };
+}
+
 test("Coordinator provisioning HTTP responses preserve the public status and error code", async () => {
   const accepted = await coordinatorProvisioningResponseJson(new Response(
     JSON.stringify({ attempt: { id: "accepted" } }),
@@ -5784,6 +5800,8 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
     route: {
       rootTaskId: "root",
       rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project",
+      codexProjectKind: "local",
       codexHostId: "local",
       rootWorkspacePath: "/tmp/taskboard/root",
     },
@@ -5800,10 +5818,7 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
   const options = {
     hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({
-      projectId: "taskboard-core",
-      coordination: { ownerDecisionRequest: request },
-    }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => ({
       claimed: true,
       receipt: { id: "delivery-1" },
@@ -5840,6 +5855,8 @@ test("an idle Owner decision delivery cannot request interactive approval", asyn
     route: {
       rootTaskId: "root",
       rootThreadId: coordinatorThreadId,
+      codexProjectId: "taskboard-project",
+      codexProjectKind: "local",
       codexHostId: "local",
       rootWorkspacePath: "/tmp/taskboard/root",
     },
@@ -7201,6 +7218,7 @@ test("Owner decision observation requires an actual Owner turn in the exact Root
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
   };
@@ -7243,6 +7261,7 @@ test("an uncertain Owner delivery is read back by id before any retry side effec
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
     deliveryReceipt: { id: "delivery-uncertain" },
@@ -7274,6 +7293,7 @@ test("Owner decision delivery uses an atomic durable reservation before any Root
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
   };
@@ -7284,7 +7304,7 @@ test("Owner decision delivery uses an atomic durable reservation before any Root
   const options = {
     hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => {
       claims += 1;
       if (claims > 1) return { claimed: false, reason: "reserved" };
@@ -7310,6 +7330,7 @@ test("Owner decision monitor stops when the service rejects a stale coordinator 
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "lease:old",
     route: {
       rootTaskId: "old-root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/old-root",
     },
   };
@@ -7317,7 +7338,7 @@ test("Owner decision monitor stops when the service rejects a stale coordinator 
   const result = await runOwnerDecisionMonitorOnce({
     hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => ({ claimed: false, reason: "stale-route" }),
     deliver: async () => { delivered += 1; },
     confirmDelivery: async () => assert.fail("stale route must not confirm"),
@@ -7328,12 +7349,38 @@ test("Owner decision monitor stops when the service rejects a stale coordinator 
   assert.equal(delivered, 0);
 });
 
+test("Owner decision monitor rejects project-kind drift before any callback", async () => {
+  const request = {
+    requestId: "1".repeat(64), expectedResumeToken: "2".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  const mustNotRun = async () => assert.fail("project-kind drift must fail before callbacks");
+  assert.deepEqual(await runOwnerDecisionMonitorOnce({
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request, {
+      codexProjectKind: "remote",
+    }),
+    claimDelivery: mustNotRun,
+    deliver: mustNotRun,
+    confirmDelivery: mustNotRun,
+    observeDecision: mustNotRun,
+    recordDecision: mustNotRun,
+  }), { delivered: false, reason: "invalid-request" });
+});
+
 test("a durable delivered request is recorded only from the exact Root observation", async () => {
   const request = {
     requestId: "5".repeat(64), expectedResumeToken: "4".repeat(64), identifier: "CAP-10",
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
   };
@@ -7341,7 +7388,7 @@ test("a durable delivered request is recorded only from the exact Root observati
   const result = await runOwnerDecisionMonitorOnce({
     hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => ({
       claimed: false,
       reason: "already-delivered",
@@ -7365,6 +7412,10 @@ test("a durable delivered request is recorded only from the exact Root observati
     requestId: request.requestId,
     expectedResumeToken: request.expectedResumeToken,
     deliveryId: "delivery-record",
+    rootCodexProjectId: request.route.codexProjectId,
+    rootCodexProjectKind: request.route.codexProjectKind,
+    rootCodexHostId: request.route.codexHostId,
+    rootWorkspacePath: request.route.rootWorkspacePath,
     outcome: "authorized",
     evidence: "Owner approved exact scope",
     ownerTurnId: "owner-turn",

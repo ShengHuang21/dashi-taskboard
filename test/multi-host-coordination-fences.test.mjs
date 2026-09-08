@@ -156,6 +156,8 @@ function monitorOptions(name, {
         id: "owner-root",
         taskType: "root_task",
         threadId: ownerRootThreadId,
+        codexProjectId: "remote-project",
+        codexProjectKind: "remote",
         codexHostId: routeHostId,
         workspacePath: "/tmp/taskboard/owner-root",
       }],
@@ -212,6 +214,15 @@ function monitorOptions(name, {
     },
     "Owner decision": {
       projectId,
+      taskLanes: [{
+        id: "owner-root",
+        taskType: "root_task",
+        threadId: ownerRootThreadId,
+        codexProjectId: "remote-project",
+        codexProjectKind: "remote",
+        codexHostId: routeHostId,
+        workspacePath: "/tmp/taskboard/owner-root",
+      }],
       coordination: {
         ownerDecisionRequest: {
           requestId: "b".repeat(64),
@@ -223,6 +234,8 @@ function monitorOptions(name, {
           route: {
             rootTaskId: "owner-root",
             rootThreadId: ownerRootThreadId,
+            codexProjectId: "remote-project",
+            codexProjectKind: "remote",
             codexHostId: routeHostId,
             rootWorkspacePath: "/tmp/taskboard/owner-root",
           },

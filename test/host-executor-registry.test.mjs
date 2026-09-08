@@ -770,6 +770,186 @@ test("host executor retention removes resolved payloads and preserves unresolved
   }
 });
 
+test("host executor activity drains bounded retention backlog for an inactive host", async () => {
+  const initialTime = Date.parse("2026-09-08T04:30:00.000Z");
+  let currentTime = initialTime;
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-retention-backlog-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const openDatabase = () => new TaskboardDatabase(databasePath, {
+    hostExecutorClock: () => currentTime,
+  });
+  let database = openDatabase();
+  try {
+    const inactiveRegistration = database.registerHostExecutor({
+      codexHostId: "remote-inactive-backlog",
+      executorInstanceId: "executor-inactive-backlog",
+      adapterId: "codex-renderer-rpc-v1",
+      capabilities: ["thread/start"],
+      idempotencyKey: "register-inactive-backlog",
+    }).registration;
+    database.close();
+
+    const fixture = new DatabaseSync(databasePath);
+    fixture.exec("BEGIN IMMEDIATE");
+    try {
+      fixture.prepare(`
+        WITH RECURSIVE backlog(entry_index) AS (
+          VALUES (0)
+          UNION ALL
+          SELECT entry_index + 1 FROM backlog WHERE entry_index + 1 < ?
+        )
+        INSERT INTO host_executor_lease_receipts (
+          id, codex_host_id, idempotency_key, request_fingerprint, action,
+          lease_id, executor_instance_id, result_json, created_at
+        )
+        SELECT
+          'inactive-receipt-' || entry_index,
+          'remote-inactive-backlog',
+          'inactive-receipt-key-' || entry_index,
+          ?,
+          'renewed',
+          'inactive-lease',
+          'executor-inactive-backlog',
+          '{"ownerPrompt":"CAP65_BACKLOG_RECEIPT_SENTINEL"}',
+          ?
+        FROM backlog
+      `).run(8_193, "a".repeat(64), new Date(initialTime).toISOString());
+      const insertEffects = fixture.prepare(`
+        WITH RECURSIVE backlog(entry_index) AS (
+          VALUES (0)
+          UNION ALL
+          SELECT entry_index + 1 FROM backlog WHERE entry_index + 1 < ?
+        )
+        INSERT INTO host_executor_effects (
+          effect_key, codex_host_id, executor_instance_id, registration_fingerprint,
+          lease_id, adapter_id, request_fingerprint, operations_json, status,
+          dispatch_token, result_json, created_at, updated_at
+        )
+        SELECT
+          ? || entry_index,
+          'remote-inactive-backlog',
+          'executor-inactive-backlog',
+          ?,
+          'inactive-lease',
+          'codex-renderer-rpc-v1',
+          ?,
+          ?,
+          ?,
+          CASE WHEN ? = 'uncertain' THEN 'inactive-dispatch-' || entry_index ELSE NULL END,
+          ?,
+          ?,
+          ?
+        FROM backlog
+      `);
+      insertEffects.run(
+        8_193,
+        "inactive-completed-",
+        inactiveRegistration.fingerprint,
+        "b".repeat(64),
+        '[{"method":"thread/start","params":{"prompt":"CAP65_BACKLOG_COMPLETED_SENTINEL"}}]',
+        "completed",
+        "completed",
+        '{"ownerResult":"CAP65_BACKLOG_COMPLETED_RESULT_SENTINEL"}',
+        new Date(initialTime).toISOString(),
+        new Date(initialTime).toISOString(),
+      );
+      insertEffects.run(
+        8_193,
+        "inactive-uncertain-",
+        inactiveRegistration.fingerprint,
+        "c".repeat(64),
+        '[{"method":"thread/start","params":{"prompt":"CAP65_BACKLOG_UNCERTAIN_SENTINEL"}}]',
+        "uncertain",
+        "uncertain",
+        '{"ownerResult":"CAP65_BACKLOG_UNCERTAIN_RESULT_SENTINEL"}',
+        new Date(initialTime).toISOString(),
+        new Date(initialTime).toISOString(),
+      );
+      fixture.exec("COMMIT");
+    } catch (error) {
+      fixture.exec("ROLLBACK");
+      throw error;
+    } finally {
+      fixture.close();
+    }
+
+    currentTime += 24 * 60 * 60 * 1_000 + 1;
+    database = openDatabase();
+    const inactiveBacklog = () => {
+      const inspection = new DatabaseSync(databasePath);
+      try {
+        return {
+          receipts: inspection.prepare(`
+            SELECT COUNT(*) AS count FROM host_executor_lease_receipts
+            WHERE codex_host_id = 'remote-inactive-backlog'
+          `).get().count,
+          resolvedEffects: inspection.prepare(`
+            SELECT COUNT(*) AS count FROM host_executor_effects
+            WHERE codex_host_id = 'remote-inactive-backlog' AND status = 'completed'
+          `).get().count,
+          unresolvedTombstones: inspection.prepare(`
+            SELECT COUNT(*) AS count FROM host_executor_effects
+            WHERE codex_host_id = 'remote-inactive-backlog' AND status = 'uncertain'
+          `).get().count,
+          unresolvedPayloads: inspection.prepare(`
+            SELECT COUNT(*) AS count FROM host_executor_effects
+            WHERE codex_host_id = 'remote-inactive-backlog' AND status = 'uncertain'
+              AND (operations_json <> '[]' OR result_json IS NOT NULL)
+          `).get().count,
+        };
+      } finally {
+        inspection.close();
+      }
+    };
+    assert.deepEqual(inactiveBacklog(), {
+      receipts: 4_097,
+      resolvedEffects: 4_097,
+      unresolvedTombstones: 8_193,
+      unresolvedPayloads: 4_097,
+    });
+
+    const activeRegistration = database.registerHostExecutor({
+      codexHostId: "remote-active-backlog",
+      executorInstanceId: "executor-active-backlog",
+      adapterId: "codex-renderer-rpc-v1",
+      capabilities: ["thread/read"],
+      idempotencyKey: "register-active-backlog",
+    }).registration;
+    const activeLease = database.acquireHostExecutorLease({
+      codexHostId: "remote-active-backlog",
+      executorInstanceId: activeRegistration.executorInstanceId,
+      registrationFingerprint: activeRegistration.fingerprint,
+      expectedLeaseId: null,
+      leaseDurationSeconds: 60,
+      idempotencyKey: "acquire-active-backlog",
+    }).lease;
+    assert.deepEqual(inactiveBacklog(), {
+      receipts: 1,
+      resolvedEffects: 1,
+      unresolvedTombstones: 8_193,
+      unresolvedPayloads: 1,
+    });
+
+    database.renewHostExecutorLease({
+      codexHostId: "remote-active-backlog",
+      executorInstanceId: activeRegistration.executorInstanceId,
+      registrationFingerprint: activeRegistration.fingerprint,
+      expectedLeaseId: activeLease.id,
+      leaseDurationSeconds: 60,
+      idempotencyKey: "renew-active-backlog",
+    });
+    assert.deepEqual(inactiveBacklog(), {
+      receipts: 0,
+      resolvedEffects: 0,
+      unresolvedTombstones: 8_193,
+      unresolvedPayloads: 0,
+    });
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("host executor mutations require a fresh request-bound proof", async () => {
   const instanceSecret = "d".repeat(64);
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-executor-proof-"));
