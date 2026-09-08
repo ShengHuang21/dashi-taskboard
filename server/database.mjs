@@ -13027,31 +13027,65 @@ export class TaskboardDatabase {
         );
       }
       const claim = this.getAgentTaskClaim(task.id);
-      if (
-        task.status !== "in_progress"
-        || claim?.status !== "active"
-        || !claim.leaseExpiresAt
-        || Date.parse(claim.leaseExpiresAt) <= Date.now()
-      ) {
-        throw new ApiError(409, "COORDINATION_CLAIM_NOT_ACTIVE", "A handoff requires an active execution claim");
+      const activeClaim = task.status === "in_progress"
+        && claim?.status === "active"
+        && Boolean(claim.leaseExpiresAt)
+        && Date.parse(claim.leaseExpiresAt) > Date.now();
+      let completedRun = null;
+      if (!activeClaim) {
+        completedRun = this.getLatestTaskAgentRun(task.id);
+        const completedExecution = task.status === "in_review"
+          && claim?.status === "completed"
+          && claim.projectId === task.projectId
+          && Boolean(claim.completedAt)
+          && completedRun?.taskId === task.id
+          && completedRun.projectId === task.projectId
+          && completedRun.status === "completed"
+          && Boolean(completedRun.finishedAt)
+          && claim.completedAt === completedRun.finishedAt;
+        if (!completedExecution) {
+          throw new ApiError(409, "COORDINATION_CLAIM_NOT_ACTIVE", "A handoff requires an active execution claim");
+        }
       }
       if (
         claim.agentThreadId !== envelope.senderThreadId
         || claim.agentPath !== envelope.senderAgentPath
+        || (completedRun && (
+          completedRun.agentThreadId !== envelope.senderThreadId
+          || completedRun.agentPath !== envelope.senderAgentPath
+        ))
       ) {
         throw new ApiError(
           409,
           "COORDINATION_SENDER_MISMATCH",
-          "The handoff sender must match the active execution claim",
+          "The handoff sender must match the exact execution claim and run",
         );
       }
-      const previous = this.#prepare(`
+      const priorEnvelopes = this.#prepare(`
         SELECT envelope_json FROM agent_event_receipts
         WHERE task_id = ? AND envelope_json IS NOT NULL
         ORDER BY created_at DESC, rowid DESC
-      `).all(task.id)
-        .map((row) => JSON.parse(row.envelope_json))
-        .find((candidate) => candidate.senderAgentPath === envelope.senderAgentPath);
+      `).all(task.id).map((row) => JSON.parse(row.envelope_json));
+      if (completedRun && envelope.causationId !== completedRun.id) {
+        throw new ApiError(
+          409,
+          "COORDINATION_FINAL_HANDOFF_MISMATCH",
+          "A final handoff must be caused by the exact latest completed Agent Run",
+          { expectedCausationId: completedRun.id },
+        );
+      }
+      if (completedRun && priorEnvelopes.some((candidate) => (
+        candidate.causationId === completedRun.id
+      ))) {
+        throw new ApiError(
+          409,
+          "COORDINATION_FINAL_HANDOFF_EXISTS",
+          "The completed Agent Run already has its final handoff",
+        );
+      }
+      const previous = priorEnvelopes.find((candidate) => (
+        candidate.senderAgentPath === envelope.senderAgentPath
+      ));
       if (previous && envelope.sequence <= previous.sequence) {
         throw new ApiError(
           409,

@@ -531,6 +531,200 @@ test("durable Agent Runs checkpoint, finish, and recover through the API", async
   assert.equal(repeated.body.applied, false);
 });
 
+test("a completed Agent Run accepts exactly one causally bound final handoff", async () => {
+  let dataDirectory;
+  const baseUrl = await startServer(async (directory) => {
+    dataDirectory = directory;
+    return {};
+  });
+  const rootBinding = {
+    threadId: "final-handoff-root",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/final-handoff-worktree",
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: {
+      projectId: "local",
+      title: "Final handoff after finish",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/final-handoff-after-finish",
+      },
+    },
+  });
+  assert.equal(created.response.status, 201);
+  const claimed = await request(baseUrl, `/api/tasks/${created.body.task.id}/claim`, {
+    method: "POST",
+    body: {
+      version: created.body.task.version,
+      agentPath: "/root/final-handoff-worker",
+      agentThreadId: "final-handoff-thread",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+      writeScope: ["server/database.mjs"],
+    },
+  });
+  assert.equal(claimed.response.status, 200);
+  const finished = await request(baseUrl, `/api/runs/${claimed.body.run.id}/finish`, {
+    method: "POST",
+    body: {
+      version: claimed.body.run.version,
+      agentThreadId: "final-handoff-thread",
+      summary: "Implementation and verification finished.",
+      nextAction: "Root reviews the final evidence.",
+      status: "completed",
+    },
+  });
+  assert.equal(finished.response.status, 200);
+  assert.equal(finished.body.task.status, "in_review");
+  assert.equal(finished.body.run.status, "completed");
+
+  const envelope = {
+    eventId: "final-handoff-event",
+    idempotencyKey: "final-handoff-delivery",
+    parentTaskId: null,
+    senderThreadId: "final-handoff-thread",
+    senderAgentPath: "/root/final-handoff-worker",
+    eventType: "handoff",
+    sequence: 1,
+    timestamp: "2098-01-01T01:02:03.000Z",
+    summary: "The completed run is ready for review.",
+    evidenceRefs: ["test/server.test.mjs#final-handoff-after-finish"],
+    blocker: null,
+    nextAction: "Root verifies and accepts the completed run.",
+    requiresAck: true,
+    causationId: finished.body.run.id,
+    correlationId: "final-handoff-correlation",
+  };
+  const first = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: envelope,
+  });
+  assert.equal(first.response.status, 201);
+  assert.equal(first.body.applied, true);
+  assert.deepEqual(first.body.event.envelope, envelope);
+
+  const replay = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: envelope,
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.applied, false);
+  assert.deepEqual(replay.body.event, first.body.event);
+
+  const wrongSender = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-wrong-sender",
+      idempotencyKey: "final-handoff-wrong-sender",
+      senderThreadId: "other-thread",
+    },
+  });
+  assert.equal(wrongSender.response.status, 409);
+  assert.equal(wrongSender.body.error.code, "COORDINATION_SENDER_MISMATCH");
+
+  const wrongCausation = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-wrong-causation",
+      idempotencyKey: "final-handoff-wrong-causation",
+      causationId: "another-run",
+    },
+  });
+  assert.equal(wrongCausation.response.status, 409);
+  assert.equal(wrongCausation.body.error.code, "COORDINATION_FINAL_HANDOFF_MISMATCH");
+
+  const missingCausation = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-missing-causation",
+      idempotencyKey: "final-handoff-missing-causation",
+      causationId: null,
+    },
+  });
+  assert.equal(missingCausation.response.status, 409);
+  assert.equal(missingCausation.body.error.code, "COORDINATION_FINAL_HANDOFF_MISMATCH");
+
+  const second = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-second-event",
+      idempotencyKey: "final-handoff-second-delivery",
+      sequence: 2,
+    },
+  });
+  assert.equal(second.response.status, 409);
+  assert.equal(second.body.error.code, "COORDINATION_FINAL_HANDOFF_EXISTS");
+  const events = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`);
+  assert.deepEqual(events.body.events.map((event) => event.envelope.eventId), [envelope.eventId]);
+
+  const taskAfter = await request(baseUrl, `/api/tasks/${created.body.task.id}`);
+  assert.equal(taskAfter.body.task.status, "in_review");
+  assert.equal(taskAfter.body.task.version, finished.body.task.version);
+  const runAfter = await request(baseUrl, `/api/runs/${claimed.body.run.id}`);
+  assert.deepEqual(runAfter.body.run, finished.body.run);
+  const database = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+  const claimAfter = database.getAgentTaskClaim(created.body.task.id);
+  database.close();
+  assert.equal(claimAfter.status, "completed");
+  assert.equal(claimAfter.completedAt, finished.body.run.finishedAt);
+  assert.equal(claimAfter.agentPath, envelope.senderAgentPath);
+  assert.equal(claimAfter.agentThreadId, envelope.senderThreadId);
+
+  const moved = await request(baseUrl, `/api/tasks/${created.body.task.id}/move`, {
+    method: "POST",
+    body: {
+      version: finished.body.task.version,
+      status: "done",
+    },
+  });
+  assert.equal(moved.response.status, 200);
+  const afterDone = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-after-done",
+      idempotencyKey: "final-handoff-after-done",
+      sequence: 2,
+    },
+  });
+  assert.equal(afterDone.response.status, 409);
+  assert.equal(afterDone.body.error.code, "COORDINATION_CLAIM_NOT_ACTIVE");
+
+  const canceled = await request(baseUrl, `/api/tasks/${created.body.task.id}/move`, {
+    method: "POST",
+    body: {
+      version: moved.body.task.version,
+      status: "canceled",
+    },
+  });
+  assert.equal(canceled.response.status, 200);
+  const afterCanceled = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-after-canceled",
+      idempotencyKey: "final-handoff-after-canceled",
+      sequence: 2,
+    },
+  });
+  assert.equal(afterCanceled.response.status, 409);
+  assert.equal(afterCanceled.body.error.code, "COORDINATION_CLAIM_NOT_ACTIVE");
+});
+
 test("structured handoff envelopes replay and acknowledge without changing execution", async () => {
   let dataDirectory;
   let baseUrl = await startServer(async (directory) => {
