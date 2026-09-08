@@ -2482,7 +2482,7 @@ test("Owner Root registration rejects an active legacy non-Root Global lease", a
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
     body: {
       threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
     },
   });
@@ -3201,7 +3201,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
         {
           id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex",
           threadId: "coordinator-thread", taskType: "root_task",
-          codexProjectId: "sbkk-project", codexProjectKind: "local",
+          codexProjectId: "sbkk-project", codexProjectKind: "remote",
           codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
         },
         {
@@ -3237,7 +3237,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "7".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "market-project", codexProjectKind: "local",
+      codexProjectId: "market-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
     },
   });
@@ -3248,19 +3248,20 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
   assert.equal(snapshot.body.coordination.lease.bindingValid, false);
   assert.equal(snapshot.body.coordination.assignment, "unassigned");
 
-  await request(baseUrl, "/api/local/host-runtime", {
+  const invalidGlobalKind = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "c".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "sbkk-project", codexProjectKind: "remote",
+      codexProjectId: "sbkk-project", codexProjectKind: "local",
       codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
     },
   });
+  assert.equal(invalidGlobalKind.response.status, 400);
   const globalKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(globalKindSnapshot.body.coordination.lease.bindingValid, false);
 
-  await request(baseUrl, "/api/local/host-runtime", {
+  const domainProjectDrift = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "8".repeat(32)),
     body: {
@@ -3269,11 +3270,12 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
       codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
     },
   });
+  assert.equal(domainProjectDrift.response.status, 200);
   const domainSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(domainSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
   assert.equal(domainSnapshot.body.coordination.domainCoordinators[0].assignment, "unassigned");
 
-  await request(baseUrl, "/api/local/host-runtime", {
+  const invalidDomainKind = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "d".repeat(32)),
     body: {
@@ -3282,6 +3284,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
       codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
     },
   });
+  assert.equal(invalidDomainKind.response.status, 400);
   const domainKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(domainKindSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
 
@@ -3290,7 +3293,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
     body: {
       threadId: "unrelated-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "unrelated-project", codexProjectKind: "local",
+      codexProjectId: "unrelated-project", codexProjectKind: "remote",
       codexHostId: "unrelated-host", workspacePath: "/tmp/unrelated",
     },
   });
@@ -3310,7 +3313,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "9".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "market-project", codexProjectKind: "local",
+      codexProjectId: "market-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
     },
   });
@@ -3328,7 +3331,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
     body: {
       threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "market-project", codexProjectKind: "local",
+      codexProjectId: "market-project", codexProjectKind: "remote",
       codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
     },
   });
@@ -6797,7 +6800,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
     body: {
       threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-owner", workspacePath: ownerWorkspacePath,
     },
   });
@@ -6811,7 +6814,7 @@ test("protected window registration separates Owner Root from a replaceable coor
   assert.deepEqual(owner.body.configuration.windows.find((window) => window.taskId === "owner-root"), {
     taskId: "owner-root", label: "Owner conversation", role: "owner_root",
     threadId: "owner-thread", codexHostId: "host-owner",
-    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexProjectId: "codex-project", codexProjectKind: "remote",
     workspacePath: ownerWorkspacePath,
   });
 
@@ -6838,7 +6841,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator", workspacePath: "/tmp/coordinator",
     },
   });
@@ -6873,7 +6876,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "f".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator-new", workspacePath: "/tmp/coordinator-new",
     },
   });
@@ -6907,7 +6910,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "e".repeat(32)),
     body: {
       threadId: "adapter-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-adapter", workspacePath: "/tmp/adapter-window",
     },
   });
@@ -7222,7 +7225,7 @@ test("active coordinator repairs one legacy Root binding from protected host ide
     body: {
       threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
       codexProjectId: "codex-project", codexProjectKind: "local",
-      codexHostId: "drifted-host", workspacePath: "/tmp/drifted-repair-root",
+      codexHostId: "local", workspacePath: "/tmp/drifted-repair-root",
     },
   });
   const driftedHostRepair = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
@@ -7490,7 +7493,8 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
       tasks: [
         {
           id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
-          threadId: ownerThreadId, taskType: "root_task", codexHostId: "local",
+          threadId: ownerThreadId, taskType: "root_task",
+          codexProjectId: "owner-project", codexProjectKind: "local", codexHostId: "local",
           workspacePath: "/tmp/owner-root-workspace",
         },
         {
@@ -7570,8 +7574,7 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
     headers: signedInjectorHeaders(instanceSecret, "01".repeat(32)),
     body: {
       ...hostBinding,
-      codexHostId: "replacement-host",
-      workspacePath: "/tmp/replaced-owner-root-workspace",
+      codexProjectId: "wrong-owner-project",
       threadRunning: false,
       threadTodoProgress: null,
     },

@@ -4505,25 +4505,29 @@ export function createTaskboardServer(options = {}) {
             }
             threadTodoProgress = { completed: Math.min(completed, total), total };
           }
+          const identityFields = [
+            body.codexProjectId,
+            body.codexProjectKind,
+            body.codexHostId,
+            body.workspacePath,
+          ];
+          const threadBinding = identityFields.every((field) => field == null)
+            ? null
+            : parseThreadBinding({
+                threadId,
+                codexProjectId: body.codexProjectId,
+                codexProjectKind: body.codexProjectKind,
+                codexHostId: body.codexHostId,
+                workspacePath: body.workspacePath,
+              });
           hostRuntime = {
             threadId,
             threadRunning: body.threadRunning,
             threadTodoProgress,
-            codexProjectId: stringField(body.codexProjectId ?? null, "codexProjectId", {
-              nullable: true,
-              maxLength: 256,
-            }),
-            codexProjectKind: body.codexProjectKind === "local" || body.codexProjectKind === "remote"
-              ? body.codexProjectKind
-              : null,
-            codexHostId: stringField(body.codexHostId ?? null, "codexHostId", {
-              nullable: true,
-              maxLength: 256,
-            }),
-            workspacePath: stringField(body.workspacePath ?? null, "workspacePath", {
-              nullable: true,
-              maxLength: 4096,
-            }),
+            codexProjectId: threadBinding?.codexProjectId ?? null,
+            codexProjectKind: threadBinding?.codexProjectKind ?? null,
+            codexHostId: threadBinding?.codexHostId ?? null,
+            workspacePath: threadBinding?.workspacePath ?? null,
             updatedAt: Date.now(),
           };
           observedHostRuntimes.delete(threadId);

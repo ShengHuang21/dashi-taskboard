@@ -648,10 +648,7 @@ test("remote Owner Intent survives a later heartbeat from another host", async (
     headers: injectorHeaders(server.instanceSecret, "7".repeat(32)),
     body: {
       ...remoteBinding,
-      codexProjectId: "local-project",
-      codexProjectKind: "local",
-      codexHostId: "local",
-      workspacePath: "/tmp/taskboard/conflicting-owner",
+      codexProjectId: "wrong-remote-owner-project",
       threadRunning: false,
       threadTodoProgress: null,
     },
@@ -675,6 +672,43 @@ test("remote Owner Intent survives a later heartbeat from another host", async (
     body: conflictingBody,
   });
   assert.equal(rejected.response.status, 409, JSON.stringify(rejected.body));
+  assert.equal(rejected.body.error.code, "OWNER_ROOT_ROUTE_STALE");
   const listed = await jsonRequest(server.baseUrl, intentPath);
   assert.deepEqual(listed.body.intents.map(({ intentId }) => intentId), [intentBody.intentId]);
+});
+
+test("host runtime rejects incomplete or kind-host inconsistent identity atomically", async () => {
+  const server = await startConfiguredServer(async () => ({}));
+  const hostRuntimePath = "/api/local/host-runtime";
+  const validRuntime = {
+    threadId: ownerRootThreadId,
+    codexProjectId: "remote-owner-project",
+    codexProjectKind: "remote",
+    codexHostId: "remote-owner-host",
+    workspacePath: "/tmp/taskboard/remote-owner",
+    threadRunning: false,
+    threadTodoProgress: null,
+  };
+  const published = await jsonRequest(server.baseUrl, hostRuntimePath, {
+    method: "PUT",
+    headers: injectorHeaders(server.instanceSecret, "9".repeat(32)),
+    body: validRuntime,
+  });
+  assert.equal(published.response.status, 200, JSON.stringify(published.body));
+  const before = await jsonRequest(server.baseUrl, hostRuntimePath);
+
+  for (const [nonce, body] of [
+    ["a".repeat(32), { ...validRuntime, codexProjectKind: "local" }],
+    ["b".repeat(32), { ...validRuntime, codexProjectId: null }],
+  ]) {
+    const rejected = await jsonRequest(server.baseUrl, hostRuntimePath, {
+      method: "PUT",
+      headers: injectorHeaders(server.instanceSecret, nonce),
+      body,
+    });
+    assert.equal(rejected.response.status, 400, JSON.stringify(rejected.body));
+    assert.equal(rejected.body.error.code, "INVALID_FIELD");
+    const after = await jsonRequest(server.baseUrl, hostRuntimePath);
+    assert.deepEqual(after.body.runtime, before.body.runtime);
+  }
 });

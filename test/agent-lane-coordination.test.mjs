@@ -297,7 +297,7 @@ test("active Global and domain leases fail closed after their configured window 
     rootTaskId: "global",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/route-drift-owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "route-drift", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/route-drift-owner" },
       { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/route-drift-global" },
       { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "route-drift", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/route-drift-frontend" },
     ],
@@ -926,7 +926,12 @@ test("Owner Intent replay is bound to its Taskboard project", async () => {
     rootTaskId: "coordinator",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      {
+        id: "owner", label: "Owner", owner: "Codex", source: "codex",
+        threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "shared-codex-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/owner",
+      },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -945,6 +950,10 @@ test("Owner Intent replay is bound to its Taskboard project", async () => {
     ownerRootTaskId: "owner", ownerRootThreadId: "owner-thread",
     ownerTurnId: "shared-owner-turn", rootCaptureTurnId: "shared-capture-turn", evidence: "synthetic",
   };
+  assert.throws(() => database.recordProjectOwnerIntent(
+    "intent-project-a", input, { ...sourceBinding, codexProjectKind: "remote" }, actor,
+  ), (error) => error?.code === "OWNER_ROOT_ROUTE_STALE");
+  assert.equal(database.listProjectOwnerIntents("intent-project-a").length, 0);
   database.recordProjectOwnerIntent("intent-project-a", input, sourceBinding, actor);
   assert.throws(() => database.recordProjectOwnerIntent(
     "intent-project-b", input, sourceBinding, actor,
@@ -983,7 +992,7 @@ test("Owner Root lease, cancel plans, and plan-owned task moves fail closed", as
   database.upsertAgentLaneProject("authority-a", {
     rootTaskId: "coordinator", ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "authority", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -2304,7 +2313,7 @@ test("Owner Intent supersede reopens outcomes and reconciles plan-owned dependen
     rootTaskId: "coordinator",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "plan-revision", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -2449,7 +2458,7 @@ test("headless control plane survives capacity defer and coordinator recovery wi
   database.upsertAgentLaneProject("control-plane", {
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: ownerWorkspacePath },
+      { id: "owner", label: "Owner Root", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "control-plane", codexProjectKind: "local", codexHostId: "local", workspacePath: ownerWorkspacePath },
       { id: "global", label: "Global", owner: "Codex", source: "codex", threadId: "global-thread", taskType: "root_task", codexHostId: "local", workspacePath: globalWorkspacePath },
       { id: "frontend", label: "Frontend", owner: "Codex", source: "codex", threadId: "frontend-thread", taskType: "peer_task", codexProjectId: "control-plane", codexProjectKind: "local", codexHostId: "local", workspacePath: frontendWorkspacePath },
     ],
@@ -2753,7 +2762,7 @@ test("Owner Intent replanning is durably bounded after three invalid coordinator
     rootTaskId: "coordinator",
     ownerRootTaskId: "owner",
     tasks: [
-      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/owner" },
+      { id: "owner", label: "Owner", owner: "Codex", source: "codex", threadId: "owner-thread", taskType: "root_task", codexProjectId: "retry-limit", codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner" },
       { id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex", threadId: "coordinator-thread", taskType: "root_task", codexHostId: "local", workspacePath: "/tmp/coordinator" },
     ],
     adapters: [],
@@ -2871,7 +2880,8 @@ test("Agent Lane snapshot stays readable while an adopted Owner Intent waits for
     tasks: [
       {
         id: "owner", label: "Owner", owner: "Codex", source: "codex",
-        threadId: "owner-thread", taskType: "root_task", codexHostId: "local",
+        threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "intent-recovery", codexProjectKind: "local", codexHostId: "local",
         workspacePath: "/tmp/intent-recovery-owner",
       },
       {

@@ -11863,6 +11863,8 @@ export class TaskboardDatabase {
         || input.ownerRootTaskId !== config.ownerRootTaskId
         || input.ownerRootThreadId !== ownerRoot.threadId
         || sourceThreadBinding.threadId !== ownerRoot.threadId
+        || sourceThreadBinding.codexProjectId !== ownerRoot.codexProjectId
+        || sourceThreadBinding.codexProjectKind !== ownerRoot.codexProjectKind
         || sourceThreadBinding.codexHostId !== ownerRoot.codexHostId
         || typeof sourceThreadBinding.workspacePath !== "string"
         || typeof ownerRoot.workspacePath !== "string"
