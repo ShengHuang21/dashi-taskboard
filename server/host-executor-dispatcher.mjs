@@ -1,6 +1,5 @@
 import { ApiError } from "./database.mjs";
 
-const LOCAL_CODEX_HOST_ID = "local";
 const SELECTED_MODEL_CAPACITY_ERROR = /selected model is at capacity\.\s*please try a different model\.?/i;
 const MUTATING_METHODS = new Set([
   "thread/archive",
@@ -19,8 +18,8 @@ export class HostExecutorDispatcher {
       throw new TypeError("Host executor dispatcher requires the Taskboard database");
     }
     if (typeof adapter?.ensureReady !== "function"
-      || typeof adapter?.requestReady !== "function") {
-      throw new TypeError("Host executor dispatcher requires a ready local Codex RPC adapter");
+      || typeof adapter?.dispatchReady !== "function") {
+      throw new TypeError("Host executor dispatcher requires a ready Codex RPC adapter router");
     }
     this.database = database;
     this.adapter = adapter;
@@ -30,19 +29,12 @@ export class HostExecutorDispatcher {
   }
 
   async execute(input) {
-    if (input?.execution?.codexHostId !== LOCAL_CODEX_HOST_ID) {
-      throw new ApiError(
-        409,
-        "HOST_EXECUTOR_ADAPTER_MISMATCH",
-        "The server-owned local Codex adapter only supports the local host",
-      );
-    }
     if (!Array.isArray(input?.operations)
       || input.operations.some((operation) => !MUTATING_METHODS.has(operation?.method))) {
       throw new ApiError(
         400,
         "HOST_EXECUTOR_RPC_METHOD_NOT_ALLOWED",
-        "The fenced dispatcher accepts only mutating local Codex RPC methods",
+        "The fenced dispatcher accepts only mutating Codex RPC methods",
       );
     }
 
@@ -52,28 +44,27 @@ export class HostExecutorDispatcher {
     }
 
     await this.afterReserve({ input, reservation });
-    await this.adapter.ensureReady();
+    await this.adapter.ensureReady(input.execution);
 
     // No await may be introduced between this final server-clock fence and the
-    // ready adapter calls. requestReady must enqueue to Codex synchronously.
+    // ready adapter call. dispatchReady must enqueue the whole effect synchronously.
     const dispatch = this.database.beginHostExecutorEffectDispatch(input);
     if (!dispatch.dispatch) {
       return { replayed: true, effect: dispatch.effect, results: dispatch.effect.result };
     }
     let pending;
     try {
-      pending = input.operations.map((operation) => this.adapter.requestReady(
-        input.execution.codexHostId,
-        operation.method,
-        operation.params,
-      ));
+      pending = this.adapter.dispatchReady(
+        input.execution,
+        input.operations,
+      );
     } catch (error) {
       this.database.markHostExecutorEffectUncertain(input.effectKey, dispatch.dispatchToken);
       throw error;
     }
 
     try {
-      const results = await Promise.all(pending);
+      const results = await pending;
       const effect = this.database.completeHostExecutorEffect(
         input.effectKey,
         dispatch.dispatchToken,

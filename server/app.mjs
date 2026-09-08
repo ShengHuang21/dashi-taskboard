@@ -35,6 +35,10 @@ import { ApiError, TaskboardDatabase } from "./database.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { createHostExecutorDispatcher } from "./host-executor-dispatcher.mjs";
+import {
+  createHostExecutorAdapterRouter,
+  createRemoteHostExecutorChannelRegistry,
+} from "./remote-host-executor-channel.mjs";
 import { ProjectSummaryService } from "./project-summary.mjs";
 import {
   STANDING_AUTHORITY_ACTIONS,
@@ -530,7 +534,7 @@ function parseHostExecutorEffect(value, codexHostId, effectKey) {
       throw new ApiError(
         400,
         "HOST_EXECUTOR_RPC_METHOD_NOT_ALLOWED",
-        "The fenced dispatcher accepts only mutating local Codex RPC methods",
+        "The fenced dispatcher accepts only mutating Codex RPC methods",
       );
     }
     assertPlainObject(operation.params);
@@ -540,6 +544,80 @@ function parseHostExecutorEffect(value, codexHostId, effectKey) {
     effectKey: parseHostExecutorIdentifier(effectKey, "effectKey"),
     execution: parseHostExecutorExecution(value.execution, codexHostId),
     operations,
+  };
+}
+
+function parseRemoteHostExecutorChannelExecution(value, codexHostId, executorInstanceId) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["execution"]));
+  const execution = parseHostExecutorExecution(value.execution, codexHostId);
+  if (execution.executorInstanceId !== executorInstanceId) {
+    throw new ApiError(
+      409,
+      "HOST_EXECUTOR_CHANNEL_IDENTITY_MISMATCH",
+      "The remote channel route does not match its executor envelope",
+    );
+  }
+  return execution;
+}
+
+function parseRemoteHostExecutorChannelPoll(value, codexHostId, executorInstanceId) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["execution", "pollId"]));
+  return {
+    execution: parseRemoteHostExecutorChannelExecution(
+      { execution: value.execution },
+      codexHostId,
+      executorInstanceId,
+    ),
+    pollId: parseHostExecutorIdentifier(value.pollId, "pollId"),
+  };
+}
+
+function parseRemoteHostExecutorChannelCompletion(
+  value,
+  codexHostId,
+  executorInstanceId,
+) {
+  assertPlainObject(value);
+  assertAllowedKeys(value, new Set(["execution", "outcome"]));
+  const execution = parseRemoteHostExecutorChannelExecution(
+    { execution: value.execution },
+    codexHostId,
+    executorInstanceId,
+  );
+  assertPlainObject(value.outcome);
+  const hasResult = Object.hasOwn(value.outcome, "result");
+  const hasError = Object.hasOwn(value.outcome, "error");
+  if (hasResult === hasError) {
+    throw new ApiError(
+      400,
+      "INVALID_FIELD",
+      "'outcome' must contain exactly one result or error",
+    );
+  }
+  if (hasResult) {
+    assertAllowedKeys(value.outcome, new Set(["result"]));
+    return { execution, outcome: { result: value.outcome.result } };
+  }
+  assertAllowedKeys(value.outcome, new Set(["error"]));
+  assertPlainObject(value.outcome.error);
+  assertAllowedKeys(value.outcome.error, new Set(["message", "definitiveRejection"]));
+  if (value.outcome.error.definitiveRejection !== undefined
+    && typeof value.outcome.error.definitiveRejection !== "boolean") {
+    throw new ApiError(400, "INVALID_FIELD", "'definitiveRejection' must be a boolean");
+  }
+  return {
+    execution,
+    outcome: {
+      error: {
+        message: stringField(value.outcome.error.message, "message", {
+          required: true,
+          maxLength: 4_000,
+        }),
+        definitiveRejection: value.outcome.error.definitiveRejection === true,
+      },
+    },
   };
 }
 
@@ -3753,9 +3831,19 @@ export function createTaskboardServer(options = {}) {
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
+  const remoteHostExecutorChannels = options.remoteHostExecutorChannels
+    ?? createRemoteHostExecutorChannelRegistry({
+      database,
+      pollTimeoutMs: options.remoteHostExecutorPollTimeoutMs,
+      requestTimeoutMs: options.remoteHostExecutorRequestTimeoutMs,
+    });
+  const hostExecutorAdapter = createHostExecutorAdapterRouter({
+    localAdapter: options.hostExecutorRpcAdapter ?? aiChat.appServer,
+    remoteChannels: remoteHostExecutorChannels,
+  });
   const hostExecutorDispatcher = createHostExecutorDispatcher({
     database,
-    adapter: options.hostExecutorRpcAdapter ?? aiChat.appServer,
+    adapter: hostExecutorAdapter,
     hooks: options.hostExecutorDispatchHooks,
   });
   const projectSummary = new ProjectSummaryService({
@@ -4177,6 +4265,110 @@ export function createTaskboardServer(options = {}) {
             effectKey,
           )),
         );
+      }
+
+      const remoteHostExecutorCompletionMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/channels\/([^/]+)\/requests\/([^/]+)\/complete$/,
+      );
+      if (remoteHostExecutorCompletionMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Remote host executor completion routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(remoteHostExecutorCompletionMatch[1]);
+        const executorInstanceId = parseHostExecutorIdentifier(
+          decodeRouteSegment(remoteHostExecutorCompletionMatch[2], "Executor instance id"),
+          "executorInstanceId",
+        );
+        const requestId = parseHostExecutorIdentifier(
+          decodeRouteSegment(remoteHostExecutorCompletionMatch[3], "Remote request id"),
+          "requestId",
+        );
+        const completion = parseRemoteHostExecutorChannelCompletion(
+          body,
+          codexHostId,
+          executorInstanceId,
+        );
+        return sendJson(
+          response,
+          200,
+          remoteHostExecutorChannels.complete(
+            completion.execution,
+            requestId,
+            completion.outcome,
+          ),
+        );
+      }
+
+      const remoteHostExecutorPollMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/channels\/([^/]+)\/requests$/,
+      );
+      if (remoteHostExecutorPollMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Remote host executor request routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(remoteHostExecutorPollMatch[1]);
+        const executorInstanceId = parseHostExecutorIdentifier(
+          decodeRouteSegment(remoteHostExecutorPollMatch[2], "Executor instance id"),
+          "executorInstanceId",
+        );
+        const poll = parseRemoteHostExecutorChannelPoll(
+          body,
+          codexHostId,
+          executorInstanceId,
+        );
+        let settled = false;
+        const cancel = () => {
+          if (!settled) remoteHostExecutorChannels.cancelPoll(poll.execution, poll.pollId);
+        };
+        response.once("close", cancel);
+        try {
+          const result = await remoteHostExecutorChannels.poll(poll.execution, poll.pollId);
+          settled = true;
+          return sendJson(response, 200, result);
+        } finally {
+          response.off("close", cancel);
+        }
+      }
+
+      const remoteHostExecutorDisconnectMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/channels\/([^/]+)\/disconnect$/,
+      );
+      if (remoteHostExecutorDisconnectMatch) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Remote host executor disconnect routes");
+        const body = await readJson(request);
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          body,
+          database,
+        );
+        const codexHostId = parseHostExecutorRoute(remoteHostExecutorDisconnectMatch[1]);
+        const executorInstanceId = parseHostExecutorIdentifier(
+          decodeRouteSegment(remoteHostExecutorDisconnectMatch[2], "Executor instance id"),
+          "executorInstanceId",
+        );
+        const execution = parseRemoteHostExecutorChannelExecution(
+          body,
+          codexHostId,
+          executorInstanceId,
+        );
+        return sendJson(response, 200, remoteHostExecutorChannels.disconnect(execution));
       }
 
       const hostExecutorLeaseTransitionMatch = pathname.match(
@@ -6862,6 +7054,7 @@ export function createTaskboardServer(options = {}) {
     aiChat,
     agentLanes,
     hostExecutorDispatcher,
+    remoteHostExecutorChannels,
     reconcileAgentLanes,
     server,
     options: resolved,
@@ -6901,6 +7094,7 @@ export function createTaskboardServer(options = {}) {
           })
         : Promise.resolve();
       events.close();
+      remoteHostExecutorChannels.close();
       if (agentLaneTimer) clearInterval(agentLaneTimer);
       agentLaneTimer = null;
       for (const response of aiEventResponses) response.end();

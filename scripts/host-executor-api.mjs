@@ -57,13 +57,13 @@ export function createHostExecutorApi({
     };
   }
 
-  async function request(pathname, { method = "GET", body = null, action }) {
+  async function request(pathname, { method = "GET", body = null, action, signal }) {
     const response = await fetchImpl(`${origin}${pathname}`, {
       method,
       headers: proofHeaders(pathname, body, method),
       ...(body === null ? {} : { body: JSON.stringify(body) }),
       cache: "no-store",
-      signal: timeoutSignal(),
+      signal: signal ?? timeoutSignal(),
     });
     let result;
     try {
@@ -140,6 +140,44 @@ export function createHostExecutorApi({
     });
   };
 
+  const remoteChannelRequest = (action, input) => {
+    const execution = input?.execution;
+    const codexHostId = requiredString(execution?.codexHostId, "codexHostId");
+    const executorInstanceId = requiredString(
+      execution?.executorInstanceId,
+      "executorInstanceId",
+    );
+    if (codexHostId === "local") {
+      throw new Error("Remote host executor channels do not support the local host");
+    }
+    const channelPath = `/api/local/host-executors/${encodeURIComponent(codexHostId)}`
+      + `/channels/${encodeURIComponent(executorInstanceId)}`;
+    if (action === "poll") {
+      const pollId = requiredString(input?.pollId ?? randomUUID(), "pollId");
+      return request(`${channelPath}/requests`, {
+        method: "POST",
+        action: "remote channel poll",
+        body: { execution, pollId },
+        signal: input.signal,
+      });
+    }
+    if (action === "disconnect") {
+      return request(`${channelPath}/disconnect`, {
+        method: "POST",
+        action: "remote channel disconnect",
+        body: { execution },
+        signal: input.signal,
+      });
+    }
+    const requestId = requiredString(input?.requestId, "requestId");
+    return request(`${channelPath}/requests/${encodeURIComponent(requestId)}/complete`, {
+      method: "POST",
+      action: "remote channel completion",
+      body: { execution, outcome: input.outcome },
+      signal: input.signal,
+    });
+  };
+
   return {
     register: registration,
     inspect: inspection,
@@ -147,5 +185,8 @@ export function createHostExecutorApi({
     renew: (input) => leaseMutation("renew", input),
     release: (input) => leaseMutation("release", input),
     executeEffect,
+    pollRemoteRequest: (input) => remoteChannelRequest("poll", input),
+    completeRemoteRequest: (input) => remoteChannelRequest("complete", input),
+    disconnectRemoteChannel: (input) => remoteChannelRequest("disconnect", input),
   };
 }

@@ -26,6 +26,8 @@ const COORDINATION_IDENTITY_HANDSHAKE_TTL_MS = 2 * 60_000;
 const COORDINATOR_PROVISIONING_ATTEMPT_TTL_MS = 10 * 60_000;
 const COORDINATOR_PROVISIONING_MISSING_THREAD_GRACE_MS = 60_000;
 const DOMAIN_COORDINATOR_SHUTDOWN_ABANDON_MS = 10 * 60_000;
+const LOCAL_HOST_EXECUTOR_ADAPTER_ID = "local-codex-app-server-v1";
+const REMOTE_HOST_EXECUTOR_ADAPTER_ID = "codex-renderer-rpc-v1";
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -4041,11 +4043,14 @@ export class TaskboardDatabase {
     try {
       const { execution, registration } = this.#requireActiveHostExecutorFence(input.execution);
       const { timestamp } = this.#hostExecutorTime();
-      if (registration.adapter_id !== "local-codex-app-server-v1") {
+      const expectedAdapterId = execution.codexHostId === "local"
+        ? LOCAL_HOST_EXECUTOR_ADAPTER_ID
+        : REMOTE_HOST_EXECUTOR_ADAPTER_ID;
+      if (registration.adapter_id !== expectedAdapterId) {
         throw new ApiError(
           409,
           "HOST_EXECUTOR_ADAPTER_MISMATCH",
-          "The active host executor is not registered for the local Codex adapter",
+          "The active host executor is not registered for the requested Codex host adapter",
         );
       }
       const capabilities = new Set(JSON.parse(registration.capabilities_json));
@@ -4124,6 +4129,29 @@ export class TaskboardDatabase {
       `).get(input.effectKey);
       this.database.exec("COMMIT");
       return { applied: true, replayed: false, effect: hostExecutorEffectFromRow(row) };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  assertHostExecutorChannelExecution(rawExecution, expectedAdapterIdInput) {
+    const expectedAdapterId = hostExecutorIdentifier(
+      expectedAdapterIdInput,
+      "expectedAdapterId",
+    );
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { execution, registration } = this.#requireActiveHostExecutorFence(rawExecution);
+      if (registration.adapter_id !== expectedAdapterId) {
+        throw new ApiError(
+          409,
+          "HOST_EXECUTOR_ADAPTER_MISMATCH",
+          "The active host executor does not own the requested channel adapter",
+        );
+      }
+      this.database.exec("COMMIT");
+      return { ...execution, adapterId: registration.adapter_id };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;

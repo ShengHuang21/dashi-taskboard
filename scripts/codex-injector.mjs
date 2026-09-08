@@ -14,6 +14,7 @@ import { resolvePort } from "../server/app.mjs";
 import { normalizeRepository } from "../server/standing-authority.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { isCanonicalCodexHostId } from "../shared/domain.mjs";
 import {
   parseTaskboardAutomationHostRequest,
   reconcileTaskboardAutomation,
@@ -79,6 +80,12 @@ import {
   createHostExecutorEffectKey,
 } from "./host-executor-api.mjs";
 import { createHostExecutorLeaseLifecycle } from "./host-executor-lifecycle.mjs";
+import {
+  createRemoteHostInventoryController,
+  createRemoteHostExecutorManager,
+  createRemoteHostExecutorWorker,
+  decodeCodexRendererRpcOutcome,
+} from "./remote-host-executor-runtime.mjs";
 import {
   CdpPipeBrowser,
   validatedLoopbackCdpWebSocketUrl,
@@ -182,6 +189,7 @@ const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:po
 const backgroundContinuationIntervalMs = 15_000;
 const residentHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
 const residentHostExecutorAdapterId = "local-codex-app-server-v1";
+const remoteHostExecutorAdapterId = "codex-renderer-rpc-v1";
 const residentHostExecutorMutatingRpcMethods = new Set([
   "thread/archive",
   "thread/name/set",
@@ -210,6 +218,7 @@ const quotaPolicyRestorePromises = new WeakMap();
 let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
+const hostExecutorEffectTimeoutMs = taskConversationAppServerTimeoutMs + 10_000;
 let localCodexThreadRpcEnabled = false;
 let localCodexThreadRpcLifecycle = null;
 let residentHostExecutorLeaseLifecycle = null;
@@ -1232,8 +1241,8 @@ async function requestCodexAppServerViaCdp(
 ) {
   const residentExecution = residentHostExecutorContext.getStore();
   if (residentExecution && residentHostExecutorMutatingRpcMethods.has(method)) {
-    if (hostId !== residentExecution.codexHostId || hostId !== "local") {
-      throw new Error("Resident host executor cannot mutate a non-local Codex host");
+    if (hostId !== residentExecution.codexHostId) {
+      throw new Error("Resident host executor cannot mutate a different Codex host");
     }
     if (method === "turn/start" && params?.approvalPolicy !== "never") {
       throw new Error("Headless Codex turns require approvalPolicy 'never'");
@@ -1246,7 +1255,9 @@ async function requestCodexAppServerViaCdp(
     const result = await createHostExecutorApi({
       baseUrl: taskboardBaseUrl,
       instanceSecret: taskboardInstanceSecret,
-      timeoutSignal: () => AbortSignal.timeout(timeoutMs),
+      timeoutSignal: () => AbortSignal.timeout(
+        Math.max(timeoutMs, hostExecutorEffectTimeoutMs),
+      ),
     }).executeEffect({
       effectKey,
       execution: {
@@ -1279,6 +1290,24 @@ async function requestCodexAppServerViaCdp(
       throw error;
     }
   }
+  return requestCodexRendererRpcViaCdp(
+    cdp,
+    executionContextId,
+    hostId,
+    method,
+    params,
+    timeoutMs,
+  );
+}
+
+async function requestCodexRendererRpcViaCdp(
+  cdp,
+  executionContextId,
+  hostId,
+  method,
+  params,
+  timeoutMs = taskConversationAppServerTimeoutMs,
+) {
   if (!cdp || typeof cdp.send !== "function") {
     throw new Error("Codex renderer RPC is unavailable");
   }
@@ -1293,7 +1322,10 @@ async function requestCodexAppServerViaCdp(
       const requestId = ${JSON.stringify(requestId)};
       const bridge = window.electronBridge;
       if (!bridge || typeof bridge.sendMessageFromView !== "function") {
-        resolve({ ok: false, error: "Codex App Server bridge is unavailable" });
+        resolve({
+          kind: "transport-error",
+          error: "Codex App Server bridge is unavailable",
+        });
         return;
       }
       let settled = false;
@@ -1314,17 +1346,13 @@ async function requestCodexAppServerViaCdp(
           || message.message?.id !== requestId
         ) return;
         event.stopImmediatePropagation();
-        if (message.message.error) {
-          finish({
-            ok: false,
-            error: message.message.error.message || "Codex App Server request failed",
-          });
-          return;
-        }
-        finish({ ok: true, result: message.message.result });
+        finish({ kind: "response", message: message.message });
       };
       const timeout = window.setTimeout(
-        () => finish({ ok: false, error: "Codex App Server request timed out" }),
+        () => finish({
+          kind: "transport-error",
+          error: "Codex App Server request timed out",
+        }),
         ${JSON.stringify(timeoutMs)},
       );
       window.addEventListener("message", onMessage, true);
@@ -1342,7 +1370,7 @@ async function requestCodexAppServerViaCdp(
         expiresAtMs: Date.now() + ${JSON.stringify(timeoutMs)},
       })).catch((error) => {
         finish({
-          ok: false,
+          kind: "transport-error",
           error: error instanceof Error ? error.message : String(error),
         });
       });
@@ -1358,8 +1386,54 @@ async function requestCodexAppServerViaCdp(
     );
   }
   const response = evaluation.result.value;
-  if (!response?.ok) throw new Error(response?.error || "Codex App Server request failed");
-  return response.result;
+  return decodeCodexRendererRpcOutcome(response);
+}
+
+async function readCodexRemoteHostIdsViaCdp(cdp) {
+  if (!cdp || typeof cdp.send !== "function" || cdp.closed) {
+    throw new Error("Codex renderer metadata is unavailable");
+  }
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const bridge = window.electronBridge;
+      if (!bridge || typeof bridge.getInitialSidebarBootstrap !== "function") {
+        return { available: false };
+      }
+      const bootstrap = await bridge.getInitialSidebarBootstrap();
+      const entries = Array.isArray(bootstrap?.globalStateEntries)
+        ? bootstrap.globalStateEntries
+        : [];
+      const remoteProjects = entries.find((entry) => entry?.key === "remote-projects")?.value;
+      if (!Array.isArray(remoteProjects)) return { available: false };
+      const complete = remoteProjects.every((project) => (
+        typeof project?.id === "string" && project.id.trim()
+        && typeof project?.remotePath === "string" && project.remotePath.trim()
+        && typeof project?.hostId === "string" && project.hostId.trim()
+      ));
+      if (!complete) return { available: false };
+      return {
+        available: true,
+        hostIds: remoteProjects.map((project) => project.hostId.trim()),
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      evaluation.exceptionDetails.exception?.description
+      || "Codex renderer project metadata failed",
+    );
+  }
+  const result = evaluation.result.value;
+  if (result?.available !== true || !Array.isArray(result.hostIds)) {
+    throw new Error("Codex renderer did not publish authoritative remote project metadata");
+  }
+  const hostIds = [...new Set(result.hostIds)];
+  if (hostIds.some((hostId) => !isCanonicalCodexHostId(hostId) || hostId === "local")) {
+    throw new Error("Codex renderer published an invalid remote host identity");
+  }
+  return hostIds.sort();
 }
 
 function initializeHostRequestQueueExpression(queueName) {
@@ -3657,13 +3731,20 @@ async function runCoordinatorIdentityHandshakeFastLaneOnce(cdp) {
   });
 }
 
-function startResidentCoordinatorMonitors(cdp, { isStopped = () => false } = {}) {
+function startResidentCoordinatorMonitors(cdp, {
+  isStopped = () => false,
+  isActive = residentHostExecutorLeaseIsActive,
+  executionEnvelope = residentHostExecutorExecution,
+  resolveCdp = () => cdp,
+} = {}) {
   const schedule = (run, intervalMs, label) => createDisposableMonitorTimer(async () => {
-    if (isStopped() || !residentHostExecutorLeaseIsActive()) return;
-    const execution = residentHostExecutorExecution();
+    if (isStopped() || !isActive()) return;
+    const execution = executionEnvelope();
     if (!execution) return;
+    const activeCdp = resolveCdp();
+    if (execution.codexHostId !== "local" && (!activeCdp || activeCdp.closed)) return;
     try {
-      await residentHostExecutorContext.run(execution, () => run(cdp));
+      await residentHostExecutorContext.run(execution, () => run(activeCdp));
     } catch (error) {
       console.error(`${label}: ${error.message}`);
     }
@@ -4608,6 +4689,121 @@ async function main() {
   if (options.watch) {
     residentHostExecutorLeaseLifecycle = createResidentHostExecutorLeaseLifecycle();
   }
+  let remoteHostExecutorManager = null;
+  let remoteHostInventoryController = null;
+  let reconcileRemoteHostExecutorInventory = async () => ({ hosts: [] });
+  let lastRemoteHostInventoryError = null;
+  const reportRemoteHostInventoryError = (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === lastRemoteHostInventoryError) return;
+    lastRemoteHostInventoryError = message;
+    console.error(`Waiting for remote Codex host inventory: ${message}`);
+  };
+  const clearRemoteHostInventoryError = () => {
+    lastRemoteHostInventoryError = null;
+  };
+  if (options.watch) {
+    const hostExecutorApi = createHostExecutorApi({
+      baseUrl: taskboardBaseUrl,
+      instanceSecret: taskboardInstanceSecret,
+    });
+    remoteHostExecutorManager = createRemoteHostExecutorManager({
+      createWorker: (codexHostId) => {
+        let lastLeaseState = null;
+        let lastLeaseFailure = null;
+        const lifecycle = createHostExecutorLeaseLifecycle({
+          codexHostId,
+          executorInstanceId: randomUUID(),
+          adapterId: remoteHostExecutorAdapterId,
+          leaseDurationSeconds: residentHostExecutorLeaseDurationSeconds,
+          renewIntervalMs: residentHostExecutorRenewIntervalMs,
+          register: hostExecutorApi.register,
+          inspect: hostExecutorApi.inspect,
+          acquire: hostExecutorApi.acquire,
+          renew: hostExecutorApi.renew,
+          release: hostExecutorApi.release,
+          createOperationId: randomUUID,
+          onStateChange: (state) => {
+            const diagnostic = JSON.stringify({
+              event: "taskboard.remote-host-executor.lease",
+              codexHostId,
+              active: state.active,
+              reason: state.reason,
+              leaseStatus: state.lease?.status ?? null,
+            });
+            if (diagnostic === lastLeaseState) return;
+            lastLeaseState = diagnostic;
+            lastLeaseFailure = null;
+            console.log(diagnostic);
+          },
+          onError: (error) => {
+            const failure = typeof error?.code === "string" && error.code
+              ? error.code
+              : error instanceof Error ? error.message : String(error);
+            if (failure === lastLeaseFailure) return;
+            lastLeaseFailure = failure;
+            console.error(`Taskboard remote host executor lease unavailable: ${error.message}`);
+          },
+        });
+        const channelWorker = createRemoteHostExecutorWorker({
+          codexHostId,
+          lifecycle,
+          pollRequest: hostExecutorApi.pollRemoteRequest,
+          completeRequest: hostExecutorApi.completeRemoteRequest,
+          disconnectRequest: hostExecutorApi.disconnectRemoteChannel,
+          executeRpc: (ownedCodexHostId, method, params) => {
+            const renderer = remoteHostInventoryController?.rendererFor(ownedCodexHostId);
+            if (!renderer || renderer.closed) {
+              throw new Error("The exact Codex renderer for the remote host is unavailable");
+            }
+            return requestCodexRendererRpcViaCdp(
+              renderer,
+              undefined,
+              ownedCodexHostId,
+              method,
+              params,
+              taskConversationAppServerTimeoutMs,
+            );
+          },
+          onError: (error) => {
+            console.error(`Taskboard remote host executor channel unavailable: ${error.message}`);
+          },
+        });
+        let stopped = true;
+        let disposeMonitors = null;
+        return {
+          async start() {
+            stopped = false;
+            const state = await channelWorker.start();
+            disposeMonitors = startResidentCoordinatorMonitors(null, {
+              isStopped: () => stopped,
+              isActive: lifecycle.isActive,
+              executionEnvelope: lifecycle.executionEnvelope,
+              resolveCdp: () => remoteHostInventoryController?.rendererFor(codexHostId) ?? null,
+            });
+            return state;
+          },
+          async stop() {
+            stopped = true;
+            disposeMonitors?.();
+            disposeMonitors = null;
+            return channelWorker.stop();
+          },
+        };
+      },
+    });
+    remoteHostInventoryController = createRemoteHostInventoryController({
+      listRenderers: () => [...injectedTargets.values()]
+        .filter((connection) => !connection.closed),
+      readHostIds: readCodexRemoteHostIdsViaCdp,
+      manager: remoteHostExecutorManager,
+    });
+    reconcileRemoteHostExecutorInventory = async () => {
+      const result = await remoteHostInventoryController.reconcile();
+      clearRemoteHostInventoryError();
+      return result;
+    };
+  }
 
   const publishRuntime = async () => {
     const pending = publishTaskboardRuntime();
@@ -4712,6 +4908,13 @@ async function main() {
     cleanupPromise = (async () => {
       disposeResidentCoordinatorMonitors?.();
       disposeResidentCoordinatorMonitors = null;
+      try {
+        await remoteHostInventoryController?.stop();
+      } catch (error) {
+        console.error(`Taskboard remote host executor cleanup failed: ${error.message}`);
+      }
+      remoteHostInventoryController = null;
+      remoteHostExecutorManager = null;
       await residentHostExecutorLeaseLifecycle?.stop();
       residentHostExecutorLeaseLifecycle = null;
       await closeLocalCodexThreadRpcTransport();
@@ -4893,6 +5096,11 @@ async function main() {
       }
       console.log(JSON.stringify({ injected: firstResults }, null, 2));
     }
+    try {
+      await reconcileRemoteHostExecutorInventory();
+    } catch (error) {
+      reportRemoteHostInventoryError(error);
+    }
     if (hasOpenPending()) {
       await requestTaskboardOpen();
     }
@@ -4921,6 +5129,11 @@ async function main() {
         try {
           await connection.hostBridge?.publishHeartbeat();
         } catch (_) {}
+      }
+      try {
+        await reconcileRemoteHostExecutorInventory();
+      } catch (error) {
+        reportRemoteHostInventoryError(error);
       }
       if (nativeCodexBrowser) {
         const visibleCodex = codexAppProcesses(options.appPath)
@@ -4979,6 +5192,11 @@ async function main() {
         );
         if (results.length > 0) {
           console.log(JSON.stringify({ injected: results }, null, 2));
+          try {
+            await reconcileRemoteHostExecutorInventory();
+          } catch (error) {
+            reportRemoteHostInventoryError(error);
+          }
         }
         if (hasOpenPending()) {
           await requestTaskboardOpen();

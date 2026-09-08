@@ -473,10 +473,16 @@ test("resident injector wires lifecycle start, restart reconciliation, monitor g
   assert.match(source, /await publishRuntime\(\);[\s\S]*?await residentHostExecutorLeaseLifecycle\?\.start\(\);/);
   assert.match(source, /service\.restarted[\s\S]*?await publishRuntime\(\);[\s\S]*?residentHostExecutorLeaseLifecycle\?\.reconcile\(\)/);
   assert.match(source, /residentHostExecutorLeaseIsActive\(\)/);
-  assert.equal(source.match(/!residentHostExecutorLeaseIsActive\(\)/g)?.length, 4);
+  assert.equal(source.match(/!residentHostExecutorLeaseIsActive\(\)/g)?.length, 3);
+  assert.match(source, /if \(isStopped\(\) \|\| !isActive\(\)\) return;/);
+  assert.match(source, /const execution = executionEnvelope\(\);/);
+  assert.match(source, /const activeCdp = resolveCdp\(\);/);
   assert.equal(source.match(/residentHostExecutorContext\.run\(/g)?.length, 4);
   assert.match(source, /residentHostExecutorMutatingRpcMethods\.has\(method\)[\s\S]*?\.executeEffect\(\{/);
   assert.match(source, /residentHostExecutorFenceHeaders\(pathname, body\)/);
   assert.match(source, /if \(options\.watch\) \{[\s\S]*?createResidentHostExecutorLeaseLifecycle\(\)/);
-  assert.match(source, /disposeResidentCoordinatorMonitors\?\.\(\);[\s\S]*?await residentHostExecutorLeaseLifecycle\?\.stop\(\);[\s\S]*?await closeLocalCodexThreadRpcTransport\(\);/);
+  assert.match(source, /createRemoteHostExecutorManager[\s\S]*?createRemoteHostExecutorWorker/);
+  assert.match(source, /createRemoteHostInventoryController\(\{/);
+  assert.match(source, /requestCodexRendererRpcViaCdp/);
+  assert.match(source, /disposeResidentCoordinatorMonitors\?\.\(\);[\s\S]*?await remoteHostInventoryController\?\.stop\(\);[\s\S]*?await residentHostExecutorLeaseLifecycle\?\.stop\(\);[\s\S]*?await closeLocalCodexThreadRpcTransport\(\);/);
 });
