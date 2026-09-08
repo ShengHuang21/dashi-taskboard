@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 
+import { isCanonicalCodexHostId } from "../shared/domain.mjs";
+
 const HOST_REQUEST_ERROR = "自动认领配置暂时无法应用，请刷新后重试";
 const AUTOMATION_SCHEMA_DIAGNOSTIC = "AUTOMATION_SCHEMA_MISMATCH";
 const coordinationDeliveries = new Map();
@@ -36,6 +38,120 @@ const COORDINATOR_DELIVERY_MODEL_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_MODEL_
 const COORDINATOR_DELIVERY_EFFORT_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:";
 const COORDINATOR_DELIVERY_RETRY_BASE_MS = 15_000;
 const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
+function normalizeHostExecutor(value) {
+  const ownedCodexHostId = value?.ownedCodexHostId;
+  if (!isCanonicalCodexHostId(ownedCodexHostId)) return null;
+  const fenceValues = [
+    value?.codexHostId,
+    value?.executorInstanceId,
+    value?.registrationFingerprint,
+    value?.leaseId,
+  ];
+  if (fenceValues.every((candidate) => candidate === undefined)) {
+    return { ownedCodexHostId };
+  }
+  if (value.codexHostId !== ownedCodexHostId
+    || typeof value.executorInstanceId !== "string" || !value.executorInstanceId
+    || !RESUME_TOKEN_PATTERN.test(value.registrationFingerprint ?? "")
+    || typeof value.leaseId !== "string" || !value.leaseId) {
+    return null;
+  }
+  return Object.freeze({
+    ownedCodexHostId,
+    codexHostId: value.codexHostId,
+    executorInstanceId: value.executorInstanceId,
+    registrationFingerprint: value.registrationFingerprint,
+    leaseId: value.leaseId,
+  });
+}
+
+function hostExecutorOwnsRoute(hostExecutor, route) {
+  return route?.codexHostId === hostExecutor.ownedCodexHostId;
+}
+
+function hostExecutorOwnsCanonicalRoute(hostExecutor, route) {
+  return isCanonicalCodexHostId(route?.codexHostId)
+    && hostExecutorOwnsRoute(hostExecutor, route);
+}
+
+function hasCompleteOwnerDecisionRoute(route) {
+  return Boolean(
+    COORDINATION_ID_PATTERN.test(route?.rootTaskId ?? "")
+    && THREAD_ID_PATTERN.test(route?.rootThreadId ?? "")
+    && hasCompleteCodexLaunchRoute({
+      codexProjectId: route?.codexProjectId,
+      codexProjectKind: route?.codexProjectKind,
+      codexHostId: route?.codexHostId,
+      workspacePath: route?.rootWorkspacePath,
+    }),
+  );
+}
+
+function ownerDecisionRouteMatchesLane(route, lane) {
+  return Boolean(hasCompleteOwnerDecisionRoute(route)
+    && lane?.id === route.rootTaskId
+    && lane.threadId === route.rootThreadId
+    && lane.codexProjectId === route.codexProjectId
+    && lane.codexProjectKind === route.codexProjectKind
+    && lane.codexHostId === route.codexHostId
+    && typeof lane.workspacePath === "string"
+    && path.isAbsolute(lane.workspacePath)
+    && path.resolve(lane.workspacePath) === path.resolve(route.rootWorkspacePath));
+}
+
+function hostProjectMonitorRunKey(hostExecutor, projectId) {
+  return JSON.stringify([hostExecutor.ownedCodexHostId, projectId]);
+}
+
+function coordinatorShutdownRunKey(hostExecutor, projectId) {
+  return hostProjectMonitorRunKey(hostExecutor, projectId);
+}
+
+function coordinatorShutdownObservationKey(hostExecutor, projectId) {
+  return coordinatorShutdownRunKey(hostExecutor, projectId);
+}
+
+function domainCoordinatorShutdownObservationKey(hostExecutor, projectId, domainId) {
+  return JSON.stringify([hostExecutor.ownedCodexHostId, projectId, domainId]);
+}
+
+function shutdownAttemptOwnedByHost(attempt, hostExecutor, projectId, domainId = undefined) {
+  return attempt?.projectId === projectId
+    && (domainId === undefined || attempt?.domainId === domainId)
+    && hostExecutorOwnsCanonicalRoute(hostExecutor, attempt);
+}
+
+const COORDINATOR_SHUTDOWN_ATTEMPT_ENVELOPE_FIELDS = [
+  "id", "idempotencyKey", "projectId", "domainId", "expectedRevision", "expectedLeaseId",
+  "holderTaskId", "holderThreadId", "codexProjectId", "codexProjectKind",
+  "codexHostId", "workspacePath",
+  "ownerRootTaskId", "ownerRootThreadId", "ownerRootCodexProjectId",
+  "ownerRootCodexProjectKind", "ownerRootCodexHostId", "ownerRootWorkspacePath",
+  "globalHolderTaskId", "globalHolderThreadId", "expectedGlobalLeaseId",
+];
+const COORDINATOR_SHUTDOWN_ATTEMPT_PATH_FIELDS = new Set([
+  "workspacePath", "ownerRootWorkspacePath",
+]);
+
+function coordinatorShutdownAttemptEnvelope(attempt) {
+  return Object.fromEntries(COORDINATOR_SHUTDOWN_ATTEMPT_ENVELOPE_FIELDS.map(
+    (field) => [
+      field,
+      COORDINATOR_SHUTDOWN_ATTEMPT_PATH_FIELDS.has(field)
+        && typeof attempt?.[field] === "string"
+        ? path.resolve(attempt[field])
+        : attempt?.[field],
+    ],
+  ));
+}
+
+function retainsCoordinatorShutdownAttemptEnvelope(attempt, envelope, { includeId = true } = {}) {
+  const candidate = coordinatorShutdownAttemptEnvelope(attempt);
+  return COORDINATOR_SHUTDOWN_ATTEMPT_ENVELOPE_FIELDS.every(
+    (field) => (!includeId && field === "id")
+      || candidate[field] === envelope[field],
+  );
+}
 
 export function admissionRecoveryRpcTimeoutMs(method) {
   return method === "thread/resume" || method === "turn/start" ? 30_000 : 10_000;
@@ -599,6 +715,99 @@ function coordinatorProvisioningIdentity(projectId, revision, ownerRootTaskId) {
   };
 }
 
+function hasCanonicalCoordinatorProvisioningAttemptIdentity(attempt) {
+  const idempotencyMatch = /^coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.idempotencyKey ?? "",
+  );
+  const sourceMatch = /^taskboard-coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.threadSource ?? "",
+  );
+  const taskPrefix = typeof attempt?.projectId === "string"
+    ? `coordinator-${attempt.projectId}-`
+    : null;
+  const taskFingerprint = taskPrefix && typeof attempt?.taskId === "string"
+    && attempt.taskId.startsWith(taskPrefix)
+    ? attempt.taskId.slice(taskPrefix.length)
+    : null;
+  const taskIsCanonical = /^[a-f0-9]{12}$/.test(taskFingerprint ?? "");
+  if (!idempotencyMatch && !sourceMatch && !taskIsCanonical) return true;
+  return Boolean(idempotencyMatch && sourceMatch && taskIsCanonical
+    && taskFingerprint === idempotencyMatch[1].slice(0, 12)
+    && sourceMatch[1] === idempotencyMatch[1]);
+}
+
+function validateGlobalCoordinatorWindowSet(windows, ownerRootTaskId, hostExecutor) {
+  if (!Array.isArray(windows)) return { valid: false, issue: "malformed" };
+  if (!COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
+    || windows.some((window) => !COORDINATION_ID_PATTERN.test(window?.taskId ?? ""))
+    || windows.some((window) => !["owner_root", "coordinator"].includes(window?.role))) {
+    return { valid: false, issue: "malformed" };
+  }
+  const ownerWindows = windows.filter((window) => window.role === "owner_root");
+  if (ownerWindows.length !== 1 || ownerWindows[0].taskId !== ownerRootTaskId) {
+    return { valid: false, issue: "owner" };
+  }
+  if (new Set(windows.map((window) => window.taskId)).size !== windows.length) {
+    return { valid: false, issue: "malformed" };
+  }
+  const unownedWindow = windows.find(
+    (window) => !hostExecutorOwnsCanonicalRoute(hostExecutor, window),
+  );
+  if (unownedWindow) {
+    return { valid: false, issue: unownedWindow.role === "owner_root" ? "owner-host" : "coordinator-host" };
+  }
+  return {
+    valid: true,
+    ownerWindow: ownerWindows[0],
+    coordinatorWindows: windows.filter((window) => window.role === "coordinator"),
+  };
+}
+
+const COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS = [
+  "id", "idempotencyKey", "projectId", "taskId", "label", "threadSource",
+  "model", "reasoningEffort", "ownerRootTaskId", "ownerRootThreadId",
+  "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath", "createdAt",
+];
+const COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS = [
+  "expectedRevision", "status", "threadId", "retryCount", "missingSince", "expiresAt",
+];
+
+function coordinatorProvisioningAttemptEnvelope(attempt) {
+  return Object.fromEntries(COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS
+    .map((field) => [field, field === "workspacePath"
+      ? path.resolve(attempt?.[field] ?? "")
+      : attempt?.[field]]));
+}
+
+function coordinatorProvisioningAttemptMutableState(attempt) {
+  return Object.fromEntries(COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS
+    .map((field) => [field, attempt?.[field]]));
+}
+
+function retainsCoordinatorProvisioningAttemptEnvelope(candidate, envelope) {
+  return COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS.every((field) => (
+    field === "workspacePath"
+      ? path.resolve(candidate?.[field] ?? "") === envelope[field]
+      : candidate?.[field] === envelope[field]
+  ));
+}
+
+function matchesCoordinatorProvisioningTransitionResponse(candidate, envelope, before, {
+  allowedMutable = [],
+  expected = {},
+} = {}) {
+  if (!retainsCoordinatorProvisioningAttemptEnvelope(candidate, envelope)) return false;
+  for (const field of COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS) {
+    if (!allowedMutable.includes(field) && candidate?.[field] !== before[field]) return false;
+  }
+  return Object.entries(expected).every(([field, value]) => candidate?.[field] === value);
+}
+
+function coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, projectId) {
+  return attempt?.projectId === projectId
+    && hostExecutorOwnsCanonicalRoute(hostExecutor, attempt);
+}
+
 function domainCoordinatorProvisioningIdentity(
   projectId, revision, domainId, taskId, globalLeaseId,
 ) {
@@ -609,6 +818,147 @@ function domainCoordinatorProvisioningIdentity(
     idempotencyKey: `domain-coordinator-provision-${fingerprint}`,
     threadSource: `taskboard-domain-coordinator-provision-${fingerprint}`,
   };
+}
+
+function hasCanonicalDomainCoordinatorProvisioningAttemptIdentity(attempt) {
+  const idempotency = /^domain-coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.idempotencyKey ?? "",
+  );
+  const source = /^taskboard-domain-coordinator-provision-([a-f0-9]{64})$/.exec(
+    attempt?.threadSource ?? "",
+  );
+  if (!idempotency && !source) return true;
+  return Boolean(idempotency && source && idempotency[1] === source[1]);
+}
+
+const DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS = [
+  "id", "projectId", "domainId", "idempotencyKey", "taskId", "label", "threadSource",
+  "model", "reasoningEffort", "globalHolderTaskId", "globalHolderThreadId",
+  "globalHolderCodexProjectId", "globalHolderCodexProjectKind", "globalHolderCodexHostId",
+  "globalHolderWorkspacePath", "codexProjectId", "codexProjectKind", "codexHostId",
+  "workspacePath", "writeScope", "createdAt",
+];
+const DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS = [
+  "expectedRevision", "expectedGlobalLeaseId", "status", "threadId", "retryCount",
+  "missingSince", "expiresAt",
+];
+const DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_PATH_FIELDS = new Set([
+  "globalHolderWorkspacePath", "workspacePath",
+]);
+
+function domainCoordinatorProvisioningAttemptField(attempt, field) {
+  const value = attempt?.[field];
+  if (DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_PATH_FIELDS.has(field)) {
+    return typeof value === "string" ? path.resolve(value) : value;
+  }
+  return field === "writeScope" && Array.isArray(value) ? JSON.stringify(value) : value;
+}
+
+function domainCoordinatorProvisioningAttemptEnvelope(attempt) {
+  return Object.fromEntries(DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS
+    .map((field) => [field, domainCoordinatorProvisioningAttemptField(attempt, field)]));
+}
+
+function domainCoordinatorProvisioningAttemptMutableState(attempt) {
+  return Object.fromEntries(DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS
+    .map((field) => [field, attempt?.[field]]));
+}
+
+function retainsDomainCoordinatorProvisioningAttemptEnvelope(candidate, envelope) {
+  return DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_IMMUTABLE_FIELDS.every(
+    (field) => domainCoordinatorProvisioningAttemptField(candidate, field) === envelope[field],
+  );
+}
+
+function matchesDomainCoordinatorProvisioningTransitionResponse(
+  candidate,
+  envelope,
+  before,
+  { allowedMutable = [], expected = {} } = {},
+) {
+  if (!retainsDomainCoordinatorProvisioningAttemptEnvelope(candidate, envelope)) return false;
+  for (const field of DOMAIN_COORDINATOR_PROVISIONING_ATTEMPT_MUTABLE_FIELDS) {
+    if (!allowedMutable.includes(field) && candidate?.[field] !== before[field]) return false;
+  }
+  return Object.entries(expected).every(([field, value]) => candidate?.[field] === value);
+}
+
+function domainCoordinatorProvisioningAttemptOwnedByHost(
+  attempt, hostExecutor, projectId, domainId,
+) {
+  return attempt?.projectId === projectId
+    && attempt?.domainId === domainId
+    && hostExecutorOwnsCanonicalRoute(hostExecutor, attempt);
+}
+
+function hasCompleteCodexLaunchRoute(route) {
+  return typeof route?.codexProjectId === "string" && route.codexProjectId
+    && ["local", "remote"].includes(route.codexProjectKind)
+    && isCanonicalCodexHostId(route.codexHostId)
+    && ((route.codexProjectKind === "local" && route.codexHostId === "local")
+      || (route.codexProjectKind === "remote" && route.codexHostId !== "local"))
+    && typeof route.workspacePath === "string" && path.isAbsolute(route.workspacePath);
+}
+
+function hasAnyCodexLaunchRouteField(route) {
+  return ["codexProjectId", "codexProjectKind", "codexHostId", "workspacePath"]
+    .some((field) => route?.[field] !== undefined && route?.[field] !== null && route?.[field] !== "");
+}
+
+function matchesDomainCoordinatorProvisioningAttemptBinding(attempt, {
+  policy,
+  domain,
+  lane,
+  launchLane,
+  globalLease,
+  globalHolder,
+  hostExecutor,
+  identity,
+  requireCurrentIdentity,
+  requireCompleteGlobalBinding,
+}) {
+  const globalBindingValues = [
+    attempt?.globalHolderCodexProjectId,
+    attempt?.globalHolderCodexProjectKind,
+    attempt?.globalHolderCodexHostId,
+    attempt?.globalHolderWorkspacePath,
+  ];
+  const hasAnyGlobalBinding = globalBindingValues.some(
+    (value) => value !== undefined && value !== null && value !== "",
+  );
+  const completeGlobalBinding = attempt?.globalHolderCodexProjectId === globalHolder.codexProjectId
+    && attempt?.globalHolderCodexProjectKind === globalHolder.codexProjectKind
+    && attempt?.globalHolderCodexHostId === globalHolder.codexHostId
+    && typeof attempt?.globalHolderWorkspacePath === "string"
+    && path.resolve(attempt.globalHolderWorkspacePath) === path.resolve(globalHolder.workspacePath);
+  return Boolean(typeof attempt?.id === "string" && attempt.id
+    && attempt.projectId === policy.projectId
+    && attempt.domainId === domain.domainId
+    && attempt.taskId === lane.id
+    && attempt.label === lane.label
+    && typeof attempt.model === "string" && attempt.model
+    && typeof attempt.reasoningEffort === "string" && attempt.reasoningEffort
+    && (typeof policy.model !== "string" || !policy.model || attempt.model === policy.model)
+    && (typeof policy.reasoningEffort !== "string" || !policy.reasoningEffort
+      || attempt.reasoningEffort === policy.reasoningEffort)
+    && attempt.globalHolderTaskId === globalHolder.id
+    && attempt.globalHolderThreadId === globalHolder.threadId
+    && (!hasAnyGlobalBinding ? !requireCompleteGlobalBinding : completeGlobalBinding)
+    && attempt.codexProjectId === launchLane.codexProjectId
+    && attempt.codexProjectKind === launchLane.codexProjectKind
+    && attempt.codexHostId === launchLane.codexHostId
+    && typeof attempt.workspacePath === "string"
+    && path.resolve(attempt.workspacePath) === path.resolve(launchLane.workspacePath)
+    && JSON.stringify(attempt.writeScope) === JSON.stringify(domain.writeScope)
+    && typeof attempt.createdAt === "string" && attempt.createdAt
+    && hasCanonicalDomainCoordinatorProvisioningAttemptIdentity(attempt)
+    && (!requireCurrentIdentity
+      || (attempt.idempotencyKey === identity.idempotencyKey
+        && attempt.threadSource === identity.threadSource))
+    && domainCoordinatorProvisioningAttemptOwnedByHost(
+      attempt, hostExecutor, policy.projectId, domain.domainId,
+    )
+    && globalLease?.id);
 }
 
 function coordinatorShutdownIdentity(projectId, lease, lane, ownerLane) {
@@ -646,8 +996,16 @@ function domainCoordinatorShutdownIdentity(projectId, domainId, revision, lease,
   return { idempotencyKey: `domain-coordinator-shutdown-${fingerprint}`, fingerprint };
 }
 
-async function continueCoordinatorShutdownAttempt(options, attempt) {
+async function continueCoordinatorShutdownAttempt(options, attempt, expected) {
+  const { hostExecutor, projectId, domainId } = expected;
+  if (!shutdownAttemptOwnedByHost(attempt, hostExecutor, projectId, domainId)) {
+    return { shutdown: false, reason: "attempt-host-unowned" };
+  }
   if (!attempt?.id) return { shutdown: false, reason: "attempt-unavailable" };
+  const envelope = coordinatorShutdownAttemptEnvelope(attempt);
+  const responseMismatch = () => ({
+    shutdown: false, reason: "attempt-response-mismatch", attemptId: envelope.id,
+  });
   if (attempt.status === "completed") {
     return { shutdown: true, reason: "completed", attemptId: attempt.id };
   }
@@ -656,21 +1014,38 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
   }
   if (attempt.status === "pending") {
     try {
-      const released = await options.releaseAttempt({ attemptId: attempt.id });
-      attempt = released?.attempt ?? attempt;
+      const released = await options.releaseAttempt({
+        attemptId: attempt.id,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
+      });
+      if (!retainsCoordinatorShutdownAttemptEnvelope(released?.attempt, envelope)) {
+        return responseMismatch();
+      }
+      attempt = released.attempt;
     } catch {
       return { shutdown: false, reason: "release-unavailable", attemptId: attempt.id };
     }
+  }
+  if (!shutdownAttemptOwnedByHost(attempt, hostExecutor, projectId, domainId)) {
+    return { shutdown: false, reason: "attempt-host-unowned", attemptId: attempt?.id };
   }
   if (!["released", "authorized", "archiving"].includes(attempt.status)) {
     return { shutdown: false, reason: "attempt-state-unavailable", attemptId: attempt.id };
   }
   if (typeof options.authorizeAttempt === "function" && attempt.status !== "archiving") {
     try {
-      const authorization = await options.authorizeAttempt({ attemptId: attempt.id });
-      if (authorization?.authorized !== true
-        || authorization?.attempt?.id !== attempt.id
-        || authorization.attempt.status !== "authorized") {
+      const authorization = await options.authorizeAttempt({
+        attemptId: attempt.id,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
+      });
+      if (!retainsCoordinatorShutdownAttemptEnvelope(authorization?.attempt, envelope)) {
+        return responseMismatch();
+      }
+      if (authorization.authorized !== true
+        || authorization.attempt.status !== "authorized"
+        || !shutdownAttemptOwnedByHost(
+          authorization.attempt, hostExecutor, projectId, domainId,
+        )) {
         return { shutdown: false, reason: "archive-authorization-unavailable", attemptId: attempt.id };
       }
       attempt = authorization.attempt;
@@ -680,7 +1055,15 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
   }
   const cancelPreArchive = async (reason) => {
     if (attempt.status === "authorized" && typeof options.cancelAttempt === "function") {
-      try { await options.cancelAttempt({ attemptId: attempt.id }); } catch { /* retry observation */ }
+      try {
+        const canceled = await options.cancelAttempt({
+          attemptId: attempt.id,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        if (!retainsCoordinatorShutdownAttemptEnvelope(canceled?.attempt, envelope)) {
+          return responseMismatch();
+        }
+      } catch { /* retry observation */ }
     }
     return { shutdown: false, reason, attemptId: attempt.id };
   };
@@ -716,9 +1099,16 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
   }
   if (typeof options.beginArchiveAttempt === "function" && attempt.status !== "archiving") {
     try {
-      const begun = await options.beginArchiveAttempt({ attemptId: attempt.id });
-      if (begun?.archiving !== true || begun?.attempt?.id !== attempt.id
-        || begun.attempt.status !== "archiving") {
+      const begun = await options.beginArchiveAttempt({
+        attemptId: attempt.id,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
+      });
+      if (!retainsCoordinatorShutdownAttemptEnvelope(begun?.attempt, envelope)) {
+        return responseMismatch();
+      }
+      if (begun.archiving !== true
+        || begun.attempt.status !== "archiving"
+        || !shutdownAttemptOwnedByHost(begun.attempt, hostExecutor, projectId, domainId)) {
         return { shutdown: false, reason: "archive-fence-unavailable", attemptId: attempt.id };
       }
       attempt = begun.attempt;
@@ -738,8 +1128,14 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
     }
   }
   try {
-    const completed = await options.completeAttempt({ attemptId: attempt.id });
-    return completed?.attempt?.status === "completed"
+    const completed = await options.completeAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    if (!retainsCoordinatorShutdownAttemptEnvelope(completed?.attempt, envelope)) {
+      return responseMismatch();
+    }
+    return completed.attempt.status === "completed"
       ? { shutdown: true, reason: "completed", attemptId: attempt.id }
       : { shutdown: false, reason: "completion-unavailable", attemptId: attempt.id };
   } catch {
@@ -748,11 +1144,14 @@ async function continueCoordinatorShutdownAttempt(options, attempt) {
 }
 
 async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
-  const { policy } = options;
+  const { policy, hostExecutor } = options;
+  const observationKey = coordinatorShutdownObservationKey(hostExecutor, policy.projectId);
   const existing = (await options.getAttempt({ projectId: policy.projectId }))?.attempt ?? null;
   if (existing && existing.status !== "completed" && existing.status !== "canceled") {
-    coordinatorShutdownIdleObservations.delete(policy.projectId);
-    return continueCoordinatorShutdownAttempt(options, existing);
+    coordinatorShutdownIdleObservations.delete(observationKey);
+    return continueCoordinatorShutdownAttempt(options, existing, {
+      hostExecutor, projectId: policy.projectId,
+    });
   }
   const [snapshot, windows] = await Promise.all([
     options.readSnapshot(policy.projectId),
@@ -786,7 +1185,7 @@ async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
     && COORDINATION_ID_PATTERN.test(holderTaskId ?? "")
     && holderTaskId !== ownerRootTaskId
     && THREAD_ID_PATTERN.test(lane?.threadId ?? "")
-    && COORDINATION_ID_PATTERN.test(lane?.codexHostId ?? "")
+    && hostExecutorOwnsCanonicalRoute(hostExecutor, lane)
     && typeof lane?.workspacePath === "string"
     && path.isAbsolute(lane.workspacePath)
     && holderWindow?.role === "coordinator"
@@ -797,7 +1196,7 @@ async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
     && path.resolve(holderWindow.workspacePath ?? "") === path.resolve(lane.workspacePath)
     && ownerWindow?.role === "owner_root"
     && THREAD_ID_PATTERN.test(ownerLane?.threadId ?? "")
-    && COORDINATION_ID_PATTERN.test(ownerLane?.codexHostId ?? "")
+    && isCanonicalCodexHostId(ownerLane?.codexHostId)
     && typeof ownerLane?.workspacePath === "string"
     && path.isAbsolute(ownerLane.workspacePath)
     && ownerWindow.threadId === ownerLane.threadId
@@ -810,7 +1209,7 @@ async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
     && path.resolve(coordination.ownerRootRoute.rootWorkspacePath ?? "")
       === path.resolve(ownerLane.workspacePath);
   if (!exact) {
-    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    coordinatorShutdownIdleObservations.delete(observationKey);
     return { shutdown: false, reason: "not-idle-or-binding-drift" };
   }
   let thread;
@@ -820,7 +1219,7 @@ async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
       codexHostId: lane.codexHostId,
     }))?.thread;
   } catch {
-    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    coordinatorShutdownIdleObservations.delete(observationKey);
     return { shutdown: false, reason: "thread-unavailable" };
   }
   if (thread?.id !== lane.threadId
@@ -828,14 +1227,14 @@ async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
     || path.resolve(thread.cwd) !== path.resolve(lane.workspacePath)
     || !Array.isArray(thread.turns)
     || thread.turns.some((turn) => turn?.status === "inProgress")) {
-    coordinatorShutdownIdleObservations.delete(policy.projectId);
+    coordinatorShutdownIdleObservations.delete(observationKey);
     return { shutdown: false, reason: "thread-busy-or-drifted" };
   }
   const identity = coordinatorShutdownIdentity(policy.projectId, lease, lane, ownerLane);
   const observedAt = options.now();
-  const observation = coordinatorShutdownIdleObservations.get(policy.projectId);
+  const observation = coordinatorShutdownIdleObservations.get(observationKey);
   if (!observation || observation.fingerprint !== identity.fingerprint) {
-    coordinatorShutdownIdleObservations.set(policy.projectId, {
+    coordinatorShutdownIdleObservations.set(observationKey, {
       fingerprint: identity.fingerprint,
       firstObservedAt: observedAt,
     });
@@ -844,36 +1243,48 @@ async function runCoordinatorShutdownMonitorOnceUnlocked(options) {
   if (observedAt - observation.firstObservedAt < policy.idleGraceMs) {
     return { shutdown: false, reason: "idle-grace" };
   }
+  const requestAttempt = {
+    projectId: policy.projectId,
+    ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    idempotencyKey: identity.idempotencyKey,
+    expectedRevision: windows.revision,
+    expectedLeaseId: lease.id,
+    holderTaskId,
+    holderThreadId: lane.threadId,
+    ownerRootTaskId,
+    ownerRootThreadId: ownerLane.threadId,
+    ownerRootCodexProjectId: ownerLane.codexProjectId,
+    ownerRootCodexProjectKind: ownerLane.codexProjectKind,
+    ownerRootCodexHostId: ownerLane.codexHostId,
+    ownerRootWorkspacePath: path.resolve(ownerLane.workspacePath),
+    codexProjectId: lane.codexProjectId,
+    codexProjectKind: lane.codexProjectKind,
+    codexHostId: lane.codexHostId,
+    workspacePath: path.resolve(lane.workspacePath),
+  };
+  const requestEnvelope = coordinatorShutdownAttemptEnvelope(requestAttempt);
   let attempt;
   try {
-    attempt = (await options.requestAttempt({
-      projectId: policy.projectId,
-      idempotencyKey: identity.idempotencyKey,
-      expectedRevision: windows.revision,
-      expectedLeaseId: lease.id,
-      holderTaskId,
-      holderThreadId: lane.threadId,
-      ownerRootTaskId,
-      ownerRootThreadId: ownerLane.threadId,
-      ownerRootCodexProjectId: ownerLane.codexProjectId,
-      ownerRootCodexProjectKind: ownerLane.codexProjectKind,
-      ownerRootCodexHostId: ownerLane.codexHostId,
-      ownerRootWorkspacePath: ownerLane.workspacePath,
-      codexProjectId: lane.codexProjectId,
-      codexProjectKind: lane.codexProjectKind,
-      codexHostId: lane.codexHostId,
-      workspacePath: lane.workspacePath,
-    }))?.attempt ?? null;
+    attempt = (await options.requestAttempt(requestAttempt))?.attempt ?? null;
   } catch {
     return { shutdown: false, reason: "attempt-unavailable" };
   }
-  coordinatorShutdownIdleObservations.delete(policy.projectId);
-  return continueCoordinatorShutdownAttempt(options, attempt);
+  if (!attempt?.id || !retainsCoordinatorShutdownAttemptEnvelope(
+    attempt, requestEnvelope, { includeId: false },
+  )) {
+    return { shutdown: false, reason: "attempt-response-mismatch" };
+  }
+  coordinatorShutdownIdleObservations.delete(observationKey);
+  return continueCoordinatorShutdownAttempt(options, attempt, {
+    hostExecutor, projectId: policy.projectId,
+  });
 }
 
 export async function runCoordinatorShutdownMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { shutdown: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { shutdown: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy.projectId ?? "")
     || !Number.isSafeInteger(policy.idleGraceMs)
     || policy.idleGraceMs < 1
@@ -890,21 +1301,22 @@ export async function runCoordinatorShutdownMonitorOnce(options) {
     || typeof options?.completeAttempt !== "function") {
     return { shutdown: false, reason: "invalid-monitor" };
   }
-  const current = coordinatorShutdownMonitorRuns.get(policy.projectId);
+  const runKey = coordinatorShutdownRunKey(hostExecutor, policy.projectId);
+  const current = coordinatorShutdownMonitorRuns.get(runKey);
   if (current) return current;
-  const run = runCoordinatorShutdownMonitorOnceUnlocked(options);
-  coordinatorShutdownMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorShutdownMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorShutdownMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorShutdownMonitorRuns.get(policy.projectId) === run) {
-      coordinatorShutdownMonitorRuns.delete(policy.projectId);
+    if (coordinatorShutdownMonitorRuns.get(runKey) === run) {
+      coordinatorShutdownMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
-  const { policy } = options;
+  const { policy, hostExecutor } = options;
   const [snapshot, windows] = await Promise.all([
     options.readSnapshot(policy.projectId), options.readWindows(policy.projectId),
   ]);
@@ -919,19 +1331,31 @@ async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
       && candidate.assignment === "lease" && candidate.lease?.status === "active"
       && candidate.lease.bindingValid === true && !candidate.lease.releasedAt)
     .map((candidate) => candidate.domainId));
+  const observationPrefix = `${JSON.stringify([
+    hostExecutor.ownedCodexHostId, policy.projectId,
+  ]).slice(0, -1)},`;
   for (const key of domainCoordinatorShutdownIdleObservations.keys()) {
-    const prefix = `${policy.projectId}:`;
-    if (key.startsWith(prefix) && !idleDomainIds.has(key.slice(prefix.length))) {
+    if (key.startsWith(observationPrefix)
+      && !idleDomainIds.has(JSON.parse(key)[2])) {
       domainCoordinatorShutdownIdleObservations.delete(key);
     }
   }
+  const domainsWithUnownedAttempts = new Set();
   for (const domain of snapshot.coordination.domainCoordinators) {
     if (!COORDINATION_ID_PATTERN.test(domain?.domainId ?? "")) continue;
     const existing = (await options.getAttempt({
       projectId: policy.projectId, domainId: domain.domainId,
     }))?.attempt ?? null;
     if (existing && !["completed", "canceled"].includes(existing.status)) {
-      const result = await continueCoordinatorShutdownAttempt(options, existing);
+      if (!shutdownAttemptOwnedByHost(
+        existing, hostExecutor, policy.projectId, domain.domainId,
+      )) {
+        domainsWithUnownedAttempts.add(domain.domainId);
+        continue;
+      }
+      const result = await continueCoordinatorShutdownAttempt(options, existing, {
+        hostExecutor, projectId: policy.projectId, domainId: domain.domainId,
+      });
       return { ...result, domainId: domain.domainId };
     }
   }
@@ -939,31 +1363,55 @@ async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
   const globalLane = snapshot.taskLanes.find(
     (lane) => lane?.id === snapshot.coordination.coordinatorTaskId,
   ) ?? null;
-  const domain = snapshot.coordination.domainCoordinators.find((candidate) => (
-    candidate?.durableWorkPending === false && candidate.assignment === "lease"
-    && candidate.lease?.status === "active" && candidate.lease.bindingValid === true
-    && !candidate.lease.releasedAt
-  ));
-  if (!domain) return { shutdown: false, reason: "no-idle-domain" };
-  const lane = snapshot.taskLanes.find((candidate) => candidate?.id === domain.coordinatorTaskId) ?? null;
-  const holderWindow = windows.windows?.find((window) => window?.taskId === lane?.id) ?? null;
-  const exact = globalLease?.status === "active" && globalLease.bindingValid === true
-    && COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
-    && THREAD_ID_PATTERN.test(globalLane?.threadId ?? "")
-    && COORDINATION_ID_PATTERN.test(domain.domainId)
-    && COORDINATION_ID_PATTERN.test(domain.lease?.id ?? "")
-    && THREAD_ID_PATTERN.test(lane?.threadId ?? "")
-    && lane?.source === "codex" && lane.taskType === "peer_task"
-    && COORDINATION_ID_PATTERN.test(lane.codexHostId ?? "")
-    && typeof lane.workspacePath === "string" && path.isAbsolute(lane.workspacePath)
-    && holderWindow?.threadId === lane.threadId
-    && holderWindow.codexHostId === lane.codexHostId
-    && path.resolve(holderWindow.workspacePath ?? "") === path.resolve(lane.workspacePath);
-  const observationKey = `${policy.projectId}:${domain.domainId}`;
-  if (!exact) {
-    domainCoordinatorShutdownIdleObservations.delete(observationKey);
-    return { shutdown: false, reason: "binding-drift", domainId: domain.domainId };
+  let domain = null;
+  let lane = null;
+  let observationKey = null;
+  let idleCandidateSeen = false;
+  for (const candidate of snapshot.coordination.domainCoordinators) {
+    if (candidate?.durableWorkPending !== false || candidate.assignment !== "lease"
+      || candidate.lease?.status !== "active" || candidate.lease.bindingValid !== true
+      || candidate.lease.releasedAt) continue;
+    idleCandidateSeen = true;
+    if (domainsWithUnownedAttempts.has(candidate.domainId)) continue;
+    const candidateLane = snapshot.taskLanes.find(
+      (entry) => entry?.id === candidate.coordinatorTaskId,
+    ) ?? null;
+    const candidateObservationKey = domainCoordinatorShutdownObservationKey(
+      hostExecutor, policy.projectId, candidate.domainId,
+    );
+    if (!COORDINATION_ID_PATTERN.test(candidate.domainId ?? "")
+      || !hostExecutorOwnsCanonicalRoute(hostExecutor, candidateLane)) {
+      domainCoordinatorShutdownIdleObservations.delete(candidateObservationKey);
+      continue;
+    }
+    const holderWindow = windows.windows?.find(
+      (window) => window?.taskId === candidateLane.id,
+    ) ?? null;
+    const exact = globalLease?.status === "active" && globalLease.bindingValid === true
+      && COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
+      && THREAD_ID_PATTERN.test(globalLane?.threadId ?? "")
+      && COORDINATION_ID_PATTERN.test(candidate.lease?.id ?? "")
+      && THREAD_ID_PATTERN.test(candidateLane.threadId ?? "")
+      && candidateLane.source === "codex" && candidateLane.taskType === "peer_task"
+      && typeof candidateLane.workspacePath === "string"
+      && path.isAbsolute(candidateLane.workspacePath)
+      && holderWindow?.threadId === candidateLane.threadId
+      && holderWindow.codexHostId === candidateLane.codexHostId
+      && path.resolve(holderWindow.workspacePath ?? "")
+        === path.resolve(candidateLane.workspacePath);
+    if (!exact) {
+      domainCoordinatorShutdownIdleObservations.delete(candidateObservationKey);
+      continue;
+    }
+    domain = candidate;
+    lane = candidateLane;
+    observationKey = candidateObservationKey;
+    break;
   }
+  if (!domain) return {
+    shutdown: false,
+    reason: idleCandidateSeen ? "no-owned-idle-domain" : "no-idle-domain",
+  };
   let thread;
   try {
     thread = (await options.readThread({
@@ -995,29 +1443,41 @@ async function runDomainCoordinatorShutdownMonitorOnceUnlocked(options) {
   if (observedAt - observation.firstObservedAt < policy.idleGraceMs) {
     return { shutdown: false, reason: "idle-grace", domainId: domain.domainId };
   }
+  const requestAttempt = {
+    idempotencyKey: identity.idempotencyKey,
+    projectId: policy.projectId, domainId: domain.domainId,
+    ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    expectedRevision: windows.revision, expectedLeaseId: domain.lease.id,
+    holderTaskId: lane.id, holderThreadId: lane.threadId,
+    globalHolderTaskId: globalLane.id, globalHolderThreadId: globalLane.threadId,
+    expectedGlobalLeaseId: globalLease.id,
+    codexProjectId: lane.codexProjectId, codexProjectKind: lane.codexProjectKind,
+    codexHostId: lane.codexHostId, workspacePath: path.resolve(lane.workspacePath),
+  };
+  const requestEnvelope = coordinatorShutdownAttemptEnvelope(requestAttempt);
   let attempt;
   try {
-    attempt = (await options.requestAttempt({
-      idempotencyKey: identity.idempotencyKey,
-      projectId: policy.projectId, domainId: domain.domainId,
-      expectedRevision: windows.revision, expectedLeaseId: domain.lease.id,
-      holderTaskId: lane.id, holderThreadId: lane.threadId,
-      globalHolderTaskId: globalLane.id, globalHolderThreadId: globalLane.threadId,
-      expectedGlobalLeaseId: globalLease.id,
-      codexProjectId: lane.codexProjectId, codexProjectKind: lane.codexProjectKind,
-      codexHostId: lane.codexHostId, workspacePath: lane.workspacePath,
-    }))?.attempt ?? null;
+    attempt = (await options.requestAttempt(requestAttempt))?.attempt ?? null;
   } catch {
     return { shutdown: false, reason: "attempt-unavailable", domainId: domain.domainId };
   }
+  if (!attempt?.id || !retainsCoordinatorShutdownAttemptEnvelope(
+    attempt, requestEnvelope, { includeId: false },
+  )) {
+    return { shutdown: false, reason: "attempt-response-mismatch", domainId: domain.domainId };
+  }
   domainCoordinatorShutdownIdleObservations.delete(observationKey);
-  const result = await continueCoordinatorShutdownAttempt(options, attempt);
+  const result = await continueCoordinatorShutdownAttempt(options, attempt, {
+    hostExecutor, projectId: policy.projectId, domainId: domain.domainId,
+  });
   return { ...result, domainId: domain.domainId };
 }
 
 export async function runDomainCoordinatorShutdownMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { shutdown: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { shutdown: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy.projectId ?? "")
     || !Number.isSafeInteger(policy.idleGraceMs) || policy.idleGraceMs < 1
     || policy.idleGraceMs > 60 * 60_000
@@ -1030,19 +1490,20 @@ export async function runDomainCoordinatorShutdownMonitorOnce(options) {
     || typeof options?.archiveThread !== "function" || typeof options?.completeAttempt !== "function") {
     return { shutdown: false, reason: "invalid-monitor" };
   }
-  const current = domainCoordinatorShutdownMonitorRuns.get(policy.projectId);
+  const runKey = coordinatorShutdownRunKey(hostExecutor, policy.projectId);
+  const current = domainCoordinatorShutdownMonitorRuns.get(runKey);
   if (current) return current;
-  const run = runDomainCoordinatorShutdownMonitorOnceUnlocked(options);
-  domainCoordinatorShutdownMonitorRuns.set(policy.projectId, run);
+  const run = runDomainCoordinatorShutdownMonitorOnceUnlocked({ ...options, hostExecutor });
+  domainCoordinatorShutdownMonitorRuns.set(runKey, run);
   try { return await run; } finally {
-    if (domainCoordinatorShutdownMonitorRuns.get(policy.projectId) === run) {
-      domainCoordinatorShutdownMonitorRuns.delete(policy.projectId);
+    if (domainCoordinatorShutdownMonitorRuns.get(runKey) === run) {
+      domainCoordinatorShutdownMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
-  const { policy } = options;
+  const { policy, hostExecutor } = options;
   let snapshot;
   let windows;
   if (typeof options.readPreflight === "function") {
@@ -1093,13 +1554,24 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     return { provisioned: false, reason: "coordinator-shutdown-in-progress" };
   }
   const ownerRootTaskId = snapshot?.coordination?.ownerRootTaskId;
+  const windowSet = validateGlobalCoordinatorWindowSet(
+    windows?.windows, ownerRootTaskId, hostExecutor,
+  );
+  if (!windowSet.valid) {
+    if (windowSet.issue === "owner") return { provisioned: false, reason: "owner-root-invalid" };
+    if (windowSet.issue === "owner-host") {
+      return { provisioned: false, reason: "host-executor-unavailable" };
+    }
+    if (windowSet.issue === "coordinator-host") {
+      return { provisioned: false, reason: "coordinator-window-exists" };
+    }
+    return { provisioned: false, reason: "invalid-project-state" };
+  }
   const ownerRoute = snapshot?.coordination?.ownerRootRoute;
   const ownerLane = Array.isArray(snapshot?.taskLanes)
     ? snapshot.taskLanes.find((lane) => lane?.id === ownerRootTaskId) ?? null
     : null;
-  const ownerWindow = Array.isArray(windows?.windows)
-    ? windows.windows.find((window) => window?.taskId === ownerRootTaskId) ?? null
-    : null;
+  const ownerWindow = windowSet.ownerWindow;
   const ownerBindingValid = COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
     && snapshot?.coordination?.ownerRootValid !== false
     && windows.ownerRootTaskId === ownerRootTaskId
@@ -1116,6 +1588,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     && path.resolve(ownerRoute.rootWorkspacePath) === path.resolve(ownerLane?.workspacePath ?? "")
     && path.resolve(ownerRoute.rootWorkspacePath) === path.resolve(ownerWindow?.workspacePath ?? "");
   if (!ownerBindingValid) return { provisioned: false, reason: "owner-root-invalid" };
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, ownerLane)) {
+    return { provisioned: false, reason: "host-executor-unavailable" };
+  }
   if (snapshot?.coordination?.assignment !== "unassigned") {
     return { provisioned: false, reason: "coordinator-assigned" };
   }
@@ -1124,7 +1599,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   if (lease?.status === "expired" && lease.bindingValid === true && !lease.releasedAt) {
     return { provisioned: false, reason: "same-holder-recoverable" };
   }
-  const coordinatorWindows = windows.windows.filter((window) => window?.role === "coordinator");
+  const coordinatorWindows = windowSet.coordinatorWindows;
   const retireCoordinatorWindows = [];
   for (const window of coordinatorWindows) {
     if (typeof options.inspectCoordinatorWindow !== "function") {
@@ -1175,14 +1650,24 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     ? await options.getAttempt({
         projectId: policy.projectId,
         idempotencyKey: identity.idempotencyKey,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
       })
     : null;
   let attempt = result?.attempt ?? null;
   let recoveredActiveAttempt = false;
   if (!attempt && typeof options.getAttempt === "function") {
-    result = await options.getAttempt({ projectId: policy.projectId });
+    result = await options.getAttempt({
+      projectId: policy.projectId,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     attempt = result?.attempt ?? null;
     recoveredActiveAttempt = Boolean(attempt);
+  }
+  if (attempt && !hasCanonicalCoordinatorProvisioningAttemptIdentity(attempt)) {
+    return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+  }
+  if (attempt && retireCoordinatorWindows.length > 0) {
+    return { provisioned: false, reason: "stale-retirement-required", attemptId: attempt.id };
   }
   if (!attempt) {
     let selectedModel = {
@@ -1202,6 +1687,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     }
     result = await options.requestAttempt({
       ...identity,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
       model: selectedModel.model,
       reasoningEffort: selectedModel.reasoningEffort,
       projectId: policy.projectId,
@@ -1215,6 +1701,37 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       retireCoordinatorWindows,
     });
     attempt = result?.attempt ?? null;
+    if (attempt && !hasCanonicalCoordinatorProvisioningAttemptIdentity(attempt)) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
+    if (retireCoordinatorWindows.length > 0) {
+      if (typeof options.readPreflight !== "function") {
+        return { provisioned: false, reason: "retirement-preflight-unavailable", attemptId: attempt?.id };
+      }
+      const freshPreflight = await options.readPreflight();
+      const freshWindowSet = validateGlobalCoordinatorWindowSet(
+        freshPreflight?.windows, freshPreflight?.ownerRootTaskId, hostExecutor,
+      );
+      const freshOwner = freshWindowSet.ownerWindow;
+      const freshOwnerExact = freshWindowSet.valid
+        && freshPreflight?.projectId === policy.projectId
+        && RESUME_TOKEN_PATTERN.test(freshPreflight?.revision ?? "")
+        && freshPreflight.revision === attempt?.expectedRevision
+        && freshPreflight?.ownerRootValid === true
+        && freshPreflight?.ownerRootTaskId === ownerRootTaskId
+        && freshOwner?.role === "owner_root"
+        && freshOwner?.threadId === ownerRoute.rootThreadId
+        && freshOwner?.codexProjectId === ownerLane.codexProjectId
+        && freshOwner?.codexProjectKind === ownerLane.codexProjectKind
+        && freshOwner?.codexHostId === ownerLane.codexHostId
+        && path.resolve(freshOwner?.workspacePath ?? "")
+          === path.resolve(ownerRoute.rootWorkspacePath)
+        && freshWindowSet.coordinatorWindows.length === 0;
+      if (!freshOwnerExact) {
+        return { provisioned: false, reason: "retirement-preflight-invalid", attemptId: attempt?.id };
+      }
+      windows = freshPreflight;
+    }
   }
   if (!attempt?.id) return { provisioned: false, reason: "attempt-unavailable" };
   const stableAttemptBindingMismatch = attempt.projectId !== policy.projectId
@@ -1235,11 +1752,21 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     && !stableAttemptBindingMismatch
     && attempt.expectedRevision !== windows.revision;
   if (safeRecoveredRevisionDrift && typeof options.rebindAttempt === "function") {
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
     result = await options.rebindAttempt({
       attemptId: attempt.id,
       expectedRevision: windows.revision,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
     });
-    attempt = result?.attempt ?? attempt;
+    const reboundAttempt = result?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(reboundAttempt, envelope, before, {
+      allowedMutable: ["expectedRevision"],
+      expected: { expectedRevision: windows.revision },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = reboundAttempt;
   }
   if (stableAttemptBindingMismatch
     || attempt.projectId !== policy.projectId
@@ -1252,6 +1779,7 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || attempt.codexProjectId !== ownerLane.codexProjectId
     || attempt.codexProjectKind !== ownerLane.codexProjectKind
     || attempt.codexHostId !== ownerLane.codexHostId
+    || !coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)
     || path.resolve(attempt.workspacePath ?? "") !== path.resolve(ownerRoute.rootWorkspacePath)
     || typeof attempt.model !== "string" || !attempt.model
     || typeof attempt.reasoningEffort !== "string" || !attempt.reasoningEffort) {
@@ -1267,6 +1795,9 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
   let archivedThreadChecked = false;
   let exactThreadArchived = false;
   if (attempt.threadId && typeof options.readThread === "function") {
+    if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
     const directThread = await options.readThread(attempt);
     if (directThread) {
       if (directThread.id !== attempt.threadId
@@ -1282,16 +1813,35 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       if (!exactThreadArchived) thread = directThread;
     }
   }
-  if (!thread && !exactThreadArchived) thread = await options.findThread(attempt);
+  if (!thread && !exactThreadArchived) {
+    if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    }
+    thread = await options.findThread(attempt);
+  }
   if (!thread && (attempt.status === "started" || recoverableExpiredThread)) {
     if (!archivedThreadChecked && typeof options.findArchivedThread === "function") {
+      if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+        return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+      }
       await options.findArchivedThread(attempt);
     }
     if (typeof options.observeMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
-    const observed = await options.observeMissingAttempt({ attemptId: attempt.id });
-    attempt = observed?.attempt ?? attempt;
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    const observed = await options.observeMissingAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const observedAttempt = observed?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(observedAttempt, envelope, before, {
+      allowedMutable: ["missingSince"],
+    }) || typeof observedAttempt.missingSince !== "string" || !observedAttempt.missingSince) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = observedAttempt;
     const missingSince = Date.parse(attempt.missingSince ?? "");
     const currentTime = typeof options.now === "function" ? options.now() : Date.now();
     if (!Number.isFinite(missingSince)
@@ -1299,11 +1849,22 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       || typeof options.resetMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
-    const reset = await options.resetMissingAttempt({ attemptId: attempt.id });
+    const resetEnvelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const resetBefore = coordinatorProvisioningAttemptMutableState(attempt);
+    const reset = await options.resetMissingAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     const resetAttempt = reset?.attempt ?? null;
-    if (resetAttempt?.id !== attempt.id
-      || resetAttempt.status !== "pending"
-      || resetAttempt.threadId !== null) {
+    if (!matchesCoordinatorProvisioningTransitionResponse(
+      resetAttempt,
+      resetEnvelope,
+      resetBefore,
+      {
+        allowedMutable: ["status", "threadId", "retryCount", "missingSince", "expiresAt"],
+        expected: { status: "pending", threadId: null, missingSince: null },
+      },
+    )) {
       return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
     }
     return { provisioned: false, reason: "missing-thread-reset", attemptId: attempt.id };
@@ -1312,9 +1873,24 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
   }
   if (!thread) {
-    result = await options.markStarting({ attemptId: attempt.id });
-    attempt = result?.attempt ?? attempt;
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    result = await options.markStarting({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const startingAttempt = result?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(startingAttempt, envelope, before, {
+      allowedMutable: ["status"],
+      expected: { status: "starting" },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = startingAttempt;
     try {
+      if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+        return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+      }
       const started = await options.startThread({
         codexHostId: attempt.codexHostId,
         cwd: attempt.workspacePath,
@@ -1328,7 +1904,18 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
       thread = started?.thread ?? null;
     } catch (error) {
       if (isSelectedModelCapacityError(error) && typeof options.resetAttempt === "function") {
-        await options.resetAttempt({ attemptId: attempt.id });
+        const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+        const before = coordinatorProvisioningAttemptMutableState(attempt);
+        const reset = await options.resetAttempt({
+          attemptId: attempt.id,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        if (!matchesCoordinatorProvisioningTransitionResponse(reset?.attempt, envelope, before, {
+          allowedMutable: ["status", "retryCount", "expiresAt"],
+          expected: { status: "pending" },
+        })) {
+          return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+        }
         return { provisioned: false, reason: "model-capacity", attemptId: attempt.id };
       }
       return { provisioned: false, reason: "thread-start-uncertain", attemptId: attempt.id };
@@ -1343,11 +1930,20 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     if (typeof options.clearMissingAttempt !== "function") {
       return { provisioned: false, reason: "started-thread-missing", attemptId: attempt.id };
     }
-    const cleared = await options.clearMissingAttempt({ attemptId: attempt.id });
-    attempt = cleared?.attempt ?? attempt;
-    if (attempt.missingSince) {
-      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    const cleared = await options.clearMissingAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const clearedAttempt = cleared?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(clearedAttempt, envelope, before, {
+      allowedMutable: ["missingSince"],
+      expected: { missingSince: null },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
     }
+    attempt = clearedAttempt;
   }
   const exactDeliveryMarker = `TASKBOARD_COORDINATOR_PROVISIONING_V1:${attempt.id}`;
   const recoverableExpiredDelivery = attempt.status === "expired"
@@ -1360,18 +1956,40 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
     if (typeof options.resumeExpiredAttempt !== "function") {
       return { provisioned: false, reason: "attempt-expired-thread-active", attemptId: attempt.id };
     }
-    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    const resumed = await options.resumeExpiredAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     const resumedAttempt = resumed?.attempt ?? null;
-    if (resumedAttempt?.id !== attempt.id
-      || resumedAttempt.status !== "started"
-      || resumedAttempt.threadId !== thread.id) {
+    if (!matchesCoordinatorProvisioningTransitionResponse(resumedAttempt, envelope, before, {
+      allowedMutable: ["status", "expiresAt"],
+      expected: { status: "started", threadId: thread.id },
+    })) {
       return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
     }
     attempt = resumedAttempt;
   }
   if (attempt.threadId !== thread.id || !["started", "expired"].includes(attempt.status)) {
-    result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
-    attempt = result?.attempt ?? attempt;
+    const envelope = coordinatorProvisioningAttemptEnvelope(attempt);
+    const before = coordinatorProvisioningAttemptMutableState(attempt);
+    result = await options.attachThread({
+      attemptId: attempt.id,
+      threadId: thread.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const attachedAttempt = result?.attempt ?? null;
+    if (!matchesCoordinatorProvisioningTransitionResponse(attachedAttempt, envelope, before, {
+      allowedMutable: ["status", "threadId", "missingSince"],
+      expected: { status: "started", threadId: thread.id },
+    })) {
+      return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: envelope.id };
+    }
+    attempt = attachedAttempt;
+  }
+  if (!coordinatorProvisioningAttemptOwnedByHost(attempt, hostExecutor, policy.projectId)) {
+    return { provisioned: false, reason: "attempt-binding-mismatch", attemptId: attempt.id };
   }
   const delivery = await options.deliverInstruction({
     attempt,
@@ -1398,6 +2016,8 @@ async function runCoordinatorProvisioningMonitorOnceUnlocked(options) {
 export async function runCoordinatorProvisioningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { provisioned: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || (typeof options?.readPreflight !== "function"
       && (typeof options?.readSnapshot !== "function" || typeof options?.readWindows !== "function"))
@@ -1409,21 +2029,22 @@ export async function runCoordinatorProvisioningMonitorOnce(options) {
     || typeof options?.deliverInstruction !== "function") {
     return { provisioned: false, reason: "invalid-monitor" };
   }
-  const existing = coordinatorProvisioningMonitorRuns.get(policy.projectId);
+  const runKey = coordinatorShutdownRunKey(hostExecutor, policy.projectId);
+  const existing = coordinatorProvisioningMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCoordinatorProvisioningMonitorOnceUnlocked(options);
-  coordinatorProvisioningMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorProvisioningMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorProvisioningMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorProvisioningMonitorRuns.get(policy.projectId) === run) {
-      coordinatorProvisioningMonitorRuns.delete(policy.projectId);
+    if (coordinatorProvisioningMonitorRuns.get(runKey) === run) {
+      coordinatorProvisioningMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
-  const { policy } = options;
+  const { policy, hostExecutor } = options;
   const [snapshot, windows] = await Promise.all([
     options.readSnapshot(policy.projectId),
     options.readWindows(policy.projectId),
@@ -1443,52 +2064,100 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     || !COORDINATION_ID_PATTERN.test(globalLease.id ?? "")
     || !COORDINATION_ID_PATTERN.test(globalHolderTaskId ?? "")
     || !THREAD_ID_PATTERN.test(globalHolder?.threadId ?? "")
-    || typeof globalHolder?.codexProjectId !== "string" || !globalHolder.codexProjectId
-    || !["local", "remote"].includes(globalHolder?.codexProjectKind)
-    || !COORDINATION_ID_PATTERN.test(globalHolder?.codexHostId ?? "")
-    || typeof globalHolder?.workspacePath !== "string"
-    || !path.isAbsolute(globalHolder.workspacePath)) {
+    || !hasCompleteCodexLaunchRoute(globalHolder)) {
     return { provisioned: false, reason: "global-coordinator-unavailable" };
   }
-  const domain = snapshot.coordination.domainCoordinators.find((candidate) => (
+  const pendingDomains = snapshot.coordination.domainCoordinators.filter((candidate) => (
     candidate?.durableWorkPending === true
     && candidate.assignment === "unassigned"
     && COORDINATION_ID_PATTERN.test(candidate.domainId ?? "")
     && Array.isArray(candidate.eligibleTaskIds)
+    && Array.isArray(candidate.writeScope)
   ));
-  if (!domain) return { provisioned: false, reason: "no-domain-work" };
-  const lane = domain.eligibleTaskIds
-    .map((taskId) => snapshot.taskLanes.find((candidate) => candidate?.id === taskId) ?? null)
-    .find((candidate) => (
-      candidate?.source === "codex"
-      && candidate.taskType === "peer_task"
-      && typeof candidate.label === "string" && candidate.label
-    ));
-  if (!lane) {
-    return { provisioned: false, reason: "domain-route-unavailable", domainId: domain.domainId };
+  if (pendingDomains.length === 0) return { provisioned: false, reason: "no-domain-work" };
+  const selections = [];
+  let routeCandidateSeen = false;
+  let foreignRouteSeen = false;
+  for (const candidateDomain of pendingDomains) {
+    for (const taskId of candidateDomain.eligibleTaskIds) {
+      const candidateLane = snapshot.taskLanes.find(
+        (entry) => entry?.id === taskId,
+      ) ?? null;
+      if (candidateLane?.source !== "codex"
+        || candidateLane.taskType !== "peer_task"
+        || typeof candidateLane.label !== "string" || !candidateLane.label) continue;
+      routeCandidateSeen = true;
+      const completePeerRoute = hasCompleteCodexLaunchRoute(candidateLane);
+      const launchCandidate = completePeerRoute
+        ? candidateLane
+        : hasAnyCodexLaunchRouteField(candidateLane) ? null : globalHolder;
+      if (!launchCandidate || !hasCompleteCodexLaunchRoute(launchCandidate)) continue;
+      if (!hostExecutorOwnsCanonicalRoute(hostExecutor, launchCandidate)) {
+        foreignRouteSeen = true;
+        continue;
+      }
+      selections.push({
+        domain: candidateDomain,
+        lane: candidateLane,
+        launchLane: launchCandidate,
+      });
+      break;
+    }
   }
-  const launchLane = (
-    typeof lane.codexProjectId === "string" && lane.codexProjectId
-    && ["local", "remote"].includes(lane.codexProjectKind)
-    && COORDINATION_ID_PATTERN.test(lane.codexHostId ?? "")
-    && typeof lane.workspacePath === "string" && path.isAbsolute(lane.workspacePath)
-  ) ? lane : globalHolder;
-  const identity = domainCoordinatorProvisioningIdentity(
-    policy.projectId, windows.revision, domain.domainId, lane.id, globalLease.id,
-  );
-  let result = await options.getAttempt({
-    projectId: policy.projectId,
-    domainId: domain.domainId,
-    idempotencyKey: identity.idempotencyKey,
-  });
-  let attempt = result?.attempt ?? null;
-  if (!attempt) {
-    result = await options.getAttempt({
-      projectId: policy.projectId,
-      domainId: domain.domainId,
-    });
-    attempt = result?.attempt ?? null;
+  if (selections.length === 0) {
+    if (foreignRouteSeen) return { provisioned: false, reason: "host-executor-unavailable" };
+    return {
+      provisioned: false,
+      reason: "domain-route-unavailable",
+      ...(routeCandidateSeen ? { domainId: pendingDomains[0].domainId } : {}),
+    };
   }
+  let selection = null;
+  let identity = null;
+  let result = null;
+  let attempt = null;
+  let recoveredActiveAttempt = false;
+  for (const candidate of selections) {
+    const candidateIdentity = domainCoordinatorProvisioningIdentity(
+      policy.projectId,
+      windows.revision,
+      candidate.domain.domainId,
+      candidate.lane.id,
+      globalLease.id,
+    );
+    try {
+      let candidateResult = await options.getAttempt({
+        projectId: policy.projectId,
+        domainId: candidate.domain.domainId,
+        idempotencyKey: candidateIdentity.idempotencyKey,
+        ownedCodexHostId: hostExecutor.ownedCodexHostId,
+      });
+      let candidateAttempt = candidateResult?.attempt ?? null;
+      let candidateRecoveredActiveAttempt = false;
+      if (!candidateAttempt) {
+        candidateResult = await options.getAttempt({
+          projectId: policy.projectId,
+          domainId: candidate.domain.domainId,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        candidateAttempt = candidateResult?.attempt ?? null;
+        candidateRecoveredActiveAttempt = Boolean(candidateAttempt);
+      }
+      selection = candidate;
+      identity = candidateIdentity;
+      result = candidateResult;
+      attempt = candidateAttempt;
+      recoveredActiveAttempt = candidateRecoveredActiveAttempt;
+      break;
+    } catch (error) {
+      if (!isCoordinatorProvisioningHostExecutorMismatch(error)) throw error;
+    }
+  }
+  if (!selection) {
+    return { provisioned: false, reason: "host-executor-unavailable" };
+  }
+  const { domain, lane, launchLane } = selection;
+  let requestedAttempt = false;
   if (!attempt) {
     let selectedModel = { model: policy.model, reasoningEffort: policy.reasoningEffort };
     if ((!selectedModel.model || !selectedModel.reasoningEffort)
@@ -1504,6 +2173,7 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     }
     result = await options.requestAttempt({
       ...identity,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
       projectId: policy.projectId,
       domainId: domain.domainId,
       taskId: lane.id,
@@ -1520,13 +2190,20 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       workspacePath: launchLane.workspacePath,
     });
     attempt = result?.attempt ?? null;
+    requestedAttempt = true;
   }
-  if (!attempt?.id
-    || attempt.projectId !== policy.projectId
-    || attempt.domainId !== domain.domainId
-    || attempt.taskId !== lane.id
-    || attempt.codexHostId !== launchLane.codexHostId
-    || path.resolve(attempt.workspacePath ?? "") !== path.resolve(launchLane.workspacePath)) {
+  if (!matchesDomainCoordinatorProvisioningAttemptBinding(attempt, {
+    policy,
+    domain,
+    lane,
+    launchLane,
+    globalLease,
+    globalHolder,
+    hostExecutor,
+    identity,
+    requireCurrentIdentity: !recoveredActiveAttempt,
+    requireCompleteGlobalBinding: requestedAttempt,
+  })) {
     return { provisioned: false, reason: "attempt-binding-mismatch", domainId: domain.domainId };
   }
   if ((attempt.expectedRevision !== windows.revision
@@ -1539,19 +2216,33 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
         domainId: domain.domainId, attemptId: attempt.id,
       };
     }
+    const envelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+    const before = domainCoordinatorProvisioningAttemptMutableState(attempt);
     result = await options.rebindAttempt({
       attemptId: attempt.id,
       expectedRevision: windows.revision,
       expectedGlobalLeaseId: globalLease.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
     });
-    attempt = result?.attempt ?? attempt;
-    if (attempt.expectedRevision !== windows.revision
-      || attempt.expectedGlobalLeaseId !== globalLease.id) {
+    const reboundAttempt = result?.attempt ?? null;
+    if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+      reboundAttempt,
+      envelope,
+      before,
+      {
+        allowedMutable: ["expectedRevision", "expectedGlobalLeaseId"],
+        expected: {
+          expectedRevision: windows.revision,
+          expectedGlobalLeaseId: globalLease.id,
+        },
+      },
+    )) {
       return {
-        provisioned: false, reason: "attempt-rebind-mismatch",
-        domainId: domain.domainId, attemptId: attempt.id,
+        provisioned: false, reason: "attempt-binding-mismatch",
+        domainId: domain.domainId, attemptId: envelope.id,
       };
     }
+    attempt = reboundAttempt;
   }
   if (["completed", "canceled"].includes(attempt.status)) {
     return {
@@ -1563,6 +2254,14 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
   }
   let deliveryThread = null;
   let thread = null;
+  if (!domainCoordinatorProvisioningAttemptOwnedByHost(
+    attempt, hostExecutor, policy.projectId, domain.domainId,
+  )) {
+    return {
+      provisioned: false, reason: "attempt-binding-mismatch",
+      domainId: domain.domainId, attemptId: attempt.id,
+    };
+  }
   if (attempt.status === "expired"
     && THREAD_ID_PATTERN.test(attempt.threadId ?? "")
     && typeof options.readThread === "function") {
@@ -1580,9 +2279,34 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     };
   }
   if (!thread) {
-    result = await options.markStarting({ attemptId: attempt.id });
-    attempt = result?.attempt ?? attempt;
+    const envelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+    const before = domainCoordinatorProvisioningAttemptMutableState(attempt);
+    result = await options.markStarting({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
+    const startingAttempt = result?.attempt ?? null;
+    if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+      startingAttempt,
+      envelope,
+      before,
+      { allowedMutable: ["status"], expected: { status: "starting" } },
+    )) {
+      return {
+        provisioned: false, reason: "attempt-binding-mismatch",
+        domainId: domain.domainId, attemptId: envelope.id,
+      };
+    }
+    attempt = startingAttempt;
     try {
+      if (!domainCoordinatorProvisioningAttemptOwnedByHost(
+        attempt, hostExecutor, policy.projectId, domain.domainId,
+      )) {
+        return {
+          provisioned: false, reason: "attempt-binding-mismatch",
+          domainId: domain.domainId, attemptId: attempt.id,
+        };
+      }
       const started = await options.startThread({
         codexHostId: attempt.codexHostId,
         cwd: attempt.workspacePath,
@@ -1596,7 +2320,26 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
       thread = started?.thread ?? null;
     } catch (error) {
       if (isSelectedModelCapacityError(error)) {
-        await options.resetAttempt({ attemptId: attempt.id });
+        const resetEnvelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+        const resetBefore = domainCoordinatorProvisioningAttemptMutableState(attempt);
+        const reset = await options.resetAttempt({
+          attemptId: attempt.id,
+          ownedCodexHostId: hostExecutor.ownedCodexHostId,
+        });
+        if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+          reset?.attempt,
+          resetEnvelope,
+          resetBefore,
+          {
+            allowedMutable: ["status", "retryCount", "missingSince", "expiresAt"],
+            expected: { status: "pending" },
+          },
+        )) {
+          return {
+            provisioned: false, reason: "attempt-binding-mismatch",
+            domainId: domain.domainId, attemptId: resetEnvelope.id,
+          };
+        }
         return {
           provisioned: false, reason: "model-capacity",
           domainId: domain.domainId, attemptId: attempt.id,
@@ -1649,11 +2392,22 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
         domainId: domain.domainId, attemptId: attempt.id,
       };
     }
-    const resumed = await options.resumeExpiredAttempt({ attemptId: attempt.id });
+    const envelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+    const before = domainCoordinatorProvisioningAttemptMutableState(attempt);
+    const resumed = await options.resumeExpiredAttempt({
+      attemptId: attempt.id,
+      ownedCodexHostId: hostExecutor.ownedCodexHostId,
+    });
     const resumedAttempt = resumed?.attempt ?? null;
-    if (resumedAttempt?.id !== attempt.id
-      || resumedAttempt.status !== "started"
-      || resumedAttempt.threadId !== thread.id) {
+    if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+      resumedAttempt,
+      envelope,
+      before,
+      {
+        allowedMutable: ["status", "missingSince", "expiresAt"],
+        expected: { status: "started", threadId: thread.id },
+      },
+    )) {
       return {
         provisioned: false, reason: "attempt-binding-mismatch",
         domainId: domain.domainId, attemptId: attempt.id,
@@ -1661,12 +2415,35 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
     }
     attempt = resumedAttempt;
   }
-  result = await options.attachThread({ attemptId: attempt.id, threadId: thread.id });
-  attempt = result?.attempt ?? null;
-  if (attempt?.status !== "started" || attempt.threadId !== thread.id) {
+  const attachEnvelope = domainCoordinatorProvisioningAttemptEnvelope(attempt);
+  const attachBefore = domainCoordinatorProvisioningAttemptMutableState(attempt);
+  result = await options.attachThread({
+    attemptId: attempt.id,
+    threadId: thread.id,
+    ownedCodexHostId: hostExecutor.ownedCodexHostId,
+  });
+  const attachedAttempt = result?.attempt ?? null;
+  if (!matchesDomainCoordinatorProvisioningTransitionResponse(
+    attachedAttempt,
+    attachEnvelope,
+    attachBefore,
+    {
+      allowedMutable: ["status", "threadId", "missingSince"],
+      expected: { status: "started", threadId: thread.id },
+    },
+  )) {
     return {
       provisioned: false, reason: "attempt-binding-mismatch",
-      domainId: domain.domainId, attemptId: attempt?.id ?? null,
+      domainId: domain.domainId, attemptId: attachEnvelope.id,
+    };
+  }
+  attempt = attachedAttempt;
+  if (!domainCoordinatorProvisioningAttemptOwnedByHost(
+    attempt, hostExecutor, policy.projectId, domain.domainId,
+  )) {
+    return {
+      provisioned: false, reason: "attempt-binding-mismatch",
+      domainId: domain.domainId, attemptId: attempt.id,
     };
   }
   const delivery = await options.deliverInstruction({
@@ -1700,6 +2477,8 @@ async function runDomainCoordinatorProvisioningMonitorOnceUnlocked(options) {
 export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { provisioned: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { provisioned: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.readWindows !== "function"
@@ -1713,10 +2492,10 @@ export async function runDomainCoordinatorProvisioningMonitorOnce(options) {
     || typeof options?.deliverInstruction !== "function") {
     return { provisioned: false, reason: "invalid-monitor" };
   }
-  const key = policy.projectId;
+  const key = coordinatorShutdownRunKey(hostExecutor, policy.projectId);
   const existing = domainCoordinatorProvisioningMonitorRuns.get(key);
   if (existing) return existing;
-  const run = runDomainCoordinatorProvisioningMonitorOnceUnlocked(options);
+  const run = runDomainCoordinatorProvisioningMonitorOnceUnlocked({ ...options, hostExecutor });
   domainCoordinatorProvisioningMonitorRuns.set(key, run);
   try {
     return await run;
@@ -1745,10 +2524,30 @@ export function classifyOwnerIntentPlanHttpFailure(status, errorCode = null) {
   return null;
 }
 
+export async function coordinatorProvisioningResponseJson(response) {
+  if (response?.ok === true) return response.json();
+  const status = Number.isInteger(response?.status) ? response.status : 0;
+  let errorCode = null;
+  try {
+    const payload = await response?.json();
+    errorCode = typeof payload?.error?.code === "string" ? payload.error.code : null;
+  } catch {
+    // Keep non-JSON transport failures opaque while retaining their HTTP status.
+  }
+  const error = new Error(`Taskboard Coordinator provisioning returned HTTP ${status}`);
+  error.status = status;
+  if (errorCode) error.code = errorCode;
+  throw error;
+}
+
 function isSelectedModelCapacityError(error) {
   return SELECTED_MODEL_CAPACITY_ERROR.test(
     typeof error?.message === "string" ? error.message : String(error ?? ""),
   );
+}
+
+function isCoordinatorProvisioningHostExecutorMismatch(error) {
+  return error?.status === 409 && error?.code === "HOST_EXECUTOR_MISMATCH";
 }
 
 function collectStringValues(value, output = []) {
@@ -1837,7 +2636,7 @@ function ownerIntentCaptureRoute(snapshot) {
   if (!COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
     || lane?.taskType !== "root_task"
     || !THREAD_ID_PATTERN.test(lane?.threadId ?? "")
-    || !COORDINATION_ID_PATTERN.test(lane?.codexHostId ?? "")
+    || !isCanonicalCodexHostId(lane?.codexHostId)
     || typeof lane?.workspacePath !== "string"
     || !path.isAbsolute(lane.workspacePath)) return null;
   return {
@@ -2005,6 +2804,8 @@ export async function observeTaskboardOwnerIntentCapture(request, rpc) {
 export async function runOwnerIntentCaptureMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { captured: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { captured: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.listIntents !== "function"
@@ -2012,7 +2813,8 @@ export async function runOwnerIntentCaptureMonitorOnce(options) {
     || typeof options?.recordCapture !== "function") {
     return { captured: false, reason: "invalid-monitor" };
   }
-  const existing = ownerIntentCaptureMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerIntentCaptureMonitorRuns.get(runKey);
   if (existing) return existing;
   const run = (async () => {
     const snapshot = await options.readSnapshot(policy.projectId);
@@ -2021,6 +2823,9 @@ export async function runOwnerIntentCaptureMonitorOnce(options) {
     }
     const route = ownerIntentCaptureRoute(snapshot);
     if (!route) return { captured: false, reason: "owner-root-unavailable" };
+    if (!hostExecutorOwnsCanonicalRoute(hostExecutor, route)) {
+      return { captured: false, reason: "host-executor-unavailable" };
+    }
     const intents = await options.listIntents(policy.projectId);
     if (!Array.isArray(intents)) return { captured: false, reason: "invalid-intent-frontier" };
     const capture = await options.observeCapture({
@@ -2047,12 +2852,12 @@ export async function runOwnerIntentCaptureMonitorOnce(options) {
       ? { captured: true, intentId: capture.intentId, ownerTurnId: capture.ownerTurnId }
       : { captured: false, reason: "already-captured" };
   })();
-  ownerIntentCaptureMonitorRuns.set(policy.projectId, run);
+  ownerIntentCaptureMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerIntentCaptureMonitorRuns.get(policy.projectId) === run) {
-      ownerIntentCaptureMonitorRuns.delete(policy.projectId);
+    if (ownerIntentCaptureMonitorRuns.get(runKey) === run) {
+      ownerIntentCaptureMonitorRuns.delete(runKey);
     }
   }
 }
@@ -2221,10 +3026,7 @@ function parseHostRequest(payload, parseAutomationRequest) {
     && !/[\u0000-\u001f\u007f]/.test(request.taskId)
     && typeof request.previousThreadId === "string"
     && request.previousThreadId.length <= 240
-    && typeof request.codexHostId === "string"
-    && request.codexHostId.length > 0
-    && request.codexHostId.length <= 240
-    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && isCanonicalCodexHostId(request.codexHostId)
     && typeof request.projectless === "boolean"
     && (
       request.projectless
@@ -2247,10 +3049,7 @@ function parseHostRequest(payload, parseAutomationRequest) {
     request.action === "coordinate-agent-todo"
     && typeof request.rootThreadId === "string"
     && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(request.rootThreadId)
-    && typeof request.codexHostId === "string"
-    && request.codexHostId.length > 0
-    && request.codexHostId.length <= 240
-    && !/[\u0000-\u001f\u007f]/.test(request.codexHostId)
+    && isCanonicalCodexHostId(request.codexHostId)
     && typeof request.projectId === "string"
     && /^[a-z0-9._-]{1,128}$/i.test(request.projectId)
     && typeof request.todoId === "string"
@@ -2304,6 +3103,9 @@ export async function deliverTaskboardCoordination(
 }
 
 export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = false } = {}) {
+  if (!hasCompleteOwnerDecisionRoute(request?.route)) {
+    throw new Error("Owner decision delivery requires one complete protected Root identity");
+  }
   const threadResult = await rpc("thread/read", {
     threadId: request.route.rootThreadId,
     includeTurns: true,
@@ -2341,6 +3143,7 @@ export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = f
   const started = await rpc("turn/start", {
     threadId: request.route.rootThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid Root turn receipt");
@@ -2349,6 +3152,9 @@ export async function deliverTaskboardOwnerDecision(request, rpc, { readOnly = f
 }
 
 export async function observeTaskboardOwnerDecision(request, receipt, rpc) {
+  if (!hasCompleteOwnerDecisionRoute(request?.route)) {
+    throw new Error("Owner decision observation requires one complete protected Root identity");
+  }
   const threadResult = await rpc("thread/read", {
     threadId: request.route.rootThreadId,
     includeTurns: true,
@@ -2425,6 +3231,7 @@ export async function deliverTaskboardOwnerIntent(request, rpc, { readOnly = fal
   const started = await rpc("turn/start", {
     threadId: route.coordinatorThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid Coordinator turn receipt");
@@ -2435,6 +3242,8 @@ export async function deliverTaskboardOwnerIntent(request, rpc, { readOnly = fal
 export async function runOwnerIntentAdoptionMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.claimAdoption !== "function"
@@ -2442,15 +3251,16 @@ export async function runOwnerIntentAdoptionMonitorOnce(options) {
     || typeof options?.deliver !== "function") {
     return { delivered: false, reason: "invalid-monitor" };
   }
-  const existing = ownerIntentAdoptionMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerIntentAdoptionMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runOwnerIntentAdoptionMonitorOnceUnlocked(options);
-  ownerIntentAdoptionMonitorRuns.set(policy.projectId, run);
+  const run = runOwnerIntentAdoptionMonitorOnceUnlocked({ ...options, hostExecutor });
+  ownerIntentAdoptionMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerIntentAdoptionMonitorRuns.get(policy.projectId) === run) {
-      ownerIntentAdoptionMonitorRuns.delete(policy.projectId);
+    if (ownerIntentAdoptionMonitorRuns.get(runKey) === run) {
+      ownerIntentAdoptionMonitorRuns.delete(runKey);
     }
   }
 }
@@ -2494,19 +3304,25 @@ export async function observeTaskboardOwnerIntentPlan(request, rpc) {
 export async function runOwnerIntentPlanningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { applied: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { applied: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.observePlan !== "function"
     || typeof options?.applyPlan !== "function") {
     return { applied: false, reason: "invalid-monitor" };
   }
-  const existing = ownerIntentPlanningMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerIntentPlanningMonitorRuns.get(runKey);
   if (existing) return existing;
   const run = (async () => {
     const snapshot = await options.readSnapshot(policy.projectId);
     const request = snapshot?.coordination?.pendingOwnerIntentPlan;
     if (snapshot?.projectId !== policy.projectId || !request) {
       return { applied: false, reason: "no-plan-pending" };
+    }
+    if (!hostExecutorOwnsCanonicalRoute(hostExecutor, request.route)) {
+      return { applied: false, reason: "host-executor-unavailable" };
     }
     const plan = await options.observePlan(request);
     if (!plan) return { applied: false, reason: "awaiting-plan" };
@@ -2542,12 +3358,12 @@ export async function runOwnerIntentPlanningMonitorOnce(options) {
     }
     return { applied: result.applied, intentId: request.intentId, revisionId: plan.revisionId };
   })();
-  ownerIntentPlanningMonitorRuns.set(policy.projectId, run);
+  ownerIntentPlanningMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerIntentPlanningMonitorRuns.get(policy.projectId) === run) {
-      ownerIntentPlanningMonitorRuns.delete(policy.projectId);
+    if (ownerIntentPlanningMonitorRuns.get(runKey) === run) {
+      ownerIntentPlanningMonitorRuns.delete(runKey);
     }
   }
 }
@@ -2572,10 +3388,13 @@ export function runTaskboardContinuationFastLane({
   projects,
   runContinuation,
   observeResult = () => {},
+  hostExecutor: hostExecutorInput,
 }) {
+  const hostExecutor = normalizeHostExecutor(hostExecutorInput);
   if (!Array.isArray(projects)
     || typeof runContinuation !== "function"
-    || typeof observeResult !== "function") {
+    || typeof observeResult !== "function"
+    || !hostExecutor) {
     throw new Error("Taskboard continuation fast lane requires exact project state");
   }
   const eligible = projects.filter((project) => (
@@ -2584,7 +3403,8 @@ export function runTaskboardContinuationFastLane({
   ));
   return eligible.map((project) => {
     const projectId = project.projectId;
-    if (continuationFastLaneRuns.has(projectId)) {
+    const runKey = `${hostExecutor.ownedCodexHostId}:${projectId}`;
+    if (continuationFastLaneRuns.has(runKey)) {
       return { projectId, state: "in_flight" };
     }
     const run = Promise.resolve()
@@ -2597,10 +3417,10 @@ export function runTaskboardContinuationFastLane({
           error: error instanceof Error ? error.message : String(error),
         }),
       );
-    continuationFastLaneRuns.set(projectId, run);
+    continuationFastLaneRuns.set(runKey, run);
     void run.then((result) => {
-      if (continuationFastLaneRuns.get(projectId) === run) {
-        continuationFastLaneRuns.delete(projectId);
+      if (continuationFastLaneRuns.get(runKey) === run) {
+        continuationFastLaneRuns.delete(runKey);
       }
       try {
         observeResult(result);
@@ -2612,8 +3432,13 @@ export function runTaskboardContinuationFastLane({
   });
 }
 
-export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHandshake }) {
-  if (!Array.isArray(projects) || typeof runHandshake !== "function") {
+export async function runCoordinatorIdentityHandshakeFastLane({
+  projects,
+  runHandshake,
+  hostExecutor: hostExecutorInput,
+}) {
+  const hostExecutor = normalizeHostExecutor(hostExecutorInput);
+  if (!Array.isArray(projects) || typeof runHandshake !== "function" || !hostExecutor) {
     throw new Error("Coordinator identity handshake fast lane requires exact project state");
   }
   const results = [];
@@ -2621,10 +3446,11 @@ export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHan
     if (project?.continuationEnabled !== true
       || !COORDINATION_ID_PATTERN.test(project?.projectId ?? "")) continue;
     const projectId = project.projectId;
-    let run = coordinatorIdentityHandshakeFastLaneRuns.get(projectId);
+    const runKey = `${hostExecutor.ownedCodexHostId}:${projectId}`;
+    let run = coordinatorIdentityHandshakeFastLaneRuns.get(runKey);
     if (!run) {
       run = Promise.resolve().then(() => runHandshake(projectId));
-      coordinatorIdentityHandshakeFastLaneRuns.set(projectId, run);
+      coordinatorIdentityHandshakeFastLaneRuns.set(runKey, run);
     }
     try {
       results.push({ projectId, ok: true, result: await run });
@@ -2635,8 +3461,8 @@ export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHan
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
-      if (coordinatorIdentityHandshakeFastLaneRuns.get(projectId) === run) {
-        coordinatorIdentityHandshakeFastLaneRuns.delete(projectId);
+      if (coordinatorIdentityHandshakeFastLaneRuns.get(runKey) === run) {
+        coordinatorIdentityHandshakeFastLaneRuns.delete(runKey);
       }
     }
   }
@@ -2645,10 +3471,15 @@ export async function runCoordinatorIdentityHandshakeFastLane({ projects, runHan
 
 export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
   projectId,
+  hostExecutor: hostExecutorInput,
   listHandshakes,
   readThread,
   confirmIdentity,
 }) {
+  const hostExecutor = normalizeHostExecutor(hostExecutorInput);
+  if (!hostExecutor) {
+    return { confirmed: 0, skipped: 0, failed: 0, reason: "host-executor-unavailable" };
+  }
   if (!COORDINATION_ID_PATTERN.test(projectId ?? "")) {
     return { confirmed: 0, skipped: 0, failed: 0, reason: "invalid-project" };
   }
@@ -2667,9 +3498,10 @@ export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
       || typeof expected?.codexProjectId !== "string"
       || !expected.codexProjectId
       || !["local", "remote"].includes(expected.codexProjectKind)
-      || !COORDINATION_ID_PATTERN.test(expected.codexHostId ?? "")
+      || !isCanonicalCodexHostId(expected.codexHostId)
       || typeof expected?.workspacePath !== "string"
-      || !path.isAbsolute(expected.workspacePath)) {
+      || !path.isAbsolute(expected.workspacePath)
+      || !hostExecutorOwnsRoute(hostExecutor, expected)) {
       skipped += 1;
       continue;
     }
@@ -2702,6 +3534,7 @@ export async function runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
 
 async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   readThread,
   renewLease,
@@ -2751,11 +3584,12 @@ async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
       workspacePath: lane?.workspacePath,
     };
     if (!THREAD_ID_PATTERN.test(route.threadId ?? "")
-      || !COORDINATION_ID_PATTERN.test(route.codexHostId ?? "")
+      || !isCanonicalCodexHostId(route.codexHostId)
       || typeof route.workspacePath !== "string"
       || !path.isAbsolute(route.workspacePath)) {
       return "skipped";
     }
+    if (!hostExecutorOwnsRoute(hostExecutor, route)) return "skipped";
     try {
       const threadResult = await readThread(route);
       const thread = threadResult?.thread;
@@ -2792,6 +3626,10 @@ async function runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({
 }
 
 export async function runCoordinatorLeaseKeepaliveMonitorOnce(options) {
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) {
+    return { renewed: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable" };
+  }
   const policy = options?.policy;
   if (policy?.enabled !== true) return { renewed: 0, failed: 0, skipped: 0, reason: "disabled" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
@@ -2806,21 +3644,23 @@ export async function runCoordinatorLeaseKeepaliveMonitorOnce(options) {
     || typeof options?.renewLease !== "function") {
     return { renewed: 0, failed: 0, skipped: 0, reason: "invalid-monitor" };
   }
-  const existing = coordinatorLeaseKeepaliveMonitorRuns.get(policy.projectId);
+  const runKey = `${hostExecutor.ownedCodexHostId}:${policy.projectId}`;
+  const existing = coordinatorLeaseKeepaliveMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCoordinatorLeaseKeepaliveMonitorOnceUnlocked(options);
-  coordinatorLeaseKeepaliveMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorLeaseKeepaliveMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorLeaseKeepaliveMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorLeaseKeepaliveMonitorRuns.get(policy.projectId) === run) {
-      coordinatorLeaseKeepaliveMonitorRuns.delete(policy.projectId);
+    if (coordinatorLeaseKeepaliveMonitorRuns.get(runKey) === run) {
+      coordinatorLeaseKeepaliveMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runCoordinatorLeaseRecoveryMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   readThread,
   recoverLease,
@@ -2866,11 +3706,12 @@ async function runCoordinatorLeaseRecoveryMonitorOnceUnlocked({
       workspacePath: lane?.workspacePath,
     };
     if (!THREAD_ID_PATTERN.test(route.threadId ?? "")
-      || !COORDINATION_ID_PATTERN.test(route.codexHostId ?? "")
+      || !isCanonicalCodexHostId(route.codexHostId)
       || typeof route.workspacePath !== "string"
       || !path.isAbsolute(route.workspacePath)) {
       return "skipped";
     }
+    if (!hostExecutorOwnsRoute(hostExecutor, route)) return "skipped";
     try {
       const threadResult = await readThread(route);
       const thread = threadResult?.thread;
@@ -2908,6 +3749,10 @@ async function runCoordinatorLeaseRecoveryMonitorOnceUnlocked({
 }
 
 export async function runCoordinatorLeaseRecoveryMonitorOnce(options) {
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) {
+    return { recovered: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable" };
+  }
   const policy = options?.policy;
   if (policy?.enabled !== true) return { recovered: 0, failed: 0, skipped: 0, reason: "disabled" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
@@ -2919,15 +3764,16 @@ export async function runCoordinatorLeaseRecoveryMonitorOnce(options) {
     || typeof options?.recoverLease !== "function") {
     return { recovered: 0, failed: 0, skipped: 0, reason: "invalid-monitor" };
   }
-  const existing = coordinatorLeaseRecoveryMonitorRuns.get(policy.projectId);
+  const runKey = `${hostExecutor.ownedCodexHostId}:${policy.projectId}`;
+  const existing = coordinatorLeaseRecoveryMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCoordinatorLeaseRecoveryMonitorOnceUnlocked(options);
-  coordinatorLeaseRecoveryMonitorRuns.set(policy.projectId, run);
+  const run = runCoordinatorLeaseRecoveryMonitorOnceUnlocked({ ...options, hostExecutor });
+  coordinatorLeaseRecoveryMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (coordinatorLeaseRecoveryMonitorRuns.get(policy.projectId) === run) {
-      coordinatorLeaseRecoveryMonitorRuns.delete(policy.projectId);
+    if (coordinatorLeaseRecoveryMonitorRuns.get(runKey) === run) {
+      coordinatorLeaseRecoveryMonitorRuns.delete(runKey);
     }
   }
 }
@@ -2963,6 +3809,7 @@ export async function deliverTaskboardCrossDomainHandoff(request, rpc, { readOnl
   const started = await rpc("turn/start", {
     threadId: route.targetThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid cross-domain handoff turn receipt");
@@ -2972,6 +3819,7 @@ export async function deliverTaskboardCrossDomainHandoff(request, rpc, { readOnl
 
 async function runCrossDomainHandoffMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimDelivery,
   confirmDelivery,
@@ -2987,10 +3835,13 @@ async function runCrossDomainHandoffMonitorOnceUnlocked({
     || !COORDINATION_ID_PATTERN.test(request.targetIdentifier ?? "")
     || !RESUME_TOKEN_PATTERN.test(request.fingerprint ?? "")
     || !THREAD_ID_PATTERN.test(route?.targetThreadId ?? "")
-    || !COORDINATION_ID_PATTERN.test(route?.codexHostId ?? "")
+    || !isCanonicalCodexHostId(route?.codexHostId)
     || typeof route?.targetWorkspacePath !== "string"
     || !path.isAbsolute(route.targetWorkspacePath)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, route)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
   }
   const claim = await claimDelivery(request);
   if (!claim?.receipt || typeof claim.receipt.id !== "string") {
@@ -3024,6 +3875,8 @@ async function runCrossDomainHandoffMonitorOnceUnlocked({
 export async function runCrossDomainHandoffMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.claimDelivery !== "function"
@@ -3031,21 +3884,23 @@ export async function runCrossDomainHandoffMonitorOnce(options) {
     || typeof options?.deliver !== "function") {
     return { delivered: false, reason: "invalid-monitor" };
   }
-  const existing = crossDomainHandoffMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = crossDomainHandoffMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCrossDomainHandoffMonitorOnceUnlocked(options);
-  crossDomainHandoffMonitorRuns.set(policy.projectId, run);
+  const run = runCrossDomainHandoffMonitorOnceUnlocked({ ...options, hostExecutor });
+  crossDomainHandoffMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (crossDomainHandoffMonitorRuns.get(policy.projectId) === run) {
-      crossDomainHandoffMonitorRuns.delete(policy.projectId);
+    if (crossDomainHandoffMonitorRuns.get(runKey) === run) {
+      crossDomainHandoffMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runOwnerIntentAdoptionMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimAdoption,
   confirmAdoption,
@@ -3069,6 +3924,9 @@ async function runOwnerIntentAdoptionMonitorOnceUnlocked({
     || typeof route?.coordinatorWorkspacePath !== "string"
     || !path.isAbsolute(route.coordinatorWorkspacePath)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, route)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
   }
   const claim = await claimAdoption(request);
   const claimedIntent = claim?.executionIntent;
@@ -3119,6 +3977,8 @@ async function runOwnerIntentAdoptionMonitorOnceUnlocked({
 export async function runOwnerDecisionMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.claimDelivery !== "function"
@@ -3128,21 +3988,23 @@ export async function runOwnerDecisionMonitorOnce(options) {
     || typeof options?.recordDecision !== "function") {
     return { delivered: false, reason: "invalid-monitor" };
   }
-  const existing = ownerDecisionMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerDecisionMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runOwnerDecisionMonitorOnceUnlocked(options);
-  ownerDecisionMonitorRuns.set(policy.projectId, run);
+  const run = runOwnerDecisionMonitorOnceUnlocked({ ...options, hostExecutor });
+  ownerDecisionMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerDecisionMonitorRuns.get(policy.projectId) === run) {
-      ownerDecisionMonitorRuns.delete(policy.projectId);
+    if (ownerDecisionMonitorRuns.get(runKey) === run) {
+      ownerDecisionMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runOwnerDecisionMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimDelivery,
   confirmDelivery,
@@ -3152,6 +4014,9 @@ async function runOwnerDecisionMonitorOnceUnlocked({
 }) {
   const snapshot = await readSnapshot(policy.projectId);
   const request = snapshot?.coordination?.ownerDecisionRequest;
+  const ownerLane = Array.isArray(snapshot?.taskLanes)
+    ? snapshot.taskLanes.find((lane) => lane?.id === request?.route?.rootTaskId) ?? null
+    : null;
   if (snapshot?.projectId !== policy.projectId
     || !request
     || !RESUME_TOKEN_PATTERN.test(request.requestId ?? "")
@@ -3162,10 +4027,11 @@ async function runOwnerDecisionMonitorOnceUnlocked({
     || !request.message.trim()
     || typeof request.coordinatorEpoch !== "string"
     || !request.coordinatorEpoch
-    || !THREAD_ID_PATTERN.test(request.route?.rootThreadId ?? "")
-    || typeof request.route?.rootWorkspacePath !== "string"
-    || !path.isAbsolute(request.route.rootWorkspacePath)) {
+    || !ownerDecisionRouteMatchesLane(request.route, ownerLane)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, request.route)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
   }
   const claim = await claimDelivery(request);
   if (!claim?.receipt || typeof claim.receipt.id !== "string") {
@@ -3197,11 +4063,16 @@ async function runOwnerDecisionMonitorOnceUnlocked({
   const decision = await observeDecision(request, deliveryReceipt);
   if (decision) {
     const recorded = await recordDecision({
+      ...decision,
       taskId: request.identifier,
       requestId: request.requestId,
       expectedResumeToken: request.expectedResumeToken,
       deliveryId: deliveryReceipt.id,
-      ...decision,
+      rootThreadId: request.route.rootThreadId,
+      rootCodexProjectId: request.route.codexProjectId,
+      rootCodexProjectKind: request.route.codexProjectKind,
+      rootCodexHostId: request.route.codexHostId,
+      rootWorkspacePath: request.route.rootWorkspacePath,
     });
     if (recorded?.applied !== true && recorded?.applied !== false) {
       return { delivered: false, reason: "decision-not-recorded" };
@@ -3224,19 +4095,22 @@ async function runOwnerDecisionMonitorOnceUnlocked({
 export async function runTaskboardContinuationMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
   if (!policy || !COORDINATION_ID_PATTERN.test(policy.projectId ?? "")) {
     return { delivered: false, reason: "invalid-policy" };
   }
-  const existing = continuationMonitorRuns.get(policy.projectId);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
+  const runKey = `${hostExecutor.ownedCodexHostId}:${policy.projectId}`;
+  const existing = continuationMonitorRuns.get(runKey);
   if (existing) return existing;
 
-  const run = runTaskboardContinuationMonitorOnceUnlocked(options);
-  continuationMonitorRuns.set(policy.projectId, run);
+  const run = runTaskboardContinuationMonitorOnceUnlocked({ ...options, hostExecutor });
+  continuationMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (continuationMonitorRuns.get(policy.projectId) === run) {
-      continuationMonitorRuns.delete(policy.projectId);
+    if (continuationMonitorRuns.get(runKey) === run) {
+      continuationMonitorRuns.delete(runKey);
     }
   }
 }
@@ -3322,6 +4196,7 @@ function durableModelCapacityRetry(snapshot, candidate, target, readyWork, safeA
 
 async function runTaskboardContinuationMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimReceipt,
   confirmDelivery,
@@ -3349,6 +4224,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   if (snapshot?.projectId !== policy.projectId || !Array.isArray(snapshot.todos)) {
     return { delivered: false, reason: "invalid-snapshot" };
   }
+  let hostExecutorUnavailable = false;
   const replacementRecoveryObservedAt = now();
   const replacementRecoveryTodo = snapshot.todos.find((candidate) => {
     const admission = candidate?.admission;
@@ -3357,7 +4233,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     const expiredPendingAdmission = ["awaiting_admission", "prepared"].includes(admission?.state)
       && Number.isFinite(Date.parse(admission?.deadlineAt ?? ""))
       && Date.parse(admission.deadlineAt) <= replacementRecoveryObservedAt;
-    return COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+    const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
       && (admission?.state === "admission_uncertain" || expiredPendingAdmission)
       && typeof admission?.receiptId === "string" && admission.receiptId
@@ -3382,6 +4258,12 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && path.resolve(admission.rootWorkspacePath) === path.resolve(target.rootWorkspacePath)
       && RESUME_TOKEN_PATTERN.test(admission.resumeToken ?? "")
       && COORDINATION_ID_PATTERN.test(admission.safeActionId ?? "");
+    if (!eligible) return false;
+    if (!hostExecutorOwnsRoute(hostExecutor, target)) {
+      hostExecutorUnavailable = true;
+      return false;
+    }
+    return true;
   });
   if (replacementRecoveryTodo) {
     if (typeof claimReplacementAdmissionProbe !== "function"
@@ -3415,6 +4297,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       || !path.isAbsolute(probe.observationTarget.rootWorkspacePath)) {
       return { delivered: false, reason: "replacement-admission-probe-unavailable" };
     }
+    if (!hostExecutorOwnsRoute(hostExecutor, probe.observationTarget)) {
+      return { delivered: false, reason: "host-executor-unavailable" };
+    }
     recovery.admissionProbeId = probe.receipt.admissionProbeId;
     recovery.admissionProbeRequestedAt = probe.receipt.admissionProbeRequestedAt;
     const probeDelivery = await deliverAdmissionRecovery({
@@ -3443,7 +4328,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   }
   const recoveryTodo = snapshot.todos.find((candidate) => {
     const admission = candidate?.admission;
-    return COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
+    const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
       && ["awaiting_admission", "prepared", "admission_uncertain", "recovery_confirmed"].includes(admission?.state)
       && typeof admission?.receiptId === "string" && admission.receiptId
@@ -3453,6 +4338,12 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && typeof candidate.dispatchTarget.codexHostId === "string" && candidate.dispatchTarget.codexHostId
       && RESUME_TOKEN_PATTERN.test(admission?.resumeToken ?? "")
       && COORDINATION_ID_PATTERN.test(admission?.safeActionId ?? "");
+    if (!eligible) return false;
+    if (!hostExecutorOwnsRoute(hostExecutor, candidate.dispatchTarget)) {
+      hostExecutorUnavailable = true;
+      return false;
+    }
+    return true;
   });
   if (recoveryTodo) {
     const admission = recoveryTodo.admission;
@@ -3551,16 +4442,17 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && COORDINATION_ID_PATTERN.test(safeAction?.id ?? "")
       && RESUME_TOKEN_PATTERN.test(readyWork?.resumeToken ?? "")
       && THREAD_ID_PATTERN.test(target?.rootThreadId ?? "")
-      && typeof target?.codexHostId === "string"
-      && target.codexHostId.length > 0
-      && target.codexHostId.length <= 240
-      && !/[\u0000-\u001f\u007f]/.test(target.codexHostId)
+      && isCanonicalCodexHostId(target?.codexHostId)
       && typeof target?.rootWorkspacePath === "string"
       && path.isAbsolute(target.rootWorkspacePath)
       && typeof target?.worktreePath === "string"
       && path.isAbsolute(target.worktreePath)
     );
     if (!eligible) return false;
+    if (!hostExecutorOwnsRoute(hostExecutor, target)) {
+      hostExecutorUnavailable = true;
+      return false;
+    }
     const modelRetry = durableModelCapacityRetry(
       snapshot,
       candidate,
@@ -3623,7 +4515,11 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
             : "capacity-observation-unavailable",
       };
     }
-    return { delivered: false, reason: capacityReason ?? "no-eligible-work" };
+    return {
+      delivered: false,
+      reason: capacityReason
+        ?? (hostExecutorUnavailable ? "host-executor-unavailable" : "no-eligible-work"),
+    };
   }
 
   const safeAction = todo.readyWork.safeActions[0];
@@ -3631,6 +4527,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     todoId: todo.id,
     taskId: todo.taskId,
     rootThreadId: todo.dispatchTarget.rootThreadId,
+    ownedCodexHostId: hostExecutor.ownedCodexHostId,
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
   };
@@ -3649,6 +4546,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     || typeof recoveryRoute.rootWorkspacePath !== "string" || !path.isAbsolute(recoveryRoute.rootWorkspacePath)
     || typeof recoveryRoute.worktreePath !== "string" || !path.isAbsolute(recoveryRoute.worktreePath)
   )) return { delivered: false, reason: "invalid-recovery-route" };
+  if (!hostExecutorOwnsRoute(hostExecutor, dispatch)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
+  }
   if (recoveryRoute) {
     authorization.rootThreadId = reservation.receipt.rootThreadId;
     authorization.expectedResumeToken = reservation.receipt.resumeToken;
@@ -3754,6 +4654,7 @@ export async function deliverTaskboardCapacityObservation(request, rpc) {
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid capacity observation turn receipt");
@@ -3927,6 +4828,7 @@ export async function deliverTaskboardAdmissionRecovery(
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,
     input: [{ type: "text", text: instruction }],
+    approvalPolicy: "never",
   });
   if (typeof started?.turn?.id !== "string" || !started.turn.id) {
     throw new Error("Codex did not return a valid admission recovery turn receipt");

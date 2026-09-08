@@ -1533,15 +1533,20 @@ export function createAgentLaneSnapshotProvider({
         : `configured:${coordinatorTaskId}`;
       const decisionPriority = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
       const explicitOwnerRoute = configured.ownerRootTaskId && currentOwnerRoot?.threadId
+        && currentOwnerRoot.codexProjectId && currentOwnerRoot.codexProjectKind
         && currentOwnerRoot.codexHostId && currentOwnerRoot.workspacePath
         ? {
             rootTaskId: ownerRootTaskId,
             rootThreadId: currentOwnerRoot.threadId,
+            codexProjectId: currentOwnerRoot.codexProjectId,
+            codexProjectKind: currentOwnerRoot.codexProjectKind,
             codexHostId: currentOwnerRoot.codexHostId,
             rootWorkspacePath: currentOwnerRoot.workspacePath,
           }
         : null;
       const ownerDecisionRequest = coordinatorEpoch && currentOwnerRoot?.threadId
+        && currentOwnerRoot.codexProjectId && currentOwnerRoot.codexProjectKind
+        && currentOwnerRoot.codexHostId && currentOwnerRoot.workspacePath
         ? todos
           .filter((todo) => (
             todo.readyWork?.approvalRequest?.requestId
@@ -1565,8 +1570,10 @@ export function createAgentLaneSnapshotProvider({
             route: explicitOwnerRoute ?? {
               rootTaskId: coordinatorTaskId,
               rootThreadId: currentCoordinator.threadId,
-              codexHostId: todo.dispatchTarget.codexHostId,
-              rootWorkspacePath: todo.dispatchTarget.rootWorkspacePath,
+              codexProjectId: currentCoordinator.codexProjectId,
+              codexProjectKind: currentCoordinator.codexProjectKind,
+              codexHostId: currentCoordinator.codexHostId,
+              rootWorkspacePath: currentCoordinator.workspacePath,
             },
           }))[0] ?? null
         : null;
