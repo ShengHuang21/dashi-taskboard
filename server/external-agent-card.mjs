@@ -3,7 +3,9 @@ import { open } from "node:fs/promises";
 import { createAgentCapabilityCatalog } from "./agent-capability-catalog.mjs";
 
 const DEFAULT_MAX_AGE_MS = 15 * 60 * 1_000;
+const MAX_FUTURE_SKEW_MS = 60 * 1_000;
 const MAX_CARD_BYTES = 256 * 1_024;
+const MAX_READ_ATTEMPTS = 2;
 const MAX_SKILLS = 64;
 const MAX_MODES = 16;
 const MAX_SECURITY_SCHEMES = 16;
@@ -34,6 +36,48 @@ function unavailableResult(state, reasonCode, { configured, observedAt = null } 
     selectionBlockers: [reasonCode, "EXTERNAL_DISPATCH_NOT_IMPLEMENTED"],
     safety: safetyBoundary(),
   };
+}
+
+function isSameFileRevision(before, after) {
+  return before.dev === after.dev
+    && before.ino === after.ino
+    && before.size === after.size
+    && before.mtimeMs === after.mtimeMs
+    && before.ctimeMs === after.ctimeMs;
+}
+
+async function readBoundedSnapshot(sourcePath, openFile) {
+  const handle = await openFile(sourcePath, "r");
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.size > MAX_CARD_BYTES) {
+      return { kind: "invalid", metadata: before };
+    }
+
+    const bytes = Buffer.allocUnsafe(MAX_CARD_BYTES + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(
+        bytes,
+        offset,
+        bytes.length - offset,
+        offset,
+      );
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+
+    const after = await handle.stat();
+    if (!isSameFileRevision(before, after)) return { kind: "changed" };
+    if (offset > MAX_CARD_BYTES) return { kind: "invalid", metadata: after };
+    return {
+      kind: "ready",
+      metadata: after,
+      raw: bytes.subarray(0, offset),
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 function normalizedString(value, { field, maxLength = 512, pattern } = {}) {
@@ -256,6 +300,7 @@ export async function inspectExternalAgentCard({
   sourcePath,
   maxAgeMs = DEFAULT_MAX_AGE_MS,
   now = Date.now(),
+  openFile = open,
 } = {}) {
   if (!sourcePath) {
     return unavailableResult("not_configured", "SOURCE_NOT_CONFIGURED", {
@@ -263,46 +308,29 @@ export async function inspectExternalAgentCard({
     });
   }
 
-  let metadata;
-  let raw;
+  let snapshot;
   try {
-    const handle = await open(sourcePath, "r");
-    try {
-      metadata = await handle.stat();
-      if (!metadata.isFile() || metadata.size > MAX_CARD_BYTES) {
-        return unavailableResult("unsupported", "INVALID_AGENT_CARD", {
-          configured: true,
-          observedAt: metadata.mtime.toISOString(),
-        });
-      }
-
-      const bytes = Buffer.allocUnsafe(MAX_CARD_BYTES + 1);
-      let offset = 0;
-      while (offset < bytes.length) {
-        const { bytesRead } = await handle.read(
-          bytes,
-          offset,
-          bytes.length - offset,
-          offset,
-        );
-        if (bytesRead === 0) break;
-        offset += bytesRead;
-      }
-      if (offset > MAX_CARD_BYTES) {
-        return unavailableResult("unsupported", "INVALID_AGENT_CARD", {
-          configured: true,
-          observedAt: metadata.mtime.toISOString(),
-        });
-      }
-      raw = bytes.subarray(0, offset);
-    } finally {
-      await handle.close();
+    for (let attempt = 0; attempt < MAX_READ_ATTEMPTS; attempt += 1) {
+      snapshot = await readBoundedSnapshot(sourcePath, openFile);
+      if (snapshot.kind !== "changed") break;
     }
   } catch {
     return unavailableResult("unreachable", "SOURCE_UNREACHABLE", {
       configured: true,
     });
   }
+  if (snapshot.kind === "changed") {
+    return unavailableResult("unreachable", "SOURCE_CHANGED_DURING_READ", {
+      configured: true,
+    });
+  }
+  if (snapshot.kind === "invalid") {
+    return unavailableResult("unsupported", "INVALID_AGENT_CARD", {
+      configured: true,
+      observedAt: snapshot.metadata.mtime.toISOString(),
+    });
+  }
+  const { metadata, raw } = snapshot;
 
   let card;
   try {
@@ -319,7 +347,14 @@ export async function inspectExternalAgentCard({
   }
 
   const observedAt = metadata.mtime.toISOString();
-  const state = now - metadata.mtimeMs > maxAgeMs ? "stale" : "valid";
+  const ageMs = now - metadata.mtimeMs;
+  if (ageMs < -MAX_FUTURE_SKEW_MS) {
+    return unavailableResult("unsupported", "SOURCE_TIME_INVALID", {
+      configured: true,
+      observedAt,
+    });
+  }
+  const state = ageMs > maxAgeMs ? "stale" : "valid";
   const comparison = compareAgentCard(card);
   const publicCard = {
     protocolVersion: card.protocolVersion,

@@ -1,18 +1,23 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "node:test";
 
 import { createTaskboardServer, resolveServerOptions } from "../server/index.mjs";
+import { inspectExternalAgentCard } from "../server/external-agent-card.mjs";
 
 const runningApps = [];
+const temporaryDirectories = [];
 
 afterEach(async () => {
   while (runningApps.length > 0) {
     const { app, directory } = runningApps.pop();
     await app.close();
     await rm(directory, { recursive: true, force: true });
+  }
+  while (temporaryDirectories.length > 0) {
+    await rm(temporaryDirectories.pop(), { recursive: true, force: true });
   }
 });
 
@@ -248,6 +253,103 @@ test("external Agent Card distinguishes stale and unreachable configured sources
   assert.equal(unreachable.body.card, null);
   assert.equal(unreachable.body.comparison, null);
   assert.doesNotMatch(JSON.stringify(unreachable.body), /configured-agent-card\.json/);
+
+  const futureBaseUrl = await startServer({
+    card: fixtureCard(),
+    modifiedAt: new Date("2099-01-01T00:00:00.000Z"),
+  });
+  const future = await request(futureBaseUrl, "/api/agent-capabilities/external");
+  assert.equal(future.response.status, 200);
+  assert.equal(future.body.source.state, "unsupported");
+  assert.equal(future.body.source.reasonCode, "SOURCE_TIME_INVALID");
+  assert.equal(future.body.card, null);
+
+  const toleratedSkewBaseUrl = await startServer({
+    card: fixtureCard({ securitySchemes: {}, security: [] }),
+    modifiedAt: new Date(Date.now() + 30_000),
+  });
+  const toleratedSkew = await request(
+    toleratedSkewBaseUrl,
+    "/api/agent-capabilities/external",
+  );
+  assert.equal(toleratedSkew.response.status, 200);
+  assert.equal(toleratedSkew.body.source.state, "valid");
+  assert.equal(toleratedSkew.body.source.reasonCode, null);
+});
+
+test("external Agent Card retries when content changes during its bounded read", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-agent-card-rewrite-"));
+  temporaryDirectories.push(directory);
+  const sourcePath = path.join(directory, "agent-card.json");
+  const oldTime = new Date("2000-01-01T00:00:00.000Z");
+  const rewrittenTime = new Date("2026-09-01T00:00:05.000Z");
+  await writeFile(sourcePath, `${JSON.stringify(fixtureCard({ name: "Old revision" }))}\n`);
+  await utimes(sourcePath, oldTime, oldTime);
+
+  let rewrites = 0;
+  const openWithOneRewrite = async (...args) => {
+    const handle = await open(...args);
+    return {
+      stat: (...statArgs) => handle.stat(...statArgs),
+      read: async (...readArgs) => {
+        if (rewrites === 0) {
+          rewrites += 1;
+          await writeFile(
+            sourcePath,
+            `${JSON.stringify(fixtureCard({ name: "Current revision after rewrite" }))}\n`,
+          );
+          await utimes(sourcePath, rewrittenTime, rewrittenTime);
+        }
+        return handle.read(...readArgs);
+      },
+      close: () => handle.close(),
+    };
+  };
+
+  const result = await inspectExternalAgentCard({
+    sourcePath,
+    maxAgeMs: 60_000,
+    now: new Date("2026-09-01T00:00:10.000Z").getTime(),
+    openFile: openWithOneRewrite,
+  });
+
+  assert.equal(rewrites, 1);
+  assert.equal(result.source.state, "valid");
+  assert.equal(result.source.observedAt, rewrittenTime.toISOString());
+  assert.equal(result.card.name, "Current revision after rewrite");
+
+  let changingRevision = 0;
+  const openWithPersistentRewrite = async (...args) => {
+    const handle = await open(...args);
+    let changedThisAttempt = false;
+    return {
+      stat: (...statArgs) => handle.stat(...statArgs),
+      read: async (...readArgs) => {
+        if (!changedThisAttempt) {
+          changedThisAttempt = true;
+          changingRevision += 1;
+          await writeFile(
+            sourcePath,
+            `${JSON.stringify(fixtureCard({ name: `Changing revision ${changingRevision}` }))}\n`,
+          );
+          const changedAt = new Date(rewrittenTime.getTime() + changingRevision * 1_000);
+          await utimes(sourcePath, changedAt, changedAt);
+        }
+        return handle.read(...readArgs);
+      },
+      close: () => handle.close(),
+    };
+  };
+  const unstable = await inspectExternalAgentCard({
+    sourcePath,
+    maxAgeMs: 60_000,
+    now: new Date("2026-09-01T00:00:10.000Z").getTime(),
+    openFile: openWithPersistentRewrite,
+  });
+  assert.equal(changingRevision, 2);
+  assert.equal(unstable.source.state, "unreachable");
+  assert.equal(unstable.source.reasonCode, "SOURCE_CHANGED_DURING_READ");
+  assert.equal(unstable.card, null);
 });
 
 test("external Agent Card reports unsupported input without exposing or dispatching it", async () => {
