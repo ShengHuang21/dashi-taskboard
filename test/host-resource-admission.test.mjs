@@ -591,6 +591,63 @@ test("continuation fast lane gives every project one shared per-tick budget", as
   assert.equal(observedBudgets[0], observedBudgets[1]);
 });
 
+test("continuation fast lane fixes the Agent-slot ceiling before concurrent starts", async () => {
+  const fixtures = new Map([
+    ["late-slot-project-a", monitorFixture({
+      projectId: "late-slot-project-a",
+      todoId: "CAP-54-LATE-A",
+      taskId: "28cf5799-a245-4f54-b772-0aa2acf16e50",
+      fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93c0",
+      active: 0,
+    })],
+    ["late-slot-project-b", monitorFixture({
+      projectId: "late-slot-project-b",
+      todoId: "CAP-54-LATE-B",
+      taskId: "28cf5799-a245-4f54-b772-0aa2acf16e51",
+      fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93c1",
+      active: 2,
+    })],
+    ["late-slot-project-c", monitorFixture({
+      projectId: "late-slot-project-c",
+      todoId: "CAP-54-LATE-C",
+      taskId: "28cf5799-a245-4f54-b772-0aa2acf16e52",
+      fixtureRootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93c2",
+      active: 0,
+    })],
+  ]);
+  const delayed = fixtures.get("late-slot-project-b");
+  const readDelayedSnapshot = delayed.options.readSnapshot;
+  delayed.options.readSnapshot = async (...args) => {
+    await new Promise((resolve) => setImmediate(resolve));
+    return readDelayedSnapshot(...args);
+  };
+
+  const observed = [];
+  let complete;
+  const completed = new Promise((resolve) => { complete = resolve; });
+  runTaskboardContinuationFastLane({
+    hostExecutor: { ownedCodexHostId: "local" },
+    projects: [...fixtures.keys()].map((projectId) => ({
+      projectId,
+      continuationEnabled: true,
+    })),
+    runContinuation: (projectId, budget) => {
+      const fixture = fixtures.get(projectId);
+      fixture.options.hostResourceAdmissionBudget = budget;
+      return runTaskboardContinuationMonitorOnce(fixture.options);
+    },
+    observeResult: (result) => {
+      observed.push(result);
+      if (observed.length === fixtures.size) complete();
+    },
+  });
+  await completed;
+
+  const allFixtures = [...fixtures.values()];
+  assert.equal(allFixtures.reduce((total, fixture) => total + fixture.calls.claim, 0), 1);
+  assert.equal(allFixtures.reduce((total, fixture) => total + fixture.calls.deliver, 0), 1);
+});
+
 test("local continuation fails closed for missing, warming, stale, or wrong-host observations", async () => {
   const cases = [
     [null, "host-resource-observation-unavailable"],

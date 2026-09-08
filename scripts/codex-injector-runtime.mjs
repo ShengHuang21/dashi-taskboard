@@ -9,6 +9,7 @@ const coordinationDeliveries = new Map();
 const COORDINATION_DEDUPLICATION_MS = 60_000;
 const continuationMonitorRuns = new Map();
 const continuationFastLaneRuns = new Map();
+const hostResourceAdmissionBudgetBarriers = new WeakMap();
 const ownerDecisionMonitorRuns = new Map();
 const ownerIntentCaptureMonitorRuns = new Map();
 const ownerIntentAdoptionMonitorRuns = new Map();
@@ -3402,6 +3403,47 @@ export async function runTaskboardProjectMonitorSequence(monitors) {
   return results;
 }
 
+function createHostResourceAdmissionBudget(participantProjectIds) {
+  const budget = new Map();
+  let resolveReady;
+  const ready = new Promise((resolve) => { resolveReady = resolve; });
+  hostResourceAdmissionBudgetBarriers.set(budget, {
+    participants: new Map(participantProjectIds.map((projectId) => [projectId, "pending"])),
+    reservations: new Map(),
+    finalized: false,
+    ready,
+    resolveReady,
+  });
+  return budget;
+}
+
+function finalizeHostResourceAdmissionBudget(budget) {
+  const barrier = hostResourceAdmissionBudgetBarriers.get(budget);
+  if (!barrier || barrier.finalized
+    || [...barrier.participants.values()].some((state) => state === "pending")) {
+    return;
+  }
+  const limits = new Map();
+  for (const reservation of barrier.reservations.values()) {
+    limits.set(
+      reservation.hostId,
+      Math.min(limits.get(reservation.hostId) ?? reservation.headroomAgents, reservation.headroomAgents),
+    );
+  }
+  for (const [hostId, limit] of limits) {
+    budget.set(hostId, { limit, used: 0 });
+  }
+  barrier.finalized = true;
+  barrier.resolveReady();
+}
+
+function completeHostResourceAdmissionBudgetParticipant(budget, projectId) {
+  const barrier = hostResourceAdmissionBudgetBarriers.get(budget);
+  if (!barrier || barrier.participants.get(projectId) !== "pending") return;
+  barrier.participants.set(projectId, "complete");
+  finalizeHostResourceAdmissionBudget(budget);
+}
+
 export function runTaskboardContinuationFastLane({
   projects,
   runContinuation,
@@ -3419,7 +3461,16 @@ export function runTaskboardContinuationFastLane({
     project?.continuationEnabled === true
     && COORDINATION_ID_PATTERN.test(project?.projectId ?? "")
   ));
-  const hostResourceAdmissionBudget = new Map();
+  const startableProjectIds = [];
+  const startableRunKeys = new Set();
+  for (const project of eligible) {
+    const runKey = `${hostExecutor.ownedCodexHostId}:${project.projectId}`;
+    if (!continuationFastLaneRuns.has(runKey) && !startableRunKeys.has(runKey)) {
+      startableRunKeys.add(runKey);
+      startableProjectIds.push(project.projectId);
+    }
+  }
+  const hostResourceAdmissionBudget = createHostResourceAdmissionBudget(startableProjectIds);
   return eligible.map((project) => {
     const projectId = project.projectId;
     const runKey = `${hostExecutor.ownedCodexHostId}:${projectId}`;
@@ -3438,6 +3489,7 @@ export function runTaskboardContinuationFastLane({
       );
     continuationFastLaneRuns.set(runKey, run);
     void run.then((result) => {
+      completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, projectId);
       if (continuationFastLaneRuns.get(runKey) === run) {
         continuationFastLaneRuns.delete(runKey);
       }
@@ -4243,7 +4295,7 @@ export function evaluateHostResourceAdmission({
   return result;
 }
 
-function reserveHostResourceAdmissionBudget({ budget, target, headroomAgents }) {
+async function reserveHostResourceAdmissionBudget({ budget, projectId, target, headroomAgents }) {
   if (!(budget instanceof Map)) {
     return { available: false, reason: "host-resource-budget-unavailable" };
   }
@@ -4251,6 +4303,16 @@ function reserveHostResourceAdmissionBudget({ budget, target, headroomAgents }) 
     return { available: false, reason: "waiting-host-resources" };
   }
   const hostId = target?.codexHostId;
+  const barrier = hostResourceAdmissionBudgetBarriers.get(budget);
+  if (barrier) {
+    if (barrier.participants.get(projectId) !== "pending") {
+      return { available: false, reason: "host-resource-budget-unavailable" };
+    }
+    barrier.participants.set(projectId, "reservation");
+    barrier.reservations.set(projectId, { hostId, headroomAgents });
+    finalizeHostResourceAdmissionBudget(budget);
+    await barrier.ready;
+  }
   const current = budget.get(hostId);
   const state = current ?? { limit: headroomAgents, used: 0 };
   if (!Number.isSafeInteger(state.limit)
@@ -4451,6 +4513,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     return true;
   });
   if (replacementRecoveryTodo) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
     if (typeof claimReplacementAdmissionProbe !== "function"
       || typeof reconcileReplacementAdmission !== "function"
       || typeof deliverAdmissionRecovery !== "function") {
@@ -4531,6 +4594,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     return true;
   });
   if (recoveryTodo) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
     const admission = recoveryTodo.admission;
     const recovery = {
       projectId: policy.projectId,
@@ -4725,6 +4789,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     return true;
   });
   if (!todo) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
     if (capacityProbe) {
       const capacityDelivery = await requestCapacityObservation(capacityProbe);
       return {
@@ -4744,10 +4809,14 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     };
   }
 
+  if (selectedHostResourceHeadroom == null) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
+  }
   const hostResourceReservation = selectedHostResourceHeadroom == null
     ? null
-    : reserveHostResourceAdmissionBudget({
+    : await reserveHostResourceAdmissionBudget({
         budget: hostResourceAdmissionBudget,
+        projectId: policy.projectId,
         target: todo.dispatchTarget,
         headroomAgents: selectedHostResourceHeadroom,
       });
