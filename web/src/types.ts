@@ -687,6 +687,9 @@ export interface CoordinationTodoSnapshot {
     status: "active" | "needs_coordinator";
     coordinatorTaskId: string | null;
     leaseId: string | null;
+    assignedByLeaseId: string;
+    assignedByTaskId: string;
+    assignedByThreadId: string;
   } | null;
   workflow: {
     profile: "formal" | "vibe";

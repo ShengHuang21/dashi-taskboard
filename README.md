@@ -136,9 +136,11 @@ this fail-closed behavior.
 
 ## Embed in Codex
 
-### Manual: use a dedicated CDP port
+### Legacy/manual: use a dedicated CDP port
 
-Keep the existing Codex window open. From the Taskboard repository, start a second Codex instance with a dedicated CDP port:
+The resident macOS launcher below is the normal single-visible-app path. For
+manual CDP diagnostics only, keep the existing Codex window open and start a
+second Codex instance with a dedicated port:
 
 ```bash
 open -n -a /Applications/ChatGPT.app --args \
@@ -155,7 +157,7 @@ npm run codex:inject -- --port 9231 --open
 
 Keep the injector terminal running while using the embedded panel. The original Codex window remains unchanged, and the new window receives the Taskboard sidebar entry. If port `9231` is occupied, use another port in both commands.
 
-### Recommended: launch an independent Taskboard window with one command
+### Recommended: one visible Codex with a headless coordinator
 
 Keep existing Codex windows open and run:
 
@@ -163,7 +165,13 @@ Keep existing Codex windows open and run:
 CODEX_TASKBOARD_HOST=127.0.0.1 npm run codex
 ```
 
-This starts the local Taskboard service when needed. It reuses an open Codex with a reachable CDP renderer, opens Taskboard in the native browser panel of an ordinary Codex without CDP, or launches the official macOS Codex app with an independent profile and loopback-only port `9231` when no Codex is open. It injects a native-looking Taskboard entry after Plugins when CDP is available and keeps watching both the service and replacement renderers. Keep this command running while using the embedded panel. The launcher does not modify `ChatGPT.app` or its `app.asar`.
+This starts the local Taskboard service and one headless Codex app-server for
+resident coordination. It never launches an independent visible Codex profile
+on macOS. Opening Taskboard uses the ordinary Codex app's native browser panel;
+if the app is closed, coordination continues headlessly and the next explicit
+open request launches the normal app through its `codex://` deep link. Keep this
+command running while using resident coordination. The launcher does not modify
+`ChatGPT.app`, its profile, or its `app.asar`.
 
 The source launcher writes its authenticated endpoint to `.data/launcher-runtime.json`. A `taskctl` command installed with `npm link` reads this file by default, so a normal shell and a Codex task opened from the panel use the same Taskboard service without an extra environment variable.
 
@@ -184,7 +192,18 @@ npm run app:build
 
 Open `src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Taskboard.app` from Finder. The DMG is in `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`. If you only want the stable App, download the current DMG from [GitHub Releases](https://github.com/chuspeeism/dashi-taskboard/releases/latest).
 
-The App contains its own Node runtime, Taskboard service, built web UI, Skill, CLI wrapper, and injection script. It starts the service, reuses an open Codex with a reachable CDP renderer, opens Taskboard in the native browser panel of an ordinary Codex without CDP, or launches the official Codex app when no Codex is open. It waits for the renderer, injects the sidebar entry when CDP is available, and opens the panel without showing a terminal window. The App can be copied away from this checkout; the target Mac only needs the official Codex app and does not need this repository, a system Node installation, or a separate Codex CLI installation. Taskboard data is stored in `~/Library/Application Support/Codex Taskboard`, and launcher output is written to `~/Library/Logs/Codex Taskboard/codex-taskboard-launcher.log`.
+The App contains its own Node runtime, Taskboard service, built web UI, Skill,
+CLI wrapper, and headless coordinator transport. It preserves an already-open
+ordinary Codex app, keeps background coordination independent of renderer
+lifecycle, and opens Taskboard in that app's native browser panel without a
+terminal or second Dock icon. Login startup and crash recovery stay in the
+background without opening or focusing Codex; choosing **打开任务面板** or
+reopening the Taskboard App is the explicit signal that opens the panel. The App
+can be copied away from this checkout;
+the target Mac only needs the official Codex app and does not need this
+repository, a system Node installation, or a separate Codex CLI installation.
+Taskboard data is stored in `~/Library/Application Support/Codex Taskboard`, and
+launcher output is written to `~/Library/Logs/Codex Taskboard/codex-taskboard-launcher.log`.
 
 ### Linux App: Ubuntu 24.04 x64 packages
 

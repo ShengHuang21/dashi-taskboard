@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { test } from "node:test";
@@ -8,6 +9,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
   buildCoordinatorProvisioningDeliveryTurnStartParams,
+  coordinatorProvisioningResponseJson,
   admissionRecoveryRpcTimeoutMs,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
@@ -63,6 +65,47 @@ import {
 } from "../scripts/codex-injector-runtime.mjs";
 
 const coordinatorThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+const localHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
+const remoteHostExecutor = Object.freeze({ ownedCodexHostId: "remote-builder" });
+
+function ownerDecisionMonitorSnapshot(request, laneOverrides = {}) {
+  return {
+    projectId: "taskboard-core",
+    coordination: { ownerDecisionRequest: request },
+    taskLanes: [{
+      id: request.route.rootTaskId,
+      threadId: request.route.rootThreadId,
+      codexProjectId: request.route.codexProjectId,
+      codexProjectKind: request.route.codexProjectKind,
+      codexHostId: request.route.codexHostId,
+      workspacePath: request.route.rootWorkspacePath,
+      ...laneOverrides,
+    }],
+  };
+}
+
+test("Coordinator provisioning HTTP responses preserve the public status and error code", async () => {
+  const accepted = await coordinatorProvisioningResponseJson(new Response(
+    JSON.stringify({ attempt: { id: "accepted" } }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  ));
+  assert.deepEqual(accepted, { attempt: { id: "accepted" } });
+  await assert.rejects(
+    coordinatorProvisioningResponseJson(new Response(
+      JSON.stringify({ error: { code: "HOST_EXECUTOR_MISMATCH", details: "ignored" } }),
+      { status: 409, headers: { "content-type": "application/json" } },
+    )),
+    (error) => error?.status === 409
+      && error?.code === "HOST_EXECUTOR_MISMATCH"
+      && error.message === "Taskboard Coordinator provisioning returned HTTP 409",
+  );
+  await assert.rejects(
+    coordinatorProvisioningResponseJson(new Response("unavailable", { status: 503 })),
+    (error) => error?.status === 503
+      && error?.code === undefined
+      && error.message === "Taskboard Coordinator provisioning returned HTTP 503",
+  );
+});
 
 test("cold admission recovery allows bounded thread loading beyond the fast RPC budget", () => {
   assert.equal(admissionRecoveryRpcTimeoutMs("thread/read"), 10_000);
@@ -90,6 +133,7 @@ test("admission recovery replays its exact marker and rejects Root workspace dri
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       instruction = params.input[0].text;
       return { turn: { id: "turn-cap46-probe" } };
     }
@@ -146,6 +190,7 @@ test("admission recovery retries the same probe after a terminal transport failu
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       assert.match(params.input[0].text, new RegExp(marker));
       return { turn: { id: "turn-cap51-retry" } };
     }
@@ -865,6 +910,7 @@ test("background Coordinator identity handshake verifies the exact host thread w
   const workspacePath = path.resolve("/tmp/sbkk");
   const result = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
     projectId: "local",
+    hostExecutor: localHostExecutor,
     listHandshakes: async () => ({ handshakes: [{
       id: "handshake-1", role: "coordinator", threadId: coordinatorThreadId,
       registration: {
@@ -902,6 +948,7 @@ test("background Coordinator identity handshake verifies the exact host thread w
 
   const wrongWorkspace = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
     projectId: "local",
+    hostExecutor: localHostExecutor,
     listHandshakes: async () => ({ handshakes: [{
       id: "handshake-2", role: "coordinator", threadId: coordinatorThreadId,
       registration: {
@@ -918,6 +965,84 @@ test("background Coordinator identity handshake verifies the exact host thread w
     confirmIdentity: async () => { throw new Error("must not confirm"); },
   });
   assert.deepEqual(wrongWorkspace, { confirmed: 0, skipped: 1, failed: 0 });
+});
+
+test("Coordinator identity handshake reads and confirms only the exact owned host", async () => {
+  const remoteThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const workspacePath = "/tmp/taskboard/remote";
+  const remoteHandshake = {
+    id: "handshake-remote",
+    role: "coordinator",
+    threadId: remoteThreadId,
+    registration: {
+      projectId: "taskboard-core",
+      role: "coordinator",
+      taskId: "remote-coordinator",
+      label: "Remote Coordinator",
+      threadId: remoteThreadId,
+      expectedRevision: "b".repeat(64),
+      idempotencyKey: "handshake-remote",
+    },
+    expectedHostBinding: {
+      codexProjectId: "remote-project",
+      codexProjectKind: "remote",
+      codexHostId: remoteHostExecutor.ownedCodexHostId,
+      workspacePath,
+    },
+  };
+  let reads = 0;
+  let confirmations = 0;
+  const foreignResult = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "taskboard-core",
+    hostExecutor: localHostExecutor,
+    listHandshakes: async () => ({ handshakes: [remoteHandshake] }),
+    readThread: async () => { reads += 1; },
+    confirmIdentity: async () => { confirmations += 1; },
+  });
+  assert.deepEqual(foreignResult, { confirmed: 0, skipped: 1, failed: 0 });
+  assert.equal(reads, 0);
+  assert.equal(confirmations, 0);
+
+  const localThreadId = coordinatorThreadId;
+  const ownedResult = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "taskboard-core",
+    hostExecutor: remoteHostExecutor,
+    listHandshakes: async () => ({ handshakes: [{
+      ...remoteHandshake,
+      id: "handshake-local",
+      threadId: localThreadId,
+      registration: {
+        ...remoteHandshake.registration,
+        taskId: "local-coordinator",
+        threadId: localThreadId,
+        idempotencyKey: "handshake-local",
+      },
+      expectedHostBinding: {
+        ...remoteHandshake.expectedHostBinding,
+        codexProjectId: "local-project",
+        codexProjectKind: "local",
+        codexHostId: localHostExecutor.ownedCodexHostId,
+        workspacePath: "/tmp/taskboard/local",
+      },
+    }, remoteHandshake] }),
+    readThread: async (route) => {
+      reads += 1;
+      assert.deepEqual(route, {
+        threadId: remoteThreadId,
+        codexHostId: remoteHostExecutor.ownedCodexHostId,
+      });
+      return { thread: { id: remoteThreadId, cwd: workspacePath } };
+    },
+    confirmIdentity: async (handshakeId, registration, binding) => {
+      confirmations += 1;
+      assert.equal(handshakeId, remoteHandshake.id);
+      assert.equal(registration, remoteHandshake.registration);
+      assert.equal(binding.codexHostId, remoteHostExecutor.ownedCodexHostId);
+    },
+  });
+  assert.deepEqual(ownedResult, { confirmed: 1, skipped: 1, failed: 0 });
+  assert.equal(reads, 1);
+  assert.equal(confirmations, 1);
 });
 
 test("each open generation resolves one fresh Coordinator route and coalesces retries", async () => {
@@ -1096,7 +1221,12 @@ test("Owner Intent plan HTTP failures distinguish replan validation from stale s
   assert.equal(classifyOwnerIntentPlanHttpFailure(503, "SERVICE_UNAVAILABLE"), null);
 });
 
-function coordinatorKeepaliveSnapshot({ expiresAt, domainExpiresAt = expiresAt } = {}) {
+function coordinatorKeepaliveSnapshot({
+  expiresAt,
+  domainExpiresAt = expiresAt,
+  globalCodexHostId = localHostExecutor.ownedCodexHostId,
+  domainCodexHostId = localHostExecutor.ownedCodexHostId,
+} = {}) {
   return {
     projectId: "taskboard-core",
     coordination: {
@@ -1122,13 +1252,13 @@ function coordinatorKeepaliveSnapshot({ expiresAt, domainExpiresAt = expiresAt }
       {
         id: "global",
         threadId: coordinatorThreadId,
-        codexHostId: "host-global",
+        codexHostId: globalCodexHostId,
         workspacePath: "/tmp/taskboard/global",
       },
       {
         id: "frontend",
         threadId: "01a004bd-a749-7b53-81e2-af2d477f93af",
-        codexHostId: "host-frontend",
+        codexHostId: domainCodexHostId,
         workspacePath: "/tmp/taskboard/frontend",
       },
     ],
@@ -1139,6 +1269,7 @@ test("coordinator keepalive renews exact near-expiry Global and domain leases in
   const renewed = [];
   const now = Date.parse("2026-08-31T01:00:00.000Z");
   const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -1190,6 +1321,7 @@ test("resident Coordinator lifecycle discovery keeps an idle background lease al
   let busy = true;
   const receipts = [];
   const runTick = () => runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "capstone-dev",
@@ -1251,6 +1383,264 @@ test("resident keepalive survives an unavailable continuation policy without ena
   assert.deepEqual(projects, [{ projectId: "capstone-dev", continuationEnabled: false }]);
 });
 
+test("Coordinator keepalive skips foreign-first routes and renews only exact owned hosts", async () => {
+  const now = Date.parse("2026-08-31T01:00:00.000Z");
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T01:00:30.000Z",
+    domainExpiresAt: "2026-08-31T01:00:35.000Z",
+    globalCodexHostId: remoteHostExecutor.ownedCodexHostId,
+    domainCodexHostId: localHostExecutor.ownedCodexHostId,
+  });
+  const reads = [];
+  const renewals = [];
+  const run = (hostExecutor) => runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor,
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => now,
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => {
+      reads.push(route.codexHostId);
+      return { thread: { id: route.threadId, cwd: route.workspacePath, turns: [] } };
+    },
+    renewLease: async (request) => {
+      renewals.push(request);
+      return { lease: { id: request.expectedLeaseId, status: "active" } };
+    },
+  });
+
+  assert.deepEqual(await run(localHostExecutor), { renewed: 1, failed: 0, skipped: 1 });
+  assert.deepEqual(reads, [localHostExecutor.ownedCodexHostId]);
+  assert.deepEqual(renewals.map(({ scope, codexHostId }) => [scope, codexHostId]), [[
+    "domain", localHostExecutor.ownedCodexHostId,
+  ]]);
+
+  reads.length = 0;
+  renewals.length = 0;
+  assert.deepEqual(await run(remoteHostExecutor), { renewed: 1, failed: 0, skipped: 1 });
+  assert.deepEqual(reads, [remoteHostExecutor.ownedCodexHostId]);
+  assert.deepEqual(renewals.map(({ scope, codexHostId }) => [scope, codexHostId]), [[
+    "global", remoteHostExecutor.ownedCodexHostId,
+  ]]);
+});
+
+async function runCoordinatorHostRouteBoundary({ routeHostId, hostExecutor }) {
+  const workspacePath = "/tmp/taskboard/host-boundary";
+  const observedAt = Date.parse("2026-08-31T01:00:00.000Z");
+  const threadReads = [];
+  const mutations = [];
+  const taskLane = {
+    id: "global",
+    threadId: coordinatorThreadId,
+    codexHostId: routeHostId,
+    workspacePath,
+  };
+  const readThread = (monitor) => async (route) => {
+    threadReads.push(monitor);
+    assert.equal(route.codexHostId, routeHostId);
+    return { thread: { id: route.threadId, cwd: route.workspacePath, turns: [] } };
+  };
+  const handshake = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+    projectId: "taskboard-core",
+    hostExecutor,
+    listHandshakes: async () => ({ handshakes: [{
+      id: "handshake-host-boundary",
+      role: "coordinator",
+      threadId: coordinatorThreadId,
+      registration: {
+        projectId: "taskboard-core",
+        role: "coordinator",
+        taskId: "global",
+        label: "Coordinator",
+        threadId: coordinatorThreadId,
+        expectedRevision: "d".repeat(64),
+        idempotencyKey: "handshake-host-boundary",
+      },
+      expectedHostBinding: {
+        codexProjectId: "host-boundary-project",
+        codexProjectKind: "remote",
+        codexHostId: routeHostId,
+        workspacePath,
+      },
+    }] }),
+    readThread: async (route) => {
+      threadReads.push("handshake");
+      assert.equal(route.codexHostId, routeHostId);
+      return { thread: { id: route.threadId, cwd: workspacePath } };
+    },
+    confirmIdentity: async () => { mutations.push("handshake"); },
+  });
+  const keepalive = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor,
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    now: () => observedAt,
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: {
+        coordinatorTaskId: "global",
+        lease: {
+          id: "global-lease",
+          status: "active",
+          acquiredAt: "2026-08-31T00:00:00.000Z",
+          expiresAt: "2026-08-31T01:00:30.000Z",
+        },
+        domainCoordinators: [],
+      },
+      taskLanes: [taskLane],
+    }),
+    readThread: readThread("keepalive"),
+    renewLease: async (request) => {
+      mutations.push("keepalive");
+      return { lease: { id: request.expectedLeaseId, status: "active" } };
+    },
+  });
+  const recovery = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => ({
+      projectId: "taskboard-core",
+      coordination: {
+        lease: {
+          id: "global-lease",
+          holderTaskId: "global",
+          status: "expired",
+          bindingValid: true,
+          releasedAt: null,
+        },
+        domainCoordinators: [],
+      },
+      taskLanes: [taskLane],
+    }),
+    readThread: readThread("recovery"),
+    recoverLease: async () => {
+      mutations.push("recovery");
+      return { lease: { id: "global-recovered", status: "active" } };
+    },
+  });
+  return { handshake, keepalive, recovery, threadReads, mutations };
+}
+
+test("Coordinator monitors accept exact canonical 240, 241, and 256 character host routes", async () => {
+  for (const length of [240, 241, 256]) {
+    const ownedCodexHostId = `host-${"x".repeat(length - 5)}`;
+    assert.equal(ownedCodexHostId.length, length);
+    assert.deepEqual(await runCoordinatorHostRouteBoundary({
+      routeHostId: ownedCodexHostId,
+      hostExecutor: { ownedCodexHostId },
+    }), {
+      handshake: { confirmed: 1, skipped: 0, failed: 0 },
+      keepalive: { renewed: 1, failed: 0, skipped: 0 },
+      recovery: { recovered: 1, failed: 0, skipped: 0 },
+      threadReads: ["handshake", "keepalive", "recovery"],
+      mutations: ["handshake", "keepalive", "recovery"],
+    });
+  }
+});
+
+test("Coordinator monitors reject noncanonical, missing, and mismatched route hosts before RPC", async () => {
+  const cases = [{
+    name: "257 characters",
+    routeHostId: "x".repeat(257),
+  }, {
+    name: "control character",
+    routeHostId: "local\u0000remote",
+  }, {
+    name: "missing",
+    routeHostId: undefined,
+  }, {
+    name: "mismatch",
+    routeHostId: "remote-builder",
+  }];
+  for (const candidate of cases) {
+    const result = await runCoordinatorHostRouteBoundary({
+      routeHostId: candidate.routeHostId,
+      hostExecutor: localHostExecutor,
+    });
+    assert.deepEqual(result, {
+      handshake: { confirmed: 0, skipped: 1, failed: 0 },
+      keepalive: { renewed: 0, failed: 0, skipped: 1 },
+      recovery: { recovered: 0, failed: 0, skipped: 1 },
+      threadReads: [],
+      mutations: [],
+    }, candidate.name);
+  }
+});
+
+test("Coordinator lease monitors reject missing or invalid host executors before callbacks", async () => {
+  const invalidExecutors = [
+    undefined,
+    null,
+    {},
+    { ownedCodexHostId: "" },
+    { ownedCodexHostId: "   " },
+    { ownedCodexHostId: "local\nremote" },
+    { ownedCodexHostId: "x".repeat(257) },
+  ];
+  for (const hostExecutor of invalidExecutors) {
+    let callbacks = 0;
+    const optionalHostExecutor = hostExecutor === undefined ? {} : { hostExecutor };
+    const handshakeResult = await runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+      projectId: "taskboard-core",
+      ...optionalHostExecutor,
+      listHandshakes: async () => { callbacks += 1; return { handshakes: [] }; },
+      readThread: async () => { callbacks += 1; },
+      confirmIdentity: async () => { callbacks += 1; },
+    });
+    const keepaliveResult = await runCoordinatorLeaseKeepaliveMonitorOnce({
+      ...optionalHostExecutor,
+      policy: {
+        enabled: true,
+        projectId: "taskboard-core",
+        renewWindowMs: 45_000,
+        leaseDurationSeconds: 120,
+      },
+      readSnapshot: async () => {
+        callbacks += 1;
+        return {
+          projectId: "taskboard-core",
+          coordination: { lease: null, domainCoordinators: [] },
+          taskLanes: [],
+        };
+      },
+      readThread: async () => { callbacks += 1; },
+      renewLease: async () => { callbacks += 1; },
+    });
+    const recoveryResult = await runCoordinatorLeaseRecoveryMonitorOnce({
+      ...optionalHostExecutor,
+      policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+      readSnapshot: async () => {
+        callbacks += 1;
+        return {
+          projectId: "taskboard-core",
+          coordination: { lease: null, domainCoordinators: [] },
+          taskLanes: [],
+        };
+      },
+      readThread: async () => { callbacks += 1; },
+      recoverLease: async () => { callbacks += 1; },
+    });
+    assert.deepEqual(handshakeResult, {
+      confirmed: 0, skipped: 0, failed: 0, reason: "host-executor-unavailable",
+    });
+    assert.deepEqual(keepaliveResult, {
+      renewed: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable",
+    });
+    assert.deepEqual(recoveryResult, {
+      recovered: 0, failed: 0, skipped: 0, reason: "host-executor-unavailable",
+    });
+    assert.equal(callbacks, 0);
+  }
+});
+
 test("resident Coordinator shutdown waits through idle grace and recovers one exact archive", async () => {
   let observedAt = Date.parse("2026-09-03T00:00:00.000Z");
   const holder = {
@@ -1303,6 +1693,7 @@ test("resident Coordinator shutdown waits through idle grace and recovers one ex
     taskLanes: [{ id: holder.taskId, ...holder }, { id: owner.taskId, ...owner }],
   });
   const runTick = () => runCoordinatorShutdownMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 30_000 },
     now: () => observedAt,
     readSnapshot: async () => snapshot(),
@@ -1322,7 +1713,7 @@ test("resident Coordinator shutdown waits through idle grace and recovers one ex
       assert.equal(request.ownerRootCodexProjectId, owner.codexProjectId);
       assert.equal(request.ownerRootCodexProjectKind, owner.codexProjectKind);
       assert.equal(request.ownerRootCodexHostId, owner.codexHostId);
-      assert.equal(request.ownerRootWorkspacePath, owner.workspacePath);
+      assert.equal(request.ownerRootWorkspacePath, path.resolve(owner.workspacePath));
       attempt = { ...request, id: "shutdown-1", status: "pending" };
       return { applied: true, attempt };
     },
@@ -1368,9 +1759,660 @@ test("resident Coordinator shutdown waits through idle grace and recovers one ex
   assert.equal(completionCalls, 1);
 });
 
+test("foreign persisted Coordinator shutdown attempts have zero host or mutation effects", async () => {
+  for (const [kind, runMonitor] of [
+    ["global", runCoordinatorShutdownMonitorOnce],
+    ["domain", runDomainCoordinatorShutdownMonitorOnce],
+  ]) {
+    for (const status of ["pending", "released"]) {
+      const projectId = `cap58-${kind}-${status}`;
+      const effects = [];
+      const attempt = {
+        id: `${kind}-${status}-attempt`, projectId, status,
+        holderTaskId: `${kind}-holder`, holderThreadId: coordinatorThreadId,
+        codexHostId: "remote-builder", workspacePath: `/tmp/${projectId}`,
+        ...(kind === "domain" ? { domainId: "frontend" } : {}),
+      };
+      const common = {
+        hostExecutor: localHostExecutor,
+        policy: { enabled: true, projectId, idleGraceMs: 1 },
+        now: () => 1,
+        readSnapshot: async () => ({
+          projectId,
+          coordination: {
+            coordinatorTaskId: "global",
+            lease: { id: "global-lease", status: "active", bindingValid: true },
+            domainCoordinators: kind === "domain" ? [{
+              domainId: "frontend", assignment: "unassigned", durableWorkPending: false,
+              coordinatorTaskId: null, lease: { id: "frontend-lease", status: "expired" },
+            }] : [],
+          },
+          taskLanes: [],
+        }),
+        readWindows: async () => ({ projectId, revision: "a".repeat(64), windows: [] }),
+        readThread: async () => { effects.push("read-thread"); },
+        getAttempt: async () => ({ attempt }),
+        requestAttempt: async () => { effects.push("request"); },
+        releaseAttempt: async () => {
+          effects.push("release");
+          return { attempt: { ...attempt, status: "released" } };
+        },
+        authorizeAttempt: async () => { effects.push("authorize"); },
+        beginArchiveAttempt: async () => { effects.push("begin-archive"); },
+        cancelAttempt: async () => { effects.push("cancel"); },
+        findArchivedThread: async () => { effects.push("find-archived"); },
+        archiveThread: async () => { effects.push("archive"); },
+        completeAttempt: async () => { effects.push("complete"); },
+      };
+      await runMonitor(common);
+      assert.deepEqual(effects, [], `${kind} ${status}`);
+    }
+  }
+});
+
+test("Coordinator shutdown rejects same-host cross-attempt transition responses", async () => {
+  for (const [kind, runMonitor] of [
+    ["global", runCoordinatorShutdownMonitorOnce],
+    ["domain", runDomainCoordinatorShutdownMonitorOnce],
+  ]) {
+    for (const phase of ["release", "complete"]) {
+      const projectId = `cap58-cross-attempt-${kind}-${phase}`;
+      const domainId = "frontend";
+      const attempt = {
+        id: `${kind}-${phase}-attempt-a`, projectId,
+        ...(kind === "domain" ? { domainId } : {}),
+        status: phase === "release" ? "pending" : "archiving",
+        holderTaskId: `${kind}-holder`, holderThreadId: coordinatorThreadId,
+        codexHostId: "local", workspacePath: `/tmp/${projectId}`,
+      };
+      const effects = [];
+      const result = await runMonitor({
+        hostExecutor: localHostExecutor,
+        policy: { enabled: true, projectId, idleGraceMs: 1 },
+        now: () => 0,
+        readSnapshot: async () => ({
+          projectId,
+          coordination: {
+            domainCoordinators: kind === "domain" ? [{ domainId }] : [],
+          },
+          taskLanes: [],
+        }),
+        readWindows: async () => ({
+          projectId, revision: "d".repeat(64), windows: [],
+        }),
+        readThread: async () => { effects.push("read-thread"); },
+        getAttempt: async () => ({ attempt }),
+        requestAttempt: async () => { effects.push("request"); },
+        releaseAttempt: async () => {
+          effects.push("release");
+          return { attempt: { ...attempt, id: `${kind}-${phase}-attempt-b`, status: "released" } };
+        },
+        authorizeAttempt: async () => { effects.push("authorize"); },
+        beginArchiveAttempt: async () => { effects.push("begin-archive"); },
+        cancelAttempt: async () => { effects.push("cancel"); },
+        findArchivedThread: async () => {
+          effects.push("find-archived");
+          return { id: attempt.holderThreadId, cwd: attempt.workspacePath };
+        },
+        archiveThread: async () => { effects.push("archive"); },
+        completeAttempt: async () => {
+          effects.push("complete");
+          return { attempt: { ...attempt, id: `${kind}-${phase}-attempt-b`, status: "completed" } };
+        },
+      });
+      assert.equal(result.shutdown, false, `${kind} ${phase}`);
+      assert.equal(result.reason, "attempt-response-mismatch", `${kind} ${phase}`);
+      assert.equal(result.attemptId, attempt.id, `${kind} ${phase}`);
+      assert.deepEqual(
+        effects,
+        phase === "release" ? ["release"] : ["find-archived", "complete"],
+        `${kind} ${phase}`,
+      );
+    }
+  }
+});
+
+test("Coordinator shutdown rejects same-host request responses with another binding", async () => {
+  const globalProjectId = "cap58-global-request-envelope";
+  let globalObservedAt = 10;
+  let globalReleases = 0;
+  const globalOptions = freshGlobalShutdownOptions({
+    projectId: globalProjectId,
+    hostId: "local",
+    now: () => globalObservedAt,
+    requestAttempt: async (request) => ({ attempt: {
+      ...request, id: "global-request-attempt", status: "pending",
+      expectedLeaseId: "another-global-lease",
+    } }),
+  });
+  globalOptions.releaseAttempt = async () => { globalReleases += 1; };
+  assert.equal((await runCoordinatorShutdownMonitorOnce(globalOptions)).reason, "idle-grace");
+  globalObservedAt += 1;
+  assert.equal(
+    (await runCoordinatorShutdownMonitorOnce(globalOptions)).reason,
+    "attempt-response-mismatch",
+  );
+
+  const domainProjectId = "cap58-domain-request-envelope";
+  const domainId = "frontend";
+  let domainObservedAt = 20;
+  const globalLane = { id: "global", threadId: coordinatorThreadId };
+  const holder = {
+    id: domainId, taskId: domainId,
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    source: "codex", taskType: "peer_task", codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend",
+  };
+  const effects = [];
+  const domainOptions = {
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: domainProjectId, idleGraceMs: 1 },
+    now: () => domainObservedAt,
+    readSnapshot: async () => ({
+      projectId: domainProjectId,
+      coordination: {
+        coordinatorTaskId: globalLane.id,
+        lease: { id: "global-lease", status: "active", bindingValid: true },
+        domainCoordinators: [{
+          domainId, label: "Frontend", writeScope: ["web"],
+          eligibleTaskIds: [holder.id], assignment: "lease", durableWorkPending: false,
+          coordinatorTaskId: holder.id,
+          lease: {
+            id: "frontend-lease", holderTaskId: holder.id,
+            status: "active", bindingValid: true, releasedAt: null,
+          },
+        }],
+      },
+      taskLanes: [globalLane, holder],
+    }),
+    readWindows: async () => ({
+      projectId: domainProjectId, revision: "e".repeat(64),
+      windows: [{ ...holder, taskId: holder.id }],
+    }),
+    readThread: async () => ({
+      thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
+    }),
+    getAttempt: async () => ({ attempt: null }),
+    requestAttempt: async (request) => ({ attempt: {
+      ...request, id: "domain-request-attempt", status: "pending",
+      globalHolderThreadId: "another-global-thread",
+    } }),
+    releaseAttempt: async () => { effects.push("release"); },
+    authorizeAttempt: async () => { effects.push("authorize"); },
+    beginArchiveAttempt: async () => { effects.push("begin-archive"); },
+    cancelAttempt: async () => { effects.push("cancel"); },
+    findArchivedThread: async () => { effects.push("find-archived"); },
+    archiveThread: async () => { effects.push("archive"); },
+    completeAttempt: async () => { effects.push("complete"); },
+  };
+  assert.deepEqual(await runDomainCoordinatorShutdownMonitorOnce(domainOptions), {
+    shutdown: false, reason: "idle-grace", domainId,
+  });
+  domainObservedAt += 1;
+  const domainResult = await runDomainCoordinatorShutdownMonitorOnce(domainOptions);
+  assert.equal(domainResult.shutdown, false);
+  assert.equal(domainResult.reason, "attempt-response-mismatch");
+  assert.equal(domainResult.domainId, domainId);
+  assert.deepEqual({ globalReleases, domainEffects: effects }, {
+    globalReleases: 0, domainEffects: [],
+  });
+});
+
+test("Coordinator shutdown transition responses retain every immutable binding field", async () => {
+  const fields = [
+    ["expectedRevision", "global"], ["expectedLeaseId", "global"],
+    ["idempotencyKey", "global"], ["projectId", "global"], ["id", "global"],
+    ["holderTaskId", "global"], ["holderThreadId", "global"],
+    ["codexProjectId", "global"], ["codexProjectKind", "global"],
+    ["codexHostId", "global"], ["workspacePath", "global"],
+    ["ownerRootTaskId", "global"], ["ownerRootThreadId", "global"],
+    ["ownerRootCodexProjectId", "global"], ["ownerRootCodexProjectKind", "global"],
+    ["ownerRootCodexHostId", "global"], ["ownerRootWorkspacePath", "global"],
+    ["domainId", "domain"], ["globalHolderTaskId", "domain"],
+    ["globalHolderThreadId", "domain"], ["expectedGlobalLeaseId", "domain"],
+  ];
+  for (const [index, [field, kind]] of fields.entries()) {
+    const projectId = `cap58-transition-envelope-${index}`;
+    const domainId = "frontend";
+    const attempt = {
+      id: `attempt-${index}`, idempotencyKey: `shutdown-${index}`,
+      projectId, ...(kind === "domain" ? {
+        domainId, globalHolderTaskId: "global", globalHolderThreadId: "global-thread",
+        expectedGlobalLeaseId: "global-lease",
+      } : {
+        ownerRootTaskId: "owner", ownerRootThreadId: "owner-thread",
+        ownerRootCodexProjectId: "owner-project", ownerRootCodexProjectKind: "remote",
+        ownerRootCodexHostId: "owner-host", ownerRootWorkspacePath: "/tmp/owner",
+      }),
+      expectedRevision: "f".repeat(64), expectedLeaseId: `${kind}-lease`,
+      holderTaskId: `${kind}-holder`, holderThreadId: coordinatorThreadId,
+      codexProjectId: `${kind}-project`, codexProjectKind: "local",
+      codexHostId: "local", workspacePath: `/tmp/${projectId}`, status: "pending",
+    };
+    const alteredValue = field.endsWith("WorkspacePath") || field === "workspacePath"
+      ? `/tmp/${projectId}-drift`
+      : field === "expectedRevision" ? "0".repeat(64)
+        : field === "codexHostId" ? "remote-builder"
+          : field === "projectId" ? `${projectId}-drift`
+            : field === "domainId" ? "backend"
+              : `${attempt[field]}-drift`;
+    const effects = [];
+    const runMonitor = kind === "global"
+      ? runCoordinatorShutdownMonitorOnce
+      : runDomainCoordinatorShutdownMonitorOnce;
+    const result = await runMonitor({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId, idleGraceMs: 1 },
+      now: () => 0,
+      readSnapshot: async () => ({
+        projectId,
+        coordination: {
+          domainCoordinators: kind === "domain" ? [{ domainId }] : [],
+        },
+        taskLanes: [],
+      }),
+      readWindows: async () => ({ projectId, revision: "1".repeat(64), windows: [] }),
+      readThread: async () => { effects.push("read-thread"); },
+      getAttempt: async () => ({ attempt }),
+      requestAttempt: async () => { effects.push("request"); },
+      releaseAttempt: async () => {
+        effects.push("release");
+        return { attempt: { ...attempt, [field]: alteredValue, status: "released" } };
+      },
+      authorizeAttempt: async () => { effects.push("authorize"); },
+      beginArchiveAttempt: async () => { effects.push("begin-archive"); },
+      cancelAttempt: async () => { effects.push("cancel"); },
+      findArchivedThread: async () => { effects.push("find-archived"); },
+      archiveThread: async () => { effects.push("archive"); },
+      completeAttempt: async () => { effects.push("complete"); },
+    });
+    assert.equal(result.shutdown, false, field);
+    assert.equal(result.reason, "attempt-response-mismatch", field);
+    assert.equal(result.attemptId, attempt.id, field);
+    assert.deepEqual(effects, ["release"], field);
+  }
+});
+
+test("Coordinator shutdown monitors reject invalid host executors before any callback", async () => {
+  for (const [kind, runMonitor] of [
+    ["global", runCoordinatorShutdownMonitorOnce],
+    ["domain", runDomainCoordinatorShutdownMonitorOnce],
+  ]) {
+    for (const [label, hostExecutor] of [
+      ["missing", undefined],
+      ["null", null],
+      ["empty", { ownedCodexHostId: "" }],
+      ["whitespace", { ownedCodexHostId: " remote-builder " }],
+      ["control", { ownedCodexHostId: "remote\nhost" }],
+      ["257 characters", { ownedCodexHostId: "h".repeat(257) }],
+    ]) {
+      let callbacks = 0;
+      const called = async () => { callbacks += 1; return {}; };
+      const result = await runMonitor({
+        hostExecutor,
+        policy: { enabled: true, projectId: `cap58-invalid-${kind}-${label}`, idleGraceMs: 1 },
+        now: () => { callbacks += 1; return 0; },
+        readSnapshot: called,
+        readWindows: called,
+        readThread: called,
+        getAttempt: called,
+        requestAttempt: called,
+        releaseAttempt: called,
+        authorizeAttempt: called,
+        beginArchiveAttempt: called,
+        cancelAttempt: called,
+        findArchivedThread: called,
+        archiveThread: called,
+        completeAttempt: called,
+      });
+      assert.deepEqual(result, {
+        shutdown: false, reason: "host-executor-unavailable",
+      }, `${kind} ${label}`);
+      assert.equal(callbacks, 0, `${kind} ${label}`);
+    }
+  }
+});
+
+test("Coordinator shutdown monitors accept canonical 240, 241, and 256 character hosts", async () => {
+  for (const length of [240, 241, 256]) {
+    for (const [kind, runMonitor] of [
+      ["global", runCoordinatorShutdownMonitorOnce],
+      ["domain", runDomainCoordinatorShutdownMonitorOnce],
+    ]) {
+      const hostId = "h".repeat(length);
+      const projectId = `cap58-host-${length}-${kind}`;
+      const domainId = "frontend";
+      const attempt = {
+        id: `${kind}-${length}`, projectId, status: "pending",
+        holderTaskId: `${kind}-holder`, holderThreadId: coordinatorThreadId,
+        codexHostId: hostId, workspacePath: `/tmp/${projectId}`,
+        ...(kind === "domain" ? { domainId } : {}),
+      };
+      let releases = 0;
+      const result = await runMonitor({
+        hostExecutor: { ownedCodexHostId: hostId },
+        policy: { enabled: true, projectId, idleGraceMs: 1 },
+        now: () => 0,
+        readSnapshot: async () => ({
+          projectId,
+          coordination: {
+            lease: { id: "global-lease", status: "active", bindingValid: true },
+            domainCoordinators: kind === "domain" ? [{
+              domainId, assignment: "unassigned", durableWorkPending: false,
+              coordinatorTaskId: null, lease: { id: "domain-lease", status: "expired" },
+            }] : [],
+          },
+          taskLanes: [],
+        }),
+        readWindows: async () => ({ projectId, revision: "a".repeat(64), windows: [] }),
+        readThread: async () => assert.fail("persisted pending attempt must release first"),
+        getAttempt: async () => ({ attempt }),
+        requestAttempt: async () => assert.fail("persisted attempt must be reused"),
+        releaseAttempt: async ({ attemptId, ownedCodexHostId }) => {
+          assert.equal(attemptId, attempt.id);
+          assert.equal(ownedCodexHostId, hostId);
+          releases += 1;
+          throw new Error("stop after proving canonical ownership");
+        },
+        authorizeAttempt: async () => assert.fail("release failure must stop"),
+        beginArchiveAttempt: async () => assert.fail("release failure must stop"),
+        cancelAttempt: async () => assert.fail("release failure must stop"),
+        findArchivedThread: async () => assert.fail("release failure must stop"),
+        archiveThread: async () => assert.fail("release failure must stop"),
+        completeAttempt: async () => assert.fail("release failure must stop"),
+      });
+      assert.equal(result.reason, "release-unavailable", `${kind} ${length}`);
+      assert.equal(releases, 1, `${kind} ${length}`);
+    }
+  }
+});
+
+test("domain shutdown skips a foreign persisted attempt and continues to an owned domain", async () => {
+  const projectId = "cap58-domain-existing-foreign-first";
+  const attempts = {
+    frontend: {
+      id: "foreign-attempt", projectId, domainId: "frontend", status: "pending",
+      holderTaskId: "frontend", holderThreadId: coordinatorThreadId,
+      codexHostId: "remote-builder", workspacePath: "/tmp/frontend",
+    },
+    backend: {
+      id: "owned-attempt", projectId, domainId: "backend", status: "pending",
+      holderTaskId: "backend", holderThreadId: coordinatorThreadId,
+      codexHostId: "local", workspacePath: "/tmp/backend",
+    },
+  };
+  const released = [];
+  const result = await runDomainCoordinatorShutdownMonitorOnce({
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId, idleGraceMs: 1 },
+    now: () => 0,
+    readSnapshot: async () => ({
+      projectId,
+      coordination: {
+        lease: { id: "global-lease", status: "active", bindingValid: true },
+        domainCoordinators: ["frontend", "backend"].map((domainId) => ({
+          domainId, assignment: "unassigned", durableWorkPending: false,
+          coordinatorTaskId: null, lease: { id: `${domainId}-lease`, status: "expired" },
+        })),
+      },
+      taskLanes: [],
+    }),
+    readWindows: async () => ({ projectId, revision: "a".repeat(64), windows: [] }),
+    readThread: async () => assert.fail("release failure must stop"),
+    getAttempt: async ({ domainId }) => ({ attempt: attempts[domainId] }),
+    requestAttempt: async () => assert.fail("persisted attempt must be reused"),
+    releaseAttempt: async ({ attemptId, ownedCodexHostId }) => {
+      released.push(`${attemptId}:${ownedCodexHostId}`);
+      throw new Error("stop after owned release");
+    },
+    authorizeAttempt: async () => assert.fail("release failure must stop"),
+    beginArchiveAttempt: async () => assert.fail("release failure must stop"),
+    cancelAttempt: async () => assert.fail("release failure must stop"),
+    findArchivedThread: async () => assert.fail("release failure must stop"),
+    archiveThread: async () => assert.fail("release failure must stop"),
+    completeAttempt: async () => assert.fail("release failure must stop"),
+  });
+  assert.equal(result.domainId, "backend");
+  assert.deepEqual(released, ["owned-attempt:local"]);
+});
+
+test("mixed-host domain shutdown selects owned-later and rechecks the request response", async () => {
+  const projectId = "cap58-domain-fresh-foreign-first";
+  let observedAt = 100;
+  const globalLane = { id: "global", threadId: coordinatorThreadId };
+  const remoteLane = {
+    id: "frontend", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    source: "codex", taskType: "peer_task", codexProjectId: "remote-project",
+    codexProjectKind: "remote", codexHostId: "remote-builder", workspacePath: "/tmp/frontend",
+  };
+  const localLane = {
+    id: "backend", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+    source: "codex", taskType: "peer_task", codexProjectId: "local-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/backend",
+  };
+  const snapshot = {
+    projectId,
+    coordination: {
+      coordinatorTaskId: globalLane.id,
+      lease: { id: "global-lease", status: "active", bindingValid: true },
+      domainCoordinators: [remoteLane, localLane].map((lane) => ({
+        domainId: lane.id, label: lane.id, writeScope: [lane.id],
+        eligibleTaskIds: [lane.id], assignment: "lease", durableWorkPending: false,
+        coordinatorTaskId: lane.id,
+        lease: {
+          id: `${lane.id}-lease`, holderTaskId: lane.id,
+          status: "active", bindingValid: true, releasedAt: null,
+        },
+      })),
+    },
+    taskLanes: [globalLane, remoteLane, localLane],
+  };
+  const windows = {
+    projectId, revision: "b".repeat(64),
+    windows: [remoteLane, localLane].map((lane) => ({ ...lane, taskId: lane.id })),
+  };
+  const readHosts = [];
+  const requests = [];
+  let releases = 0;
+  const options = {
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId, idleGraceMs: 1 },
+    now: () => observedAt,
+    readSnapshot: async () => snapshot,
+    readWindows: async () => windows,
+    readThread: async ({ threadId, codexHostId }) => {
+      readHosts.push(codexHostId);
+      const lane = snapshot.taskLanes.find((candidate) => candidate.threadId === threadId);
+      return { thread: { id: threadId, cwd: lane.workspacePath, turns: [] } };
+    },
+    getAttempt: async () => ({ attempt: null }),
+    requestAttempt: async (request) => {
+      requests.push(request);
+      return { attempt: {
+        ...request, id: "foreign-response", status: "pending", codexHostId: "remote-builder",
+      } };
+    },
+    releaseAttempt: async () => { releases += 1; },
+    authorizeAttempt: async () => assert.fail("foreign response must stop"),
+    beginArchiveAttempt: async () => assert.fail("foreign response must stop"),
+    cancelAttempt: async () => assert.fail("foreign response must stop"),
+    findArchivedThread: async () => assert.fail("foreign response must stop"),
+    archiveThread: async () => assert.fail("foreign response must stop"),
+    completeAttempt: async () => assert.fail("foreign response must stop"),
+  };
+  assert.deepEqual(await runDomainCoordinatorShutdownMonitorOnce(options), {
+    shutdown: false, reason: "idle-grace", domainId: "backend",
+  });
+  observedAt += 1;
+  const result = await runDomainCoordinatorShutdownMonitorOnce(options);
+  assert.equal(result.domainId, "backend");
+  assert.equal(result.reason, "attempt-response-mismatch");
+  assert.deepEqual(readHosts, ["local", "local"]);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].domainId, "backend");
+  assert.equal(requests[0].ownedCodexHostId, "local");
+  assert.equal(releases, 0);
+
+  const remoteReadHosts = [];
+  assert.deepEqual(await runDomainCoordinatorShutdownMonitorOnce({
+    ...options,
+    hostExecutor: remoteHostExecutor,
+    readThread: async ({ threadId, codexHostId }) => {
+      remoteReadHosts.push(codexHostId);
+      const lane = snapshot.taskLanes.find((candidate) => candidate.threadId === threadId);
+      return { thread: { id: threadId, cwd: lane.workspacePath, turns: [] } };
+    },
+    requestAttempt: async () => assert.fail("first remote observation must wait"),
+  }), {
+    shutdown: false, reason: "idle-grace", domainId: "frontend",
+  });
+  assert.deepEqual(remoteReadHosts, ["remote-builder"]);
+});
+
+function freshGlobalShutdownOptions({ projectId, hostId, now, requestAttempt, getAttempt }) {
+  const holder = {
+    id: "coordinator", taskId: "coordinator", threadId: coordinatorThreadId,
+    codexProjectId: `${projectId}-holder`, codexProjectKind: hostId === "local" ? "local" : "remote",
+    codexHostId: hostId, workspacePath: `/tmp/${projectId}-${hostId}-holder`,
+  };
+  const owner = {
+    id: "owner", taskId: "owner", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: `${projectId}-owner`, codexProjectKind: "remote",
+    codexHostId: "owner-host", workspacePath: `/tmp/${projectId}-owner`,
+  };
+  const lease = {
+    id: "global-lease", holderTaskId: holder.id, status: "active",
+    bindingValid: true, releasedAt: null,
+  };
+  return {
+    hostExecutor: { ownedCodexHostId: hostId },
+    policy: { enabled: true, projectId, idleGraceMs: 1 },
+    now,
+    readSnapshot: async () => ({
+      projectId,
+      coordination: {
+        assignment: "lease", coordinatorTaskId: holder.id, ownerRootTaskId: owner.id,
+        ownerRootRoute: {
+          rootTaskId: owner.id, rootThreadId: owner.threadId,
+          codexHostId: owner.codexHostId, rootWorkspacePath: owner.workspacePath,
+        },
+        lease, durableWorkPending: false, domainCoordinators: [],
+      },
+      taskLanes: [holder, owner],
+    }),
+    readWindows: async () => ({
+      projectId, revision: "c".repeat(64), ownerRootTaskId: owner.id,
+      windows: [{ ...holder, role: "coordinator" }, { ...owner, role: "owner_root" }],
+    }),
+    readThread: async ({ threadId, codexHostId }) => {
+      assert.equal(threadId, holder.threadId);
+      assert.equal(codexHostId, hostId);
+      return { thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] } };
+    },
+    getAttempt: getAttempt ?? (async () => ({ attempt: null })),
+    requestAttempt,
+    releaseAttempt: async () => assert.fail("test request must stop before release"),
+    findArchivedThread: async () => assert.fail("test request must stop before archive lookup"),
+    archiveThread: async () => assert.fail("test request must stop before archive"),
+    completeAttempt: async () => assert.fail("test request must stop before completion"),
+  };
+}
+
+test("Global shutdown uses the holder host, not the Owner Root host, and rechecks request ownership", async () => {
+  const projectId = "cap58-global-owner-host-differs";
+  let observedAt = 1_000;
+  let request = null;
+  let releases = 0;
+  const options = freshGlobalShutdownOptions({
+    projectId,
+    hostId: "local",
+    now: () => observedAt,
+    requestAttempt: async (input) => {
+      request = input;
+      return { attempt: {
+        ...input, id: "foreign-global-response", status: "pending",
+        codexHostId: "remote-builder",
+      } };
+    },
+  });
+  options.releaseAttempt = async () => { releases += 1; };
+  assert.equal((await runCoordinatorShutdownMonitorOnce(options)).reason, "idle-grace");
+  observedAt += 1;
+  assert.deepEqual(await runCoordinatorShutdownMonitorOnce(options), {
+    shutdown: false, reason: "attempt-response-mismatch",
+  });
+  assert.equal(request.ownedCodexHostId, "local");
+  assert.equal(request.ownerRootCodexHostId, "owner-host");
+  assert.equal(releases, 0);
+});
+
+test("Global shutdown single-flight is scoped by exact host and project", async () => {
+  const projectId = "cap58-global-flight-host-isolation";
+  let releaseGate;
+  const gate = new Promise((resolve) => { releaseGate = resolve; });
+  const started = [];
+  const makeOptions = (hostId) => freshGlobalShutdownOptions({
+    projectId,
+    hostId,
+    now: () => 0,
+    requestAttempt: async () => assert.fail("persisted attempt must win"),
+    getAttempt: async () => {
+      started.push(hostId);
+      await gate;
+      return { attempt: {
+        id: `${hostId}-attempt`, projectId, status: "pending",
+        holderTaskId: "coordinator", holderThreadId: coordinatorThreadId,
+        codexHostId: hostId, workspacePath: `/tmp/${projectId}-${hostId}-holder`,
+      } };
+    },
+  });
+  const localOptions = makeOptions("local");
+  const remoteOptions = makeOptions("remote-builder");
+  const local = runCoordinatorShutdownMonitorOnce(localOptions);
+  await Promise.resolve();
+  const localDuplicate = runCoordinatorShutdownMonitorOnce(localOptions);
+  const remote = runCoordinatorShutdownMonitorOnce(remoteOptions);
+  await Promise.resolve();
+  releaseGate();
+  await Promise.all([local, localDuplicate, remote]);
+  assert.deepEqual(started.sort(), ["local", "remote-builder"]);
+});
+
+test("Global shutdown idle grace is isolated by host and project", async () => {
+  const projectId = "cap58-global-idle-host-isolation";
+  let observedAt = 10;
+  const requests = [];
+  const makeOptions = (hostId) => {
+    const options = freshGlobalShutdownOptions({
+      projectId,
+      hostId,
+      now: () => observedAt,
+      requestAttempt: async (request) => {
+        requests.push(request.ownedCodexHostId);
+        return { attempt: { ...request, id: `${hostId}-foreign`, status: "pending", codexHostId: "foreign" } };
+      },
+    });
+    options.releaseAttempt = async () => assert.fail("foreign response must not release");
+    return options;
+  };
+  const local = makeOptions("local");
+  const remote = makeOptions("remote-builder");
+  assert.equal((await runCoordinatorShutdownMonitorOnce(local)).reason, "idle-grace");
+  assert.equal((await runCoordinatorShutdownMonitorOnce(remote)).reason, "idle-grace");
+  observedAt += 1;
+  assert.equal((await runCoordinatorShutdownMonitorOnce(local)).reason, "attempt-response-mismatch");
+  assert.equal((await runCoordinatorShutdownMonitorOnce(remote)).reason, "attempt-response-mismatch");
+  assert.deepEqual(requests.sort(), ["local", "remote-builder"]);
+});
+
 test("idle domain Coordinator retirement releases and archives only its exact domain thread", async () => {
   let observedAt = Date.parse("2026-09-05T06:00:00.000Z");
-  const global = { id: "global", threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae" };
+  const global = {
+    id: "global", taskId: "global",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    source: "codex", taskType: "root_task", codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global",
+  };
   const holder = {
     id: "frontend", taskId: "frontend",
     threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
@@ -1381,21 +2423,28 @@ test("idle domain Coordinator retirement releases and archives only its exact do
   let archived = false;
   let releaseCalls = 0;
   let workPending = false;
+  let windowsRevision = "a".repeat(64);
+  const globalLease = {
+    id: "global-lease", holderTaskId: global.id, status: "active", bindingValid: true,
+    acquiredAt: "2026-09-05T05:55:00.000Z", expiresAt: "2026-09-05T06:05:00.000Z",
+  };
   const lease = {
     id: "frontend-lease", status: "active", bindingValid: true,
     holderTaskId: holder.id, acquiredAt: "2026-09-05T05:55:00.000Z",
     expiresAt: "2026-09-05T06:05:00.000Z", releasedAt: null,
   };
   const runTick = () => runDomainCoordinatorShutdownMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 30_000 },
     now: () => observedAt,
     readSnapshot: async () => ({
       projectId: "capstone-dev",
       coordination: {
         coordinatorTaskId: global.id,
-        lease: { id: "global-lease", status: "active", bindingValid: true },
+        lease: globalLease,
         domainCoordinators: [{
-          domainId: "frontend", assignment: "lease", durableWorkPending: workPending,
+          domainId: "frontend", label: "Frontend", writeScope: ["web"],
+          eligibleTaskIds: [holder.id], assignment: "lease", durableWorkPending: workPending,
           coordinatorTaskId: holder.id, lease,
         }, {
           domainId: "backend", assignment: "lease", durableWorkPending: true,
@@ -1407,8 +2456,8 @@ test("idle domain Coordinator retirement releases and archives only its exact do
       taskLanes: [{ ...global }, { ...holder }],
     }),
     readWindows: async () => ({
-      projectId: "capstone-dev", revision: "a".repeat(64),
-      windows: [{ ...holder }],
+      projectId: "capstone-dev", revision: windowsRevision,
+      windows: [{ ...global, role: "coordinator" }],
     }),
     readThread: async () => ({
       thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
@@ -1418,6 +2467,7 @@ test("idle domain Coordinator retirement releases and archives only its exact do
       assert.equal(request.domainId, "frontend");
       assert.equal(request.expectedLeaseId, lease.id);
       assert.equal(request.globalHolderTaskId, global.id);
+      assert.equal(request.expectedRevision, windowsRevision);
       assert.equal(Object.hasOwn(request, "fingerprint"), false);
       attempt = { ...request, id: "domain-shutdown", status: "pending" };
       return { applied: true, attempt };
@@ -1457,7 +2507,15 @@ test("idle domain Coordinator retirement releases and archives only its exact do
   assert.equal((await runTick()).reason, "no-idle-domain");
   workPending = false;
   assert.equal((await runTick()).reason, "idle-grace");
-  observedAt += 30_000;
+  observedAt += 15_000;
+  windowsRevision = "b".repeat(64);
+  lease.expiresAt = "2026-09-05T06:10:00.000Z";
+  globalLease.expiresAt = "2026-09-05T06:10:00.000Z";
+  assert.equal((await runTick()).reason, "idle-grace");
+  observedAt += 15_000;
+  windowsRevision = "c".repeat(64);
+  lease.expiresAt = "2026-09-05T06:15:00.000Z";
+  globalLease.expiresAt = "2026-09-05T06:15:00.000Z";
   assert.deepEqual(await runTick(), {
     shutdown: true, reason: "completed", attemptId: "domain-shutdown", domainId: "frontend",
   });
@@ -1465,9 +2523,86 @@ test("idle domain Coordinator retirement releases and archives only its exact do
   assert.equal(archived, true);
 });
 
+test("domain shutdown idle grace resets only for durable policy or binding drift", async () => {
+  const drifts = [
+    ["label", ({ domain }) => { domain.label = "Frontend replacement"; }],
+    ["write scope", ({ domain }) => { domain.writeScope = ["server"]; }],
+    ["eligible task", ({ domain }) => { domain.eligibleTaskIds = ["frontend", "visual"]; }],
+    ["domain lease", ({ lease }) => { lease.id = "frontend-lease-replacement"; }],
+    ["holder thread", ({ holder }) => {
+      holder.threadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
+    }],
+    ["holder workspace", ({ holder }) => { holder.workspacePath = "/tmp/frontend-v2"; }],
+    ["Global lease", ({ globalLease }) => { globalLease.id = "global-lease-replacement"; }],
+  ];
+  for (const [index, [label, drift]] of drifts.entries()) {
+    const projectId = `cap58-idle-drift-${index}`;
+    let observedAt = 0;
+    let revision = "d".repeat(64);
+    const global = {
+      id: "global", taskId: "global", threadId: coordinatorThreadId,
+      source: "codex", taskType: "root_task", codexProjectId: "project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global",
+    };
+    const holder = {
+      id: "frontend", taskId: "frontend",
+      threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      source: "codex", taskType: "peer_task", codexProjectId: "project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend",
+    };
+    const globalLease = {
+      id: "global-lease", status: "active", bindingValid: true,
+    };
+    const lease = {
+      id: "frontend-lease", holderTaskId: holder.id,
+      status: "active", bindingValid: true, releasedAt: null,
+    };
+    const domain = {
+      domainId: "frontend", label: "Frontend", writeScope: ["web"],
+      eligibleTaskIds: [holder.id], assignment: "lease", durableWorkPending: false,
+      coordinatorTaskId: holder.id, lease,
+    };
+    let requests = 0;
+    const runTick = () => runDomainCoordinatorShutdownMonitorOnce({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId, idleGraceMs: 30_000 },
+      now: () => observedAt,
+      readSnapshot: async () => ({
+        projectId,
+        coordination: {
+          coordinatorTaskId: global.id, lease: globalLease, domainCoordinators: [domain],
+        },
+        taskLanes: [global, holder],
+      }),
+      readWindows: async () => ({
+        projectId, revision, windows: [{ ...global, role: "coordinator" }],
+      }),
+      readThread: async () => ({
+        thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
+      }),
+      getAttempt: async () => ({ attempt: null }),
+      requestAttempt: async () => { requests += 1; return { attempt: null }; },
+      releaseAttempt: async () => assert.fail("drift must reset grace"),
+      authorizeAttempt: async () => assert.fail("drift must reset grace"),
+      beginArchiveAttempt: async () => assert.fail("drift must reset grace"),
+      cancelAttempt: async () => assert.fail("drift must reset grace"),
+      findArchivedThread: async () => assert.fail("drift must reset grace"),
+      archiveThread: async () => assert.fail("drift must reset grace"),
+      completeAttempt: async () => assert.fail("drift must reset grace"),
+    });
+    assert.equal((await runTick()).reason, "idle-grace", label);
+    drift({ domain, lease, holder, globalLease });
+    revision = "e".repeat(64);
+    observedAt += 30_000;
+    assert.equal((await runTick()).reason, "idle-grace", label);
+    assert.equal(requests, 0, label);
+  }
+});
+
 test("released domain retirement never archives before protected reauthorization", async () => {
   let archiveCalls = 0;
   const result = await runDomainCoordinatorShutdownMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "authorization-project", idleGraceMs: 30_000 },
     now: Date.now,
     readSnapshot: async () => ({
@@ -1521,6 +2656,7 @@ test("authorized domain retirement releases its fence and retries after transien
     codexHostId: "local", workspacePath: "/tmp/frontend",
   };
   const runTick = () => runDomainCoordinatorShutdownMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "cancel-project", idleGraceMs: 30_000 },
     now: Date.now,
     readSnapshot: async () => ({
@@ -1621,6 +2757,7 @@ test("Coordinator shutdown and replacement provisioning fail closed around work 
     baseSnapshot,
   ]) {
     const result = await runCoordinatorShutdownMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 1 },
       now: () => Date.parse("2026-09-03T00:00:00.000Z"),
       readSnapshot: async () => snapshot,
@@ -1653,6 +2790,7 @@ test("Coordinator shutdown and replacement provisioning fail closed around work 
     ["workspacePath", "/tmp/other-workspace"],
   ]) {
     const result = await runCoordinatorShutdownMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "capstone-dev", idleGraceMs: 1 },
       now: () => Date.parse("2026-09-03T00:00:00.000Z"),
       readSnapshot: async () => baseSnapshot,
@@ -1686,6 +2824,7 @@ test("Coordinator shutdown and replacement provisioning fail closed around work 
     },
   };
   const provisioning = await runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     readSnapshot: async () => unassigned,
     readWindows: async () => ({ projectId: "capstone-dev", revision: "a".repeat(64), windows: [] }),
@@ -1714,6 +2853,7 @@ test("resident Coordinator provisioning persists one attempt before starting exa
   let deliveryCalls = 0;
   let modelReads = 0;
   const runTick = () => runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "capstone-dev",
@@ -1813,6 +2953,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
         assignment: "unassigned",
         durableWorkPending: true,
         eligibleTaskIds: ["frontend"],
+        writeScope: ["web"],
       }],
     },
     taskLanes: [
@@ -1837,6 +2978,7 @@ test("domain provisioning retries selected-model capacity on the same durable at
   let expiredResumes = 0;
   let attachedThreadVisible = true;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev",
       model: null, reasoningEffort: null,
@@ -1852,16 +2994,27 @@ test("domain provisioning retries selected-model capacity on the same durable at
     getAttempt: async () => ({ attempt: attempt ? { ...attempt } : null }),
     requestAttempt: async (request) => {
       requests += 1;
+      assert.equal(request.ownedCodexHostId, "local");
       assert.equal(request.taskId, "frontend");
       assert.equal(request.codexProjectId, "local-project");
       assert.equal(request.codexHostId, "local");
       assert.equal(request.workspacePath, "/tmp/taskboard");
+      const { ownedCodexHostId: _ownedCodexHostId, ...persistedRequest } = request;
       attempt = {
-        ...request,
+        ...persistedRequest,
         id: "domain-attempt",
+        globalHolderCodexProjectId: "local-project",
+        globalHolderCodexProjectKind: "local",
+        globalHolderCodexHostId: "local",
+        globalHolderWorkspacePath: "/tmp/taskboard",
+        writeScope: ["web"],
         status: "pending",
         threadId: null,
         retryCount: 0,
+        missingSince: null,
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
       };
       return { attempt: { ...attempt } };
     },
@@ -1880,7 +3033,8 @@ test("domain provisioning retries selected-model capacity on the same durable at
         input: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${readAttempt.id}`,
       }],
     }),
-    markStarting: async () => {
+    markStarting: async ({ ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       attempt = { ...attempt, status: "starting" };
       return { attempt: { ...attempt } };
     },
@@ -1898,17 +3052,20 @@ test("domain provisioning retries selected-model capacity on the same durable at
         threadSource: settings.threadSource,
       } };
     },
-    resetAttempt: async () => {
+    resetAttempt: async ({ ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       resets += 1;
       attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
       return { attempt: { ...attempt } };
     },
-    resumeExpiredAttempt: async () => {
+    resumeExpiredAttempt: async ({ ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       expiredResumes += 1;
       attempt = { ...attempt, status: "started" };
       return { attempt: { ...attempt } };
     },
-    attachThread: async ({ threadId }) => {
+    attachThread: async ({ threadId, ownedCodexHostId }) => {
+      assert.equal(ownedCodexHostId, "local");
       attaches += 1;
       attempt = { ...attempt, status: "started", threadId };
       return { attempt: { ...attempt } };
@@ -1974,11 +3131,17 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
     label: "Frontend Coordinator", threadSource: "taskboard-domain-rebind-frontend",
     model: "gpt-5", reasoningEffort: "high", expectedRevision: previousRevision,
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
-    globalHolderThreadId: globalThreadId, codexProjectId: "local-project",
+    globalHolderThreadId: globalThreadId,
+    globalHolderCodexProjectId: "local-project", globalHolderCodexProjectKind: "local",
+    globalHolderCodexHostId: "local", globalHolderWorkspacePath: workspacePath,
+    codexProjectId: "local-project",
     codexProjectKind: "local", codexHostId: "local", workspacePath,
-    status: "started", threadId: domainThreadId, retryCount: 0,
+    writeScope: ["web"], status: "started", threadId: domainThreadId, retryCount: 0,
+    missingSince: null, createdAt: "2026-09-08T00:00:00.000Z",
+    updatedAt: "2026-09-08T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
   };
   const result = await runDomainCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     readSnapshot: async () => ({
       projectId: "capstone-dev",
@@ -1988,6 +3151,7 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
         domainCoordinators: [{
           domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
           eligibleTaskIds: ["frontend"],
+          writeScope: ["web"],
         }],
       },
       taskLanes: [
@@ -2007,10 +3171,13 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
       idempotencyKey ? { attempt: null } : { attempt: { ...attempt } }
     ),
     requestAttempt: async () => assert.fail("revision drift must reuse the durable attempt"),
-    rebindAttempt: async ({ attemptId, expectedRevision, expectedGlobalLeaseId }) => {
+    rebindAttempt: async ({
+      attemptId, expectedRevision, expectedGlobalLeaseId, ownedCodexHostId,
+    }) => {
       assert.equal(attemptId, attempt.id);
       assert.equal(expectedRevision, currentRevision);
       assert.equal(expectedGlobalLeaseId, currentGlobalLeaseId);
+      assert.equal(ownedCodexHostId, "local");
       rebinds += 1;
       attempt = { ...attempt, expectedRevision, expectedGlobalLeaseId };
       return { attempt: { ...attempt } };
@@ -2020,8 +3187,9 @@ test("domain provisioning rebinds the same attached attempt after Global Coordin
     }),
     markStarting: async () => assert.fail("the attached attempt must not start another thread"),
     startThread: async () => assert.fail("the attached attempt must not start another thread"),
-    attachThread: async ({ threadId }) => {
+    attachThread: async ({ threadId, ownedCodexHostId }) => {
       assert.equal(threadId, domainThreadId);
+      assert.equal(ownedCodexHostId, "local");
       attaches += 1;
       return { attempt: { ...attempt } };
     },
@@ -2054,17 +3222,23 @@ test("Coordinator provisioning rebinds the same active attempt after safe window
     codexHostId: "local",
     workspacePath: "/tmp/taskboard",
   };
+  const previousRevision = "a".repeat(64);
+  const previousFingerprint = createHash("sha256")
+    .update(JSON.stringify({
+      projectId: "capstone-dev", revision: previousRevision, ownerRootTaskId: owner.taskId,
+    }))
+    .digest("hex");
   const currentRevision = "b".repeat(64);
   let attempt = {
     id: "attempt-rebind",
     projectId: "capstone-dev",
-    idempotencyKey: "older-revision-key",
-    taskId: "coordinator-capstone-dev-stable",
+    idempotencyKey: `coordinator-provision-${previousFingerprint}`,
+    taskId: `coordinator-capstone-dev-${previousFingerprint.slice(0, 12)}`,
     label: "Taskboard Execution Coordinator",
-    threadSource: "taskboard-coordinator-provision-stable",
+    threadSource: `taskboard-coordinator-provision-${previousFingerprint}`,
     model: "gpt-5",
     reasoningEffort: "high",
-    expectedRevision: "a".repeat(64),
+    expectedRevision: previousRevision,
     ownerRootTaskId: owner.taskId,
     ownerRootThreadId: owner.threadId,
     codexProjectId: owner.codexProjectId,
@@ -2080,6 +3254,7 @@ test("Coordinator provisioning rebinds the same active attempt after safe window
   let starts = 0;
   let loseRebindResponse = true;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     readSnapshot: async () => ({
       projectId: "capstone-dev",
@@ -2190,6 +3365,7 @@ test("Coordinator provisioning rejects explicit model policy drift without rebin
       threadId: null,
     };
     const result = await runCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "capstone-dev", ...policyDrift },
       readSnapshot: async () => ({
         projectId: "capstone-dev",
@@ -2269,6 +3445,7 @@ test("Coordinator provisioning retries selected-model capacity on the same attem
     let resets = 0;
     let modelReads = 0;
     const options = {
+      hostExecutor: localHostExecutor,
       policy: {
         enabled: true, projectId: "capstone-dev",
       },
@@ -2360,6 +3537,7 @@ test("Coordinator provisioning safely resets a confirmed missing started thread 
   let starts = 0;
   let currentTime = Date.parse("2026-09-03T00:00:30.000Z");
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     now: () => currentTime,
     readSnapshot: async () => ({
@@ -2403,7 +3581,13 @@ test("Coordinator provisioning safely resets a confirmed missing started thread 
     resetMissingAttempt: async ({ attemptId }) => {
       assert.equal(attemptId, attempt.id);
       missingResets += 1;
-      attempt = { ...attempt, status: "pending", threadId: null, retryCount: 1 };
+      attempt = {
+        ...attempt,
+        status: "pending",
+        threadId: null,
+        retryCount: 1,
+        missingSince: null,
+      };
       return { attempt: { ...attempt } };
     },
     markStarting: async () => {
@@ -2495,6 +3679,7 @@ test("Coordinator provisioning clears a transient missing observation when the o
   let resets = 0;
   let expiredResumes = 0;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
     now: () => currentTime,
     readSnapshot: async () => ({
@@ -2641,6 +3826,7 @@ test("Coordinator provisioning performs zero mutation when a lease or Coordinato
     { lease: null, windows: [{ ...owner, taskId: "coordinator", role: "coordinator" }] },
   ]) {
     const result = await runCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: {
         enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
       },
@@ -2678,7 +3864,12 @@ test("Coordinator provisioning retires only protected stale windows and starts o
   let attempt = null;
   let requests = 0;
   let starts = 0;
+  let retired = false;
+  let preflightReads = 0;
+  const beforeRevision = "d".repeat(64);
+  const afterRevision = "e".repeat(64);
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -2695,9 +3886,24 @@ test("Coordinator provisioning retires only protected stale windows and starts o
       taskLanes: [{ id: owner.taskId, ...owner }],
     }),
     readWindows: async () => ({
-      projectId: "capstone-dev", revision: "d".repeat(64), ownerRootTaskId: owner.taskId,
+      projectId: "capstone-dev", revision: beforeRevision, ownerRootTaskId: owner.taskId,
       windows: [{ ...owner, role: "owner_root" }, stale],
     }),
+    readPreflight: async () => {
+      preflightReads += 1;
+      return {
+        projectId: "capstone-dev",
+        revision: retired ? afterRevision : beforeRevision,
+        ownerRootTaskId: owner.taskId,
+        coordinatorLease: { status: "released", releasedAt: "2026-09-02T22:55:28.211Z" },
+        durableWorkPending: true,
+        ownerRootValid: true,
+        shutdownAttempt: null,
+        windows: retired
+          ? [{ ...owner, label: "Owner Root", role: "owner_root" }]
+          : [{ ...owner, label: "Owner Root", role: "owner_root" }, stale],
+      };
+    },
     inspectCoordinatorWindow: async (window) => {
       assert.deepEqual(window, stale);
       return { eligibility: "stale", reason: "archived", window };
@@ -2706,7 +3912,11 @@ test("Coordinator provisioning retires only protected stale windows and starts o
     requestAttempt: async (request) => {
       requests += 1;
       assert.deepEqual(request.retireCoordinatorWindows, [stale]);
-      attempt ??= { ...request, id: "attempt-stale", status: "pending", threadId: null };
+      retired = true;
+      attempt ??= {
+        ...request, expectedRevision: afterRevision,
+        id: "attempt-stale", status: "pending", threadId: null,
+      };
       return { attempt: { ...attempt } };
     },
     findThread: async () => null,
@@ -2730,6 +3940,7 @@ test("Coordinator provisioning retires only protected stale windows and starts o
   });
   assert.equal(requests, 1);
   assert.equal(starts, 1);
+  assert.equal(preflightReads, 2);
 });
 
 test("Coordinator provisioning reaches protected stale inspection without reading an invalid full snapshot", async () => {
@@ -2747,7 +3958,11 @@ test("Coordinator provisioning reaches protected stale inspection without readin
   let inspections = 0;
   let starts = 0;
   let attempt = null;
+  let retired = false;
+  const beforeRevision = "9".repeat(64);
+  const afterRevision = "a".repeat(64);
   const result = await runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -2758,7 +3973,8 @@ test("Coordinator provisioning reaches protected stale inspection without readin
       throw new Error("the protected preflight already contains the exact window revision");
     },
     readPreflight: async () => ({
-      projectId: "capstone-dev", revision: "9".repeat(64), ownerRootTaskId: owner.taskId,
+      projectId: "capstone-dev", revision: retired ? afterRevision : beforeRevision,
+      ownerRootTaskId: owner.taskId,
       coordinatorLease: {
         id: "released-lease", holderTaskId: "retired-coordinator",
         holderThreadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
@@ -2768,7 +3984,7 @@ test("Coordinator provisioning reaches protected stale inspection without readin
       durableWorkPending: true,
       ownerRootValid: true,
       shutdownAttempt: null,
-      windows: [{ ...owner, label: "Owner Root", role: "owner_root" }, stale],
+      windows: [{ ...owner, label: "Owner Root", role: "owner_root" }, ...(retired ? [] : [stale])],
     }),
     inspectCoordinatorWindow: async (window) => {
       inspections += 1;
@@ -2778,8 +3994,10 @@ test("Coordinator provisioning reaches protected stale inspection without readin
     requestAttempt: async (request) => {
       attempts += 1;
       assert.deepEqual(request.retireCoordinatorWindows, [stale]);
+      retired = true;
       attempt = {
-        ...request, id: "attempt-invalid-stale", status: "pending", threadId: null,
+        ...request, expectedRevision: afterRevision,
+        id: "attempt-invalid-stale", status: "pending", threadId: null,
       };
       return { attempt: { ...attempt } };
     },
@@ -2812,6 +4030,7 @@ test("Coordinator provisioning preflight rejects an invalid Owner Root before st
   let inspections = 0;
   let attempts = 0;
   const result = await runCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -2863,6 +4082,7 @@ test("Coordinator provisioning recovers the same attempt after stale-window reti
   let requests = 0;
   let starts = 0;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high",
     },
@@ -2943,6 +4163,7 @@ test("Coordinator provisioning fails closed for fresh busy or uncertain register
     { eligibility: "uncertain", reason: "host-unavailable", window: coordinator },
   ]) {
     const result = await runCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "capstone-dev", model: "gpt-5", reasoningEffort: "high" },
       readSnapshot: async () => ({
         projectId: "capstone-dev",
@@ -2986,6 +4207,7 @@ test("coordinator keepalive fails closed for busy, drifted, or non-active holder
   });
   snapshot.coordination.domainCoordinators[0].lease.status = "expired";
   const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3010,6 +4232,7 @@ test("coordinator keepalive fails closed for busy, drifted, or non-active holder
 test("coordinator keepalive fails closed when thread busy state is unavailable", async () => {
   let renewed = 0;
   const result = await runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3051,6 +4274,7 @@ test("coordinator recovery restores only exact naturally expired Global and doma
   };
   const recovered = [];
   const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
     readSnapshot: async () => snapshot,
     readThread: async (route) => ({
@@ -3066,6 +4290,49 @@ test("coordinator recovery restores only exact naturally expired Global and doma
     ["domain", "frontend"],
   ]);
   assert.deepEqual(result, { recovered: 2, failed: 0, skipped: 0 });
+});
+
+test("Coordinator recovery skips foreign-first expired routes and restores only exact owned hosts", async () => {
+  const snapshot = coordinatorKeepaliveSnapshot({
+    expiresAt: "2026-08-31T00:59:00.000Z",
+    domainExpiresAt: "2026-08-31T00:59:00.000Z",
+    globalCodexHostId: remoteHostExecutor.ownedCodexHostId,
+    domainCodexHostId: localHostExecutor.ownedCodexHostId,
+  });
+  snapshot.coordination.lease = {
+    ...snapshot.coordination.lease,
+    holderTaskId: "global",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  snapshot.coordination.domainCoordinators[0].lease = {
+    ...snapshot.coordination.domainCoordinators[0].lease,
+    holderTaskId: "frontend",
+    bindingValid: true,
+    status: "expired",
+    releasedAt: null,
+  };
+  const reads = [];
+  const recoveries = [];
+  const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => snapshot,
+    readThread: async (route) => {
+      reads.push(route.codexHostId);
+      return { thread: { id: route.threadId, cwd: route.workspacePath, turns: [] } };
+    },
+    recoverLease: async (request) => {
+      recoveries.push(request);
+      return { lease: { id: `${request.scope}-recovered`, status: "active" } };
+    },
+  });
+  assert.deepEqual(result, { recovered: 1, failed: 0, skipped: 1 });
+  assert.deepEqual(reads, [localHostExecutor.ownedCodexHostId]);
+  assert.deepEqual(recoveries.map(({ scope, codexHostId }) => [scope, codexHostId]), [[
+    "domain", localHostExecutor.ownedCodexHostId,
+  ]]);
 });
 
 test("coordinator recovery skips explicit release and busy holders", async () => {
@@ -3089,6 +4356,7 @@ test("coordinator recovery skips explicit release and busy holders", async () =>
   };
   let recovered = 0;
   const result = await runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
     readSnapshot: async () => snapshot,
     readThread: async (route) => ({
@@ -3145,6 +4413,7 @@ test("background continuation delivers one eligible first safe action without a 
     },
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo] }),
     claimReceipt: async (claim) => {
@@ -3152,6 +4421,7 @@ test("background continuation delivers one eligible first safe action without a 
         todoId: todo.id,
         taskId: todo.taskId,
         rootThreadId: todo.dispatchTarget.rootThreadId,
+        ownedCodexHostId: "local",
         safeActionId: "safe-first",
         expectedResumeToken: "b".repeat(64),
       });
@@ -3194,6 +4464,318 @@ test("background continuation delivers one eligible first safe action without a 
   });
 });
 
+test("background continuation leaves a remote Todo untouched when this executor owns only local", async () => {
+  const mutations = { claim: 0, confirm: 0, deliver: 0, complete: 0 };
+  const remoteTodo = {
+    id: "TASKBOARD-REMOTE-HOST",
+    taskId: "3b47e46d-3b02-4ea5-8134-ae7721d9a99c",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "remote-builder",
+      rootWorkspacePath: "/srv/taskboard/root",
+      worktreePath: "/srv/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: "9".repeat(64),
+    },
+  };
+
+  const result = await runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    hostExecutor: { ownedCodexHostId: "local" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [remoteTodo] }),
+    claimReceipt: async () => { mutations.claim += 1; },
+    confirmDelivery: async () => { mutations.confirm += 1; },
+    deliver: async () => { mutations.deliver += 1; },
+    completeDelivery: async () => { mutations.complete += 1; },
+  });
+
+  assert.deepEqual(result, { delivered: false, reason: "host-executor-unavailable" });
+  assert.deepEqual(mutations, { claim: 0, confirm: 0, deliver: 0, complete: 0 });
+});
+
+test("background continuation requires an explicit valid host executor", async () => {
+  const mutations = { claim: 0, confirm: 0, deliver: 0, complete: 0 };
+  const localTodo = {
+    id: "TASKBOARD-EXPLICIT-EXECUTOR",
+    taskId: "60694ad4-68e7-47a5-a3fa-91357f59f1a8",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/root",
+      worktreePath: "/tmp/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first" }],
+      deferredActions: [],
+      resumeToken: "6".repeat(64),
+    },
+  };
+  const invalidExecutors = [undefined, null, {}, { ownedCodexHostId: "" }, {
+    ownedCodexHostId: "   ",
+  }, { ownedCodexHostId: "local\nremote" }];
+
+  for (const hostExecutor of invalidExecutors) {
+    const result = await runTaskboardContinuationMonitorOnce({
+      policy: { enabled: true, projectId: "taskboard-core" },
+      ...(hostExecutor === undefined ? {} : { hostExecutor }),
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: [localTodo] }),
+      claimReceipt: async () => {
+        mutations.claim += 1;
+        return {
+          available: true,
+          completed: false,
+          receipt: { id: "invalid-executor-receipt", reservationLeaseId: "lease" },
+        };
+      },
+      confirmDelivery: async () => {
+        mutations.confirm += 1;
+        return {
+          worktreePath: localTodo.dispatchTarget.worktreePath,
+          branch: "codex/local-work",
+          repository: null,
+        };
+      },
+      deliver: async () => {
+        mutations.deliver += 1;
+        return { delivery: "started", turnId: "local-turn" };
+      },
+      completeDelivery: async () => {
+        mutations.complete += 1;
+        return { completed: true };
+      },
+    });
+    assert.deepEqual(result, { delivered: false, reason: "host-executor-unavailable" });
+  }
+  assert.deepEqual(mutations, { claim: 0, confirm: 0, deliver: 0, complete: 0 });
+});
+
+test("host executor and dispatch routes share the canonical 256 character boundary", async () => {
+  let claims = 0;
+  let reads = 0;
+  const run = (ownedCodexHostId) => runTaskboardContinuationMonitorOnce({
+    policy: { enabled: true, projectId: "taskboard-core" },
+    hostExecutor: { ownedCodexHostId },
+    readSnapshot: async () => {
+      reads += 1;
+      return {
+        projectId: "taskboard-core",
+        todos: [{
+          id: "TASKBOARD-HOST-BOUNDARY",
+          taskId: "fbf01545-8a8a-492f-a67b-f90a16bdc493",
+          run: null,
+          dispatchTarget: {
+            rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+            codexHostId: ownedCodexHostId,
+            rootWorkspacePath: "/srv/taskboard/root",
+            worktreePath: "/srv/taskboard/worktree",
+          },
+          readyWork: {
+            eligible: true,
+            safeActions: [{ id: "safe-first" }],
+            deferredActions: [],
+            resumeToken: "5".repeat(64),
+          },
+        }],
+      };
+    },
+    claimReceipt: async () => {
+      claims += 1;
+      return { available: false, completed: true, receipt: { id: "already-delivered" } };
+    },
+    confirmDelivery: async () => assert.fail("completed work must not confirm"),
+    deliver: async () => assert.fail("completed work must not deliver"),
+    completeDelivery: async () => assert.fail("completed work must not complete twice"),
+  });
+
+  for (const length of [240, 241, 256]) {
+    assert.deepEqual(await run("h".repeat(length)), {
+      delivered: false,
+      reason: "already-delivered",
+    }, String(length));
+  }
+  const readsAfterValid = reads;
+  const claimsAfterValid = claims;
+  for (const invalidHostId of ["h".repeat(257), "remote\ncontrol"]) {
+    assert.deepEqual(await run(invalidHostId), {
+      delivered: false,
+      reason: "host-executor-unavailable",
+    }, JSON.stringify(invalidHostId));
+  }
+  assert.equal(readsAfterValid, 3);
+  assert.equal(claimsAfterValid, 3);
+  assert.equal(reads, readsAfterValid);
+  assert.equal(claims, claimsAfterValid);
+});
+
+test("the exact remote host executor delivers once and replay does not redeliver", async () => {
+  const calls = { claim: 0, confirm: 0, deliver: 0, complete: 0 };
+  const rpcCalls = [];
+  let completed = false;
+  const remoteTodo = {
+    id: "TASKBOARD-REMOTE-EXECUTOR",
+    taskId: "7e42020f-ac38-4839-bc5e-4d3ce5dcb203",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "remote-builder",
+      rootWorkspacePath: "/srv/taskboard/root",
+      worktreePath: "/srv/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first", text: "Run focused tests" }],
+      deferredActions: [],
+      resumeToken: "8".repeat(64),
+    },
+  };
+  const options = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    hostExecutor: { ownedCodexHostId: "remote-builder" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [remoteTodo] }),
+    claimReceipt: async () => {
+      calls.claim += 1;
+      return completed
+        ? { available: false, completed: true, receipt: { id: "remote-receipt" } }
+        : {
+            available: true,
+            completed: false,
+            receipt: {
+              id: "remote-receipt",
+              reservationLeaseId: "remote-lease",
+              admissionAttemptId: "remote-attempt",
+            },
+          };
+    },
+    confirmDelivery: async () => {
+      calls.confirm += 1;
+      return {
+        worktreePath: remoteTodo.dispatchTarget.worktreePath,
+        branch: "codex/remote-work",
+        repository: null,
+      };
+    },
+    deliver: async (request) => {
+      calls.deliver += 1;
+      assert.equal(request.codexHostId, "remote-builder");
+      const hostAwareRpc = async (codexHostId, method, params) => {
+        assert.equal(codexHostId, "remote-builder");
+        rpcCalls.push(method);
+        if (method === "thread/read") return {
+          thread: {
+            id: request.rootThreadId,
+            cwd: request.rootWorkspacePath,
+            turns: [],
+          },
+        };
+        if (method === "thread/resume") return {};
+        if (method === "turn/start") {
+          assert.equal(params.approvalPolicy, "never");
+          return { turn: { id: "remote-turn" } };
+        }
+        return assert.fail(`unexpected remote RPC ${method}`);
+      };
+      return deliverCoordination(
+        request,
+        (method, params) => hostAwareRpc(request.codexHostId, method, params),
+      );
+    },
+    completeDelivery: async () => {
+      calls.complete += 1;
+      completed = true;
+      return { completed: true };
+    },
+  };
+
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: true,
+    todoId: remoteTodo.id,
+    actionId: "safe-first",
+  });
+  assert.deepEqual(await runTaskboardContinuationMonitorOnce(options), {
+    delivered: false,
+    reason: "already-delivered",
+  });
+  assert.deepEqual(calls, { claim: 2, confirm: 1, deliver: 1, complete: 1 });
+  assert.deepEqual(rpcCalls, ["thread/read", "thread/resume", "turn/start"]);
+});
+
+test("concurrent local and remote executors let only the exact remote host claim", async () => {
+  let releaseLocalSnapshot;
+  let localSnapshotStarted;
+  const localSnapshotGate = new Promise((resolve) => { releaseLocalSnapshot = resolve; });
+  const localSnapshotObserved = new Promise((resolve) => { localSnapshotStarted = resolve; });
+  let claims = 0;
+  const remoteTodo = {
+    id: "TASKBOARD-CONCURRENT-REMOTE",
+    taskId: "8034b761-b99f-4672-b9fc-6d8171ccf525",
+    run: null,
+    dispatchTarget: {
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexHostId: "remote-builder",
+      rootWorkspacePath: "/srv/taskboard/root",
+      worktreePath: "/srv/taskboard/worktree",
+    },
+    readyWork: {
+      eligible: true,
+      safeActions: [{ id: "safe-first" }],
+      deferredActions: [],
+      resumeToken: "7".repeat(64),
+    },
+  };
+  const shared = {
+    policy: { enabled: true, projectId: "taskboard-core" },
+    claimReceipt: async () => {
+      claims += 1;
+      return {
+        available: true,
+        completed: false,
+        receipt: { id: "concurrent-receipt", reservationLeaseId: "concurrent-lease" },
+      };
+    },
+    confirmDelivery: async () => ({
+      worktreePath: remoteTodo.dispatchTarget.worktreePath,
+      branch: "codex/remote-work",
+      repository: null,
+    }),
+    deliver: async () => ({ delivery: "started", turnId: "concurrent-turn" }),
+    completeDelivery: async () => ({ completed: true }),
+  };
+
+  const localRun = runTaskboardContinuationMonitorOnce({
+    ...shared,
+    hostExecutor: { ownedCodexHostId: "local" },
+    readSnapshot: async () => {
+      localSnapshotStarted();
+      await localSnapshotGate;
+      return { projectId: "taskboard-core", todos: [remoteTodo] };
+    },
+  });
+  await localSnapshotObserved;
+  const remoteRun = runTaskboardContinuationMonitorOnce({
+    ...shared,
+    hostExecutor: { ownedCodexHostId: "remote-builder" },
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [remoteTodo] }),
+  });
+  await Promise.resolve();
+  releaseLocalSnapshot();
+
+  const [localResult, remoteResult] = await Promise.all([localRun, remoteRun]);
+  assert.deepEqual(localResult, { delivered: false, reason: "host-executor-unavailable" });
+  assert.deepEqual(remoteResult, {
+    delivered: true,
+    todoId: remoteTodo.id,
+    actionId: "safe-first",
+  });
+  assert.equal(claims, 1);
+});
+
 test("background continuation durably defers explicit model capacity and retries the same route", async () => {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const todo = {
@@ -3218,6 +4800,7 @@ test("background continuation durably defers explicit model capacity and retries
   const deferred = [];
   const deliveredRoutes = [];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3374,6 +4957,7 @@ test("stale capacity markers neither starve later Todos nor block a fresh fronti
   const claimed = [];
   let todos = [staleRoute, generic];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true, projectId: "taskboard-core",
       maxActiveAgents: 4, capacityObservationMaxAgeMs: 60_000,
@@ -3432,6 +5016,7 @@ test("stale capacity markers neither starve later Todos nor block a fresh fronti
 test("background continuation does not reinterpret unrelated delivery failures as capacity", async () => {
   let deferred = false;
   await assert.rejects(runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -3487,6 +5072,7 @@ test("background continuation recovers an uncertain deterministic child without 
     recoveredAgentThreadId: null,
   };
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3564,6 +5150,7 @@ test("background continuation never reconciles an unconfirmed admission probe de
   ]) {
     let reconciled = false;
     const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "taskboard-core" },
       readSnapshot: async () => ({
         projectId: "taskboard-core",
@@ -3633,6 +5220,7 @@ test("background continuation retires an absent child only through the original 
     agentPath: "/root/task_admission_1234",
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -3713,6 +5301,211 @@ test("background continuation retires an absent child only through the original 
   });
 });
 
+test("background continuation recovers a Global admission after exact domain assignment and delivers once", async () => {
+  const globalRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const domainRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const taskId = "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e";
+  const globalToken = "d".repeat(64);
+  const domainToken = "e".repeat(64);
+  let stage = "global-admission";
+  let deliveries = 0;
+  const todo = () => ({
+    id: "CAP-44",
+    taskId,
+    run: null,
+    dispatchTarget: {
+      rootThreadId: domainRootThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/domain-root",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    domainAssignment: {
+      status: "active",
+      domainId: "frontend",
+      leaseId: "frontend-lease",
+      coordinatorTaskId: "frontend-coordinator",
+      assignedByLeaseId: "global-lease",
+      assignedByTaskId: "global-coordinator",
+      assignedByThreadId: globalRootThreadId,
+    },
+    ...(stage === "global-admission" ? {
+      admission: {
+        receiptId: "global-receipt",
+        attemptId: "global-attempt",
+        state: "awaiting_admission",
+        deadlineAt: "2026-08-31T00:01:00.000Z",
+        rootThreadId: globalRootThreadId,
+        rootHostId: "local",
+        rootWorkspacePath: "/tmp/global-root",
+        resumeToken: globalToken,
+        safeActionId: "safe-action",
+        globalCoordinatorLeaseId: "global-lease",
+        globalCoordinatorTaskId: "global-coordinator",
+        globalCoordinatorThreadId: globalRootThreadId,
+        coordinationDomainId: null,
+        domainCoordinatorLeaseId: null,
+        domainCoordinatorTaskId: null,
+        domainCoordinatorThreadId: null,
+        agentPath: "/root/task_admission_1234",
+      },
+    } : stage === "ready" ? {
+      admission: null,
+      readyWork: {
+        eligible: true,
+        safeActions: [{ id: "safe-action", text: "Run exact work" }],
+        resumeToken: domainToken,
+      },
+    } : {
+      admission: {
+        receiptId: "domain-receipt",
+        attemptId: "domain-attempt",
+        state: "awaiting_admission",
+        deadlineAt: "2099-01-01T00:00:00.000Z",
+        rootThreadId: domainRootThreadId,
+        rootHostId: "local",
+        rootWorkspacePath: "/tmp/domain-root",
+        resumeToken: domainToken,
+        safeActionId: "safe-action",
+        coordinationDomainId: "frontend",
+        domainCoordinatorLeaseId: "frontend-lease",
+        domainCoordinatorTaskId: "frontend-coordinator",
+        domainCoordinatorThreadId: domainRootThreadId,
+      },
+    }),
+  });
+  const options = {
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core" },
+    now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo()] }),
+    claimReplacementAdmissionProbe: async (request) => {
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      assert.equal(request.expectedResumeToken, globalToken);
+      return {
+        receipt: {
+          admissionProbeId: "global-domain-probe",
+          admissionProbeRequestedAt: "2026-08-31T00:02:00.000Z",
+        },
+        observationTarget: {
+          rootThreadId: globalRootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/global-root",
+        },
+      };
+    },
+    deliverAdmissionRecovery: async (request) => {
+      assert.equal(request.mode, "probe");
+      assert.equal(request.rootThreadId, globalRootThreadId);
+      return { delivery: "observed", turnId: "global-probe-turn" };
+    },
+    reconcileReplacementAdmission: async (request) => {
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      stage = "ready";
+      return { outcome: "absent", receipt: { admissionState: "deferred" } };
+    },
+    claimReceipt: async (request) => {
+      assert.equal(stage, "ready");
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      assert.equal(request.expectedResumeToken, domainToken);
+      return {
+        reused: false,
+        available: true,
+        completed: false,
+        receipt: {
+          id: "domain-receipt",
+          taskId,
+          safeActionId: "safe-action",
+          admissionAttemptId: "domain-attempt",
+          rootThreadId: domainRootThreadId,
+          resumeToken: domainToken,
+          reservationLeaseId: "domain-reservation",
+        },
+      };
+    },
+    confirmDelivery: async () => ({
+      worktreePath: "/tmp/taskboard/project",
+      branch: "codex/global-domain-recovery",
+    }),
+    deliver: async (request) => {
+      deliveries += 1;
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      stage = "current-admission";
+      return { delivery: "started", turnId: "domain-delivery-turn" };
+    },
+    completeDelivery: async () => ({ completed: false, awaitingAdmission: true }),
+  };
+
+  const retired = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(retired, {
+    delivered: false,
+    todoId: "CAP-44",
+    reason: "replacement-admission-deferred",
+  });
+  const delivered = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(delivered, { delivered: true, todoId: "CAP-44", actionId: "safe-action" });
+  const replay = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(replay, { delivered: false, reason: "awaiting-admission" });
+  assert.equal(deliveries, 1);
+});
+
+test("background continuation rejects Global-to-domain recovery without exact assignment provenance", async () => {
+  const globalRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const domainRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  for (const [field, value] of [
+    ["assignedByLeaseId", "unrelated-global-lease"],
+    ["assignedByTaskId", "unrelated-global-task"],
+    ["assignedByThreadId", "01a004bd-a749-7b53-81e2-af2d477f93aa"],
+  ]) {
+    let probed = false;
+    const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId: "taskboard-core" },
+      now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+      readSnapshot: async () => ({
+        projectId: "taskboard-core",
+        todos: [{
+          id: "CAP-44",
+          taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+          dispatchTarget: {
+            rootThreadId: domainRootThreadId,
+            codexHostId: "local",
+            rootWorkspacePath: "/tmp/domain-root",
+            worktreePath: "/tmp/taskboard/project",
+          },
+          domainAssignment: {
+            status: "active", domainId: "frontend", leaseId: "frontend-lease",
+            coordinatorTaskId: "frontend-coordinator",
+            assignedByLeaseId: "global-lease",
+            assignedByTaskId: "global-coordinator",
+            assignedByThreadId: globalRootThreadId,
+            [field]: value,
+          },
+          admission: {
+            receiptId: "global-receipt", attemptId: "global-attempt",
+            state: "awaiting_admission", deadlineAt: "2026-08-31T00:01:00.000Z",
+            rootThreadId: globalRootThreadId, rootHostId: "local",
+            rootWorkspacePath: "/tmp/global-root", resumeToken: "d".repeat(64),
+            safeActionId: "safe-action", globalCoordinatorLeaseId: "global-lease",
+            globalCoordinatorTaskId: "global-coordinator",
+            globalCoordinatorThreadId: globalRootThreadId,
+            coordinationDomainId: null, domainCoordinatorLeaseId: null,
+            domainCoordinatorTaskId: null, domainCoordinatorThreadId: null,
+          },
+        }],
+      }),
+      claimReceipt: async () => assert.fail("stale provenance must not reserve ordinary work"),
+      confirmDelivery: async () => assert.fail("stale provenance must not confirm work"),
+      deliver: async () => assert.fail("stale provenance must not deliver work"),
+      completeDelivery: async () => assert.fail("stale provenance must not complete work"),
+      claimReplacementAdmissionProbe: async () => { probed = true; },
+      reconcileReplacementAdmission: async () => assert.fail("stale provenance must not reconcile"),
+      deliverAdmissionRecovery: async () => assert.fail("stale provenance must not probe the old Root"),
+    });
+    assert.deepEqual(result, { delivered: false, reason: "no-eligible-work" }, field);
+    assert.equal(probed, false, field);
+  }
+});
+
 test("replacement recovery never reconciles an unconfirmed admission probe delivery", async () => {
   const oldRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const replacementRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
@@ -3722,6 +5515,7 @@ test("replacement recovery never reconciles an unconfirmed admission probe deliv
   ]) {
     let reconciled = false;
     const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "taskboard-core" },
       readSnapshot: async () => ({
         projectId: "taskboard-core",
@@ -3795,6 +5589,7 @@ test("background continuation recovers expired pending admissions after coordina
   for (const admissionState of ["awaiting_admission", "prepared"]) {
     const calls = [];
     const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: "taskboard-core" },
       now: () => Date.parse("2026-08-31T00:02:00.000Z"),
       readSnapshot: async () => ({
@@ -3894,6 +5689,7 @@ test("background continuation waits for observed Root capacity and backfills aft
     },
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -3980,6 +5776,7 @@ test("background continuation fails closed when target Root capacity is not fres
     }],
   };
   const run = (windowSubagentTrees) => runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4010,6 +5807,7 @@ test("background continuation bootstraps an idle Root capacity observation befor
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const calls = [];
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4065,6 +5863,7 @@ test("stale capacity probes are idempotent within one retry epoch and rotate aft
   let observedNow = Date.parse("2026-08-31T02:02:00.000Z");
   const probeIds = [];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4146,6 +5945,7 @@ test("capacity observation delivery starts one idle Root turn and replays its du
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       instruction = params.input[0].text;
       return { turn: { id: "turn-capacity-observation" } };
     }
@@ -4236,6 +6036,7 @@ test("fresh capacity after the bootstrap probe delivers exactly one Todo", async
     },
   };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: {
       enabled: true,
       projectId: "taskboard-core",
@@ -4302,6 +6103,8 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
     route: {
       rootTaskId: "root",
       rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project",
+      codexProjectKind: "local",
       codexHostId: "local",
       rootWorkspacePath: "/tmp/taskboard/root",
     },
@@ -4316,11 +6119,9 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
     throw new Error(`Unexpected method: ${method}`);
   });
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({
-      projectId: "taskboard-core",
-      coordination: { ownerDecisionRequest: request },
-    }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => ({
       claimed: true,
       receipt: { id: "delivery-1" },
@@ -4343,6 +6144,47 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
   assert.match(calls[1][1].input[0].text, /Do not approve it yourself/);
   assert.match(calls[1][1].input[0].text, /delivery-1/);
   assert.doesNotMatch(calls[1][1].input[0].text, /attestation token/i);
+});
+
+test("an idle Owner decision delivery cannot request interactive approval", async () => {
+  const request = {
+    requestId: "f".repeat(64),
+    expectedResumeToken: "e".repeat(64),
+    identifier: "CAP-10",
+    actionId: "push",
+    message: "Ask the Owner",
+    coordinatorEpoch: "configured:root",
+    deliveryReceipt: { id: "delivery-idle" },
+    route: {
+      rootTaskId: "root",
+      rootThreadId: coordinatorThreadId,
+      codexProjectId: "taskboard-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  const calls = [];
+  const result = await deliverTaskboardOwnerDecision(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") return {
+      thread: {
+        id: request.route.rootThreadId,
+        cwd: request.route.rootWorkspacePath,
+        turns: [],
+      },
+    };
+    if (method === "thread/resume") return {};
+    if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
+      return { turn: { id: "owner-decision-turn" } };
+    }
+    return assert.fail(`unexpected RPC ${method}`);
+  });
+  assert.deepEqual(result, { delivery: "started", turnId: "owner-decision-turn" });
+  assert.deepEqual(calls.map(([method]) => method), [
+    "thread/read", "thread/resume", "turn/start",
+  ]);
 });
 
 test("queued Owner Intent never interrupts an active Coordinator turn", async () => {
@@ -4494,6 +6336,7 @@ test("Owner Root assistant route markers carry clarify, supersede, and cancel th
     };
     let recorded = null;
     const result = await runOwnerIntentCaptureMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: snapshot.projectId },
       readSnapshot: async () => snapshot,
       listIntents: async () => [{ intentId: targetIntentId, ownerTurnId: "prior-owner-turn" }],
@@ -4593,6 +6436,7 @@ test("an exact typed route to an unknown intent never reaches the protected reco
   const ownerRootWorkspacePath = "/tmp/taskboard/owner-root";
   let recordCalls = 0;
   const result = await runOwnerIntentCaptureMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "typed-intent-unknown-target" },
     readSnapshot: async () => ({
       projectId: "typed-intent-unknown-target",
@@ -4757,6 +6601,7 @@ test("Codex environment, delegation, AGENTS, and control envelopes are never Own
   const frontier = [];
   const newTaskInput = controlInputs.at(-2);
   const monitorResult = await runOwnerIntentCaptureMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "control-envelope-project" },
     readSnapshot: async () => ({
       projectId: "control-envelope-project",
@@ -4812,6 +6657,7 @@ test("Owner Intent capture skips Taskboard decision turns and replays exactly on
   };
   let recorded = [];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => snapshot,
     listIntents: async () => recorded.map((intent) => ({ ownerTurnId: intent.ownerTurnId })),
@@ -4894,6 +6740,7 @@ test("queued Owner Intent is adopted exactly once at an idle Coordinator boundar
   const calls = [];
   let confirmed;
   const result = await runOwnerIntentAdoptionMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -4927,7 +6774,10 @@ test("queued Owner Intent is adopted exactly once at an idle Coordinator boundar
         };
       }
       if (method === "thread/resume") return {};
-      if (method === "turn/start") return { turn: { id: "turn-adopt" } };
+      if (method === "turn/start") {
+        assert.equal(params.approvalPolicy, "never");
+        return { turn: { id: "turn-adopt" } };
+      }
       throw new Error(`Unexpected method: ${method}`);
     }, options),
   });
@@ -4970,6 +6820,7 @@ test("cancel Owner Intent instruction emits an empty executable frontier", async
     };
     if (method === "thread/resume") return {};
     if (method === "turn/start") {
+      assert.equal(params.approvalPolicy, "never");
       instruction = params.input[0].text;
       return { turn: { id: "cancel-turn" } };
     }
@@ -5112,6 +6963,7 @@ test("Coordinator plan marker is observed and persisted exactly once", async () 
   }
   let applied;
   const result = await runOwnerIntentPlanningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5156,6 +7008,7 @@ test("terminal Owner Intent planning turns enter durable bounded retry", async (
 
   for (const [index, request] of attempts.entries()) {
     const options = {
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId },
       readSnapshot: async () => ({
         projectId,
@@ -5208,6 +7061,12 @@ test("server-invalid Owner Intent plan schedules durable bounded replan and acce
   const request = {
     intentId: "intent-invalid-cache",
     adoptionReceipt: { id: "adoption-invalid-cache", coordinatorEpoch: "configured:coordinator" },
+    route: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId,
+      codexHostId: "local",
+      coordinatorWorkspacePath: "/tmp/taskboard/coordinator",
+    },
   };
   const plan = { revisionId: "invalid-cache-plan" };
   let applies = 0;
@@ -5215,6 +7074,7 @@ test("server-invalid Owner Intent plan schedules durable bounded replan and acce
   let currentRequest = request;
   let currentPlan = plan;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "invalid-cache-project" },
     readSnapshot: async () => ({
       projectId: "invalid-cache-project",
@@ -5317,6 +7177,7 @@ test("capacity-sensitive continuation runs independently of a slow project monit
     return { delivered: true };
   };
   const firstLane = runTaskboardContinuationFastLane({
+    hostExecutor: localHostExecutor,
     projects,
     runContinuation,
     observeResult: (result) => {
@@ -5339,6 +7200,7 @@ test("capacity-sensitive continuation runs independently of a slow project monit
   }]);
   await firstFastProjectCompleted;
   const secondLane = runTaskboardContinuationFastLane({
+    hostExecutor: localHostExecutor,
     projects,
     runContinuation,
     observeResult: (result) => {
@@ -5377,6 +7239,7 @@ test("capacity-sensitive continuation runs independently of a slow project monit
 test("Coordinator identity handshakes run in a dedicated continuation fast lane", async () => {
   const calls = [];
   const results = await runCoordinatorIdentityHandshakeFastLane({
+    hostExecutor: localHostExecutor,
     projects: [
       { projectId: "disabled-project", continuationEnabled: false },
       { projectId: "capstone-dev", continuationEnabled: true },
@@ -5397,6 +7260,76 @@ test("Coordinator identity handshakes run in a dedicated continuation fast lane"
     },
     { projectId: "second-project", ok: false, error: "host unavailable" },
   ]);
+});
+
+test("Coordinator monitor single-flight is scoped by exact host and project", async () => {
+  let releaseHandshake;
+  const handshakeGate = new Promise((resolve) => { releaseHandshake = resolve; });
+  const handshakeRuns = [];
+  const runHandshake = (hostExecutor) => runCoordinatorIdentityHandshakeFastLane({
+    hostExecutor,
+    projects: [{ projectId: "taskboard-core", continuationEnabled: true }],
+    runHandshake: async () => {
+      handshakeRuns.push(hostExecutor.ownedCodexHostId);
+      await handshakeGate;
+      return { confirmed: 0, skipped: 0, failed: 0 };
+    },
+  });
+  const handshakeLocal = runHandshake(localHostExecutor);
+  const handshakeRemote = runHandshake(remoteHostExecutor);
+  releaseHandshake();
+  await Promise.all([handshakeLocal, handshakeRemote]);
+  assert.deepEqual(handshakeRuns.sort(), ["local", "remote-builder"]);
+
+  const emptySnapshot = {
+    projectId: "taskboard-core",
+    coordination: { lease: null, domainCoordinators: [] },
+    taskLanes: [],
+  };
+  let releaseKeepalive;
+  const keepaliveGate = new Promise((resolve) => { releaseKeepalive = resolve; });
+  const keepaliveRuns = [];
+  const runKeepalive = (hostExecutor) => runCoordinatorLeaseKeepaliveMonitorOnce({
+    hostExecutor,
+    policy: {
+      enabled: true,
+      projectId: "taskboard-core",
+      renewWindowMs: 45_000,
+      leaseDurationSeconds: 120,
+    },
+    readSnapshot: async () => {
+      keepaliveRuns.push(hostExecutor.ownedCodexHostId);
+      await keepaliveGate;
+      return emptySnapshot;
+    },
+    readThread: async () => assert.fail("empty snapshot must not read a thread"),
+    renewLease: async () => assert.fail("empty snapshot must not renew a lease"),
+  });
+  const keepaliveLocal = runKeepalive(localHostExecutor);
+  const keepaliveRemote = runKeepalive(remoteHostExecutor);
+  releaseKeepalive();
+  await Promise.all([keepaliveLocal, keepaliveRemote]);
+  assert.deepEqual(keepaliveRuns.sort(), ["local", "remote-builder"]);
+
+  let releaseRecovery;
+  const recoveryGate = new Promise((resolve) => { releaseRecovery = resolve; });
+  const recoveryRuns = [];
+  const runRecovery = (hostExecutor) => runCoordinatorLeaseRecoveryMonitorOnce({
+    hostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core", leaseDurationSeconds: 120 },
+    readSnapshot: async () => {
+      recoveryRuns.push(hostExecutor.ownedCodexHostId);
+      await recoveryGate;
+      return emptySnapshot;
+    },
+    readThread: async () => assert.fail("empty snapshot must not read a thread"),
+    recoverLease: async () => assert.fail("empty snapshot must not recover a lease"),
+  });
+  const recoveryLocal = runRecovery(localHostExecutor);
+  const recoveryRemote = runRecovery(remoteHostExecutor);
+  releaseRecovery();
+  await Promise.all([recoveryLocal, recoveryRemote]);
+  assert.deepEqual(recoveryRuns.sort(), ["local", "remote-builder"]);
 });
 
 test("disposed Coordinator fast-lane timers stop old renderer ticks", async () => {
@@ -5451,6 +7384,7 @@ test("cross-domain handoff waits for an idle Coordinator without steering", asyn
   };
   const calls = [];
   const result = await runCrossDomainHandoffMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: request.projectId },
     readSnapshot: async () => ({
       projectId: request.projectId,
@@ -5499,6 +7433,7 @@ test("cross-domain handoff starts and confirms exactly one idle Coordinator turn
   const calls = [];
   let confirmed = null;
   const result = await runCrossDomainHandoffMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: request.projectId },
     readSnapshot: async () => ({ projectId: request.projectId, coordination: { pendingCrossDomainHandoff: request } }),
     claimDelivery: async () => ({ claimed: true, receipt: { id: "handoff-once" } }),
@@ -5510,7 +7445,10 @@ test("cross-domain handoff starts and confirms exactly one idle Coordinator turn
         if (method === "thread/read") return {
           thread: { id: request.route.targetThreadId, cwd: request.route.targetWorkspacePath, turns: [] },
         };
-        if (method === "turn/start") return { turn: { id: "handoff-turn" } };
+        if (method === "turn/start") {
+          assert.equal(params.approvalPolicy, "never");
+          return { turn: { id: "handoff-turn" } };
+        }
         return {};
       },
       options,
@@ -5547,6 +7485,7 @@ test("cross-domain handoff recovers a started marker without a second turn", asy
   const calls = [];
   let confirmed = null;
   const result = await runCrossDomainHandoffMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: request.projectId },
     readSnapshot: async () => ({ projectId: request.projectId, coordination: { pendingCrossDomainHandoff: request } }),
     claimDelivery: async () => ({ claimed: false, reason: "reserved", receipt: { id: "handoff-recover" } }),
@@ -5582,6 +7521,7 @@ test("Owner decision observation requires an actual Owner turn in the exact Root
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
   };
@@ -5624,6 +7564,7 @@ test("an uncertain Owner delivery is read back by id before any retry side effec
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
     deliveryReceipt: { id: "delivery-uncertain" },
@@ -5655,6 +7596,7 @@ test("Owner decision delivery uses an atomic durable reservation before any Root
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
   };
@@ -5663,8 +7605,9 @@ test("Owner decision delivery uses an atomic durable reservation before any Root
   let release;
   const barrier = new Promise((resolve) => { release = resolve; });
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => {
       claims += 1;
       if (claims > 1) return { claimed: false, reason: "reserved" };
@@ -5690,13 +7633,15 @@ test("Owner decision monitor stops when the service rejects a stale coordinator 
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "lease:old",
     route: {
       rootTaskId: "old-root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/old-root",
     },
   };
   let delivered = 0;
   const result = await runOwnerDecisionMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => ({ claimed: false, reason: "stale-route" }),
     deliver: async () => { delivered += 1; },
     confirmDelivery: async () => assert.fail("stale route must not confirm"),
@@ -5707,19 +7652,46 @@ test("Owner decision monitor stops when the service rejects a stale coordinator 
   assert.equal(delivered, 0);
 });
 
+test("Owner decision monitor rejects project-kind drift before any callback", async () => {
+  const request = {
+    requestId: "1".repeat(64), expectedResumeToken: "2".repeat(64), identifier: "CAP-10",
+    actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
+    route: {
+      rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
+      codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
+    },
+  };
+  const mustNotRun = async () => assert.fail("project-kind drift must fail before callbacks");
+  assert.deepEqual(await runOwnerDecisionMonitorOnce({
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core" },
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request, {
+      codexProjectKind: "remote",
+    }),
+    claimDelivery: mustNotRun,
+    deliver: mustNotRun,
+    confirmDelivery: mustNotRun,
+    observeDecision: mustNotRun,
+    recordDecision: mustNotRun,
+  }), { delivered: false, reason: "invalid-request" });
+});
+
 test("a durable delivered request is recorded only from the exact Root observation", async () => {
   const request = {
     requestId: "5".repeat(64), expectedResumeToken: "4".repeat(64), identifier: "CAP-10",
     actionId: "push", message: "Ask Owner", coordinatorEpoch: "configured:root",
     route: {
       rootTaskId: "root", rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      codexProjectId: "taskboard-project", codexProjectKind: "local",
       codexHostId: "local", rootWorkspacePath: "/tmp/taskboard/root",
     },
   };
   let recorded;
   const result = await runOwnerDecisionMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
-    readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
+    readSnapshot: async () => ownerDecisionMonitorSnapshot(request),
     claimDelivery: async () => ({
       claimed: false,
       reason: "already-delivered",
@@ -5743,6 +7715,10 @@ test("a durable delivered request is recorded only from the exact Root observati
     requestId: request.requestId,
     expectedResumeToken: request.expectedResumeToken,
     deliveryId: "delivery-record",
+    rootCodexProjectId: request.route.codexProjectId,
+    rootCodexProjectKind: request.route.codexProjectKind,
+    rootCodexHostId: request.route.codexHostId,
+    rootWorkspacePath: request.route.rootWorkspacePath,
     outcome: "authorized",
     evidence: "Owner approved exact scope",
     ownerTurnId: "owner-turn",
@@ -5754,6 +7730,7 @@ test("a durable delivered request is recorded only from the exact Root observati
 test("background continuation fails closed for disabled, open-run, or malformed work", async () => {
   let delivered = 0;
   const base = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: false, projectId: "taskboard-core" },
     readSnapshot: async () => assert.fail("disabled monitor must not read"),
     claimReceipt: async () => assert.fail("must not claim a receipt"),
@@ -5800,6 +7777,7 @@ test("background continuation resumes an expired reservation and records exactly
   let completed = 0;
   const receipt = { id: "bootstrap-receipt", reservationLeaseId: "lease-retry" };
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5850,6 +7828,7 @@ test("background continuation resumes an expired reservation and records exactly
 test("background continuation fails closed when the authoritative reservation is rejected", async () => {
   let delivered = false;
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5883,6 +7862,7 @@ test("background continuation fails closed when the authoritative reservation is
 test("background continuation does not reserve an unassigned Todo without a Global route", async () => {
   let claimed = false;
   const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -5908,8 +7888,167 @@ test("background continuation does not reserve an unassigned Todo without a Glob
   assert.equal(claimed, false);
 });
 
+function extractExactObjectCall(source, callee) {
+  const marker = `${callee}({`;
+  const callStart = source.indexOf(marker);
+  assert.notEqual(callStart, -1, `${callee} call must exist`);
+  assert.equal(source.indexOf(marker, callStart + marker.length), -1, `${callee} call must be unique`);
+  const objectStart = callStart + marker.length - 1;
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = objectStart; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      quote = character;
+      continue;
+    }
+    if (character === "{") depth += 1;
+    if (character !== "}") continue;
+    depth -= 1;
+    if (depth === 0) {
+      return {
+        callStart,
+        objectStart,
+        objectEnd: index + 1,
+        objectSource: source.slice(objectStart, index + 1),
+      };
+    }
+  }
+  assert.fail(`${callee} call object must be balanced`);
+}
+
+function topLevelCallPropertyRecords(objectSource) {
+  const records = objectSource.split("\n").map((line, lineIndex) => {
+    const match = /^(\s+)([A-Za-z_$][\w$]*)(?:\s*:|\s*,\s*$)/.exec(line);
+    return match ? { indent: match[1].length, name: match[2], line, lineIndex } : null;
+  }).filter(Boolean);
+  const topLevelIndent = Math.min(...records.map((record) => record.indent));
+  return records.filter((record) => record.indent === topLevelIndent);
+}
+
+const residentCoordinatorHostWiring = [{
+  label: "outer identity fast lane",
+  callee: "runCoordinatorIdentityHandshakeFastLane",
+  properties: ["projects", "hostExecutor", "runHandshake"],
+}, {
+  label: "inner identity monitor",
+  callee: "runBackgroundCoordinatorIdentityHandshakeMonitorOnce",
+  properties: ["projectId", "hostExecutor", "listHandshakes", "readThread", "confirmIdentity"],
+}, {
+  label: "Global shutdown monitor",
+  callee: "runCoordinatorShutdownMonitorOnce",
+  properties: [
+    "hostExecutor", "policy", "now", "readSnapshot", "readWindows", "readThread",
+    "getAttempt", "requestAttempt", "releaseAttempt", "findArchivedThread", "archiveThread",
+    "completeAttempt",
+  ],
+}, {
+  label: "domain provisioning monitor",
+  callee: "runDomainCoordinatorProvisioningMonitorOnce",
+  properties: [
+    "hostExecutor", "policy", "readSnapshot", "readWindows", "readDefaultModel",
+    "getAttempt", "requestAttempt", "rebindAttempt", "findThread", "readThread",
+    "markStarting", "startThread", "attachThread", "resetAttempt", "resumeExpiredAttempt",
+    "deliverInstruction",
+  ],
+}, {
+  label: "domain shutdown monitor",
+  callee: "runDomainCoordinatorShutdownMonitorOnce",
+  properties: [
+    "hostExecutor", "policy", "now", "readSnapshot", "readWindows", "readThread",
+    "getAttempt", "requestAttempt", "releaseAttempt", "authorizeAttempt",
+    "beginArchiveAttempt", "cancelAttempt", "findArchivedThread", "archiveThread",
+    "completeAttempt",
+  ],
+}, {
+  label: "Owner Intent capture monitor",
+  callee: "runOwnerIntentCaptureMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "listIntents", "observeCapture", "recordCapture",
+  ],
+}, {
+  label: "Owner Intent planning monitor",
+  callee: "runOwnerIntentPlanningMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "observePlan", "applyPlan", "scheduleRetry",
+  ],
+}, {
+  label: "Owner Intent adoption monitor",
+  callee: "runOwnerIntentAdoptionMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "claimAdoption", "confirmAdoption", "deliver",
+  ],
+}, {
+  label: "cross-domain handoff monitor",
+  callee: "runCrossDomainHandoffMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "claimDelivery", "confirmDelivery", "deliver",
+  ],
+}, {
+  label: "Owner decision monitor",
+  callee: "runOwnerDecisionMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "claimDelivery", "confirmDelivery", "deliver",
+    "observeDecision", "recordDecision",
+  ],
+}, {
+  label: "lease keepalive monitor",
+  callee: "runCoordinatorLeaseKeepaliveMonitorOnce",
+  properties: ["hostExecutor", "policy", "readSnapshot", "readThread", "renewLease"],
+}, {
+  label: "lease recovery monitor",
+  callee: "runCoordinatorLeaseRecoveryMonitorOnce",
+  properties: ["hostExecutor", "policy", "readSnapshot", "readThread", "recoverLease"],
+}];
+
+function assertResidentCoordinatorHostWiring(source) {
+  for (const expected of residentCoordinatorHostWiring) {
+    const call = extractExactObjectCall(source, expected.callee);
+    const properties = topLevelCallPropertyRecords(call.objectSource);
+    assert.deepEqual(properties.map(({ name }) => name), expected.properties, expected.label);
+    assert.equal(
+      properties.find(({ name }) => name === "hostExecutor")?.line.trim(),
+      "hostExecutor: currentResidentHostExecutorExecution(),",
+      expected.label,
+    );
+  }
+}
+
+function removeExactCallHostExecutor(source, callee) {
+  const call = extractExactObjectCall(source, callee);
+  const lines = call.objectSource.split("\n");
+  const property = topLevelCallPropertyRecords(call.objectSource)
+    .find(({ name }) => name === "hostExecutor");
+  assert.ok(property, `${callee} must expose a first-level hostExecutor`);
+  lines.splice(property.lineIndex, 1);
+  return source.slice(0, call.objectStart)
+    + lines.join("\n")
+    + source.slice(call.objectEnd);
+}
+
 test("the resident authenticated host polls durable opt-in policies without the Agent Lanes view", async () => {
   const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
+  assert.match(source, /residentHostExecutor = Object\.freeze\(\{ ownedCodexHostId: "local" \}\)/);
+  assertResidentCoordinatorHostWiring(source);
+  for (const { callee } of residentCoordinatorHostWiring) {
+    const withoutExactArgument = removeExactCallHostExecutor(source, callee);
+    assert.throws(
+      () => assertResidentCoordinatorHostWiring(withoutExactArgument),
+      assert.AssertionError,
+      `${callee} must fail when its own first-level hostExecutor is absent`,
+    );
+  }
   assert.match(source, /taskboard:background-continuation:policy:/);
   assert.match(source, /api\/client-storage/);
   assert.match(source, /api\/local\/projects\/\$\{encodeURIComponent\(projectId\)\}\/agent-lanes/);
@@ -5922,7 +8061,12 @@ test("the resident authenticated host polls durable opt-in policies without the 
   assert.match(source, /admissionRecoveryRpcTimeoutMs\(method\)/);
   assert.match(source, /deliverTaskboardCoordination/);
   assert.match(source, /runCoordinatorProvisioningMonitorOnce/);
+  assert.match(
+    source,
+    /if \(continuationEnabled\) monitors\.push\(\s*\(\) => runCoordinatorShutdownMonitorOnce\(/,
+  );
   assert.match(source, /coordinator-provisioning-attempts/);
+  assert.match(source, /return coordinatorProvisioningResponseJson\(response\);/);
   assert.match(source, /"thread\/list"/);
   assert.match(source, /"thread\/start"/);
   assert.match(source, /TASKBOARD_COORDINATOR_PROVISIONING_V1/);
@@ -6613,4 +8757,1266 @@ test("refresh stops every stale resident before starting one token-verified repl
     ["start", 9231, startupToken],
     ["ready", 9231, 9876, startupToken],
   ]);
+});
+
+function cap59Preflight(projectId, ownerHostId, coordinatorWindows = []) {
+  const owner = {
+    taskId: "owner-root",
+    label: "Owner Root",
+    role: "owner_root",
+    threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "cap59-project",
+    codexProjectKind: ownerHostId === "local" ? "local" : "remote",
+    codexHostId: ownerHostId,
+    workspacePath: "/tmp/cap59-owner",
+  };
+  return {
+    projectId,
+    revision: "a".repeat(64),
+    ownerRootTaskId: owner.taskId,
+    ownerRootValid: true,
+    coordinatorLease: null,
+    durableWorkPending: true,
+    shutdownAttempt: null,
+    windows: [owner, ...coordinatorWindows],
+  };
+}
+
+function cap59ReadyProvisioningOptions({ projectId, hostExecutor, ownerHostId, callbacks }) {
+  let attempt = null;
+  const preflight = cap59Preflight(projectId, ownerHostId);
+  return {
+    policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+    ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    readPreflight: async () => {
+      callbacks.push("preflight");
+      return preflight;
+    },
+    getAttempt: async () => {
+      callbacks.push("lookup");
+      return { attempt: null };
+    },
+    requestAttempt: async (request) => {
+      callbacks.push(["request", request.ownedCodexHostId]);
+      const { ownedCodexHostId: _ownedCodexHostId, ...persistedRequest } = request;
+      attempt = {
+        ...persistedRequest,
+        id: `attempt-${projectId}`,
+        status: "pending",
+        threadId: null,
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => {
+      callbacks.push("find-thread");
+      return null;
+    },
+    markStarting: async () => {
+      callbacks.push("starting");
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      callbacks.push("start-thread");
+      return {
+        thread: {
+          id: "01a062c1-fd2b-7f61-9114-d483e695640e",
+          cwd: settings.cwd,
+          threadSource: settings.threadSource,
+        },
+      };
+    },
+    attachThread: async ({ threadId }) => {
+      callbacks.push("attach");
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => {
+      callbacks.push("deliver");
+      return { delivery: "started", turnId: "turn-cap59" };
+    },
+  };
+}
+
+test("CAP-59 Global provisioning rejects invalid host executors before every callback", async () => {
+  const cases = [
+    ["missing", undefined],
+    ["whitespace", { ownedCodexHostId: "   " }],
+    ["control", { ownedCodexHostId: "bad\nhost" }],
+    ["257 characters", { ownedCodexHostId: "h".repeat(257) }],
+  ];
+  const observed = [];
+  for (const [label, hostExecutor] of cases) {
+    const callbacks = [];
+    const result = await runCoordinatorProvisioningMonitorOnce(cap59ReadyProvisioningOptions({
+      projectId: `cap59-invalid-${label.replaceAll(" ", "-")}`,
+      hostExecutor,
+      ownerHostId: "local",
+      callbacks,
+    }));
+    observed.push([label, result, callbacks.length]);
+  }
+  assert.deepEqual(observed, cases.map(([label]) => [label, {
+    provisioned: false, reason: "host-executor-unavailable",
+  }, 0]));
+});
+
+test("CAP-59 Global provisioning accepts canonical host executors and carries ownership", async () => {
+  const observed = [];
+  for (const length of [240, 241, 256]) {
+    const hostId = `h${"x".repeat(length - 1)}`;
+    const callbacks = [];
+    const result = await runCoordinatorProvisioningMonitorOnce(cap59ReadyProvisioningOptions({
+      projectId: `cap59-canonical-${length}`,
+      hostExecutor: { ownedCodexHostId: hostId },
+      ownerHostId: hostId,
+      callbacks,
+    }));
+    observed.push([length, result.provisioned, callbacks.find((entry) => Array.isArray(entry))?.[1]]);
+  }
+  assert.deepEqual(observed, [240, 241, 256].map((length) => [
+    length,
+    true,
+    `h${"x".repeat(length - 1)}`,
+  ]));
+});
+
+test("CAP-59 Global provisioning fences foreign Owner and registered Coordinator routes before inspection", async () => {
+  const coordinator = (codexHostId) => ({
+    taskId: "coordinator-root",
+    label: "Global Coordinator",
+    role: "coordinator",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+    codexProjectId: "cap59-project",
+    codexProjectKind: codexHostId === "local" ? "local" : "remote",
+    codexHostId,
+    workspacePath: "/tmp/cap59-coordinator",
+  });
+  const cases = [
+    ["foreign-owner", "remote-builder", coordinator("local")],
+    ["foreign-window", "local", coordinator("remote-builder")],
+    ["invalid-window", "local", coordinator("bad\nhost")],
+    ["duplicate-owner", "local", null],
+    ["fresh-invalid-window-set", "local", coordinator("local")],
+  ];
+  const observed = [];
+  const fencedResults = {};
+  for (const [label, ownerHostId, window] of cases) {
+    const effects = [];
+    let duplicateAttempt = null;
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: { enabled: true, projectId: `cap59-fence-${label}`, model: "gpt-5", reasoningEffort: "high" },
+      hostExecutor: localHostExecutor,
+      readPreflight: async () => {
+        effects.push("preflight");
+        const preflight = cap59Preflight(
+          `cap59-fence-${label}`,
+          ownerHostId,
+          window ? [window] : [],
+        );
+        return label === "duplicate-owner" ? {
+          ...preflight,
+          windows: [...preflight.windows, {
+            taskId: "owner-root-shadow",
+            label: "Shadow Owner Root",
+            role: "owner_root",
+            threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+            codexProjectId: "cap59-project",
+            codexProjectKind: "local",
+            codexHostId: "local",
+            workspacePath: "/tmp/cap59-owner",
+          }],
+        } : label === "fresh-invalid-window-set" && effects.filter((effect) => effect === "preflight").length > 1 ? {
+          ...cap59Preflight(`cap59-fence-${label}`, "local"),
+          windows: [...cap59Preflight(`cap59-fence-${label}`, "local").windows, {
+            taskId: "owner-root-shadow",
+            label: "Shadow Owner Root",
+            role: "owner_root",
+            threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+            codexProjectId: "cap59-project",
+            codexProjectKind: "local",
+            codexHostId: "local",
+            workspacePath: "/tmp/cap59-owner",
+          }],
+        } : preflight;
+      },
+      inspectCoordinatorWindow: async () => {
+        effects.push("inspection");
+        return label === "fresh-invalid-window-set"
+          ? { eligibility: "stale", reason: "archived", window }
+          : { eligibility: "eligible", window };
+      },
+      getAttempt: async () => {
+        effects.push("lookup");
+        return { attempt: null };
+      },
+      requestAttempt: async (request) => {
+        effects.push("request");
+        if (!new Set(["duplicate-owner", "fresh-invalid-window-set"]).has(label)) return null;
+        duplicateAttempt = {
+          ...request,
+          id: "cap59-duplicate-owner-attempt",
+          status: "pending",
+          threadId: null,
+        };
+        return { attempt: { ...duplicateAttempt } };
+      },
+      findThread: async () => { effects.push("find-thread"); return null; },
+      markStarting: async () => {
+        effects.push("starting");
+        duplicateAttempt = { ...duplicateAttempt, status: "starting" };
+        return { attempt: { ...duplicateAttempt } };
+      },
+      startThread: async (settings) => {
+        effects.push("start-thread");
+        return {
+          thread: {
+            id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+            cwd: settings.cwd,
+            threadSource: settings.threadSource,
+          },
+        };
+      },
+      attachThread: async ({ threadId }) => {
+        effects.push("attach");
+        duplicateAttempt = { ...duplicateAttempt, status: "started", threadId };
+        return { attempt: { ...duplicateAttempt } };
+      },
+      deliverInstruction: async () => {
+        effects.push("deliver");
+        return { delivery: "started", turnId: "turn-cap59-duplicate-owner" };
+      },
+    });
+    if (["duplicate-owner", "fresh-invalid-window-set"].includes(label)) {
+      fencedResults[label] = [result, effects];
+    } else {
+      observed.push([label, result.provisioned, effects]);
+    }
+  }
+  assert.deepEqual(
+    [fencedResults["duplicate-owner"], fencedResults["fresh-invalid-window-set"]],
+    [[{
+      provisioned: false,
+      reason: "owner-root-invalid",
+    }, ["preflight"]], [{
+      provisioned: false,
+      reason: "retirement-preflight-invalid",
+      attemptId: "cap59-duplicate-owner-attempt",
+    }, ["preflight", "inspection", "lookup", "lookup", "request", "preflight"]]],
+  );
+  assert.deepEqual(observed, cases.slice(0, 3).map(([label]) => [label, false, ["preflight"]]));
+});
+
+test("CAP-59 Global provisioning single-flight is scoped by exact host and project", async () => {
+  let enterFirstPreflight;
+  const firstPreflight = new Promise((resolve) => { enterFirstPreflight = resolve; });
+  let releaseFirstPreflight;
+  const release = new Promise((resolve) => { releaseFirstPreflight = resolve; });
+  const observedHosts = [];
+  const makeOptions = (hostId, block) => {
+    const callbacks = [];
+    const options = cap59ReadyProvisioningOptions({
+      projectId: "cap59-single-flight",
+      hostExecutor: { ownedCodexHostId: hostId },
+      ownerHostId: hostId,
+      callbacks,
+    });
+    options.readPreflight = async () => {
+      observedHosts.push(hostId);
+      if (block) {
+        enterFirstPreflight();
+        await release;
+      }
+      return cap59Preflight("cap59-single-flight", hostId);
+    };
+    return options;
+  };
+  const local = runCoordinatorProvisioningMonitorOnce(makeOptions("local", true));
+  await firstPreflight;
+  const remote = runCoordinatorProvisioningMonitorOnce(makeOptions("remote-builder", false));
+  releaseFirstPreflight();
+  const results = await Promise.all([local, remote]);
+  assert.deepEqual(observedHosts, ["local", "remote-builder"]);
+  assert.deepEqual(results.map((result) => result.provisioned), [true, true]);
+});
+
+test("CAP-59 Global provisioning rejects immutable response-envelope drift before later effects", async () => {
+  const scenarios = [
+    ["request", "request"],
+    ["rebind", "rebind"],
+    ["starting", "starting"],
+    ["reset", "reset"],
+    ["attach", "attach"],
+    ["observe-missing", "observe"],
+    ["clear-missing", "clear"],
+    ["reset-missing", "reset-missing"],
+    ["resume-expired", "resume"],
+  ];
+  const observed = [];
+  for (const [label, transition] of scenarios) {
+    const projectId = `cap59-envelope-${label}`;
+    const effects = [];
+    let attempt = null;
+    let identityRequest = null;
+    const observedAt = Date.parse("2026-09-07T00:02:00.000Z");
+    const drift = (candidate) => ({
+      ...candidate,
+      ...(transition === "request"
+        ? { codexHostId: "remote-builder" }
+        : transition === "resume"
+          ? { idempotencyKey: `${candidate.idempotencyKey}-drift` }
+          : { id: `${candidate.id}-drift` }),
+    });
+    const fromLookup = (request, status, threadId = null, expectedRevision = "a".repeat(64)) => {
+      const fingerprint = request.idempotencyKey.slice("coordinator-provision-".length);
+      return {
+        id: `attempt-${label}`,
+        projectId,
+        idempotencyKey: request.idempotencyKey,
+        taskId: `coordinator-${projectId}-${fingerprint.slice(0, 12)}`,
+        label: "Taskboard Execution Coordinator",
+        threadSource: `taskboard-coordinator-provision-${fingerprint}`,
+        model: "gpt-5",
+        reasoningEffort: "high",
+        expectedRevision,
+        ownerRootTaskId: "owner-root",
+        ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        codexProjectId: "cap59-project",
+        codexProjectKind: "local",
+        codexHostId: "local",
+        workspacePath: "/tmp/cap59-owner",
+        status,
+        threadId,
+        missingSince: null,
+      };
+    };
+    const options = {
+      policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+      hostExecutor: localHostExecutor,
+      now: () => observedAt,
+      readPreflight: async () => cap59Preflight(projectId, "local"),
+      getAttempt: async (request) => {
+        if (transition === "request") return { attempt: null };
+        if (transition === "rebind" && request.idempotencyKey) {
+          identityRequest = request;
+          return { attempt: null };
+        }
+        if (!attempt) {
+          const status = transition === "attach" ? "starting"
+            : transition === "observe" || transition === "clear" || transition === "reset-missing"
+              ? "started"
+              : transition === "resume" ? "expired" : "pending";
+          const threadId = ["observe", "clear", "reset-missing", "resume"].includes(transition)
+            ? "01a062c1-fd2b-7f61-9114-d483e695640e" : null;
+          attempt = fromLookup(
+            identityRequest ?? request,
+            status,
+            threadId,
+            transition === "rebind" ? "b".repeat(64) : undefined,
+          );
+          if (transition === "clear") attempt.missingSince = "2000-01-01T00:00:00.000Z";
+        }
+        return { attempt: { ...attempt } };
+      },
+      requestAttempt: async (request) => {
+        effects.push("request");
+        attempt = drift({
+          ...fromLookup(request, "pending"),
+          id: `attempt-${label}`,
+        });
+        return { attempt: { ...attempt } };
+      },
+      rebindAttempt: async () => {
+        effects.push("rebind");
+        attempt = drift({ ...attempt, expectedRevision: "a".repeat(64) });
+        return { attempt: { ...attempt } };
+      },
+      findThread: async (candidate) => {
+        effects.push("find");
+        if (!["attach", "clear", "resume"].includes(transition)) return null;
+        return {
+          id: candidate.threadId ?? "01a062c1-fd2b-7f61-9114-d483e695640e",
+          cwd: candidate.workspacePath,
+          threadSource: candidate.threadSource,
+          turns: transition === "resume"
+            ? [{ input: `TASKBOARD_COORDINATOR_PROVISIONING_V1:${candidate.id}` }]
+            : [],
+        };
+      },
+      markStarting: async () => {
+        effects.push("starting");
+        attempt = transition === "starting"
+          ? drift({ ...attempt, status: "starting" })
+          : { ...attempt, status: "starting" };
+        return { attempt: { ...attempt } };
+      },
+      startThread: async (settings) => {
+        effects.push("rpc");
+        if (transition === "reset") {
+          throw new Error("Selected model is at capacity. Please try a different model.");
+        }
+        return {
+          thread: {
+            id: "01a062c1-fd2b-7f61-9114-d483e695640e",
+            cwd: settings.cwd,
+            threadSource: settings.threadSource,
+          },
+        };
+      },
+      resetAttempt: async () => {
+        effects.push("reset");
+        attempt = drift({ ...attempt, status: "pending", threadId: null });
+        return { attempt: { ...attempt } };
+      },
+      attachThread: async ({ threadId }) => {
+        effects.push("attach");
+        attempt = transition === "attach"
+          ? drift({ ...attempt, status: "started", threadId })
+          : { ...attempt, status: "started", threadId };
+        return { attempt: { ...attempt } };
+      },
+      observeMissingAttempt: async () => {
+        effects.push("observe");
+        attempt = transition === "observe"
+          ? drift({ ...attempt, missingSince: new Date(observedAt).toISOString() })
+          : { ...attempt, missingSince: "2000-01-01T00:00:00.000Z" };
+        return { attempt: { ...attempt } };
+      },
+      clearMissingAttempt: async () => {
+        effects.push("clear");
+        attempt = drift({ ...attempt, missingSince: null });
+        return { attempt: { ...attempt } };
+      },
+      resetMissingAttempt: async () => {
+        effects.push("reset-missing");
+        attempt = drift({ ...attempt, status: "pending", threadId: null, missingSince: null });
+        return { attempt: { ...attempt } };
+      },
+      resumeExpiredAttempt: async () => {
+        effects.push("resume");
+        attempt = drift({ ...attempt, status: "started" });
+        return { attempt: { ...attempt } };
+      },
+      deliverInstruction: async () => {
+        effects.push("delivery");
+        return { delivery: "started", turnId: "turn-cap59-envelope" };
+      },
+    };
+    const result = await runCoordinatorProvisioningMonitorOnce(options);
+    const transitionIndex = effects.indexOf(transition);
+    observed.push([
+      label,
+      result.reason,
+      transitionIndex >= 0,
+      effects.slice(transitionIndex + 1),
+    ]);
+  }
+  assert.deepEqual(observed, scenarios.map(([label]) => [
+    label,
+    "attempt-binding-mismatch",
+    true,
+    [],
+  ]));
+});
+
+test("CAP-59 Global provisioning replays an exact-host expired attempt", async () => {
+  const ownership = [];
+  let attempt;
+  const replay = await runCoordinatorProvisioningMonitorOnce({
+    policy: { enabled: true, projectId: "cap59-exact-replay", model: "gpt-5", reasoningEffort: "high" },
+    hostExecutor: localHostExecutor,
+    readPreflight: async () => cap59Preflight("cap59-exact-replay", "local"),
+    getAttempt: async (request) => {
+      ownership.push(["lookup", request.ownedCodexHostId]);
+      const fingerprint = request.idempotencyKey.slice("coordinator-provision-".length);
+      attempt = {
+        id: "cap59-replay-attempt", projectId: "cap59-exact-replay",
+        idempotencyKey: request.idempotencyKey,
+        taskId: `coordinator-cap59-exact-replay-${fingerprint.slice(0, 12)}`,
+        label: "Taskboard Execution Coordinator",
+        threadSource: `taskboard-coordinator-provision-${fingerprint}`,
+        model: "gpt-5", reasoningEffort: "high", expectedRevision: "a".repeat(64),
+        ownerRootTaskId: "owner-root",
+        ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        ownerRootCodexProjectId: "cap59-project",
+        ownerRootCodexProjectKind: "local",
+        ownerRootCodexHostId: "local",
+        ownerRootWorkspacePath: "/tmp/cap59-owner",
+        codexProjectId: "cap59-project", codexProjectKind: "local", codexHostId: "local",
+        workspacePath: "/tmp/cap59-owner", status: "expired",
+        threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      };
+      return { attempt };
+    },
+    requestAttempt: async () => assert.fail("the exact replay must reuse its attempt"),
+    readThread: async () => null,
+    findThread: async (candidate) => ({
+      id: candidate.threadId, cwd: candidate.workspacePath, threadSource: candidate.threadSource,
+      turns: [{ input: `TASKBOARD_COORDINATOR_PROVISIONING_V1:${candidate.id}` }],
+    }),
+    markStarting: async () => assert.fail("the exact replay must not start another thread"),
+    startThread: async () => assert.fail("the exact replay must not start another thread"),
+    attachThread: async () => assert.fail("the exact replay is already attached"),
+    resumeExpiredAttempt: async (request) => {
+      ownership.push(["resume", request.ownedCodexHostId]);
+      return { attempt: { ...attempt, status: "started" } };
+    },
+    deliverInstruction: async () => ({ delivery: "observed", turnId: "turn-cap59-replay" }),
+  });
+  assert.equal(replay.provisioned, true);
+  assert.deepEqual(ownership, [["lookup", "local"], ["resume", "local"]]);
+});
+
+for (const [lookupMode, lookupTrace] of [
+  ["exact-key", ["exact-lookup"]],
+  ["fallback-active", ["exact-lookup", "fallback-lookup"]],
+  ["fallback-identity-drift", ["exact-lookup", "fallback-lookup"]],
+]) {
+  const title = lookupMode === "fallback-identity-drift"
+    ? "CAP-59 Global provisioning rejects fallback-active identity drift before attempt recovery"
+    : `CAP-59 Global provisioning blocks stale retirement before ${lookupMode} attempt recovery`;
+  test(title, async () => {
+    const projectId = `cap59-stale-${lookupMode}`;
+    const staleWindow = {
+      taskId: "cap59-stale-coordinator",
+      label: "Stale Global Coordinator",
+      role: "coordinator",
+      threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      codexProjectId: "cap59-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/cap59-owner",
+    };
+    const effects = [];
+    const currentFingerprint = createHash("sha256")
+      .update(JSON.stringify({ projectId, revision: "a".repeat(64), ownerRootTaskId: "owner-root" }))
+      .digest("hex");
+    const fallbackFingerprint = createHash("sha256")
+      .update(JSON.stringify({ projectId, revision: "c".repeat(64), ownerRootTaskId: "owner-root" }))
+      .digest("hex");
+    const mismatchedThreadSourceFingerprint = createHash("sha256")
+      .update(JSON.stringify({ projectId, revision: "d".repeat(64), ownerRootTaskId: "owner-root" }))
+      .digest("hex");
+    const existingFingerprint = lookupMode === "exact-key" ? currentFingerprint : fallbackFingerprint;
+    const attemptId = `cap59-stale-attempt-${lookupMode}`;
+    const existingAttempt = () => ({
+      id: attemptId,
+      projectId,
+      idempotencyKey: `coordinator-provision-${existingFingerprint}`,
+      taskId: `coordinator-${projectId}-${existingFingerprint.slice(0, 12)}`,
+      label: "Taskboard Execution Coordinator",
+      threadSource: lookupMode === "fallback-identity-drift"
+        ? `taskboard-coordinator-provision-${mismatchedThreadSourceFingerprint}`
+        : `taskboard-coordinator-provision-${existingFingerprint}`,
+      model: "gpt-5",
+      reasoningEffort: "high",
+      expectedRevision: lookupMode === "fallback-identity-drift"
+        ? "a".repeat(64)
+        : "b".repeat(64),
+      ownerRootTaskId: "owner-root",
+      ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      codexProjectId: "cap59-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: "/tmp/cap59-owner",
+      status: "started",
+      threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+      retryCount: 0,
+      missingSince: null,
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const result = await runCoordinatorProvisioningMonitorOnce({
+      policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+      hostExecutor: localHostExecutor,
+      readPreflight: async () => {
+        effects.push("preflight");
+        return cap59Preflight(
+          projectId,
+          "local",
+          lookupMode === "fallback-identity-drift" ? [] : [staleWindow],
+        );
+      },
+      inspectCoordinatorWindow: async (window) => {
+        effects.push("inspection");
+        assert.deepEqual(window, staleWindow);
+        return { eligibility: "stale", reason: "archived", window };
+      },
+      getAttempt: async (request) => {
+        if (request.idempotencyKey) {
+          effects.push("exact-lookup");
+          assert.equal(request.idempotencyKey, `coordinator-provision-${currentFingerprint}`);
+          return { attempt: lookupMode === "exact-key" ? existingAttempt() : null };
+        }
+        effects.push("fallback-lookup");
+        return { attempt: existingAttempt() };
+      },
+      requestAttempt: async () => {
+        effects.push("request");
+        return { attempt: null };
+      },
+      readDefaultModel: async () => {
+        effects.push("model");
+        return { model: "gpt-5", reasoningEffort: "high" };
+      },
+      readThread: async (attempt) => {
+        effects.push("read-thread");
+        return {
+          id: attempt.threadId,
+          cwd: attempt.workspacePath,
+          threadSource: attempt.threadSource,
+          turns: [],
+        };
+      },
+      findThread: async () => {
+        effects.push("find-thread");
+        return null;
+      },
+      findArchivedThread: async () => {
+        effects.push("find-archived");
+        return null;
+      },
+      markStarting: async () => {
+        effects.push("starting");
+        return { attempt: existingAttempt() };
+      },
+      startThread: async () => {
+        effects.push("start-thread");
+        return null;
+      },
+      attachThread: async () => {
+        effects.push("attach");
+        return { attempt: existingAttempt() };
+      },
+      observeMissingAttempt: async () => {
+        effects.push("observe-missing");
+        return { attempt: existingAttempt() };
+      },
+      clearMissingAttempt: async () => {
+        effects.push("clear-missing");
+        return { attempt: existingAttempt() };
+      },
+      resumeExpiredAttempt: async () => {
+        effects.push("resume-expired");
+        return { attempt: existingAttempt() };
+      },
+      deliverInstruction: async () => {
+        effects.push("deliver");
+        return {
+          delivery: lookupMode === "fallback-identity-drift" ? "observed" : "started",
+          turnId: "turn-cap59-stale",
+        };
+      },
+    });
+    const identityDrift = lookupMode === "fallback-identity-drift";
+    assert.deepEqual(
+      [result, effects],
+      [{
+        provisioned: false,
+        reason: identityDrift ? "attempt-binding-mismatch" : "stale-retirement-required",
+        attemptId,
+      }, [
+        "preflight",
+        ...(identityDrift ? [] : ["inspection"]),
+        ...lookupTrace,
+      ]],
+    );
+  });
+}
+
+function cap60DomainMonitorOptions({ projectId, hostExecutor, snapshot, effects }) {
+  let attempt = null;
+  const globalHolder = snapshot.taskLanes.find(
+    (lane) => lane.id === snapshot.coordination.coordinatorTaskId,
+  );
+  return {
+    policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+    ...(hostExecutor === undefined ? {} : { hostExecutor }),
+    readSnapshot: async () => {
+      effects.push("snapshot");
+      return snapshot;
+    },
+    readWindows: async () => {
+      effects.push("windows");
+      return { projectId, revision: "a".repeat(64) };
+    },
+    getAttempt: async (request) => {
+      effects.push([
+        request.idempotencyKey ? "exact-lookup" : "fallback-lookup",
+        request.domainId,
+        request.ownedCodexHostId,
+      ]);
+      return { attempt: attempt ? { ...attempt } : null };
+    },
+    requestAttempt: async (request) => {
+      effects.push(["request", request.domainId, request.ownedCodexHostId]);
+      const domain = snapshot.coordination.domainCoordinators.find(
+        (candidate) => candidate.domainId === request.domainId,
+      );
+      const { ownedCodexHostId: _ownedCodexHostId, ...persistedRequest } = request;
+      attempt = {
+        ...persistedRequest,
+        id: `attempt-${projectId}`,
+        globalHolderCodexProjectId: globalHolder.codexProjectId,
+        globalHolderCodexProjectKind: globalHolder.codexProjectKind,
+        globalHolderCodexHostId: globalHolder.codexHostId,
+        globalHolderWorkspacePath: globalHolder.workspacePath,
+        writeScope: domain.writeScope,
+        status: "pending",
+        threadId: null,
+        retryCount: 0,
+        missingSince: null,
+        createdAt: "2026-09-08T00:00:00.000Z",
+        updatedAt: "2026-09-08T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
+      return { attempt: { ...attempt } };
+    },
+    findThread: async () => {
+      effects.push("find-thread");
+      return null;
+    },
+    markStarting: async ({ ownedCodexHostId }) => {
+      effects.push(["starting", ownedCodexHostId]);
+      attempt = { ...attempt, status: "starting" };
+      return { attempt: { ...attempt } };
+    },
+    startThread: async (settings) => {
+      effects.push(["start-thread", settings.codexHostId]);
+      return { thread: {
+        id: "01a09999-a749-7b53-81e2-af2d477f93ae",
+        cwd: settings.cwd,
+        threadSource: settings.threadSource,
+      } };
+    },
+    attachThread: async ({ threadId, ownedCodexHostId }) => {
+      effects.push(["attach", ownedCodexHostId]);
+      attempt = { ...attempt, status: "started", threadId };
+      return { attempt: { ...attempt } };
+    },
+    resetAttempt: async ({ ownedCodexHostId }) => {
+      effects.push(["reset", ownedCodexHostId]);
+      attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
+      return { attempt: { ...attempt } };
+    },
+    resumeExpiredAttempt: async ({ ownedCodexHostId }) => {
+      effects.push(["resume", ownedCodexHostId]);
+      attempt = { ...attempt, status: "started" };
+      return { attempt: { ...attempt } };
+    },
+    deliverInstruction: async () => {
+      effects.push("deliver");
+      return { delivery: "started", turnId: "turn-cap60" };
+    },
+  };
+}
+
+function cap60DomainSnapshot({ projectId, globalHostId, domains, lanes }) {
+  return {
+    projectId,
+    coordination: {
+      coordinatorTaskId: "global",
+      lease: { id: "global-lease", status: "active", bindingValid: true },
+      domainCoordinators: domains,
+    },
+    taskLanes: [{
+      id: "global",
+      source: "codex",
+      taskType: "root_task",
+      threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      codexProjectId: `project-${globalHostId}`,
+      codexProjectKind: globalHostId === "local" ? "local" : "remote",
+      codexHostId: globalHostId,
+      workspacePath: `/tmp/cap60-${globalHostId}`,
+    }, ...lanes],
+  };
+}
+
+function cap60DomainAttempt(snapshot, {
+  revision = "a".repeat(64),
+  expectedRevision = revision,
+  expectedGlobalLeaseId = snapshot.coordination.lease.id,
+  status = "pending",
+  threadId = null,
+} = {}) {
+  const domain = snapshot.coordination.domainCoordinators[0];
+  const lane = snapshot.taskLanes.find((candidate) => (
+    candidate.id === domain.eligibleTaskIds[0]
+  ));
+  const globalHolder = snapshot.taskLanes.find((candidate) => (
+    candidate.id === snapshot.coordination.coordinatorTaskId
+  ));
+  const launchLane = lane.codexProjectId ? lane : globalHolder;
+  const fingerprint = createHash("sha256").update(JSON.stringify({
+    projectId: snapshot.projectId,
+    revision: expectedRevision,
+    domainId: domain.domainId,
+    taskId: lane.id,
+    globalLeaseId: expectedGlobalLeaseId,
+  })).digest("hex");
+  return {
+    id: `attempt-${snapshot.projectId}`,
+    projectId: snapshot.projectId,
+    domainId: domain.domainId,
+    idempotencyKey: `domain-coordinator-provision-${fingerprint}`,
+    taskId: lane.id,
+    label: lane.label,
+    threadSource: `taskboard-domain-coordinator-provision-${fingerprint}`,
+    model: "gpt-5",
+    reasoningEffort: "high",
+    expectedRevision,
+    expectedGlobalLeaseId,
+    globalHolderTaskId: globalHolder.id,
+    globalHolderThreadId: globalHolder.threadId,
+    globalHolderCodexProjectId: globalHolder.codexProjectId,
+    globalHolderCodexProjectKind: globalHolder.codexProjectKind,
+    globalHolderCodexHostId: globalHolder.codexHostId,
+    globalHolderWorkspacePath: globalHolder.workspacePath,
+    codexProjectId: launchLane.codexProjectId,
+    codexProjectKind: launchLane.codexProjectKind,
+    codexHostId: launchLane.codexHostId,
+    workspacePath: launchLane.workspacePath,
+    writeScope: domain.writeScope,
+    status,
+    threadId,
+    retryCount: 0,
+    missingSince: null,
+    createdAt: "2026-09-08T00:00:00.000Z",
+    updatedAt: "2026-09-08T00:00:00.000Z",
+    expiresAt: status === "expired"
+      ? "2000-01-01T00:00:00.000Z"
+      : "2099-01-01T00:00:00.000Z",
+  };
+}
+
+test("CAP-60 Domain provisioning rejects invalid host executors before every callback", async () => {
+  const cases = [
+    ["missing", undefined],
+    ["null", null],
+    ["whitespace", { ownedCodexHostId: "   " }],
+    ["control", { ownedCodexHostId: "bad\nhost" }],
+    ["257 characters", { ownedCodexHostId: "h".repeat(257) }],
+  ];
+  const observed = [];
+  for (const [label, hostExecutor] of cases) {
+    const projectId = `cap60-invalid-${label.replaceAll(" ", "-")}`;
+    const effects = [];
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: "local",
+      domains: [{
+        domainId: "frontend",
+        assignment: "unassigned",
+        durableWorkPending: true,
+        eligibleTaskIds: ["frontend"],
+        writeScope: ["web"],
+      }],
+      lanes: [{
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "legacy-frontend-thread",
+      }],
+    });
+    const result = await runDomainCoordinatorProvisioningMonitorOnce(
+      cap60DomainMonitorOptions({ projectId, hostExecutor, snapshot, effects }),
+    );
+    observed.push([label, result, effects]);
+  }
+  assert.deepEqual(observed, cases.map(([label]) => [label, {
+    provisioned: false,
+    reason: "host-executor-unavailable",
+  }, []]));
+});
+
+test("CAP-60 Domain provisioning skips foreign-first routes and owns the exact peer route", async () => {
+  const projectId = "cap60-owned-route";
+  const effects = [];
+  const remoteLane = (id) => ({
+    id, label: `${id} Coordinator`, source: "codex", taskType: "peer_task",
+    threadId: `${id}-thread`, codexProjectId: `${id}-project`, codexProjectKind: "remote",
+    codexHostId: "remote-builder", workspacePath: `/tmp/${id}`,
+  });
+  const localLane = {
+    id: "backend-local", label: "Backend Local Coordinator", source: "codex",
+    taskType: "peer_task", threadId: "backend-local-thread",
+    codexProjectId: "backend-local-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/backend-local",
+  };
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "remote-global",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend-remote"], writeScope: ["web"],
+    }, {
+      domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["backend-remote", "backend-local"], writeScope: ["server"],
+    }],
+    lanes: [remoteLane("frontend-remote"), remoteLane("backend-remote"), localLane],
+  });
+  const result = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({ projectId, hostExecutor: localHostExecutor, snapshot, effects }),
+  );
+  assert.deepEqual(result, {
+    provisioned: true,
+    reason: "domain-thread-started",
+    domainId: "backend",
+    attemptId: `attempt-${projectId}`,
+    threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+  });
+  assert.deepEqual(effects.filter((effect) => Array.isArray(effect)), [
+    ["exact-lookup", "backend", "local"],
+    ["fallback-lookup", "backend", "local"],
+    ["request", "backend", "local"],
+    ["starting", "local"],
+    ["start-thread", "local"],
+    ["attach", "local"],
+  ]);
+  assert.equal(effects.filter((effect) => effect === "deliver").length, 1);
+});
+
+test("CAP-60 Domain provisioning skips a foreign persisted attempt and serves a later owned domain", async () => {
+  const projectId = "cap60-foreign-attempt";
+  const effects = [];
+  const localLane = (id) => ({
+    id, label: `${id} Coordinator`, source: "codex", taskType: "peer_task",
+    threadId: `${id}-thread`, codexProjectId: `${id}-project`, codexProjectKind: "local",
+    codexHostId: "local", workspacePath: `/tmp/${id}`,
+  });
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "local",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend"], writeScope: ["web"],
+    }, {
+      domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["backend"], writeScope: ["server"],
+    }],
+    lanes: [localLane("frontend"), localLane("backend")],
+  });
+  const foreignAttempt = {
+    ...cap60DomainAttempt(snapshot),
+    idempotencyKey: `domain-coordinator-provision-${"f".repeat(64)}`,
+    threadSource: `taskboard-domain-coordinator-provision-${"f".repeat(64)}`,
+    codexProjectId: "foreign-project",
+    codexProjectKind: "remote",
+    codexHostId: "remote-builder",
+    workspacePath: "/tmp/cap60-foreign-attempt",
+    expiresAt: "2000-01-01T00:00:00.000Z",
+  };
+  const foreignAttemptBefore = structuredClone(foreignAttempt);
+  const options = cap60DomainMonitorOptions({
+    projectId, hostExecutor: localHostExecutor, snapshot, effects,
+  });
+  const getOwnedAttempt = options.getAttempt;
+  options.getAttempt = async (request) => {
+    if (request.domainId !== "frontend") return getOwnedAttempt(request);
+    effects.push([
+      request.idempotencyKey ? "exact-lookup" : "fallback-lookup",
+      request.domainId,
+      request.ownedCodexHostId,
+    ]);
+    const persistedAttempt = request.idempotencyKey
+      && request.idempotencyKey !== foreignAttempt.idempotencyKey
+      ? null
+      : foreignAttempt;
+    if (!persistedAttempt) {
+      return coordinatorProvisioningResponseJson(new Response(
+        JSON.stringify({ attempt: null }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ));
+    }
+    const response = persistedAttempt.codexHostId === request.ownedCodexHostId
+      ? new Response(
+        JSON.stringify({ attempt: persistedAttempt }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+      : new Response(
+        JSON.stringify({ error: { code: "HOST_EXECUTOR_MISMATCH" } }),
+        { status: 409, headers: { "content-type": "application/json" } },
+      );
+    return coordinatorProvisioningResponseJson(response);
+  };
+  const result = await runDomainCoordinatorProvisioningMonitorOnce(options);
+  assert.deepEqual(result, {
+    provisioned: true,
+    reason: "domain-thread-started",
+    domainId: "backend",
+    attemptId: `attempt-${projectId}`,
+    threadId: "01a09999-a749-7b53-81e2-af2d477f93ae",
+  });
+  assert.deepEqual(foreignAttempt, foreignAttemptBefore);
+  assert.deepEqual(effects.filter((effect) => Array.isArray(effect)), [
+    ["exact-lookup", "frontend", "local"],
+    ["fallback-lookup", "frontend", "local"],
+    ["exact-lookup", "backend", "local"],
+    ["fallback-lookup", "backend", "local"],
+    ["request", "backend", "local"],
+    ["starting", "local"],
+    ["start-thread", "local"],
+    ["attach", "local"],
+  ]);
+  assert.equal(effects.filter((effect) => effect === "deliver").length, 1);
+});
+
+test("CAP-60 Domain provisioning never skips a different provisioning failure", async () => {
+  for (const [status, code] of [
+    [409, "DOMAIN_COORDINATOR_PROVISIONING_REVISION_CONFLICT"],
+    [503, "HOST_EXECUTOR_MISMATCH"],
+  ]) {
+    const projectId = `cap60-nonskippable-${status}`;
+    const effects = [];
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: "local",
+      domains: [{
+        domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+        eligibleTaskIds: ["frontend"], writeScope: ["web"],
+      }, {
+        domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+        eligibleTaskIds: ["backend"], writeScope: ["server"],
+      }],
+      lanes: ["frontend", "backend"].map((id) => ({
+        id, label: `${id} Coordinator`, source: "codex", taskType: "peer_task",
+        threadId: `${id}-thread`, codexProjectId: `${id}-project`, codexProjectKind: "local",
+        codexHostId: "local", workspacePath: `/tmp/${id}`,
+      })),
+    });
+    const options = cap60DomainMonitorOptions({
+      projectId, hostExecutor: localHostExecutor, snapshot, effects,
+    });
+    options.getAttempt = async (request) => {
+      effects.push([
+        request.idempotencyKey ? "exact-lookup" : "fallback-lookup",
+        request.domainId,
+        request.ownedCodexHostId,
+      ]);
+      if (request.idempotencyKey) return { attempt: null };
+      return coordinatorProvisioningResponseJson(new Response(
+        JSON.stringify({ error: { code } }),
+        { status, headers: { "content-type": "application/json" } },
+      ));
+    };
+    await assert.rejects(
+      runDomainCoordinatorProvisioningMonitorOnce(options),
+      (error) => error?.status === status && error?.code === code,
+    );
+    assert.deepEqual(effects, [
+      "snapshot",
+      "windows",
+      ["exact-lookup", "frontend", "local"],
+      ["fallback-lookup", "frontend", "local"],
+    ]);
+  }
+});
+
+test("CAP-60 Domain provisioning uses the Global host only for an unbound peer fallback", async () => {
+  const projectId = "cap60-fallback-route";
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "remote-builder",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend"], writeScope: ["web"],
+    }],
+    lanes: [{
+      id: "frontend", label: "Frontend Coordinator", source: "codex",
+      taskType: "peer_task", threadId: "legacy-frontend-thread",
+    }],
+  });
+  const localEffects = [];
+  const local = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({ projectId, hostExecutor: localHostExecutor, snapshot, effects: localEffects }),
+  );
+  assert.deepEqual(local, { provisioned: false, reason: "host-executor-unavailable" });
+  assert.deepEqual(localEffects, ["snapshot", "windows"]);
+
+  const remoteEffects = [];
+  const remote = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({ projectId, hostExecutor: remoteHostExecutor, snapshot, effects: remoteEffects }),
+  );
+  assert.equal(remote.provisioned, true);
+  assert.deepEqual(remoteEffects.filter((effect) => Array.isArray(effect)), [
+    ["exact-lookup", "frontend", "remote-builder"],
+    ["fallback-lookup", "frontend", "remote-builder"],
+    ["request", "frontend", "remote-builder"],
+    ["starting", "remote-builder"],
+    ["start-thread", "remote-builder"],
+    ["attach", "remote-builder"],
+  ]);
+});
+
+test("CAP-60 Domain provisioning single-flight is scoped by exact host and project", async () => {
+  let enteredLocal;
+  const localEntered = new Promise((resolve) => { enteredLocal = resolve; });
+  let releaseLocal;
+  const localRelease = new Promise((resolve) => { releaseLocal = resolve; });
+  const observedHosts = [];
+  const makeOptions = (hostExecutor, block) => {
+    const projectId = "cap60-host-flight";
+    const effects = [];
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: hostExecutor.ownedCodexHostId,
+      domains: [],
+      lanes: [],
+    });
+    const options = cap60DomainMonitorOptions({ projectId, hostExecutor, snapshot, effects });
+    options.readSnapshot = async () => {
+      observedHosts.push(hostExecutor.ownedCodexHostId);
+      if (block) {
+        enteredLocal();
+        await localRelease;
+      }
+      return snapshot;
+    };
+    return options;
+  };
+  const local = runDomainCoordinatorProvisioningMonitorOnce(makeOptions(localHostExecutor, true));
+  await localEntered;
+  const remote = runDomainCoordinatorProvisioningMonitorOnce(makeOptions(remoteHostExecutor, false));
+  releaseLocal();
+  const results = await Promise.all([local, remote]);
+  assert.deepEqual(observedHosts, ["local", "remote-builder"]);
+  assert.deepEqual(results, [
+    { provisioned: false, reason: "no-domain-work" },
+    { provisioned: false, reason: "no-domain-work" },
+  ]);
+});
+
+test("CAP-60 Domain provisioning rejects immutable drift after every durable transition", async () => {
+  const domainThreadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
+  const cases = ["request", "rebind", "starting", "reset", "attach", "resume"];
+  for (const action of cases) {
+    const projectId = `cap60-envelope-${action}`;
+    const snapshot = cap60DomainSnapshot({
+      projectId,
+      globalHostId: "local",
+      domains: [{
+        domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+        eligibleTaskIds: ["frontend"], writeScope: ["web"],
+      }],
+      lanes: [{
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "frontend-template-thread",
+        codexProjectId: "frontend-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: "/tmp/cap60-envelope-frontend",
+      }],
+    });
+    const effects = [];
+    const currentRevision = "a".repeat(64);
+    let attempt = action === "request"
+      ? null
+      : cap60DomainAttempt(snapshot, action === "rebind" ? {
+        expectedRevision: "b".repeat(64),
+        expectedGlobalLeaseId: "previous-global-lease",
+        status: "started",
+        threadId: domainThreadId,
+      } : action === "resume" ? {
+        status: "expired", threadId: domainThreadId,
+      } : {});
+    const drift = (candidate) => ({ ...candidate, label: "Drifted Coordinator" });
+    const result = await runDomainCoordinatorProvisioningMonitorOnce({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId, model: "gpt-5", reasoningEffort: "high" },
+      readSnapshot: async () => snapshot,
+      readWindows: async () => ({ projectId, revision: currentRevision }),
+      getAttempt: async ({ idempotencyKey }) => {
+        if (action === "request") return { attempt: null };
+        if (action === "rebind" && idempotencyKey) return { attempt: null };
+        return { attempt: { ...attempt } };
+      },
+      requestAttempt: async () => {
+        effects.push("request");
+        attempt = cap60DomainAttempt(snapshot);
+        return { attempt: drift(attempt) };
+      },
+      rebindAttempt: async ({ expectedRevision, expectedGlobalLeaseId }) => {
+        effects.push("rebind");
+        attempt = { ...attempt, expectedRevision, expectedGlobalLeaseId };
+        return { attempt: drift(attempt) };
+      },
+      findThread: async () => {
+        effects.push("find-thread");
+        return null;
+      },
+      readThread: async () => {
+        effects.push("read-thread");
+        return {
+          id: domainThreadId,
+          cwd: attempt.workspacePath,
+          threadSource: attempt.threadSource,
+          turns: [{
+            id: "cap60-envelope-turn",
+            status: "completed",
+            input: `TASKBOARD_DOMAIN_COORDINATOR_PROVISIONING_V1:${attempt.id}`,
+          }],
+        };
+      },
+      markStarting: async () => {
+        effects.push("starting");
+        attempt = { ...attempt, status: "starting" };
+        return { attempt: action === "starting" ? drift(attempt) : { ...attempt } };
+      },
+      startThread: async () => {
+        effects.push("start-thread");
+        if (action === "reset") {
+          throw new Error("Selected model is at capacity. Please try a different model.");
+        }
+        return { thread: {
+          id: domainThreadId,
+          cwd: attempt.workspacePath,
+          threadSource: attempt.threadSource,
+        } };
+      },
+      resetAttempt: async () => {
+        effects.push("reset");
+        attempt = { ...attempt, status: "pending", retryCount: attempt.retryCount + 1 };
+        return { attempt: drift(attempt) };
+      },
+      attachThread: async ({ threadId }) => {
+        effects.push("attach");
+        attempt = { ...attempt, status: "started", threadId };
+        return { attempt: action === "attach" ? drift(attempt) : { ...attempt } };
+      },
+      resumeExpiredAttempt: async () => {
+        effects.push("resume");
+        attempt = { ...attempt, status: "started", expiresAt: "2099-01-01T00:00:00.000Z" };
+        return { attempt: drift(attempt) };
+      },
+      deliverInstruction: async () => {
+        effects.push("deliver");
+        return { delivery: "started", turnId: "cap60-envelope-turn" };
+      },
+    });
+    assert.equal(result.reason, "attempt-binding-mismatch", `${action}: ${JSON.stringify(result)}`);
+    assert.equal(effects.at(-1), action, `${action}: ${JSON.stringify(effects)}`);
+    assert.equal(effects.includes("deliver"), false, action);
+  }
+});
+
+test("CAP-60 Domain provisioning never falls back from a partially bound peer route", async () => {
+  const projectId = "cap60-partial-route";
+  const effects = [];
+  const snapshot = cap60DomainSnapshot({
+    projectId,
+    globalHostId: "local",
+    domains: [{
+      domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+      eligibleTaskIds: ["frontend"], writeScope: ["web"],
+    }],
+    lanes: [{
+      id: "frontend", label: "Frontend Coordinator", source: "codex",
+      taskType: "peer_task", threadId: "frontend-template-thread",
+      codexProjectId: "partial-project",
+    }],
+  });
+  const result = await runDomainCoordinatorProvisioningMonitorOnce(
+    cap60DomainMonitorOptions({
+      projectId, hostExecutor: localHostExecutor, snapshot, effects,
+    }),
+  );
+  assert.deepEqual(result, {
+    provisioned: false, reason: "domain-route-unavailable", domainId: "frontend",
+  });
+  assert.deepEqual(effects, ["snapshot", "windows"]);
 });

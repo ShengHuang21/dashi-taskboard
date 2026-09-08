@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
@@ -13,6 +14,7 @@ import { resolvePort } from "../server/app.mjs";
 import { normalizeRepository } from "../server/standing-authority.mjs";
 import { resolveCodexExecutable } from "../shared/codex-executable.mjs";
 import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment.mjs";
+import { isCanonicalCodexHostId } from "../shared/domain.mjs";
 import {
   parseTaskboardAutomationHostRequest,
   reconcileTaskboardAutomation,
@@ -24,6 +26,7 @@ import {
   classifyCoordinatorProvisioningActiveThread,
   classifyCoordinatorProvisioningDeliveryTurns,
   buildCoordinatorProvisioningDeliveryTurnStartParams,
+  coordinatorProvisioningResponseJson,
   coordinatorProvisioningTurnStartParams,
   planCoordinatorProvisioningDeliveryRetry,
   selectCoordinatorProvisioningFallbackModel,
@@ -73,9 +76,28 @@ import { createNativeTaskboardPanelOpener } from "./taskboard-panel-open.mjs";
 import { readCodexQuotaStatus } from "./codex-rate-limits.mjs";
 import { createTaskboardSupervisor } from "./taskboard-supervisor.mjs";
 import {
+  createHostExecutorApi,
+  createHostExecutorEffectKey,
+} from "./host-executor-api.mjs";
+import { createHostExecutorLeaseLifecycle } from "./host-executor-lifecycle.mjs";
+import {
+  createRemoteHostInventoryController,
+  createRemoteHostExecutorManager,
+  createRemoteHostExecutorWorker,
+  decodeCodexRendererRpcOutcome,
+} from "./remote-host-executor-runtime.mjs";
+import {
   CdpPipeBrowser,
   validatedLoopbackCdpWebSocketUrl,
 } from "./codex-cdp-pipe.mjs";
+import {
+  LocalCodexThreadRpcLifecycle,
+  createLocalCodexThreadRpcTransport,
+  launchLocalCodexAppServer,
+  selectCodexThreadRpcRoute,
+  shouldRetireLocalCodexThreadRpcTransport,
+  shouldUseLocalCodexThreadRpc,
+} from "../server/codex-thread-rpc.mjs";
 
 const injectorPath = fileURLToPath(import.meta.url);
 const projectRoot = path.resolve(path.dirname(injectorPath), "..");
@@ -165,6 +187,19 @@ const taskConversationOperations = new Map();
 const taskConversationFailureTtlMs = 120_000;
 const backgroundContinuationPolicyPrefix = "taskboard:background-continuation:policy:";
 const backgroundContinuationIntervalMs = 15_000;
+const residentHostExecutor = Object.freeze({ ownedCodexHostId: "local" });
+const residentHostExecutorAdapterId = "local-codex-app-server-v1";
+const remoteHostExecutorAdapterId = "codex-renderer-rpc-v1";
+const residentHostExecutorMutatingRpcMethods = new Set([
+  "thread/archive",
+  "thread/name/set",
+  "thread/resume",
+  "thread/start",
+  "turn/start",
+  "turn/steer",
+]);
+const residentHostExecutorLeaseDurationSeconds = 120;
+const residentHostExecutorRenewIntervalMs = 30_000;
 const coordinatorIdentityHandshakeIntervalMs = 2_000;
 const coordinatorLeaseRenewWindowMs = 45_000;
 const coordinatorLeaseDurationSeconds = 120;
@@ -183,6 +218,59 @@ const quotaPolicyRestorePromises = new WeakMap();
 let quotaPoliciesLoadPromise = null;
 let quotaPoliciesWritePromise = Promise.resolve();
 const taskConversationAppServerTimeoutMs = 30_000;
+const hostExecutorEffectTimeoutMs = taskConversationAppServerTimeoutMs + 10_000;
+let localCodexThreadRpcEnabled = false;
+let localCodexThreadRpcLifecycle = null;
+let residentHostExecutorLeaseLifecycle = null;
+const residentHostExecutorContext = new AsyncLocalStorage();
+
+function residentHostExecutorExecution() {
+  const envelope = residentHostExecutorLeaseLifecycle?.executionEnvelope();
+  if (!envelope) return null;
+  return Object.freeze({ ownedCodexHostId: envelope.codexHostId, ...envelope });
+}
+
+function currentResidentHostExecutorExecution() {
+  return residentHostExecutorContext.getStore() ?? residentHostExecutorExecution();
+}
+
+function residentHostExecutorFenceHeaders(pathname, body, method = "POST") {
+  const execution = currentResidentHostExecutorExecution();
+  if (!execution) throw new Error("Taskboard resident host executor lease is unavailable");
+  const serialized = Buffer.from(JSON.stringify({
+    codexHostId: execution.codexHostId,
+    executorInstanceId: execution.executorInstanceId,
+    registrationFingerprint: execution.registrationFingerprint,
+    leaseId: execution.leaseId,
+  }), "utf8").toString("base64url");
+  return {
+    "x-codex-taskboard-host-execution": serialized,
+    "x-codex-taskboard-host-execution-proof": createHmac("sha256", taskboardInstanceSecret)
+      .update(JSON.stringify({ method, pathname, body, execution: serialized }))
+      .digest("hex"),
+  };
+}
+
+function residentHostExecutorLeaseIsActive() {
+  return residentHostExecutorLeaseLifecycle?.isActive() === true;
+}
+
+async function ensureLocalCodexThreadRpcTransport() {
+  if (!localCodexThreadRpcEnabled || !localCodexThreadRpcLifecycle) {
+    throw new Error("Local Codex thread RPC is not enabled");
+  }
+  return localCodexThreadRpcLifecycle.ensure();
+}
+
+async function closeLocalCodexThreadRpcTransport() {
+  localCodexThreadRpcEnabled = false;
+  const lifecycle = localCodexThreadRpcLifecycle;
+  if (!lifecycle) return;
+  await lifecycle.close();
+  if (localCodexThreadRpcLifecycle === lifecycle) {
+    localCodexThreadRpcLifecycle = null;
+  }
+}
 
 function parseArgs(argv) {
   const options = {
@@ -1151,6 +1239,78 @@ async function requestCodexAppServerViaCdp(
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
 ) {
+  const residentExecution = residentHostExecutorContext.getStore();
+  if (residentExecution && residentHostExecutorMutatingRpcMethods.has(method)) {
+    if (hostId !== residentExecution.codexHostId) {
+      throw new Error("Resident host executor cannot mutate a different Codex host");
+    }
+    if (method === "turn/start" && params?.approvalPolicy !== "never") {
+      throw new Error("Headless Codex turns require approvalPolicy 'never'");
+    }
+    const effectKey = createHostExecutorEffectKey({
+      codexHostId: hostId,
+      method,
+      params,
+    });
+    const result = await createHostExecutorApi({
+      baseUrl: taskboardBaseUrl,
+      instanceSecret: taskboardInstanceSecret,
+      timeoutSignal: () => AbortSignal.timeout(
+        Math.max(timeoutMs, hostExecutorEffectTimeoutMs),
+      ),
+    }).executeEffect({
+      effectKey,
+      execution: {
+        codexHostId: residentExecution.codexHostId,
+        executorInstanceId: residentExecution.executorInstanceId,
+        registrationFingerprint: residentExecution.registrationFingerprint,
+        leaseId: residentExecution.leaseId,
+      },
+      operations: [{ method, params }],
+    });
+    if (!Array.isArray(result?.results) || result.results.length !== 1) {
+      throw new Error("Taskboard host executor dispatcher returned an invalid result");
+    }
+    return result.results[0];
+  }
+  if (selectCodexThreadRpcRoute({
+    localEnabled: localCodexThreadRpcEnabled,
+    codexHostId: hostId,
+  }) === "local") {
+    if (method === "turn/start" && params?.approvalPolicy !== "never") {
+      throw new Error("Headless Codex turns require approvalPolicy 'never'");
+    }
+    const transport = await ensureLocalCodexThreadRpcTransport();
+    try {
+      return await transport.request(hostId, method, params, timeoutMs);
+    } catch (error) {
+      if (shouldRetireLocalCodexThreadRpcTransport(error)) {
+        await localCodexThreadRpcLifecycle?.retire(transport).catch(() => {});
+      }
+      throw error;
+    }
+  }
+  return requestCodexRendererRpcViaCdp(
+    cdp,
+    executionContextId,
+    hostId,
+    method,
+    params,
+    timeoutMs,
+  );
+}
+
+async function requestCodexRendererRpcViaCdp(
+  cdp,
+  executionContextId,
+  hostId,
+  method,
+  params,
+  timeoutMs = taskConversationAppServerTimeoutMs,
+) {
+  if (!cdp || typeof cdp.send !== "function") {
+    throw new Error("Codex renderer RPC is unavailable");
+  }
   const requestId = [
     "taskboard-thread",
     process.pid,
@@ -1162,7 +1322,10 @@ async function requestCodexAppServerViaCdp(
       const requestId = ${JSON.stringify(requestId)};
       const bridge = window.electronBridge;
       if (!bridge || typeof bridge.sendMessageFromView !== "function") {
-        resolve({ ok: false, error: "Codex App Server bridge is unavailable" });
+        resolve({
+          kind: "transport-error",
+          error: "Codex App Server bridge is unavailable",
+        });
         return;
       }
       let settled = false;
@@ -1183,17 +1346,13 @@ async function requestCodexAppServerViaCdp(
           || message.message?.id !== requestId
         ) return;
         event.stopImmediatePropagation();
-        if (message.message.error) {
-          finish({
-            ok: false,
-            error: message.message.error.message || "Codex App Server request failed",
-          });
-          return;
-        }
-        finish({ ok: true, result: message.message.result });
+        finish({ kind: "response", message: message.message });
       };
       const timeout = window.setTimeout(
-        () => finish({ ok: false, error: "Codex App Server request timed out" }),
+        () => finish({
+          kind: "transport-error",
+          error: "Codex App Server request timed out",
+        }),
         ${JSON.stringify(timeoutMs)},
       );
       window.addEventListener("message", onMessage, true);
@@ -1211,7 +1370,7 @@ async function requestCodexAppServerViaCdp(
         expiresAtMs: Date.now() + ${JSON.stringify(timeoutMs)},
       })).catch((error) => {
         finish({
-          ok: false,
+          kind: "transport-error",
           error: error instanceof Error ? error.message : String(error),
         });
       });
@@ -1227,8 +1386,54 @@ async function requestCodexAppServerViaCdp(
     );
   }
   const response = evaluation.result.value;
-  if (!response?.ok) throw new Error(response?.error || "Codex App Server request failed");
-  return response.result;
+  return decodeCodexRendererRpcOutcome(response);
+}
+
+async function readCodexRemoteHostIdsViaCdp(cdp) {
+  if (!cdp || typeof cdp.send !== "function" || cdp.closed) {
+    throw new Error("Codex renderer metadata is unavailable");
+  }
+  const evaluation = await cdp.send("Runtime.evaluate", {
+    expression: `(async () => {
+      const bridge = window.electronBridge;
+      if (!bridge || typeof bridge.getInitialSidebarBootstrap !== "function") {
+        return { available: false };
+      }
+      const bootstrap = await bridge.getInitialSidebarBootstrap();
+      const entries = Array.isArray(bootstrap?.globalStateEntries)
+        ? bootstrap.globalStateEntries
+        : [];
+      const remoteProjects = entries.find((entry) => entry?.key === "remote-projects")?.value;
+      if (!Array.isArray(remoteProjects)) return { available: false };
+      const complete = remoteProjects.every((project) => (
+        typeof project?.id === "string" && project.id.trim()
+        && typeof project?.remotePath === "string" && project.remotePath.trim()
+        && typeof project?.hostId === "string" && project.hostId.trim()
+      ));
+      if (!complete) return { available: false };
+      return {
+        available: true,
+        hostIds: remoteProjects.map((project) => project.hostId.trim()),
+      };
+    })()`,
+    awaitPromise: true,
+    returnByValue: true,
+  });
+  if (evaluation.exceptionDetails) {
+    throw new Error(
+      evaluation.exceptionDetails.exception?.description
+      || "Codex renderer project metadata failed",
+    );
+  }
+  const result = evaluation.result.value;
+  if (result?.available !== true || !Array.isArray(result.hostIds)) {
+    throw new Error("Codex renderer did not publish authoritative remote project metadata");
+  }
+  const hostIds = [...new Set(result.hostIds)];
+  if (hostIds.some((hostId) => !isCanonicalCodexHostId(hostId) || hostId === "local")) {
+    throw new Error("Codex renderer published an invalid remote host identity");
+  }
+  return hostIds.sort();
 }
 
 function initializeHostRequestQueueExpression(queueName) {
@@ -2028,7 +2233,40 @@ function coordinatorRenewProofHeaders(pathname, body, method = "POST") {
     "x-codex-taskboard-injector-proof": createHmac("sha256", taskboardInstanceSecret)
       .update(JSON.stringify({ nonce, issuedAt, method, pathname, body }))
       .digest("hex"),
+    ...residentHostExecutorFenceHeaders(pathname, body, method),
   };
+}
+
+function createResidentHostExecutorLeaseLifecycle() {
+  const hostExecutorApi = createHostExecutorApi({
+    baseUrl: taskboardBaseUrl,
+    instanceSecret: taskboardInstanceSecret,
+  });
+  return createHostExecutorLeaseLifecycle({
+    codexHostId: residentHostExecutor.ownedCodexHostId,
+    executorInstanceId: randomUUID(),
+    adapterId: residentHostExecutorAdapterId,
+    leaseDurationSeconds: residentHostExecutorLeaseDurationSeconds,
+    renewIntervalMs: residentHostExecutorRenewIntervalMs,
+    register: hostExecutorApi.register,
+    inspect: hostExecutorApi.inspect,
+    acquire: hostExecutorApi.acquire,
+    renew: hostExecutorApi.renew,
+    release: hostExecutorApi.release,
+    createOperationId: randomUUID,
+    onStateChange: (state) => {
+      console.log(JSON.stringify({
+        event: "taskboard.host-executor.lease",
+        codexHostId: residentHostExecutor.ownedCodexHostId,
+        active: state.active,
+        reason: state.reason,
+        leaseStatus: state.lease?.status ?? null,
+      }));
+    },
+    onError: (error) => {
+      console.error(`Taskboard host executor lease unavailable: ${error.message}`);
+    },
+  });
 }
 
 async function listCoordinatorIdentityHandshakes(projectId) {
@@ -2074,8 +2312,7 @@ async function mutateCoordinatorProvisioning(pathname, body) {
     cache: "no-store",
     signal: AbortSignal.timeout(5_000),
   });
-  if (!response.ok) throw new Error(`Taskboard Coordinator provisioning returned HTTP ${response.status}`);
-  return response.json();
+  return coordinatorProvisioningResponseJson(response);
 }
 
 async function requestCoordinatorProvisioningAttempt(request) {
@@ -2086,9 +2323,10 @@ async function requestCoordinatorProvisioningAttempt(request) {
 
 async function getCoordinatorProvisioningAttempt(request) {
   const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/coordinator-provisioning-attempts/lookup`;
-  return mutateCoordinatorProvisioning(pathname, request.idempotencyKey
-    ? { idempotencyKey: request.idempotencyKey }
-    : {});
+  return mutateCoordinatorProvisioning(pathname, {
+    ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+    ownedCodexHostId: request.ownedCodexHostId,
+  });
 }
 
 async function requestDomainCoordinatorProvisioningAttempt(request) {
@@ -2099,9 +2337,10 @@ async function requestDomainCoordinatorProvisioningAttempt(request) {
 
 async function getDomainCoordinatorProvisioningAttempt(request) {
   const pathname = `/api/local/projects/${encodeURIComponent(request.projectId)}/domain-coordinator-provisioning-attempts/${encodeURIComponent(request.domainId)}/lookup`;
-  return mutateCoordinatorProvisioning(pathname, request.idempotencyKey
-    ? { idempotencyKey: request.idempotencyKey }
-    : {});
+  return mutateCoordinatorProvisioning(pathname, {
+    ...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
+    ownedCodexHostId: request.ownedCodexHostId,
+  });
 }
 
 async function getCoordinatorShutdownAttempt(request) {
@@ -2115,9 +2354,9 @@ async function requestCoordinatorShutdownAttempt(request) {
   return mutateCoordinatorProvisioning(pathname, body);
 }
 
-async function transitionCoordinatorShutdownAttempt(attemptId, action) {
+async function transitionCoordinatorShutdownAttempt(attemptId, action, { ownedCodexHostId }) {
   const pathname = `/api/local/coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
-  return mutateCoordinatorProvisioning(pathname, {});
+  return mutateCoordinatorProvisioning(pathname, { ownedCodexHostId });
 }
 
 async function getDomainCoordinatorShutdownAttempt(request) {
@@ -2133,9 +2372,9 @@ async function requestDomainCoordinatorShutdownAttempt(request) {
   return mutateCoordinatorProvisioning(pathname, body);
 }
 
-async function transitionDomainCoordinatorShutdownAttempt(attemptId, action) {
+async function transitionDomainCoordinatorShutdownAttempt(attemptId, action, { ownedCodexHostId }) {
   const pathname = `/api/local/domain-coordinator-shutdown-attempts/${encodeURIComponent(attemptId)}/${action}`;
-  return mutateCoordinatorProvisioning(pathname, {});
+  return mutateCoordinatorProvisioning(pathname, { ownedCodexHostId });
 }
 
 async function findArchivedCoordinatorThread(cdp, attempt) {
@@ -2229,9 +2468,12 @@ async function inspectCoordinatorProvisioningWindow(cdp, window) {
   }
 }
 
-async function transitionCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
+async function transitionCoordinatorProvisioningAttempt(attemptId, action, {
+  ownedCodexHostId,
+  ...body
+} = {}) {
   const pathname = `/api/local/coordinator-provisioning-attempts/${encodeURIComponent(attemptId)}/${action}`;
-  return mutateCoordinatorProvisioning(pathname, body);
+  return mutateCoordinatorProvisioning(pathname, { ...body, ownedCodexHostId });
 }
 
 async function transitionDomainCoordinatorProvisioningAttempt(attemptId, action, body = {}) {
@@ -2440,12 +2682,20 @@ function injectorProofHeaders() {
   };
 }
 
+function residentInjectorProofHeaders(pathname, body) {
+  return {
+    ...injectorProofHeaders(),
+    ...residentHostExecutorFenceHeaders(pathname, body),
+  };
+}
+
 async function claimOwnerDecisionDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/claim`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2463,11 +2713,12 @@ async function claimOwnerDecisionDelivery(request, projectId) {
 }
 
 async function confirmOwnerDecisionDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/confirm`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-decision-delivery/confirm`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2483,11 +2734,12 @@ async function confirmOwnerDecisionDelivery(request, projectId) {
 }
 
 async function claimCrossDomainHandoffDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/claim`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2506,11 +2758,12 @@ async function claimCrossDomainHandoffDelivery(request, projectId) {
 }
 
 async function confirmCrossDomainHandoffDelivery(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/confirm`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/cross-domain-handoff-delivery/confirm`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2526,23 +2779,29 @@ async function confirmCrossDomainHandoffDelivery(request, projectId) {
 }
 
 async function recordOwnerDecision(request) {
+  const pathname = `/api/tasks/${encodeURIComponent(request.taskId)}/owner-decisions`;
+  const body = {
+    requestId: request.requestId,
+    expectedResumeToken: request.expectedResumeToken,
+    outcome: request.outcome,
+    ownerTurnId: request.ownerTurnId,
+    rootDecisionTurnId: request.rootDecisionTurnId,
+    rootThreadId: request.rootThreadId,
+    rootCodexProjectId: request.rootCodexProjectId,
+    rootCodexProjectKind: request.rootCodexProjectKind,
+    rootCodexHostId: request.rootCodexHostId,
+    rootWorkspacePath: request.rootWorkspacePath,
+    evidence: request.evidence,
+    deliveryId: request.deliveryId,
+    receipt: `owner-decision:${request.deliveryId}:${request.rootDecisionTurnId}`,
+    decidedAt: new Date().toISOString(),
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(request.taskId)}/owner-decisions`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        requestId: request.requestId,
-        expectedResumeToken: request.expectedResumeToken,
-        outcome: request.outcome,
-        ownerTurnId: request.ownerTurnId,
-        rootDecisionTurnId: request.rootDecisionTurnId,
-        rootThreadId: request.rootThreadId,
-        evidence: request.evidence,
-        deliveryId: request.deliveryId,
-        receipt: `owner-decision:${request.deliveryId}:${request.rootDecisionTurnId}`,
-        decidedAt: new Date().toISOString(),
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2556,16 +2815,18 @@ async function recordOwnerDecision(request) {
 }
 
 async function claimOwnerIntentAdoption(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/adoption/claim`;
+  const body = {
+    coordinatorTaskId: request.route.coordinatorTaskId,
+    coordinatorThreadId: request.route.coordinatorThreadId,
+    coordinatorEpoch: request.coordinatorEpoch,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/adoption/claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        coordinatorTaskId: request.route.coordinatorTaskId,
-        coordinatorThreadId: request.route.coordinatorThreadId,
-        coordinatorEpoch: request.coordinatorEpoch,
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2601,11 +2862,12 @@ async function listOwnerIntents(projectId) {
 }
 
 async function recordOwnerIntentCapture(request, projectId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2626,11 +2888,12 @@ async function recordOwnerIntentCapture(request, projectId) {
 }
 
 async function confirmOwnerIntentAdoption(request, projectId, intentId) {
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(intentId)}/adoption/confirm`;
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(intentId)}/adoption/confirm`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
+      headers: residentInjectorProofHeaders(pathname, request),
       body: JSON.stringify(request),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
@@ -2657,19 +2920,21 @@ async function applyOwnerIntentPlan(request, plan, projectId) {
     || markerCoordinatorEpoch !== request.adoptionReceipt.coordinatorEpoch) {
     return { applied: false, reason: "stale-plan-marker" };
   }
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-revisions`;
+  const body = {
+    ...serverPlan,
+    intentVersion: request.version,
+    adoptionId: request.adoptionReceipt.id,
+    coordinatorTaskId: request.route.coordinatorTaskId,
+    coordinatorThreadId: request.route.coordinatorThreadId,
+    coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-revisions`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        ...serverPlan,
-        intentVersion: request.version,
-        adoptionId: request.adoptionReceipt.id,
-        coordinatorTaskId: request.route.coordinatorTaskId,
-        coordinatorThreadId: request.route.coordinatorThreadId,
-        coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2699,16 +2964,18 @@ async function scheduleOwnerIntentPlanRetry(request, failure, projectId) {
     reason: failure.reason,
     revisionId: failure.revisionId ?? null,
   })).digest("hex");
+  const pathname = `/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-retry`;
+  const body = {
+    adoptionId: request.adoptionReceipt.id,
+    coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
+    failureKey,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/local/projects/${encodeURIComponent(projectId)}/owner-intents/${encodeURIComponent(request.intentId)}/plan-retry`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: injectorProofHeaders(),
-      body: JSON.stringify({
-        adoptionId: request.adoptionReceipt.id,
-        coordinatorEpoch: request.adoptionReceipt.coordinatorEpoch,
-        failureKey,
-      }),
+      headers: residentInjectorProofHeaders(pathname, body),
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2724,17 +2991,23 @@ async function scheduleOwnerIntentPlanRetry(request, failure, projectId) {
 
 async function claimBackgroundContinuationReceipt(claim) {
   const reservationLeaseId = randomUUID();
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    ownedCodexHostId: claim.ownedCodexHostId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-claim`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2745,6 +3018,11 @@ async function claimBackgroundContinuationReceipt(claim) {
   }
   const result = await response.json();
   const recovering = result?.recovering === true;
+  const coordinatorLeaseUnavailable = result?.coordinatorLeaseChanged === true
+    && result?.reused === true
+    && result?.available === false
+    && result?.completed === false
+    && result?.recovering === false;
   if (
     result?.receipt?.taskId !== claim.taskId
     || result.receipt.safeActionId !== claim.safeActionId
@@ -2753,9 +3031,10 @@ async function claimBackgroundContinuationReceipt(claim) {
     || typeof result.reused !== "boolean"
     || typeof result.available !== "boolean"
     || typeof result.completed !== "boolean"
-    || (!recovering && result.receipt.rootThreadId !== claim.rootThreadId)
-    || (!recovering && result.receipt.resumeToken !== claim.expectedResumeToken)
-    || (!recovering && result.available === true && result.receipt.reservationLeaseId !== reservationLeaseId)
+    || (result?.coordinatorLeaseChanged === true && !coordinatorLeaseUnavailable)
+    || (!recovering && !coordinatorLeaseUnavailable && result.receipt.rootThreadId !== claim.rootThreadId)
+    || (!recovering && !coordinatorLeaseUnavailable && result.receipt.resumeToken !== claim.expectedResumeToken)
+    || (!recovering && !coordinatorLeaseUnavailable && result.available === true && result.receipt.reservationLeaseId !== reservationLeaseId)
     || (recovering && result.available === true && (
       result.recoveryLeaseId !== reservationLeaseId
       || result.recoveryRoute?.rootThreadId !== result.receipt.rootThreadId
@@ -2773,17 +3052,22 @@ async function claimBackgroundContinuationReceipt(claim) {
 }
 
 async function confirmBackgroundContinuationDelivery(claim) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-delivery`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-delivery`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2802,20 +3086,25 @@ async function confirmBackgroundContinuationDelivery(claim) {
 }
 
 async function revalidateBackgroundContinuationHostAccess(claim) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-host-access`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+    recoveryLeaseId: claim.recoveryLeaseId,
+    admissionReceiptId: claim.deliveryReceipt.id,
+    admissionAttemptId: claim.deliveryReceipt.admissionAttemptId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-host-access`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
-        recoveryLeaseId: claim.recoveryLeaseId,
-        admissionReceiptId: claim.deliveryReceipt.id,
-        admissionAttemptId: claim.deliveryReceipt.admissionAttemptId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2827,19 +3116,24 @@ async function revalidateBackgroundContinuationHostAccess(claim) {
 }
 
 async function completeBackgroundContinuationDelivery(claim, delivery) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-complete`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+    recoveryLeaseId: claim.recoveryLeaseId,
+    deliveryTurnId: delivery?.turnId,
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/bootstrap-complete`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
-        recoveryLeaseId: claim.recoveryLeaseId,
-        deliveryTurnId: delivery?.turnId,
-      }),
+      headers: {
+        "content-type": "application/json",
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2861,19 +3155,24 @@ async function completeBackgroundContinuationDelivery(claim, delivery) {
 }
 
 async function mutateBackgroundAdmission(claim, action) {
+  const pathname = `/api/tasks/${encodeURIComponent(claim.todoId)}/admission-${action}`;
+  const body = {
+    rootThreadId: claim.rootThreadId,
+    expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId,
+    admissionReceiptId: claim.admissionReceiptId,
+    admissionAttemptId: claim.admissionAttemptId,
+    ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
+  };
   const response = await fetch(
-    `${taskboardBaseUrl}/api/tasks/${encodeURIComponent(claim.todoId)}/admission-${action}`,
+    `${taskboardBaseUrl}${pathname}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json", ...injectorProofHeaders() },
-      body: JSON.stringify({
-        rootThreadId: claim.rootThreadId,
-        expectedResumeToken: claim.expectedResumeToken,
-        safeActionId: claim.safeActionId,
-        admissionReceiptId: claim.admissionReceiptId,
-        admissionAttemptId: claim.admissionAttemptId,
-        ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
-      }),
+      headers: {
+        ...injectorProofHeaders(),
+        ...residentHostExecutorFenceHeaders(pathname, body),
+      },
+      body: JSON.stringify(body),
       cache: "no-store",
       signal: AbortSignal.timeout(5_000),
     },
@@ -2988,6 +3287,7 @@ function validateGitExecutionTarget(targetRoot, expectedIdentity) {
 
 function runBackgroundContinuationDispatch(cdp, projectId) {
   return runTaskboardContinuationMonitorOnce({
+    hostExecutor: currentResidentHostExecutorExecution(),
     policy: {
       enabled: true,
       projectId,
@@ -3051,6 +3351,7 @@ async function runBackgroundContinuationFastLane(cdp) {
   });
   return runTaskboardContinuationFastLane({
     projects,
+    hostExecutor: currentResidentHostExecutorExecution(),
     runContinuation: (projectId) => runBackgroundContinuationDispatch(cdp, projectId),
     observeResult: (result) => {
       if (!result.ok) {
@@ -3078,6 +3379,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     const monitors = [];
     if (continuationEnabled) monitors.push(
       () => runCoordinatorShutdownMonitorOnce({
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3096,18 +3398,19 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         getAttempt: getCoordinatorShutdownAttempt,
         requestAttempt: requestCoordinatorShutdownAttempt,
-        releaseAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
-          attemptId, "release",
+        releaseAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "release", { ownedCodexHostId },
         ),
         findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
         archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
           cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
         ),
-        completeAttempt: ({ attemptId }) => transitionCoordinatorShutdownAttempt(
-          attemptId, "complete",
+        completeAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorShutdownAttempt(
+          attemptId, "complete", { ownedCodexHostId },
         ),
       }),
       () => runDomainCoordinatorShutdownMonitorOnce({
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3122,29 +3425,30 @@ async function runBackgroundContinuationMonitor(cdp) {
         ),
         getAttempt: getDomainCoordinatorShutdownAttempt,
         requestAttempt: requestDomainCoordinatorShutdownAttempt,
-        releaseAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "release",
+        releaseAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "release", { ownedCodexHostId },
         ),
-        authorizeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "authorize",
+        authorizeAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "authorize", { ownedCodexHostId },
         ),
-        beginArchiveAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "begin-archive",
+        beginArchiveAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "begin-archive", { ownedCodexHostId },
         ),
-        cancelAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "cancel",
+        cancelAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "cancel", { ownedCodexHostId },
         ),
         findArchivedThread: (attempt) => findArchivedCoordinatorThread(cdp, attempt),
         archiveThread: ({ threadId, codexHostId }) => requestCodexAppServerViaCdp(
           cdp, undefined, codexHostId, "thread/archive", { threadId }, 10_000,
         ),
-        completeAttempt: ({ attemptId }) => transitionDomainCoordinatorShutdownAttempt(
-          attemptId, "complete",
+        completeAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorShutdownAttempt(
+          attemptId, "complete", { ownedCodexHostId },
         ),
       }),
     );
     monitors.push(
       () => runCoordinatorLeaseKeepaliveMonitorOnce({
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3165,6 +3469,7 @@ async function runBackgroundContinuationMonitor(cdp) {
     );
     if (continuationEnabled) monitors.push(
       () => runCoordinatorLeaseRecoveryMonitorOnce({
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3183,6 +3488,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       async () => {
         const result = await runCoordinatorProvisioningMonitorOnce({
+          hostExecutor: currentResidentHostExecutorExecution(),
           policy: {
             enabled: true,
             projectId,
@@ -3193,9 +3499,9 @@ async function runBackgroundContinuationMonitor(cdp) {
           readWindows: () => readCoordinatorProvisioningWindows(projectId),
           readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
           getAttempt: getCoordinatorProvisioningAttempt,
-          rebindAttempt: ({ attemptId, expectedRevision }) => (
+          rebindAttempt: ({ attemptId, expectedRevision, ownedCodexHostId }) => (
             transitionCoordinatorProvisioningAttempt(
-              attemptId, "rebind", { expectedRevision },
+              attemptId, "rebind", { expectedRevision, ownedCodexHostId },
             )
           ),
           inspectCoordinatorWindow: (window) => inspectCoordinatorProvisioningWindow(cdp, window),
@@ -3209,29 +3515,29 @@ async function runBackgroundContinuationMonitor(cdp) {
           }),
           findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
           findArchivedThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt, true),
-          markStarting: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "starting",
+          markStarting: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "starting", { ownedCodexHostId },
           ),
           startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
             cdp, undefined, codexHostId, "thread/start", params, 10_000,
           ),
-          attachThread: ({ attemptId, threadId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "attach", { threadId },
+          attachThread: ({ attemptId, threadId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "attach", { threadId, ownedCodexHostId },
           ),
-          resetAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "reset",
+          resetAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "reset", { ownedCodexHostId },
           ),
-          resetMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "reset-missing",
+          resetMissingAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "reset-missing", { ownedCodexHostId },
           ),
-          observeMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "observe-missing",
+          observeMissingAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "observe-missing", { ownedCodexHostId },
           ),
-          clearMissingAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "clear-missing",
+          clearMissingAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "clear-missing", { ownedCodexHostId },
           ),
-          resumeExpiredAttempt: ({ attemptId }) => transitionCoordinatorProvisioningAttempt(
-            attemptId, "resume-expired",
+          resumeExpiredAttempt: ({ attemptId, ownedCodexHostId }) => transitionCoordinatorProvisioningAttempt(
+            attemptId, "resume-expired", { ownedCodexHostId },
           ),
           deliverInstruction: ({ attempt, threadId }) => deliverCoordinatorProvisioningInstruction(
             cdp, attempt, threadId, projectId,
@@ -3241,6 +3547,7 @@ async function runBackgroundContinuationMonitor(cdp) {
         return result;
       },
       () => runDomainCoordinatorProvisioningMonitorOnce({
+        hostExecutor: currentResidentHostExecutorExecution(),
         policy: {
           enabled: true,
           projectId,
@@ -3252,9 +3559,13 @@ async function runBackgroundContinuationMonitor(cdp) {
         readDefaultModel: (route) => readDefaultCoordinatorModel(cdp, route),
         getAttempt: getDomainCoordinatorProvisioningAttempt,
         requestAttempt: requestDomainCoordinatorProvisioningAttempt,
-        rebindAttempt: ({ attemptId, expectedRevision, expectedGlobalLeaseId }) => (
+        rebindAttempt: ({
+          attemptId, expectedRevision, expectedGlobalLeaseId, ownedCodexHostId,
+        }) => (
           transitionDomainCoordinatorProvisioningAttempt(
-            attemptId, "rebind", { expectedRevision, expectedGlobalLeaseId },
+            attemptId,
+            "rebind",
+            { expectedRevision, expectedGlobalLeaseId, ownedCodexHostId },
           )
         ),
         findThread: (attempt) => findCoordinatorProvisioningThread(cdp, attempt),
@@ -3267,22 +3578,22 @@ async function runBackgroundContinuationMonitor(cdp) {
             { threadId, includeTurns }, 10_000,
           ),
         }),
-        markStarting: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
-          attemptId, "starting",
+        markStarting: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "starting", { ownedCodexHostId },
         ),
         startThread: ({ codexHostId, ...params }) => requestCodexAppServerViaCdp(
           cdp, undefined, codexHostId, "thread/start", params, 10_000,
         ),
-        attachThread: ({ attemptId, threadId }) => (
+        attachThread: ({ attemptId, threadId, ownedCodexHostId }) => (
           transitionDomainCoordinatorProvisioningAttempt(
-            attemptId, "attach", { threadId },
+            attemptId, "attach", { threadId, ownedCodexHostId },
           )
         ),
-        resetAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
-          attemptId, "reset",
+        resetAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "reset", { ownedCodexHostId },
         ),
-        resumeExpiredAttempt: ({ attemptId }) => transitionDomainCoordinatorProvisioningAttempt(
-          attemptId, "resume-expired",
+        resumeExpiredAttempt: ({ attemptId, ownedCodexHostId }) => transitionDomainCoordinatorProvisioningAttempt(
+          attemptId, "resume-expired", { ownedCodexHostId },
         ),
         deliverInstruction: ({ attempt, threadId, domainId }) => (
           deliverDomainCoordinatorProvisioningInstruction(
@@ -3292,6 +3603,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerIntentCaptureMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         listIntents: () => listOwnerIntents(projectId),
         observeCapture: (request) => observeTaskboardOwnerIntentCapture(
@@ -3309,6 +3621,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerIntentPlanningMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         observePlan: (request) => observeTaskboardOwnerIntentPlan(
           request,
@@ -3330,6 +3643,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerIntentAdoptionMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         claimAdoption: (request) => claimOwnerIntentAdoption(request, projectId),
         confirmAdoption: (request, intentId) => confirmOwnerIntentAdoption(
@@ -3352,6 +3666,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runCrossDomainHandoffMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         claimDelivery: (request) => claimCrossDomainHandoffDelivery(request, projectId),
         confirmDelivery: (request) => confirmCrossDomainHandoffDelivery(request, projectId),
@@ -3370,6 +3685,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerDecisionMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         claimDelivery: (request) => claimOwnerDecisionDelivery(request, projectId),
         confirmDelivery: (request) => confirmOwnerDecisionDelivery(request, projectId),
@@ -3404,6 +3720,72 @@ async function runBackgroundContinuationMonitor(cdp) {
   }
 }
 
+async function runCoordinatorIdentityHandshakeFastLaneOnce(cdp) {
+  const projects = await loadResidentCoordinatorMonitorProjects({
+    listLifecycleProjects: listResidentCoordinatorMonitorProjects,
+    readContinuationPolicyEntries: readTaskboardClientStorageEntries,
+    continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
+  });
+  await runCoordinatorIdentityHandshakeFastLane({
+    projects,
+    hostExecutor: currentResidentHostExecutorExecution(),
+    runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
+      projectId,
+      hostExecutor: currentResidentHostExecutorExecution(),
+      listHandshakes: listCoordinatorIdentityHandshakes,
+      readThread: (route) => requestCodexAppServerViaCdp(
+        cdp,
+        undefined,
+        route.codexHostId,
+        "thread/read",
+        { threadId: route.threadId, includeTurns: false },
+        10_000,
+      ),
+      confirmIdentity: confirmCoordinatorIdentityHandshake,
+    }),
+  });
+}
+
+function startResidentCoordinatorMonitors(cdp, {
+  isStopped = () => false,
+  isActive = residentHostExecutorLeaseIsActive,
+  executionEnvelope = residentHostExecutorExecution,
+  resolveCdp = () => cdp,
+} = {}) {
+  const schedule = (run, intervalMs, label) => createDisposableMonitorTimer(async () => {
+    if (isStopped() || !isActive()) return;
+    const execution = executionEnvelope();
+    if (!execution) return;
+    const activeCdp = resolveCdp();
+    if (execution.codexHostId !== "local" && (!activeCdp || activeCdp.closed)) return;
+    try {
+      await residentHostExecutorContext.run(execution, () => run(activeCdp));
+    } catch (error) {
+      console.error(`${label}: ${error.message}`);
+    }
+  }, intervalMs);
+  const disposeIdentity = schedule(
+    runCoordinatorIdentityHandshakeFastLaneOnce,
+    coordinatorIdentityHandshakeIntervalMs,
+    "Taskboard Coordinator identity fast lane failed",
+  );
+  const disposeFastLane = schedule(
+    runBackgroundContinuationFastLane,
+    backgroundContinuationIntervalMs,
+    "Taskboard continuation fast lane failed",
+  );
+  const disposeBackground = schedule(
+    runBackgroundContinuationMonitor,
+    backgroundContinuationIntervalMs,
+    "Taskboard background continuation check failed",
+  );
+  return () => {
+    disposeIdentity();
+    disposeFastLane();
+    disposeBackground();
+  };
+}
+
 function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   let activeContextId = null;
   let activeMainContextId = null;
@@ -3430,9 +3812,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   const scheduleBackgroundContinuation = () => {
     if (disposeBackgroundContinuationTimer || cdp.closed) return;
     disposeBackgroundContinuationTimer = createDisposableMonitorTimer(async () => {
-      if (cdp.closed) return;
+      if (cdp.closed || !residentHostExecutorLeaseIsActive()) return;
+      const execution = residentHostExecutorExecution();
+      if (!execution) return;
       try {
-        await runBackgroundContinuationMonitor(cdp);
+        await residentHostExecutorContext.run(
+          execution,
+          () => runBackgroundContinuationMonitor(cdp),
+        );
       } catch (error) {
         console.error(`Taskboard background continuation check failed: ${error.message}`);
       }
@@ -3442,9 +3829,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   const scheduleBackgroundContinuationFastLane = () => {
     if (disposeBackgroundContinuationFastLaneTimer || cdp.closed) return;
     disposeBackgroundContinuationFastLaneTimer = createDisposableMonitorTimer(async () => {
-      if (cdp.closed) return;
+      if (cdp.closed || !residentHostExecutorLeaseIsActive()) return;
+      const execution = residentHostExecutorExecution();
+      if (!execution) return;
       try {
-        await runBackgroundContinuationFastLane(cdp);
+        await residentHostExecutorContext.run(
+          execution,
+          () => runBackgroundContinuationFastLane(cdp),
+        );
       } catch (error) {
         console.error(`Taskboard continuation fast lane failed: ${error.message}`);
       }
@@ -3454,29 +3846,14 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
   const scheduleCoordinatorIdentityHandshakeFastLane = () => {
     if (disposeCoordinatorIdentityHandshakeTimer || cdp.closed) return;
     disposeCoordinatorIdentityHandshakeTimer = createDisposableMonitorTimer(async () => {
-      if (cdp.closed) return;
+      if (cdp.closed || !residentHostExecutorLeaseIsActive()) return;
+      const execution = residentHostExecutorExecution();
+      if (!execution) return;
       try {
-        const projects = await loadResidentCoordinatorMonitorProjects({
-          listLifecycleProjects: listResidentCoordinatorMonitorProjects,
-          readContinuationPolicyEntries: readTaskboardClientStorageEntries,
-          continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
-        });
-        await runCoordinatorIdentityHandshakeFastLane({
-          projects,
-          runHandshake: (projectId) => runBackgroundCoordinatorIdentityHandshakeMonitorOnce({
-            projectId,
-            listHandshakes: listCoordinatorIdentityHandshakes,
-            readThread: (route) => requestCodexAppServerViaCdp(
-              cdp,
-              undefined,
-              route.codexHostId,
-              "thread/read",
-              { threadId: route.threadId, includeTurns: false },
-              10_000,
-            ),
-            confirmIdentity: confirmCoordinatorIdentityHandshake,
-          }),
-        });
+        await residentHostExecutorContext.run(
+          execution,
+          () => runCoordinatorIdentityHandshakeFastLaneOnce(cdp),
+        );
       } catch (error) {
         console.error(`Taskboard Coordinator identity fast lane failed: ${error.message}`);
       }
@@ -3715,9 +4092,11 @@ function installTaskboardHostBinding(cdp, supervisor, startupToken) {
         returnByValue: true,
       });
       await restoreQuotaPolicies(cdp);
-      scheduleCoordinatorIdentityHandshakeFastLane();
-      scheduleBackgroundContinuationFastLane();
-      scheduleBackgroundContinuation();
+      if (!localCodexThreadRpcEnabled) {
+        scheduleCoordinatorIdentityHandshakeFastLane();
+        scheduleBackgroundContinuationFastLane();
+        scheduleBackgroundContinuation();
+      }
       return activeContextId;
     })();
     try {
@@ -4083,6 +4462,32 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   options.startupToken ??= taskboardInstanceToken;
   process.env.CODEX_EXECUTABLE = resolveCodexExecutable({ appPath: options.appPath });
+  localCodexThreadRpcEnabled = shouldUseLocalCodexThreadRpc({
+    platform: process.platform,
+    watch: options.watch,
+    launch: options.launch,
+    cdpPipe: options.cdpPipe,
+  });
+  localCodexThreadRpcLifecycle = localCodexThreadRpcEnabled
+    ? new LocalCodexThreadRpcLifecycle({
+        launchTransport: async () => {
+          const appServer = await launchLocalCodexAppServer({
+            executable: process.env.CODEX_EXECUTABLE,
+            cwd: projectRoot,
+            env: withoutTaskboardLauncherEnvironment(process.env),
+            onServerRequest: (method) => {
+              console.error(JSON.stringify({
+                event: "taskboard.codex.server-request.rejected",
+                method,
+              }));
+            },
+          });
+          const transport = createLocalCodexThreadRpcTransport({ appServer });
+          console.log(JSON.stringify({ taskboardHeadlessCodexReady: true }));
+          return transport;
+        },
+      })
+    : null;
   const cdpVersionUrl = `http://127.0.0.1:${options.port}/json/version`;
 
   if (options.daemon) {
@@ -4131,6 +4536,7 @@ async function main() {
   let cdpRuntime = null;
   let codexAppPid = null;
   let nativeCodexBrowser = false;
+  let disposeResidentCoordinatorMonitors = null;
   let runtimePublishPromise = null;
   const injectedTargets = new Map();
   let idleAfterNormalExit = false;
@@ -4160,7 +4566,13 @@ async function main() {
         });
       });
     },
-    focusApp: () => activateCodexApp(codexAppPid),
+    focusApp: () => {
+      codexAppPid = codexAppProcesses(options.appPath)
+        .find((record) => !record.command.includes(
+          ` --user-data-dir=${independentCodexProfilePath} `,
+        ))?.pid ?? null;
+      if (codexAppPid) activateCodexApp(codexAppPid);
+    },
   });
   const hasOpenPending = () => openedRequestGeneration < openRequestGeneration;
   const resolveLaunchCoordinatorRouteForGeneration = createOpenGenerationRouteResolver(
@@ -4184,6 +4596,23 @@ async function main() {
   const requestTaskboardOpen = async (preferredConnection = null) => {
     const generation = openRequestGeneration;
     if (generation <= openedRequestGeneration) return true;
+    if (nativeCodexBrowser) {
+      try {
+        const result = await nativeTaskboardPanelOpener.openOrFocus();
+        openedRequestGeneration = Math.max(openedRequestGeneration, generation);
+        console.log(JSON.stringify(
+          result.action === "opened"
+            ? { openedTaskboardInExistingCodex: true }
+            : result.action === "opening"
+              ? { openingTaskboardInExistingCodex: true }
+              : { reusedTaskboardInExistingCodex: true },
+        ));
+        return true;
+      } catch (error) {
+        console.error(`Waiting to open Taskboard: ${error.message}`);
+        return false;
+      }
+    }
     let launchCoordinatorRoute;
     try {
       launchCoordinatorRoute = await resolveLaunchCoordinatorRouteForGeneration(generation);
@@ -4195,10 +4624,9 @@ async function main() {
     const connection = preferredConnection && !preferredConnection.closed
       ? preferredConnection
       : injectedTargets.values().next().value;
-    if (!nativeCodexBrowser && !connection) return false;
+    if (!connection) return false;
     try {
       if (launchCoordinatorRoute) {
-        if (nativeCodexBrowser) return false;
         if (!(await waitForCoordinatorThreadSelection(
           connection,
           launchCoordinatorRoute.threadId,
@@ -4209,18 +4637,6 @@ async function main() {
           () => generation === openRequestGeneration,
         ))) return false;
         if (generation !== openRequestGeneration) return false;
-      }
-      if (nativeCodexBrowser) {
-        const result = await nativeTaskboardPanelOpener.openOrFocus();
-        openedRequestGeneration = Math.max(openedRequestGeneration, generation);
-        console.log(JSON.stringify(
-          result.action === "opened"
-            ? { openedTaskboardInExistingCodex: true }
-            : result.action === "opening"
-              ? { openingTaskboardInExistingCodex: true }
-              : { reusedTaskboardInExistingCodex: true },
-        ));
-        return true;
       }
       const opened = launchCoordinatorRoute
         ? await requestPreparedTaskboardOpen(
@@ -4285,6 +4701,124 @@ async function main() {
     startupTimeoutMs: 120_000,
     unhealthyChildGraceMs: 120_000,
   });
+  if (options.watch) {
+    residentHostExecutorLeaseLifecycle = createResidentHostExecutorLeaseLifecycle();
+  }
+  let remoteHostExecutorManager = null;
+  let remoteHostInventoryController = null;
+  let reconcileRemoteHostExecutorInventory = async () => ({ hosts: [] });
+  let lastRemoteHostInventoryError = null;
+  const reportRemoteHostInventoryError = (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === lastRemoteHostInventoryError) return;
+    lastRemoteHostInventoryError = message;
+    console.error(`Waiting for remote Codex host inventory: ${message}`);
+  };
+  const clearRemoteHostInventoryError = () => {
+    lastRemoteHostInventoryError = null;
+  };
+  if (options.watch) {
+    const hostExecutorApi = createHostExecutorApi({
+      baseUrl: taskboardBaseUrl,
+      instanceSecret: taskboardInstanceSecret,
+    });
+    remoteHostExecutorManager = createRemoteHostExecutorManager({
+      createWorker: (codexHostId) => {
+        let lastLeaseState = null;
+        let lastLeaseFailure = null;
+        const lifecycle = createHostExecutorLeaseLifecycle({
+          codexHostId,
+          executorInstanceId: randomUUID(),
+          adapterId: remoteHostExecutorAdapterId,
+          leaseDurationSeconds: residentHostExecutorLeaseDurationSeconds,
+          renewIntervalMs: residentHostExecutorRenewIntervalMs,
+          register: hostExecutorApi.register,
+          inspect: hostExecutorApi.inspect,
+          acquire: hostExecutorApi.acquire,
+          renew: hostExecutorApi.renew,
+          release: hostExecutorApi.release,
+          createOperationId: randomUUID,
+          onStateChange: (state) => {
+            const diagnostic = JSON.stringify({
+              event: "taskboard.remote-host-executor.lease",
+              codexHostId,
+              active: state.active,
+              reason: state.reason,
+              leaseStatus: state.lease?.status ?? null,
+            });
+            if (diagnostic === lastLeaseState) return;
+            lastLeaseState = diagnostic;
+            lastLeaseFailure = null;
+            console.log(diagnostic);
+          },
+          onError: (error) => {
+            const failure = typeof error?.code === "string" && error.code
+              ? error.code
+              : error instanceof Error ? error.message : String(error);
+            if (failure === lastLeaseFailure) return;
+            lastLeaseFailure = failure;
+            console.error(`Taskboard remote host executor lease unavailable: ${error.message}`);
+          },
+        });
+        const channelWorker = createRemoteHostExecutorWorker({
+          codexHostId,
+          lifecycle,
+          pollRequest: hostExecutorApi.pollRemoteRequest,
+          completeRequest: hostExecutorApi.completeRemoteRequest,
+          disconnectRequest: hostExecutorApi.disconnectRemoteChannel,
+          executeRpc: (ownedCodexHostId, method, params) => {
+            const renderer = remoteHostInventoryController?.rendererFor(ownedCodexHostId);
+            if (!renderer || renderer.closed) {
+              throw new Error("The exact Codex renderer for the remote host is unavailable");
+            }
+            return requestCodexRendererRpcViaCdp(
+              renderer,
+              undefined,
+              ownedCodexHostId,
+              method,
+              params,
+              taskConversationAppServerTimeoutMs,
+            );
+          },
+          onError: (error) => {
+            console.error(`Taskboard remote host executor channel unavailable: ${error.message}`);
+          },
+        });
+        let stopped = true;
+        let disposeMonitors = null;
+        return {
+          async start() {
+            stopped = false;
+            const state = await channelWorker.start();
+            disposeMonitors = startResidentCoordinatorMonitors(null, {
+              isStopped: () => stopped,
+              isActive: lifecycle.isActive,
+              executionEnvelope: lifecycle.executionEnvelope,
+              resolveCdp: () => remoteHostInventoryController?.rendererFor(codexHostId) ?? null,
+            });
+            return state;
+          },
+          async stop() {
+            stopped = true;
+            disposeMonitors?.();
+            disposeMonitors = null;
+            return channelWorker.stop();
+          },
+        };
+      },
+    });
+    remoteHostInventoryController = createRemoteHostInventoryController({
+      listRenderers: () => [...injectedTargets.values()]
+        .filter((connection) => !connection.closed),
+      readHostIds: readCodexRemoteHostIdsViaCdp,
+      manager: remoteHostExecutorManager,
+    });
+    reconcileRemoteHostExecutorInventory = async () => {
+      const result = await remoteHostInventoryController.reconcile();
+      clearRemoteHostInventoryError();
+      return result;
+    };
+  }
 
   const publishRuntime = async () => {
     const pending = publishTaskboardRuntime();
@@ -4298,6 +4832,19 @@ async function main() {
 
   const startManagedCodex = async () => {
     if (stopping) return false;
+    if (localCodexThreadRpcEnabled) {
+      const legacyManagedCodex = managedCodexProcess(options.appPath);
+      if (legacyManagedCodex) await stopManagedCodex(legacyManagedCodex);
+      if (stopping) return false;
+      await ensureLocalCodexThreadRpcTransport();
+      codexAppPid = codexAppProcesses(options.appPath)
+        .find((record) => !record.command.includes(
+          ` --user-data-dir=${independentCodexProfilePath} `,
+        ))?.pid ?? null;
+      nativeCodexBrowser = true;
+      console.log(JSON.stringify({ singleVisibleCodexMode: true }));
+      return false;
+    }
     if (!options.cdpPipe) {
       const runningCodex = codexAppProcesses(options.appPath);
       let debuggingCodexFound = false;
@@ -4374,6 +4921,18 @@ async function main() {
   const cleanup = () => {
     if (cleanupPromise) return cleanupPromise;
     cleanupPromise = (async () => {
+      disposeResidentCoordinatorMonitors?.();
+      disposeResidentCoordinatorMonitors = null;
+      try {
+        await remoteHostInventoryController?.stop();
+      } catch (error) {
+        console.error(`Taskboard remote host executor cleanup failed: ${error.message}`);
+      }
+      remoteHostInventoryController = null;
+      remoteHostExecutorManager = null;
+      await residentHostExecutorLeaseLifecycle?.stop();
+      residentHostExecutorLeaseLifecycle = null;
+      await closeLocalCodexThreadRpcTransport();
       injectedTargets.forEach((connection) => {
         unregisterQuotaPolicyCdp(connection);
         connection.close();
@@ -4461,8 +5020,9 @@ async function main() {
     await publishRuntime();
     if (stopping) return;
     let initialLaunchCoordinatorRoute = null;
-    let initialLaunchCoordinatorRouteResolved = !hasOpenPending();
-    if (hasOpenPending()) {
+    let initialLaunchCoordinatorRouteResolved = !hasOpenPending()
+      || localCodexThreadRpcEnabled;
+    if (hasOpenPending() && !localCodexThreadRpcEnabled) {
       try {
         initialLaunchCoordinatorRoute = await resolveLaunchCoordinatorRouteForGeneration(
           openRequestGeneration,
@@ -4474,7 +5034,7 @@ async function main() {
       if (stopping) return;
     }
 
-    if (options.cdpPipe || !cdpReachable) {
+    if (localCodexThreadRpcEnabled || options.cdpPipe || !cdpReachable) {
       idleAfterNormalExit = !(await startManagedCodex()) && !nativeCodexBrowser;
     } else {
       if (options.launch) {
@@ -4497,6 +5057,15 @@ async function main() {
       cdpRuntime = tcpCdpRuntime(options.port);
     }
     if (stopping) return;
+
+    await residentHostExecutorLeaseLifecycle?.start();
+    if (stopping) return;
+
+    if (localCodexThreadRpcEnabled) {
+      disposeResidentCoordinatorMonitors = startResidentCoordinatorMonitors(null, {
+        isStopped: () => stopping,
+      });
+    }
 
     const { source, sourceHash } = await currentInjectionSource();
     if (stopping) return;
@@ -4542,6 +5111,11 @@ async function main() {
       }
       console.log(JSON.stringify({ injected: firstResults }, null, 2));
     }
+    try {
+      await reconcileRemoteHostExecutorInventory();
+    } catch (error) {
+      reportRemoteHostInventoryError(error);
+    }
     if (hasOpenPending()) {
       await requestTaskboardOpen();
     }
@@ -4558,7 +5132,10 @@ async function main() {
       if (stopping) break;
       try {
         const service = await supervisor.ensure();
-        if (service.restarted && !stopping) await publishRuntime();
+        if (service.restarted && !stopping) {
+          await publishRuntime();
+          await residentHostExecutorLeaseLifecycle?.reconcile();
+        }
       } catch (error) {
         console.error(`Waiting for Taskboard service: ${error.message}`);
       }
@@ -4568,8 +5145,18 @@ async function main() {
           await connection.hostBridge?.publishHeartbeat();
         } catch (_) {}
       }
+      try {
+        await reconcileRemoteHostExecutorInventory();
+      } catch (error) {
+        reportRemoteHostInventoryError(error);
+      }
       if (nativeCodexBrowser) {
-        if (codexAppProcesses(options.appPath).length === 0) {
+        const visibleCodex = codexAppProcesses(options.appPath)
+          .find((record) => !record.command.includes(
+            ` --user-data-dir=${independentCodexProfilePath} `,
+          ));
+        codexAppPid = visibleCodex?.pid ?? null;
+        if (!localCodexThreadRpcEnabled && !visibleCodex) {
           nativeCodexBrowser = false;
           idleAfterNormalExit = true;
           console.error(
@@ -4620,6 +5207,11 @@ async function main() {
         );
         if (results.length > 0) {
           console.log(JSON.stringify({ injected: results }, null, 2));
+          try {
+            await reconcileRemoteHostExecutorInventory();
+          } catch (error) {
+            reportRemoteHostInventoryError(error);
+          }
         }
         if (hasOpenPending()) {
           await requestTaskboardOpen();
