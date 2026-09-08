@@ -6753,6 +6753,9 @@ export class TaskboardDatabase {
   ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (ownedCodexHostId !== undefined && !isCanonicalCodexHostId(ownedCodexHostId)) {
+        throw new ApiError(400, "INVALID_FIELD", "'ownedCodexHostId' is invalid");
+      }
       if (hostExecutorExecution !== undefined) {
         this.#requireResidentMutationHostExecutorFence(
           hostExecutorExecution,
@@ -6768,12 +6771,26 @@ export class TaskboardDatabase {
       this.#prepare(`
         UPDATE agent_coordination_identity_handshakes SET status = 'expired', updated_at = ?
         WHERE project_id = ? AND status IN ('pending', 'confirmed') AND expires_at <= ?
-      `).run(timestamp, projectId, timestamp);
+          AND (? IS NULL OR (
+            json_valid(expected_host_binding_json)
+            AND json_extract(expected_host_binding_json, '$.codexHostId') = ?
+          ))
+      `).run(
+        timestamp, projectId, timestamp,
+        ownedCodexHostId ?? null, ownedCodexHostId ?? null,
+      );
       this.#prepare(`
         UPDATE agent_coordination_identity_handshakes SET status = 'canceled', updated_at = ?
         WHERE project_id = ? AND status IN ('pending', 'confirmed')
           AND expires_at > ? AND expected_revision <> ?
-      `).run(timestamp, projectId, timestamp, revision);
+          AND (? IS NULL OR (
+            json_valid(expected_host_binding_json)
+            AND json_extract(expected_host_binding_json, '$.codexHostId') = ?
+          ))
+      `).run(
+        timestamp, projectId, timestamp, revision,
+        ownedCodexHostId ?? null, ownedCodexHostId ?? null,
+      );
       const rows = this.#prepare(`
         SELECT handshake.*
         FROM agent_coordination_identity_handshakes AS handshake
@@ -6784,8 +6801,15 @@ export class TaskboardDatabase {
           AND handshake.status IN ('pending', 'confirmed')
           AND handshake.expires_at > ?
           AND receipt.id IS NULL
+          AND (? IS NULL OR (
+            json_valid(handshake.expected_host_binding_json)
+            AND json_extract(handshake.expected_host_binding_json, '$.codexHostId') = ?
+          ))
         ORDER BY handshake.created_at, handshake.id
-      `).all(projectId, timestamp);
+      `).all(
+        projectId, timestamp,
+        ownedCodexHostId ?? null, ownedCodexHostId ?? null,
+      );
       this.database.exec("COMMIT");
       return rows.map(coordinationIdentityHandshakeFromRow);
     } catch (error) {
@@ -6817,23 +6841,23 @@ export class TaskboardDatabase {
   ) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      if (hostExecutorExecution !== undefined) {
-        this.#requireResidentMutationHostExecutorFence(
-          hostExecutorExecution,
-          threadBinding.codexHostId,
-        );
-      }
       const preliminary = this.#prepare(
         "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
       ).get(handshakeId);
       if (!preliminary) throw new ApiError(404, "COORDINATION_IDENTITY_HANDSHAKE_NOT_FOUND", "The protected identity handshake does not exist");
+      const expected = JSON.parse(preliminary.expected_host_binding_json);
+      if (hostExecutorExecution !== undefined) {
+        this.#requireResidentMutationHostExecutorFence(
+          hostExecutorExecution,
+          expected.codexHostId,
+        );
+      }
       if (preliminary.request_fingerprint !== coordinationIdentityRequestFingerprint(
         registration.projectId, registration,
       )) {
         throw new ApiError(409, "COORDINATION_IDENTITY_REQUEST_MISMATCH", "The authenticated proof does not match the complete original Coordinator registration");
       }
       if (preliminary.status === "completed") {
-        const expected = JSON.parse(preliminary.expected_host_binding_json);
         const binding = {
           threadId: threadBinding.threadId,
           codexProjectId: threadBinding.codexProjectId,
@@ -6878,7 +6902,6 @@ export class TaskboardDatabase {
         "SELECT * FROM agent_coordination_identity_handshakes WHERE id = ?",
       ).get(handshakeId);
       if (!row) throw new ApiError(404, "COORDINATION_IDENTITY_HANDSHAKE_NOT_FOUND", "The protected identity handshake does not exist");
-      const expected = JSON.parse(row.expected_host_binding_json);
       const binding = {
         threadId: threadBinding.threadId,
         codexProjectId: threadBinding.codexProjectId,

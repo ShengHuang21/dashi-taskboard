@@ -5798,6 +5798,7 @@ test("one project Owner decision is delivered only to its exact confirmed Root w
     throw new Error(`Unexpected method: ${method}`);
   });
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -6015,6 +6016,7 @@ test("Owner Root assistant route markers carry clarify, supersede, and cancel th
     };
     let recorded = null;
     const result = await runOwnerIntentCaptureMonitorOnce({
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId: snapshot.projectId },
       readSnapshot: async () => snapshot,
       listIntents: async () => [{ intentId: targetIntentId, ownerTurnId: "prior-owner-turn" }],
@@ -6114,6 +6116,7 @@ test("an exact typed route to an unknown intent never reaches the protected reco
   const ownerRootWorkspacePath = "/tmp/taskboard/owner-root";
   let recordCalls = 0;
   const result = await runOwnerIntentCaptureMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "typed-intent-unknown-target" },
     readSnapshot: async () => ({
       projectId: "typed-intent-unknown-target",
@@ -6278,6 +6281,7 @@ test("Codex environment, delegation, AGENTS, and control envelopes are never Own
   const frontier = [];
   const newTaskInput = controlInputs.at(-2);
   const monitorResult = await runOwnerIntentCaptureMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "control-envelope-project" },
     readSnapshot: async () => ({
       projectId: "control-envelope-project",
@@ -6333,6 +6337,7 @@ test("Owner Intent capture skips Taskboard decision turns and replays exactly on
   };
   let recorded = [];
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => snapshot,
     listIntents: async () => recorded.map((intent) => ({ ownerTurnId: intent.ownerTurnId })),
@@ -6415,6 +6420,7 @@ test("queued Owner Intent is adopted exactly once at an idle Coordinator boundar
   const calls = [];
   let confirmed;
   const result = await runOwnerIntentAdoptionMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -6637,6 +6643,7 @@ test("Coordinator plan marker is observed and persisted exactly once", async () 
   }
   let applied;
   const result = await runOwnerIntentPlanningMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({
       projectId: "taskboard-core",
@@ -6681,6 +6688,7 @@ test("terminal Owner Intent planning turns enter durable bounded retry", async (
 
   for (const [index, request] of attempts.entries()) {
     const options = {
+      hostExecutor: localHostExecutor,
       policy: { enabled: true, projectId },
       readSnapshot: async () => ({
         projectId,
@@ -6733,6 +6741,12 @@ test("server-invalid Owner Intent plan schedules durable bounded replan and acce
   const request = {
     intentId: "intent-invalid-cache",
     adoptionReceipt: { id: "adoption-invalid-cache", coordinatorEpoch: "configured:coordinator" },
+    route: {
+      coordinatorTaskId: "coordinator",
+      coordinatorThreadId,
+      codexHostId: "local",
+      coordinatorWorkspacePath: "/tmp/taskboard/coordinator",
+    },
   };
   const plan = { revisionId: "invalid-cache-plan" };
   let applies = 0;
@@ -6740,6 +6754,7 @@ test("server-invalid Owner Intent plan schedules durable bounded replan and acce
   let currentRequest = request;
   let currentPlan = plan;
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "invalid-cache-project" },
     readSnapshot: async () => ({
       projectId: "invalid-cache-project",
@@ -7049,6 +7064,7 @@ test("cross-domain handoff waits for an idle Coordinator without steering", asyn
   };
   const calls = [];
   const result = await runCrossDomainHandoffMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: request.projectId },
     readSnapshot: async () => ({
       projectId: request.projectId,
@@ -7097,6 +7113,7 @@ test("cross-domain handoff starts and confirms exactly one idle Coordinator turn
   const calls = [];
   let confirmed = null;
   const result = await runCrossDomainHandoffMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: request.projectId },
     readSnapshot: async () => ({ projectId: request.projectId, coordination: { pendingCrossDomainHandoff: request } }),
     claimDelivery: async () => ({ claimed: true, receipt: { id: "handoff-once" } }),
@@ -7148,6 +7165,7 @@ test("cross-domain handoff recovers a started marker without a second turn", asy
   const calls = [];
   let confirmed = null;
   const result = await runCrossDomainHandoffMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: request.projectId },
     readSnapshot: async () => ({ projectId: request.projectId, coordination: { pendingCrossDomainHandoff: request } }),
     claimDelivery: async () => ({ claimed: false, reason: "reserved", receipt: { id: "handoff-recover" } }),
@@ -7264,6 +7282,7 @@ test("Owner decision delivery uses an atomic durable reservation before any Root
   let release;
   const barrier = new Promise((resolve) => { release = resolve; });
   const options = {
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
     claimDelivery: async () => {
@@ -7296,6 +7315,7 @@ test("Owner decision monitor stops when the service rejects a stale coordinator 
   };
   let delivered = 0;
   const result = await runOwnerDecisionMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
     claimDelivery: async () => ({ claimed: false, reason: "stale-route" }),
@@ -7319,6 +7339,7 @@ test("a durable delivered request is recorded only from the exact Root observati
   };
   let recorded;
   const result = await runOwnerDecisionMonitorOnce({
+    hostExecutor: localHostExecutor,
     policy: { enabled: true, projectId: "taskboard-core" },
     readSnapshot: async () => ({ projectId: "taskboard-core", coordination: { ownerDecisionRequest: request } }),
     claimDelivery: async () => ({
@@ -7595,6 +7616,37 @@ const residentCoordinatorHostWiring = [{
     "getAttempt", "requestAttempt", "releaseAttempt", "authorizeAttempt",
     "beginArchiveAttempt", "cancelAttempt", "findArchivedThread", "archiveThread",
     "completeAttempt",
+  ],
+}, {
+  label: "Owner Intent capture monitor",
+  callee: "runOwnerIntentCaptureMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "listIntents", "observeCapture", "recordCapture",
+  ],
+}, {
+  label: "Owner Intent planning monitor",
+  callee: "runOwnerIntentPlanningMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "observePlan", "applyPlan", "scheduleRetry",
+  ],
+}, {
+  label: "Owner Intent adoption monitor",
+  callee: "runOwnerIntentAdoptionMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "claimAdoption", "confirmAdoption", "deliver",
+  ],
+}, {
+  label: "cross-domain handoff monitor",
+  callee: "runCrossDomainHandoffMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "claimDelivery", "confirmDelivery", "deliver",
+  ],
+}, {
+  label: "Owner decision monitor",
+  callee: "runOwnerDecisionMonitorOnce",
+  properties: [
+    "policy", "hostExecutor", "readSnapshot", "claimDelivery", "confirmDelivery", "deliver",
+    "observeDecision", "recordDecision",
   ],
 }, {
   label: "lease keepalive monitor",

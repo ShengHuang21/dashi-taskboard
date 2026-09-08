@@ -5014,7 +5014,7 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, {
           handshakes: database.listAgentLaneCoordinationIdentityHandshakes(
             projectId,
-            "local",
+            hostExecutorExecution?.codexHostId ?? "local",
             hostExecutorExecution,
           ),
         });
@@ -5416,7 +5416,7 @@ export function createTaskboardServer(options = {}) {
               request, resolved.instanceSecret, pathname, rawInput,
             ),
           };
-          const sourceThreadBinding = currentHostThreadIdentity(input.ownerRootThreadId);
+          const sourceThreadBinding = observedHostThreadIdentity(input.ownerRootThreadId);
           if (!sourceThreadBinding) {
             throw new ApiError(
               409,

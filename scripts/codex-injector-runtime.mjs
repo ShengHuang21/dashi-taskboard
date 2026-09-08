@@ -74,8 +74,12 @@ function hostExecutorOwnsCanonicalRoute(hostExecutor, route) {
     && hostExecutorOwnsRoute(hostExecutor, route);
 }
 
-function coordinatorShutdownRunKey(hostExecutor, projectId) {
+function hostProjectMonitorRunKey(hostExecutor, projectId) {
   return JSON.stringify([hostExecutor.ownedCodexHostId, projectId]);
+}
+
+function coordinatorShutdownRunKey(hostExecutor, projectId) {
+  return hostProjectMonitorRunKey(hostExecutor, projectId);
 }
 
 function coordinatorShutdownObservationKey(hostExecutor, projectId) {
@@ -2607,7 +2611,7 @@ function ownerIntentCaptureRoute(snapshot) {
   if (!COORDINATION_ID_PATTERN.test(ownerRootTaskId ?? "")
     || lane?.taskType !== "root_task"
     || !THREAD_ID_PATTERN.test(lane?.threadId ?? "")
-    || !COORDINATION_ID_PATTERN.test(lane?.codexHostId ?? "")
+    || !isCanonicalCodexHostId(lane?.codexHostId)
     || typeof lane?.workspacePath !== "string"
     || !path.isAbsolute(lane.workspacePath)) return null;
   return {
@@ -2775,6 +2779,8 @@ export async function observeTaskboardOwnerIntentCapture(request, rpc) {
 export async function runOwnerIntentCaptureMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { captured: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { captured: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.listIntents !== "function"
@@ -2782,7 +2788,8 @@ export async function runOwnerIntentCaptureMonitorOnce(options) {
     || typeof options?.recordCapture !== "function") {
     return { captured: false, reason: "invalid-monitor" };
   }
-  const existing = ownerIntentCaptureMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerIntentCaptureMonitorRuns.get(runKey);
   if (existing) return existing;
   const run = (async () => {
     const snapshot = await options.readSnapshot(policy.projectId);
@@ -2791,6 +2798,9 @@ export async function runOwnerIntentCaptureMonitorOnce(options) {
     }
     const route = ownerIntentCaptureRoute(snapshot);
     if (!route) return { captured: false, reason: "owner-root-unavailable" };
+    if (!hostExecutorOwnsCanonicalRoute(hostExecutor, route)) {
+      return { captured: false, reason: "host-executor-unavailable" };
+    }
     const intents = await options.listIntents(policy.projectId);
     if (!Array.isArray(intents)) return { captured: false, reason: "invalid-intent-frontier" };
     const capture = await options.observeCapture({
@@ -2817,12 +2827,12 @@ export async function runOwnerIntentCaptureMonitorOnce(options) {
       ? { captured: true, intentId: capture.intentId, ownerTurnId: capture.ownerTurnId }
       : { captured: false, reason: "already-captured" };
   })();
-  ownerIntentCaptureMonitorRuns.set(policy.projectId, run);
+  ownerIntentCaptureMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerIntentCaptureMonitorRuns.get(policy.projectId) === run) {
-      ownerIntentCaptureMonitorRuns.delete(policy.projectId);
+    if (ownerIntentCaptureMonitorRuns.get(runKey) === run) {
+      ownerIntentCaptureMonitorRuns.delete(runKey);
     }
   }
 }
@@ -3201,6 +3211,8 @@ export async function deliverTaskboardOwnerIntent(request, rpc, { readOnly = fal
 export async function runOwnerIntentAdoptionMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.claimAdoption !== "function"
@@ -3208,15 +3220,16 @@ export async function runOwnerIntentAdoptionMonitorOnce(options) {
     || typeof options?.deliver !== "function") {
     return { delivered: false, reason: "invalid-monitor" };
   }
-  const existing = ownerIntentAdoptionMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerIntentAdoptionMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runOwnerIntentAdoptionMonitorOnceUnlocked(options);
-  ownerIntentAdoptionMonitorRuns.set(policy.projectId, run);
+  const run = runOwnerIntentAdoptionMonitorOnceUnlocked({ ...options, hostExecutor });
+  ownerIntentAdoptionMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerIntentAdoptionMonitorRuns.get(policy.projectId) === run) {
-      ownerIntentAdoptionMonitorRuns.delete(policy.projectId);
+    if (ownerIntentAdoptionMonitorRuns.get(runKey) === run) {
+      ownerIntentAdoptionMonitorRuns.delete(runKey);
     }
   }
 }
@@ -3260,19 +3273,25 @@ export async function observeTaskboardOwnerIntentPlan(request, rpc) {
 export async function runOwnerIntentPlanningMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { applied: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { applied: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.observePlan !== "function"
     || typeof options?.applyPlan !== "function") {
     return { applied: false, reason: "invalid-monitor" };
   }
-  const existing = ownerIntentPlanningMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerIntentPlanningMonitorRuns.get(runKey);
   if (existing) return existing;
   const run = (async () => {
     const snapshot = await options.readSnapshot(policy.projectId);
     const request = snapshot?.coordination?.pendingOwnerIntentPlan;
     if (snapshot?.projectId !== policy.projectId || !request) {
       return { applied: false, reason: "no-plan-pending" };
+    }
+    if (!hostExecutorOwnsCanonicalRoute(hostExecutor, request.route)) {
+      return { applied: false, reason: "host-executor-unavailable" };
     }
     const plan = await options.observePlan(request);
     if (!plan) return { applied: false, reason: "awaiting-plan" };
@@ -3308,12 +3327,12 @@ export async function runOwnerIntentPlanningMonitorOnce(options) {
     }
     return { applied: result.applied, intentId: request.intentId, revisionId: plan.revisionId };
   })();
-  ownerIntentPlanningMonitorRuns.set(policy.projectId, run);
+  ownerIntentPlanningMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerIntentPlanningMonitorRuns.get(policy.projectId) === run) {
-      ownerIntentPlanningMonitorRuns.delete(policy.projectId);
+    if (ownerIntentPlanningMonitorRuns.get(runKey) === run) {
+      ownerIntentPlanningMonitorRuns.delete(runKey);
     }
   }
 }
@@ -3769,6 +3788,7 @@ export async function deliverTaskboardCrossDomainHandoff(request, rpc, { readOnl
 
 async function runCrossDomainHandoffMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimDelivery,
   confirmDelivery,
@@ -3784,10 +3804,13 @@ async function runCrossDomainHandoffMonitorOnceUnlocked({
     || !COORDINATION_ID_PATTERN.test(request.targetIdentifier ?? "")
     || !RESUME_TOKEN_PATTERN.test(request.fingerprint ?? "")
     || !THREAD_ID_PATTERN.test(route?.targetThreadId ?? "")
-    || !COORDINATION_ID_PATTERN.test(route?.codexHostId ?? "")
+    || !isCanonicalCodexHostId(route?.codexHostId)
     || typeof route?.targetWorkspacePath !== "string"
     || !path.isAbsolute(route.targetWorkspacePath)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, route)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
   }
   const claim = await claimDelivery(request);
   if (!claim?.receipt || typeof claim.receipt.id !== "string") {
@@ -3821,6 +3844,8 @@ async function runCrossDomainHandoffMonitorOnceUnlocked({
 export async function runCrossDomainHandoffMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.claimDelivery !== "function"
@@ -3828,21 +3853,23 @@ export async function runCrossDomainHandoffMonitorOnce(options) {
     || typeof options?.deliver !== "function") {
     return { delivered: false, reason: "invalid-monitor" };
   }
-  const existing = crossDomainHandoffMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = crossDomainHandoffMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runCrossDomainHandoffMonitorOnceUnlocked(options);
-  crossDomainHandoffMonitorRuns.set(policy.projectId, run);
+  const run = runCrossDomainHandoffMonitorOnceUnlocked({ ...options, hostExecutor });
+  crossDomainHandoffMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (crossDomainHandoffMonitorRuns.get(policy.projectId) === run) {
-      crossDomainHandoffMonitorRuns.delete(policy.projectId);
+    if (crossDomainHandoffMonitorRuns.get(runKey) === run) {
+      crossDomainHandoffMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runOwnerIntentAdoptionMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimAdoption,
   confirmAdoption,
@@ -3866,6 +3893,9 @@ async function runOwnerIntentAdoptionMonitorOnceUnlocked({
     || typeof route?.coordinatorWorkspacePath !== "string"
     || !path.isAbsolute(route.coordinatorWorkspacePath)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, route)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
   }
   const claim = await claimAdoption(request);
   const claimedIntent = claim?.executionIntent;
@@ -3916,6 +3946,8 @@ async function runOwnerIntentAdoptionMonitorOnceUnlocked({
 export async function runOwnerDecisionMonitorOnce(options) {
   const policy = options?.policy;
   if (policy?.enabled !== true) return { delivered: false, reason: "disabled" };
+  const hostExecutor = normalizeHostExecutor(options?.hostExecutor);
+  if (!hostExecutor) return { delivered: false, reason: "host-executor-unavailable" };
   if (!COORDINATION_ID_PATTERN.test(policy?.projectId ?? "")
     || typeof options?.readSnapshot !== "function"
     || typeof options?.claimDelivery !== "function"
@@ -3925,21 +3957,23 @@ export async function runOwnerDecisionMonitorOnce(options) {
     || typeof options?.recordDecision !== "function") {
     return { delivered: false, reason: "invalid-monitor" };
   }
-  const existing = ownerDecisionMonitorRuns.get(policy.projectId);
+  const runKey = hostProjectMonitorRunKey(hostExecutor, policy.projectId);
+  const existing = ownerDecisionMonitorRuns.get(runKey);
   if (existing) return existing;
-  const run = runOwnerDecisionMonitorOnceUnlocked(options);
-  ownerDecisionMonitorRuns.set(policy.projectId, run);
+  const run = runOwnerDecisionMonitorOnceUnlocked({ ...options, hostExecutor });
+  ownerDecisionMonitorRuns.set(runKey, run);
   try {
     return await run;
   } finally {
-    if (ownerDecisionMonitorRuns.get(policy.projectId) === run) {
-      ownerDecisionMonitorRuns.delete(policy.projectId);
+    if (ownerDecisionMonitorRuns.get(runKey) === run) {
+      ownerDecisionMonitorRuns.delete(runKey);
     }
   }
 }
 
 async function runOwnerDecisionMonitorOnceUnlocked({
   policy,
+  hostExecutor,
   readSnapshot,
   claimDelivery,
   confirmDelivery,
@@ -3963,6 +3997,9 @@ async function runOwnerDecisionMonitorOnceUnlocked({
     || typeof request.route?.rootWorkspacePath !== "string"
     || !path.isAbsolute(request.route.rootWorkspacePath)) {
     return { delivered: false, reason: request ? "invalid-request" : "no-request" };
+  }
+  if (!hostExecutorOwnsCanonicalRoute(hostExecutor, request.route)) {
+    return { delivered: false, reason: "host-executor-unavailable" };
   }
   const claim = await claimDelivery(request);
   if (!claim?.receipt || typeof claim.receipt.id !== "string") {

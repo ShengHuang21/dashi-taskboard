@@ -7898,6 +7898,7 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
       unsafeFinancialPlan.body.error.code,
     );
     const monitorResult = await runOwnerIntentPlanningMonitorOnce({
+      hostExecutor: localShutdownExecutor,
       policy: { enabled: true, projectId: "local" },
       readSnapshot: async () => ({
         projectId: "local",
@@ -7906,6 +7907,12 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
             intentId: financialIntent.intentId,
             version: financialAdopted.version,
             adoptionReceipt: financialClaim.body.receipt,
+            route: {
+              coordinatorTaskId: "coordinator",
+              coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+              codexHostId: "local",
+              coordinatorWorkspacePath: "/tmp/coordinator-workspace",
+            },
           },
         },
       }),

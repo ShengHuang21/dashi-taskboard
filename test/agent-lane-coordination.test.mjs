@@ -2793,6 +2793,7 @@ test("Owner Intent replanning is durably bounded after three invalid coordinator
     const terminalStatus = attempt === 2 ? "interrupted" : "failed";
     let retried;
     const monitorResult = await runOwnerIntentPlanningMonitorOnce({
+      hostExecutor: { ownedCodexHostId: "local" },
       policy: { enabled: true, projectId: "retry-limit" },
       readSnapshot: async () => ({
         projectId: "retry-limit",

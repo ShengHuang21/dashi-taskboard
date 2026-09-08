@@ -3593,6 +3593,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerIntentCaptureMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         listIntents: () => listOwnerIntents(projectId),
         observeCapture: (request) => observeTaskboardOwnerIntentCapture(
@@ -3610,6 +3611,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerIntentPlanningMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         observePlan: (request) => observeTaskboardOwnerIntentPlan(
           request,
@@ -3631,6 +3633,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerIntentAdoptionMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         claimAdoption: (request) => claimOwnerIntentAdoption(request, projectId),
         confirmAdoption: (request, intentId) => confirmOwnerIntentAdoption(
@@ -3653,6 +3656,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runCrossDomainHandoffMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         claimDelivery: (request) => claimCrossDomainHandoffDelivery(request, projectId),
         confirmDelivery: (request) => confirmCrossDomainHandoffDelivery(request, projectId),
@@ -3671,6 +3675,7 @@ async function runBackgroundContinuationMonitor(cdp) {
       }),
       () => runOwnerDecisionMonitorOnce({
         policy: { enabled: true, projectId },
+        hostExecutor: currentResidentHostExecutorExecution(),
         readSnapshot: readTaskboardAgentLaneSnapshot,
         claimDelivery: (request) => claimOwnerDecisionDelivery(request, projectId),
         confirmDelivery: (request) => confirmOwnerDecisionDelivery(request, projectId),
