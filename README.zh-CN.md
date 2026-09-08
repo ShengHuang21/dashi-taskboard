@@ -63,9 +63,9 @@ ln -s /absolute/path/to/codex-taskboard/skills/manage-taskboard \
 
 ## 嵌入 Codex
 
-### 手动：使用专用 CDP 端口
+### 旧版/手动：使用专用 CDP 端口
 
-让现有 Codex 窗口保持打开。在 Taskboard 仓库中，使用专用 CDP 端口启动第二个 Codex 实例：
+下面的驻留 macOS 启动器才是正常的单可见 App 路径。仅在手动 CDP 诊断时，让现有 Codex 窗口保持打开，并使用专用 CDP 端口启动第二个 Codex 实例：
 
 ```bash
 open -n -a /Applications/ChatGPT.app --args \
@@ -82,7 +82,7 @@ npm run codex:inject -- --port 9231 --open
 
 使用嵌入式面板时，让注入器终端保持运行。原 Codex 窗口不会变化，新窗口会显示 Taskboard 侧边栏入口。如果端口 `9231` 已被占用，请在两个命令中使用另一个端口。
 
-### 推荐：用一个命令启动独立 Taskboard 窗口
+### 推荐：一个可见 Codex 与无界面协调器
 
 让现有 Codex 窗口保持打开，然后运行：
 
@@ -90,7 +90,7 @@ npm run codex:inject -- --port 9231 --open
 CODEX_TASKBOARD_HOST=127.0.0.1 npm run codex
 ```
 
-该命令会在需要时启动本地 Taskboard 服务。它会复用已打开且有可用 CDP 渲染器的 Codex；普通 Codex 没有 CDP 时，它会在该实例的原生浏览面板中打开 Taskboard；没有打开 Codex 时，它会使用独立配置文件和仅限回环访问的端口 `9231` 启动官方 macOS Codex App。有可用 CDP 时，它会在 Plugins 后注入一个原生外观的 Taskboard 入口，并持续监视服务和替换后的渲染器。使用嵌入式面板时，请让该命令保持运行。启动器不会修改 `ChatGPT.app` 或其 `app.asar`。
+该命令会启动本地 Taskboard 服务和一个无界面的 Codex app-server，用于驻留协调。它不会在 macOS 上启动采用独立配置文件的可见 Codex。打开 Taskboard 时会使用普通 Codex App 的原生浏览面板；即使该 App 已关闭，协调仍会在后台继续，下一次明确的打开请求才会通过 `codex://` 深链启动普通 App。使用驻留协调时，请让该命令保持运行。启动器不会修改 `ChatGPT.app`、其配置文件或 `app.asar`。
 
 源码启动器会把带身份信息的服务地址写入 `.data/launcher-runtime.json`。通过 `npm link` 安装的 `taskctl` 默认读取此文件。因此，普通 shell 和从面板打开的 Codex 任务无需设置额外环境变量，即可使用同一个 Taskboard 服务。
 
@@ -111,7 +111,7 @@ npm run app:build
 
 从 Finder 打开 `src-tauri/target/universal-apple-darwin/release/bundle/macos/Codex Taskboard.app`。DMG 位于 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。如果只需安装稳定版，请从 [GitHub Releases](https://github.com/chuspeeism/dashi-taskboard/releases/latest) 下载当前 DMG。
 
-该 App 包含自己的 Node 运行时、Taskboard 服务、构建后的 Web UI、Skill、CLI 包装器和注入脚本。它会启动服务，复用已打开且有可用 CDP 渲染器的 Codex；普通 Codex 没有 CDP 时，它会在该实例的原生浏览面板中打开 Taskboard；没有打开 Codex 时，它会启动官方 Codex App。有可用 CDP 时，它会等待渲染器并注入侧边栏入口，然后在不显示终端窗口的情况下打开面板。该 App 可以复制到本检出目录之外；目标 Mac 只需安装官方 Codex App，不需要此仓库、系统 Node 安装或单独的 Codex CLI 安装。Taskboard 数据存储在 `~/Library/Application Support/Codex Taskboard`，启动器输出写入 `~/Library/Logs/Codex Taskboard/codex-taskboard-launcher.log`。
+该 App 包含自己的 Node 运行时、Taskboard 服务、构建后的 Web UI、Skill、CLI 包装器和无界面协调器传输。它会保留已经打开的普通 Codex App，让后台协调不再依赖渲染器生命周期，并在该 App 的原生浏览面板中打开 Taskboard，全程不需要终端或第二个 Dock 图标。后台启动和崩溃恢复不会打开或前置 Codex；只有选择 **打开任务面板** 或重新打开 Taskboard App，才会把它作为明确的面板打开信号。该 App 可以复制到本检出目录之外；目标 Mac 只需安装官方 Codex App，不需要此仓库、系统 Node 安装或单独的 Codex CLI 安装。Taskboard 数据存储在 `~/Library/Application Support/Codex Taskboard`，启动器输出写入 `~/Library/Logs/Codex Taskboard/codex-taskboard-launcher.log`。
 
 本地构建使用 ad-hoc 代码签名进行直接验证。公开的 macOS 下载仍需要 Developer ID 签名和 Apple 公证。
 

@@ -8,10 +8,11 @@ const MAX_STDOUT_BUFFER = 4 * 1024 * 1024;
 const STDERR_LIMIT = 16 * 1024;
 
 export class CodexAppServerError extends Error {
-  constructor(message, details) {
+  constructor(message, details, { definitiveRejection = false } = {}) {
     super(message);
     this.name = "CodexAppServerError";
     this.details = details;
+    this.definitiveRejection = definitiveRejection;
   }
 }
 
@@ -64,7 +65,20 @@ export class CodexAppServer {
   }
 
   async request(method, params) {
-    await this.#ensureStarted();
+    await this.ensureReady();
+    return this.requestReady("local", method, params);
+  }
+
+  ensureReady() {
+    return this.#ensureStarted();
+  }
+
+  requestReady(codexHostId, method, params) {
+    if (codexHostId !== "local") {
+      return Promise.reject(new CodexAppServerError(
+        "The local Codex app-server does not support this host",
+      ));
+    }
     return this.#sendRequest(method, params);
   }
 
@@ -202,6 +216,7 @@ export class CodexAppServer {
         pending.reject(new CodexAppServerError(
           `Codex app-server rejected '${pending.method}': ${message.error.message ?? "unknown error"}`,
           message.error,
+          { definitiveRejection: true },
         ));
       } else {
         pending.resolve(message.result);

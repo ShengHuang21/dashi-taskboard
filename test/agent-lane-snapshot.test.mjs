@@ -80,6 +80,7 @@ async function fixture(projectConfig = null) {
 async function assertInvalidCapacityBlocksContinuation(tree) {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const continuation = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: { ownedCodexHostId: "local" },
     policy: {
       enabled: true,
       projectId: "capstone-dev",
