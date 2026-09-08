@@ -584,6 +584,26 @@ test("inventory manager drives the real lease, channel, and renderer lifecycle",
   assert.equal(reappeared.lease.status, "active");
   assert.notEqual(reappeared.lease.id, firstLeaseId);
   assert.notEqual(reappeared.lease.executorInstanceId, firstExecutorInstanceId);
+  const secondExecutorInstanceId = reappeared.lease.executorInstanceId;
+
+  await manager.reconcile([]);
+  harness.clock.value += 24 * 60 * 60 * 1_000 + 1;
+  await manager.reconcile(["remote-managed"]);
+  const thirdGeneration = await harness.api.inspect({ codexHostId: "remote-managed" });
+  const thirdExecutorInstanceId = thirdGeneration.lease.executorInstanceId;
+  assert.deepEqual(
+    thirdGeneration.registrations.map((entry) => entry.executorInstanceId),
+    [secondExecutorInstanceId, thirdExecutorInstanceId],
+  );
+
+  await manager.reconcile([]);
+  harness.clock.value += 24 * 60 * 60 * 1_000 + 1;
+  await manager.reconcile(["remote-managed"]);
+  const fourthGeneration = await harness.api.inspect({ codexHostId: "remote-managed" });
+  assert.deepEqual(
+    fourthGeneration.registrations.map((entry) => entry.executorInstanceId),
+    [thirdExecutorInstanceId, fourthGeneration.lease.executorInstanceId],
+  );
   await manager.stop();
 });
 

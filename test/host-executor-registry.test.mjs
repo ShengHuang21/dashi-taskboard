@@ -613,6 +613,178 @@ test("host executor lease replay is inclusive for 24 hours and receipts then sta
   }
 });
 
+test("host executor registration retention removes repeated local and remote churn across restarts", async () => {
+  let currentTime = Date.parse("2026-09-08T03:00:00.000Z");
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-registration-churn-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const openDatabase = () => new TaskboardDatabase(databasePath, {
+    hostExecutorClock: () => currentTime,
+  });
+  let database = openDatabase();
+  const registerCycle = (cycle) => {
+    for (const [codexHostId, adapterId] of [
+      ["local", "codex-app-local-v1"],
+      ["remote-churn", "codex-renderer-rpc-v1"],
+    ]) {
+      for (let index = 0; index < 2; index += 1) {
+        const suffix = `${cycle}-${codexHostId}-${index}`;
+        database.registerHostExecutor({
+          codexHostId,
+          executorInstanceId: `executor-${suffix}`,
+          adapterId,
+          capabilities: ["thread/read"],
+          idempotencyKey: `register-${suffix}`,
+        });
+      }
+    }
+  };
+  try {
+    for (const cycle of ["first", "second"]) {
+      registerCycle(cycle);
+      database.close();
+      currentTime += 24 * 60 * 60 * 1_000;
+      database = openDatabase();
+      let inspection = new DatabaseSync(databasePath);
+      assert.equal(
+        inspection.prepare("SELECT COUNT(*) AS count FROM host_executor_registrations").get().count,
+        4,
+      );
+      inspection.close();
+
+      database.close();
+      currentTime += 1;
+      database = openDatabase();
+      inspection = new DatabaseSync(databasePath);
+      assert.equal(
+        inspection.prepare("SELECT COUNT(*) AS count FROM host_executor_registrations").get().count,
+        0,
+      );
+      inspection.close();
+    }
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("host executor registration retention preserves live safety references", async () => {
+  const initialTime = Date.parse("2026-09-08T03:15:00.000Z");
+  let currentTime = initialTime;
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-registration-references-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const openDatabase = () => new TaskboardDatabase(databasePath, {
+    hostExecutorClock: () => currentTime,
+  });
+  let database = openDatabase();
+  try {
+    const registrations = new Map();
+    for (const executorInstanceId of [
+      "executor-current-lease",
+      "executor-fresh-receipt",
+      "executor-unresolved-effect",
+      "executor-fresh-unreferenced",
+      "executor-stale-unreferenced",
+    ]) {
+      registrations.set(executorInstanceId, database.registerHostExecutor({
+        codexHostId: `host-${executorInstanceId}`,
+        executorInstanceId,
+        adapterId: "codex-renderer-rpc-v1",
+        capabilities: ["thread/start"],
+        idempotencyKey: `register-${executorInstanceId}`,
+      }).registration);
+    }
+    database.close();
+
+    const fixture = new DatabaseSync(databasePath);
+    const freshTimestamp = new Date(initialTime + 60_000).toISOString();
+    fixture.prepare(`
+      INSERT INTO host_executor_leases (
+        codex_host_id, lease_id, executor_instance_id, registration_fingerprint,
+        acquired_at, expires_at, released_at
+      ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      "host-executor-current-lease",
+      "registration-retention-current-lease",
+      "executor-current-lease",
+      registrations.get("executor-current-lease").fingerprint,
+      new Date(initialTime).toISOString(),
+      new Date(initialTime + 30_000).toISOString(),
+    );
+    fixture.prepare(`
+      INSERT INTO host_executor_lease_receipts (
+        id, codex_host_id, idempotency_key, request_fingerprint, action,
+        lease_id, executor_instance_id, result_json, created_at
+      ) VALUES (?, ?, ?, ?, 'acquired', ?, ?, '{}', ?)
+    `).run(
+      "registration-retention-fresh-receipt",
+      "host-executor-fresh-receipt",
+      "registration-retention-fresh-receipt-key",
+      "a".repeat(64),
+      "registration-retention-receipt-lease",
+      "executor-fresh-receipt",
+      freshTimestamp,
+    );
+    fixture.prepare(`
+      INSERT INTO host_executor_effects (
+        effect_key, codex_host_id, executor_instance_id, registration_fingerprint,
+        lease_id, adapter_id, request_fingerprint, operations_json, status,
+        dispatch_token, result_json, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uncertain', ?, NULL, ?, ?)
+    `).run(
+      "registration-retention-unresolved-effect",
+      "host-executor-unresolved-effect",
+      "executor-unresolved-effect",
+      registrations.get("executor-unresolved-effect").fingerprint,
+      "registration-retention-unresolved-lease",
+      "codex-renderer-rpc-v1",
+      "b".repeat(64),
+      '[{"method":"thread/start","params":{"prompt":"CAP65_REGISTRATION_SENTINEL"}}]',
+      "registration-retention-unresolved-dispatch",
+      new Date(initialTime).toISOString(),
+      new Date(initialTime).toISOString(),
+    );
+    fixture.prepare(`
+      UPDATE host_executor_registrations SET registered_at = ?
+      WHERE executor_instance_id = 'executor-fresh-unreferenced'
+    `).run(freshTimestamp);
+    fixture.close();
+
+    currentTime = initialTime + 24 * 60 * 60 * 1_000 + 1;
+    database = openDatabase();
+    let inspection = new DatabaseSync(databasePath);
+    assert.deepEqual(inspection.prepare(`
+      SELECT executor_instance_id FROM host_executor_registrations
+      ORDER BY executor_instance_id
+    `).all().map((row) => row.executor_instance_id), [
+      "executor-current-lease",
+      "executor-fresh-receipt",
+      "executor-fresh-unreferenced",
+      "executor-unresolved-effect",
+    ]);
+    assert.equal(inspection.prepare(`
+      SELECT operations_json FROM host_executor_effects
+      WHERE effect_key = 'registration-retention-unresolved-effect'
+    `).get().operations_json, "[]");
+    inspection.close();
+
+    database.close();
+    currentTime = initialTime + 48 * 60 * 60 * 1_000 + 60_001;
+    database = openDatabase();
+    inspection = new DatabaseSync(databasePath);
+    assert.deepEqual(inspection.prepare(`
+      SELECT executor_instance_id FROM host_executor_registrations
+      ORDER BY executor_instance_id
+    `).all().map((row) => row.executor_instance_id), [
+      "executor-current-lease",
+      "executor-unresolved-effect",
+    ]);
+    inspection.close();
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("host executor retention removes resolved payloads and preserves unresolved tombstones", async () => {
   const initialTime = Date.parse("2026-09-08T03:30:00.000Z");
   let currentTime = initialTime;
@@ -798,6 +970,28 @@ test("host executor activity drains bounded retention backlog for an inactive ho
           UNION ALL
           SELECT entry_index + 1 FROM backlog WHERE entry_index + 1 < ?
         )
+        INSERT INTO host_executor_registrations (
+          executor_instance_id, codex_host_id, adapter_id, capabilities_json,
+          idempotency_key, request_fingerprint, registration_fingerprint, registered_at
+        )
+        SELECT
+          'inactive-registration-' || entry_index,
+          CASE WHEN entry_index % 2 = 0 THEN 'local' ELSE 'remote-churn-backlog' END,
+          CASE WHEN entry_index % 2 = 0
+            THEN 'codex-app-local-v1' ELSE 'codex-renderer-rpc-v1' END,
+          '["thread/read"]',
+          'inactive-registration-key-' || entry_index,
+          printf('%064x', entry_index + 65536),
+          printf('%064x', entry_index + 65536),
+          ?
+        FROM backlog
+      `).run(8_193, new Date(initialTime).toISOString());
+      fixture.prepare(`
+        WITH RECURSIVE backlog(entry_index) AS (
+          VALUES (0)
+          UNION ALL
+          SELECT entry_index + 1 FROM backlog WHERE entry_index + 1 < ?
+        )
         INSERT INTO host_executor_lease_receipts (
           id, codex_host_id, idempotency_key, request_fingerprint, action,
           lease_id, executor_instance_id, result_json, created_at
@@ -896,6 +1090,10 @@ test("host executor activity drains bounded retention backlog for an inactive ho
             WHERE codex_host_id = 'remote-inactive-backlog' AND status = 'uncertain'
               AND (operations_json <> '[]' OR result_json IS NOT NULL)
           `).get().count,
+          registrations: inspection.prepare(`
+            SELECT COUNT(*) AS count FROM host_executor_registrations
+            WHERE executor_instance_id LIKE 'inactive-registration-%'
+          `).get().count,
         };
       } finally {
         inspection.close();
@@ -906,6 +1104,7 @@ test("host executor activity drains bounded retention backlog for an inactive ho
       resolvedEffects: 4_097,
       unresolvedTombstones: 8_193,
       unresolvedPayloads: 4_097,
+      registrations: 4_097,
     });
 
     const activeRegistration = database.registerHostExecutor({
@@ -915,6 +1114,13 @@ test("host executor activity drains bounded retention backlog for an inactive ho
       capabilities: ["thread/read"],
       idempotencyKey: "register-active-backlog",
     }).registration;
+    assert.deepEqual(inactiveBacklog(), {
+      receipts: 1,
+      resolvedEffects: 1,
+      unresolvedTombstones: 8_193,
+      unresolvedPayloads: 1,
+      registrations: 1,
+    });
     const activeLease = database.acquireHostExecutorLease({
       codexHostId: "remote-active-backlog",
       executorInstanceId: activeRegistration.executorInstanceId,
@@ -924,10 +1130,11 @@ test("host executor activity drains bounded retention backlog for an inactive ho
       idempotencyKey: "acquire-active-backlog",
     }).lease;
     assert.deepEqual(inactiveBacklog(), {
-      receipts: 1,
-      resolvedEffects: 1,
+      receipts: 0,
+      resolvedEffects: 0,
       unresolvedTombstones: 8_193,
-      unresolvedPayloads: 1,
+      unresolvedPayloads: 0,
+      registrations: 0,
     });
 
     database.renewHostExecutorLease({
@@ -943,6 +1150,7 @@ test("host executor activity drains bounded retention backlog for an inactive ho
       resolvedEffects: 0,
       unresolvedTombstones: 8_193,
       unresolvedPayloads: 0,
+      registrations: 0,
     });
   } finally {
     database.close();
@@ -1146,6 +1354,7 @@ test("host executor lease decisions sample time only after acquiring the SQLite 
     const releaseRegistration = register("remote-release-lock", "executor-release");
     const takeoverRegistrationA = register("remote-takeover-lock", "executor-takeover-a");
     const takeoverRegistrationB = register("remote-takeover-lock", "executor-takeover-b");
+    register("remote-registration-lock", "executor-registration-old");
     const renewedCandidate = acquire(
       "remote-renew-lock", renewRegistration, null, "acquire-renew-candidate",
     );
@@ -1204,6 +1413,19 @@ test("host executor lease decisions sample time only after acquiring the SQLite 
       takeoverError = error;
     }
     await acquireLock.exited;
+
+    const retentionBoundary = initialTime + 24 * 60 * 60 * 1_000;
+    await writeFile(clockPath, String(retentionBoundary));
+    const registrationLock = await holdWriteLockAndAdvanceClock(
+      databasePath,
+      clockPath,
+      retentionBoundary + 1,
+    );
+    const latestRegistration = register(
+      "remote-registration-lock",
+      "executor-registration-new",
+    );
+    await registrationLock.exited;
     assert.deepEqual(
       [renewError?.code, releaseError?.code, takeoverError?.code],
       [
@@ -1229,6 +1451,14 @@ test("host executor lease decisions sample time only after acquiring the SQLite 
         WHERE codex_host_id = 'remote-takeover-lock'
       `).get().executor_instance_id,
       "executor-takeover-b",
+    );
+    assert.deepEqual(
+      inspection.prepare(`
+        SELECT executor_instance_id FROM host_executor_registrations
+        WHERE codex_host_id = 'remote-registration-lock'
+        ORDER BY executor_instance_id
+      `).all().map((row) => row.executor_instance_id),
+      [latestRegistration.executorInstanceId],
     );
     inspection.close();
   } finally {

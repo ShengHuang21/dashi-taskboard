@@ -1735,6 +1735,9 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS host_executor_registrations_host
         ON host_executor_registrations(codex_host_id, registered_at, executor_instance_id);
 
+      CREATE INDEX IF NOT EXISTS host_executor_registrations_registered
+        ON host_executor_registrations(registered_at, executor_instance_id);
+
       CREATE TABLE IF NOT EXISTS host_executor_leases (
         codex_host_id TEXT PRIMARY KEY,
         lease_id TEXT NOT NULL UNIQUE,
@@ -1744,6 +1747,9 @@ export class TaskboardDatabase {
         expires_at TEXT NOT NULL,
         released_at TEXT
       );
+
+      CREATE INDEX IF NOT EXISTS host_executor_leases_executor
+        ON host_executor_leases(executor_instance_id);
 
       CREATE TABLE IF NOT EXISTS host_executor_lease_receipts (
         id TEXT PRIMARY KEY,
@@ -1762,6 +1768,9 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS host_executor_lease_receipts_created
         ON host_executor_lease_receipts(created_at, id);
+
+      CREATE INDEX IF NOT EXISTS host_executor_lease_receipts_executor_created
+        ON host_executor_lease_receipts(executor_instance_id, created_at, id);
 
       CREATE TABLE IF NOT EXISTS host_executor_effects (
         effect_key TEXT PRIMARY KEY,
@@ -1784,6 +1793,9 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS host_executor_effects_status_updated
         ON host_executor_effects(status, updated_at, effect_key);
+
+      CREATE INDEX IF NOT EXISTS host_executor_effects_executor
+        ON host_executor_effects(executor_instance_id, effect_key);
 
       CREATE TABLE IF NOT EXISTS host_executor_proof_nonces (
         nonce TEXT PRIMARY KEY,
@@ -3895,10 +3907,37 @@ export class TaskboardDatabase {
         LIMIT ?
       )
     `).run(cutoff, HOST_EXECUTOR_RETENTION_BATCH_SIZE);
+    const registrations = this.#prepare(`
+      DELETE FROM host_executor_registrations WHERE rowid IN (
+        SELECT registration.rowid
+        FROM host_executor_registrations AS registration
+        WHERE registration.registered_at < ?
+          AND julianday(registration.registered_at) IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM host_executor_leases AS lease
+            WHERE lease.executor_instance_id = registration.executor_instance_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM host_executor_lease_receipts AS receipt
+            WHERE receipt.executor_instance_id = registration.executor_instance_id
+              AND (
+                julianday(receipt.created_at) IS NULL
+                OR receipt.created_at >= ?
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM host_executor_effects AS effect
+            WHERE effect.executor_instance_id = registration.executor_instance_id
+          )
+        ORDER BY registration.registered_at, registration.executor_instance_id
+        LIMIT ?
+      )
+    `).run(cutoff, cutoff, HOST_EXECUTOR_RETENTION_BATCH_SIZE);
     return {
       receipts: Number(receipts.changes),
       resolvedEffects: Number(resolvedEffects.changes),
       scrubbedEffects: Number(scrubbedEffects.changes),
+      registrations: Number(registrations.changes),
     };
   }
 
@@ -3967,10 +4006,10 @@ export class TaskboardDatabase {
       adapterId,
       capabilities,
     })).digest("hex");
-    const { timestamp } = this.#hostExecutorTime();
-
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const replay = this.#prepare(`
         SELECT * FROM host_executor_registrations WHERE idempotency_key = ?
       `).get(idempotencyKey);
