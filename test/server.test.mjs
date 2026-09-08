@@ -10,6 +10,7 @@ import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 
 import { createTaskboardServer, resolveHost } from "../server/index.mjs";
+import { createAgentCapabilityCatalog } from "../server/agent-capability-catalog.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
@@ -262,6 +263,19 @@ test("agent capability catalog publishes stable supported and planned boundaries
       checkpointReceipt: false,
     },
   });
+});
+
+test("agent capability catalog calls cannot mutate later stable entries", () => {
+  const first = createAgentCapabilityCatalog();
+  first.capabilities[0].id = "mutated.capability";
+  first.capabilities[0].prerequisites.push("mutated-prerequisite");
+
+  const second = createAgentCapabilityCatalog();
+  assert.equal(second.capabilities[0].id, "taskboard.task-capsule.read");
+  assert.deepEqual(second.capabilities[0].prerequisites, [
+    "authenticated-taskboard-runtime",
+    "existing-task",
+  ]);
 });
 
 test("agent capability catalog route stays read-only and query-free", async () => {

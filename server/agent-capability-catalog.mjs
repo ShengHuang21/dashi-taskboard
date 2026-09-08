@@ -69,6 +69,15 @@ const plannedCapabilities = [
   },
 ];
 
+function copyCapability(capability) {
+  return {
+    ...capability,
+    inputModes: [...capability.inputModes],
+    outputModes: [...capability.outputModes],
+    prerequisites: [...capability.prerequisites],
+  };
+}
+
 export function createAgentCapabilityCatalog({ version = "development" } = {}) {
   return {
     catalogVersion: 1,
@@ -83,7 +92,7 @@ export function createAgentCapabilityCatalog({ version = "development" } = {}) {
       transport: "http-json",
       scope: "authenticated-local-runtime",
     },
-    capabilities: [...supportedCapabilities, ...plannedCapabilities],
+    capabilities: [...supportedCapabilities, ...plannedCapabilities].map(copyCapability),
     interoperability: {
       a2a: {
         state: "not_implemented",
