@@ -1914,7 +1914,8 @@ test("Coordinator shutdown rejects same-host request responses with another bind
         coordinatorTaskId: globalLane.id,
         lease: { id: "global-lease", status: "active", bindingValid: true },
         domainCoordinators: [{
-          domainId, assignment: "lease", durableWorkPending: false,
+          domainId, label: "Frontend", writeScope: ["web"],
+          eligibleTaskIds: [holder.id], assignment: "lease", durableWorkPending: false,
           coordinatorTaskId: holder.id,
           lease: {
             id: "frontend-lease", holderTaskId: holder.id,
@@ -2195,7 +2196,8 @@ test("mixed-host domain shutdown selects owned-later and rechecks the request re
       coordinatorTaskId: globalLane.id,
       lease: { id: "global-lease", status: "active", bindingValid: true },
       domainCoordinators: [remoteLane, localLane].map((lane) => ({
-        domainId: lane.id, assignment: "lease", durableWorkPending: false,
+        domainId: lane.id, label: lane.id, writeScope: [lane.id],
+        eligibleTaskIds: [lane.id], assignment: "lease", durableWorkPending: false,
         coordinatorTaskId: lane.id,
         lease: {
           id: `${lane.id}-lease`, holderTaskId: lane.id,
@@ -2405,7 +2407,12 @@ test("Global shutdown idle grace is isolated by host and project", async () => {
 
 test("idle domain Coordinator retirement releases and archives only its exact domain thread", async () => {
   let observedAt = Date.parse("2026-09-05T06:00:00.000Z");
-  const global = { id: "global", threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae" };
+  const global = {
+    id: "global", taskId: "global",
+    threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+    source: "codex", taskType: "root_task", codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global",
+  };
   const holder = {
     id: "frontend", taskId: "frontend",
     threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
@@ -2416,6 +2423,11 @@ test("idle domain Coordinator retirement releases and archives only its exact do
   let archived = false;
   let releaseCalls = 0;
   let workPending = false;
+  let windowsRevision = "a".repeat(64);
+  const globalLease = {
+    id: "global-lease", holderTaskId: global.id, status: "active", bindingValid: true,
+    acquiredAt: "2026-09-05T05:55:00.000Z", expiresAt: "2026-09-05T06:05:00.000Z",
+  };
   const lease = {
     id: "frontend-lease", status: "active", bindingValid: true,
     holderTaskId: holder.id, acquiredAt: "2026-09-05T05:55:00.000Z",
@@ -2429,9 +2441,10 @@ test("idle domain Coordinator retirement releases and archives only its exact do
       projectId: "capstone-dev",
       coordination: {
         coordinatorTaskId: global.id,
-        lease: { id: "global-lease", status: "active", bindingValid: true },
+        lease: globalLease,
         domainCoordinators: [{
-          domainId: "frontend", assignment: "lease", durableWorkPending: workPending,
+          domainId: "frontend", label: "Frontend", writeScope: ["web"],
+          eligibleTaskIds: [holder.id], assignment: "lease", durableWorkPending: workPending,
           coordinatorTaskId: holder.id, lease,
         }, {
           domainId: "backend", assignment: "lease", durableWorkPending: true,
@@ -2443,8 +2456,8 @@ test("idle domain Coordinator retirement releases and archives only its exact do
       taskLanes: [{ ...global }, { ...holder }],
     }),
     readWindows: async () => ({
-      projectId: "capstone-dev", revision: "a".repeat(64),
-      windows: [{ ...holder }],
+      projectId: "capstone-dev", revision: windowsRevision,
+      windows: [{ ...global, role: "coordinator" }],
     }),
     readThread: async () => ({
       thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
@@ -2454,6 +2467,7 @@ test("idle domain Coordinator retirement releases and archives only its exact do
       assert.equal(request.domainId, "frontend");
       assert.equal(request.expectedLeaseId, lease.id);
       assert.equal(request.globalHolderTaskId, global.id);
+      assert.equal(request.expectedRevision, windowsRevision);
       assert.equal(Object.hasOwn(request, "fingerprint"), false);
       attempt = { ...request, id: "domain-shutdown", status: "pending" };
       return { applied: true, attempt };
@@ -2493,12 +2507,96 @@ test("idle domain Coordinator retirement releases and archives only its exact do
   assert.equal((await runTick()).reason, "no-idle-domain");
   workPending = false;
   assert.equal((await runTick()).reason, "idle-grace");
-  observedAt += 30_000;
+  observedAt += 15_000;
+  windowsRevision = "b".repeat(64);
+  lease.expiresAt = "2026-09-05T06:10:00.000Z";
+  globalLease.expiresAt = "2026-09-05T06:10:00.000Z";
+  assert.equal((await runTick()).reason, "idle-grace");
+  observedAt += 15_000;
+  windowsRevision = "c".repeat(64);
+  lease.expiresAt = "2026-09-05T06:15:00.000Z";
+  globalLease.expiresAt = "2026-09-05T06:15:00.000Z";
   assert.deepEqual(await runTick(), {
     shutdown: true, reason: "completed", attemptId: "domain-shutdown", domainId: "frontend",
   });
   assert.equal(releaseCalls, 1);
   assert.equal(archived, true);
+});
+
+test("domain shutdown idle grace resets only for durable policy or binding drift", async () => {
+  const drifts = [
+    ["label", ({ domain }) => { domain.label = "Frontend replacement"; }],
+    ["write scope", ({ domain }) => { domain.writeScope = ["server"]; }],
+    ["eligible task", ({ domain }) => { domain.eligibleTaskIds = ["frontend", "visual"]; }],
+    ["domain lease", ({ lease }) => { lease.id = "frontend-lease-replacement"; }],
+    ["holder thread", ({ holder }) => {
+      holder.threadId = "01a062c1-fd2b-7f61-9114-d483e695640e";
+    }],
+    ["holder workspace", ({ holder }) => { holder.workspacePath = "/tmp/frontend-v2"; }],
+    ["Global lease", ({ globalLease }) => { globalLease.id = "global-lease-replacement"; }],
+  ];
+  for (const [index, [label, drift]] of drifts.entries()) {
+    const projectId = `cap58-idle-drift-${index}`;
+    let observedAt = 0;
+    let revision = "d".repeat(64);
+    const global = {
+      id: "global", taskId: "global", threadId: coordinatorThreadId,
+      source: "codex", taskType: "root_task", codexProjectId: "project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/global",
+    };
+    const holder = {
+      id: "frontend", taskId: "frontend",
+      threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+      source: "codex", taskType: "peer_task", codexProjectId: "project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/frontend",
+    };
+    const globalLease = {
+      id: "global-lease", status: "active", bindingValid: true,
+    };
+    const lease = {
+      id: "frontend-lease", holderTaskId: holder.id,
+      status: "active", bindingValid: true, releasedAt: null,
+    };
+    const domain = {
+      domainId: "frontend", label: "Frontend", writeScope: ["web"],
+      eligibleTaskIds: [holder.id], assignment: "lease", durableWorkPending: false,
+      coordinatorTaskId: holder.id, lease,
+    };
+    let requests = 0;
+    const runTick = () => runDomainCoordinatorShutdownMonitorOnce({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId, idleGraceMs: 30_000 },
+      now: () => observedAt,
+      readSnapshot: async () => ({
+        projectId,
+        coordination: {
+          coordinatorTaskId: global.id, lease: globalLease, domainCoordinators: [domain],
+        },
+        taskLanes: [global, holder],
+      }),
+      readWindows: async () => ({
+        projectId, revision, windows: [{ ...global, role: "coordinator" }],
+      }),
+      readThread: async () => ({
+        thread: { id: holder.threadId, cwd: holder.workspacePath, turns: [] },
+      }),
+      getAttempt: async () => ({ attempt: null }),
+      requestAttempt: async () => { requests += 1; return { attempt: null }; },
+      releaseAttempt: async () => assert.fail("drift must reset grace"),
+      authorizeAttempt: async () => assert.fail("drift must reset grace"),
+      beginArchiveAttempt: async () => assert.fail("drift must reset grace"),
+      cancelAttempt: async () => assert.fail("drift must reset grace"),
+      findArchivedThread: async () => assert.fail("drift must reset grace"),
+      archiveThread: async () => assert.fail("drift must reset grace"),
+      completeAttempt: async () => assert.fail("drift must reset grace"),
+    });
+    assert.equal((await runTick()).reason, "idle-grace", label);
+    drift({ domain, lease, holder, globalLease });
+    revision = "e".repeat(64);
+    observedAt += 30_000;
+    assert.equal((await runTick()).reason, "idle-grace", label);
+    assert.equal(requests, 0, label);
+  }
 });
 
 test("released domain retirement never archives before protected reauthorization", async () => {
