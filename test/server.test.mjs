@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { access, appendFile, chmod, mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
@@ -10,16 +10,20 @@ import { afterEach, test } from "node:test";
 import { promisify } from "node:util";
 
 import { createTaskboardServer, resolveHost } from "../server/index.mjs";
+import { createAgentCapabilityCatalog } from "../server/agent-capability-catalog.mjs";
 import { TaskboardDatabase } from "../server/database.mjs";
 import {
   classifyOwnerIntentPlanHttpFailure,
+  coordinatorProvisioningResponseJson,
   deliverTaskboardCoordination,
   runOwnerIntentPlanningMonitorOnce,
+  runDomainCoordinatorProvisioningMonitorOnce,
   runTaskboardContinuationMonitorOnce,
 } from "../scripts/codex-injector-runtime.mjs";
 
 const runningApps = [];
 const execFileAsync = promisify(execFile);
+const localShutdownExecutor = Object.freeze({ ownedCodexHostId: "local" });
 
 afterEach(async () => {
   while (runningApps.length > 0) {
@@ -39,16 +43,26 @@ async function startServer(configure, listenOptions = {}) {
 }
 
 async function request(baseUrl, pathname, options = {}) {
-  const headers = new Headers(options.headers);
-  if (options.body !== undefined && !headers.has("content-type")) {
+  const { residentTaskctlCompat = true, ...fetchOptions } = options;
+  const headers = new Headers(fetchOptions.headers);
+  if (fetchOptions.body !== undefined && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
+  const manualResidentMutation = (
+    /^\/api\/tasks\/[^/]+\/(?:bootstrap-(?:claim|delivery|complete|host-access)|admission-(?:defer|uncertain|reconcile|probe|replacement-probe|replacement-reconcile)|owner-decisions)$/.test(pathname)
+    || /^\/api\/local\/(?:projects\/[^/]+\/(?:coordinator-|domain-coordinator-|coordination-identity-|cross-domain-|owner-decision-|owner-intents)|coordinator-|domain-coordinator-|coordination-identity-)/.test(pathname)
+  );
+  if (residentTaskctlCompat && manualResidentMutation
+    && !headers.has("x-codex-taskboard-host-execution")
+    && !headers.has("x-taskboard-client")) {
+    headers.set("x-taskboard-client", "taskctl");
+  }
   const response = await fetch(`${baseUrl}${pathname}`, {
-    ...options,
+    ...fetchOptions,
     headers,
-    body: options.body === undefined || typeof options.body === "string"
-      ? options.body
-      : JSON.stringify(options.body),
+    body: fetchOptions.body === undefined || typeof fetchOptions.body === "string"
+      ? fetchOptions.body
+      : JSON.stringify(fetchOptions.body),
   });
   const text = await response.text();
   return {
@@ -198,6 +212,85 @@ test("health and the default local project are available", async () => {
   const agentLaneProjects = await request(baseUrl, "/api/local/agent-lane-projects");
   assert.equal(agentLaneProjects.response.status, 200);
   assert.deepEqual(agentLaneProjects.body, { projectIds: [] });
+});
+
+test("agent capability catalog publishes stable supported and planned boundaries", async () => {
+  const baseUrl = await startServer(async () => ({ version: "1.2.3-test" }));
+
+  const result = await request(baseUrl, "/api/agent-capabilities");
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.catalogVersion, 1);
+  assert.deepEqual(result.body.service, {
+    id: "codex-taskboard",
+    name: "Codex Taskboard",
+    version: "1.2.3-test",
+  });
+  assert.deepEqual(result.body.protocol, {
+    id: "taskboard-control-plane",
+    version: 1,
+    transport: "http-json",
+    scope: "authenticated-local-runtime",
+  });
+
+  const capabilitiesById = new Map(
+    result.body.capabilities.map((capability) => [capability.id, capability]),
+  );
+  assert.equal(capabilitiesById.size, result.body.capabilities.length);
+  assert.deepEqual(
+    [...capabilitiesById.entries()].map(([id, capability]) => [id, capability.state]),
+    [
+      ["taskboard.task-capsule.read", "supported"],
+      ["taskboard.owner-intent.capture", "supported"],
+      ["taskboard.work.route", "supported"],
+      ["taskboard.execution.claim", "supported"],
+      ["taskboard.handoff.record", "supported"],
+      ["external.agent-card.inspect", "planned"],
+      ["external.task.dispatch", "planned"],
+    ],
+  );
+  for (const capability of capabilitiesById.values()) {
+    assert.deepEqual(capability.inputModes, ["application/json"]);
+    assert.deepEqual(capability.outputModes, ["application/json"]);
+    assert.ok(capability.prerequisites.length > 0);
+  }
+  assert.deepEqual(result.body.interoperability, {
+    a2a: { state: "not_implemented", conformant: false },
+    externalProviders: {
+      state: "not_configured",
+      inspect: false,
+      dispatch: false,
+      wait: false,
+      checkpointReceipt: false,
+    },
+  });
+});
+
+test("agent capability catalog calls cannot mutate later stable entries", () => {
+  const first = createAgentCapabilityCatalog();
+  first.capabilities[0].id = "mutated.capability";
+  first.capabilities[0].prerequisites.push("mutated-prerequisite");
+
+  const second = createAgentCapabilityCatalog();
+  assert.equal(second.capabilities[0].id, "taskboard.task-capsule.read");
+  assert.deepEqual(second.capabilities[0].prerequisites, [
+    "authenticated-taskboard-runtime",
+    "existing-task",
+  ]);
+});
+
+test("agent capability catalog route stays read-only and query-free", async () => {
+  const baseUrl = await startServer();
+
+  const mutation = await request(baseUrl, "/api/agent-capabilities", {
+    method: "POST",
+    body: {},
+  });
+  assert.equal(mutation.response.status, 405);
+  assert.equal(mutation.response.headers.get("allow"), "GET");
+
+  const unknownQuery = await request(baseUrl, "/api/agent-capabilities?provider=external");
+  assert.equal(unknownQuery.response.status, 400);
+  assert.equal(unknownQuery.body.error.code, "UNKNOWN_QUERY_PARAMETER");
 });
 
 test("database reuses prepared statements across repeated hot reads", async () => {
@@ -518,6 +611,200 @@ test("durable Agent Runs checkpoint, finish, and recover through the API", async
   assert.equal(repeated.body.applied, false);
 });
 
+test("a completed Agent Run accepts exactly one causally bound final handoff", async () => {
+  let dataDirectory;
+  const baseUrl = await startServer(async (directory) => {
+    dataDirectory = directory;
+    return {};
+  });
+  const rootBinding = {
+    threadId: "final-handoff-root",
+    codexProjectId: "local-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: "/tmp/final-handoff-worktree",
+  };
+  const created = await request(baseUrl, "/api/tasks", {
+    method: "POST",
+    body: {
+      projectId: "local",
+      title: "Final handoff after finish",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      developmentContext: {
+        type: "worktree",
+        path: rootBinding.workspacePath,
+        branch: "codex/final-handoff-after-finish",
+      },
+    },
+  });
+  assert.equal(created.response.status, 201);
+  const claimed = await request(baseUrl, `/api/tasks/${created.body.task.id}/claim`, {
+    method: "POST",
+    body: {
+      version: created.body.task.version,
+      agentPath: "/root/final-handoff-worker",
+      agentThreadId: "final-handoff-thread",
+      leaseExpiresAt: "2099-01-01T00:00:00.000Z",
+      writeScope: ["server/database.mjs"],
+    },
+  });
+  assert.equal(claimed.response.status, 200);
+  const finished = await request(baseUrl, `/api/runs/${claimed.body.run.id}/finish`, {
+    method: "POST",
+    body: {
+      version: claimed.body.run.version,
+      agentThreadId: "final-handoff-thread",
+      summary: "Implementation and verification finished.",
+      nextAction: "Root reviews the final evidence.",
+      status: "completed",
+    },
+  });
+  assert.equal(finished.response.status, 200);
+  assert.equal(finished.body.task.status, "in_review");
+  assert.equal(finished.body.run.status, "completed");
+
+  const envelope = {
+    eventId: "final-handoff-event",
+    idempotencyKey: "final-handoff-delivery",
+    parentTaskId: null,
+    senderThreadId: "final-handoff-thread",
+    senderAgentPath: "/root/final-handoff-worker",
+    eventType: "handoff",
+    sequence: 1,
+    timestamp: "2098-01-01T01:02:03.000Z",
+    summary: "The completed run is ready for review.",
+    evidenceRefs: ["test/server.test.mjs#final-handoff-after-finish"],
+    blocker: null,
+    nextAction: "Root verifies and accepts the completed run.",
+    requiresAck: true,
+    causationId: finished.body.run.id,
+    correlationId: "final-handoff-correlation",
+  };
+  const first = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: envelope,
+  });
+  assert.equal(first.response.status, 201);
+  assert.equal(first.body.applied, true);
+  assert.deepEqual(first.body.event.envelope, envelope);
+
+  const replay = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: envelope,
+  });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.applied, false);
+  assert.deepEqual(replay.body.event, first.body.event);
+
+  const wrongSender = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-wrong-sender",
+      idempotencyKey: "final-handoff-wrong-sender",
+      senderThreadId: "other-thread",
+    },
+  });
+  assert.equal(wrongSender.response.status, 409);
+  assert.equal(wrongSender.body.error.code, "COORDINATION_SENDER_MISMATCH");
+
+  const wrongCausation = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-wrong-causation",
+      idempotencyKey: "final-handoff-wrong-causation",
+      causationId: "another-run",
+    },
+  });
+  assert.equal(wrongCausation.response.status, 409);
+  assert.equal(wrongCausation.body.error.code, "COORDINATION_FINAL_HANDOFF_MISMATCH");
+
+  const missingCausation = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-missing-causation",
+      idempotencyKey: "final-handoff-missing-causation",
+      causationId: null,
+    },
+  });
+  assert.equal(missingCausation.response.status, 409);
+  assert.equal(missingCausation.body.error.code, "COORDINATION_FINAL_HANDOFF_MISMATCH");
+
+  const second = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-second-event",
+      idempotencyKey: "final-handoff-second-delivery",
+      sequence: 2,
+    },
+  });
+  assert.equal(second.response.status, 409);
+  assert.equal(second.body.error.code, "COORDINATION_FINAL_HANDOFF_EXISTS");
+  const events = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`);
+  assert.deepEqual(events.body.events.map((event) => event.envelope.eventId), [envelope.eventId]);
+
+  const taskAfter = await request(baseUrl, `/api/tasks/${created.body.task.id}`);
+  assert.equal(taskAfter.body.task.status, "in_review");
+  assert.equal(taskAfter.body.task.version, finished.body.task.version);
+  const runAfter = await request(baseUrl, `/api/runs/${claimed.body.run.id}`);
+  assert.deepEqual(runAfter.body.run, finished.body.run);
+  const database = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
+  const claimAfter = database.getAgentTaskClaim(created.body.task.id);
+  database.close();
+  assert.equal(claimAfter.status, "completed");
+  assert.equal(claimAfter.completedAt, finished.body.run.finishedAt);
+  assert.equal(claimAfter.agentPath, envelope.senderAgentPath);
+  assert.equal(claimAfter.agentThreadId, envelope.senderThreadId);
+
+  const moved = await request(baseUrl, `/api/tasks/${created.body.task.id}/move`, {
+    method: "POST",
+    body: {
+      version: finished.body.task.version,
+      status: "done",
+    },
+  });
+  assert.equal(moved.response.status, 200);
+  const afterDone = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-after-done",
+      idempotencyKey: "final-handoff-after-done",
+      sequence: 2,
+    },
+  });
+  assert.equal(afterDone.response.status, 409);
+  assert.equal(afterDone.body.error.code, "COORDINATION_CLAIM_NOT_ACTIVE");
+
+  const canceled = await request(baseUrl, `/api/tasks/${created.body.task.id}/move`, {
+    method: "POST",
+    body: {
+      version: moved.body.task.version,
+      status: "canceled",
+    },
+  });
+  assert.equal(canceled.response.status, 200);
+  const afterCanceled = await request(baseUrl, `/api/tasks/${created.body.task.id}/coordination-events`, {
+    method: "POST",
+    body: {
+      ...envelope,
+      eventId: "final-handoff-after-canceled",
+      idempotencyKey: "final-handoff-after-canceled",
+      sequence: 2,
+    },
+  });
+  assert.equal(afterCanceled.response.status, 409);
+  assert.equal(afterCanceled.body.error.code, "COORDINATION_CLAIM_NOT_ACTIVE");
+});
+
 test("structured handoff envelopes replay and acknowledge without changing execution", async () => {
   let dataDirectory;
   let baseUrl = await startServer(async (directory) => {
@@ -744,10 +1031,65 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
 
   const bootstrap = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
   const capsule = bootstrap.body.capsule;
+  const missingExecutor = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: capsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "missing-executor-lease",
+    },
+  });
+  assert.equal(missingExecutor.response.status, 400);
+  assert.equal(missingExecutor.body.error.code, "INVALID_FIELD");
+
+  for (const length of [240, 241, 256]) {
+    const acceptedHostBoundary = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+      method: "POST",
+      body: {
+        rootThreadId: "root-thread",
+        ownedCodexHostId: "h".repeat(length),
+        expectedResumeToken: capsule.resumeToken,
+        safeActionId: capsule.readyWork.safeActions[0].id,
+        reservationLeaseId: `accepted-host-boundary-${length}`,
+      },
+    });
+    assert.equal(acceptedHostBoundary.response.status, 409, String(length));
+    assert.equal(acceptedHostBoundary.body.error.code, "HOST_EXECUTOR_MISMATCH", String(length));
+  }
+  for (const invalidHostId of ["h".repeat(257), "remote\ncontrol"]) {
+    const rejectedHostBoundary = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+      method: "POST",
+      body: {
+        rootThreadId: "root-thread",
+        ownedCodexHostId: invalidHostId,
+        expectedResumeToken: capsule.resumeToken,
+        safeActionId: capsule.readyWork.safeActions[0].id,
+        reservationLeaseId: "rejected-host-boundary",
+      },
+    });
+    assert.equal(rejectedHostBoundary.response.status, 400, JSON.stringify(invalidHostId));
+    assert.equal(rejectedHostBoundary.body.error.code, "INVALID_FIELD", JSON.stringify(invalidHostId));
+  }
+
+  const wrongExecutor = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId: "root-thread",
+      ownedCodexHostId: "remote-builder",
+      expectedResumeToken: capsule.resumeToken,
+      safeActionId: capsule.readyWork.safeActions[0].id,
+      reservationLeaseId: "wrong-executor-lease",
+    },
+  });
+  assert.equal(wrongExecutor.response.status, 409);
+  assert.equal(wrongExecutor.body.error.code, "HOST_EXECUTOR_MISMATCH");
+
   const reservation = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
     method: "POST",
     body: {
       rootThreadId: "root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: capsule.readyWork.safeActions[0].id,
       reservationLeaseId: "bootstrap-lease",
@@ -762,6 +1104,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
     method: "POST",
     body: {
       rootThreadId: "root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: "test",
       reservationLeaseId: "bootstrap-lease",
@@ -775,6 +1118,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
     method: "POST",
     body: {
       rootThreadId: "other-root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.resumeToken,
       safeActionId: "test",
       reservationLeaseId: "wrong-root-lease",
@@ -787,6 +1131,7 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
     method: "POST",
     body: {
       rootThreadId: "root-thread",
+      ownedCodexHostId: "local",
       expectedResumeToken: "0".repeat(64),
       safeActionId: "test",
       reservationLeaseId: "stale-lease",
@@ -798,6 +1143,286 @@ test("bootstrap safe-action reservation atomically validates the Capsule frontie
   const unchanged = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
   assert.equal(unchanged.body.capsule.task.status, "todo");
   assert.equal(unchanged.body.capsule.activeRun, null);
+  assert.ok(unchanged.body.capsule.executionTarget.repositoryVerifiedAt);
+});
+
+test("wrong-host bootstrap claims never persist successful or failed repository probes", async () => {
+  let databasePath;
+  let taskId;
+  let rootThreadId;
+  let expectedResumeToken;
+  let safeActionId;
+  let probeMode = "success";
+  let probeCalls = 0;
+  const snapshotDatabase = () => {
+    const inspection = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      const tables = inspection.prepare(`
+        SELECT name FROM sqlite_schema
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+      `).all();
+      return Object.fromEntries(tables.map(({ name }) => [
+        name,
+        inspection.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all(),
+      ]));
+    } finally {
+      inspection.close();
+    }
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const worktreePath = path.join(directory, "wrong-host-worktree");
+    await mkdir(worktreePath, { recursive: true });
+    const database = new TaskboardDatabase(databasePath);
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    rootThreadId = "wrong-host-root";
+    const rootBinding = {
+      threadId: rootThreadId,
+      codexProjectId: "local",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: worktreePath,
+    };
+    const task = database.createTask({
+      projectId: "local",
+      title: "Fence repository probes behind host ownership",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor,
+      assignee: actor,
+      workflowId: null,
+      developmentContext: {
+        type: "worktree", path: worktreePath, branch: "codex/wrong-host-probe",
+      },
+      workingLog: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.recordTaskWorktreeRepository(task.id, {
+      worktreePath,
+      expectedBranch: "codex/wrong-host-probe",
+      repository: "github.com/owner/original",
+      verifiedAt: "2026-09-07T00:00:00.000Z",
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "focused tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:wrong-host-probe",
+        }],
+        actions: [{
+          id: "test", order: 10, text: "Run focused tests", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const capsule = database.getTaskCapsule(task.id);
+    taskId = task.id;
+    expectedResumeToken = capsule.resumeToken;
+    safeActionId = capsule.readyWork.safeActions[0].id;
+    database.close();
+    return {
+      worktreeRepositoryExecFile: async (_executable, args) => {
+        probeCalls += 1;
+        if (probeMode === "failure") throw new Error("repository probe failed");
+        if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+        if (args.includes("get-url")) return { stdout: "git@github.com:Owner/Probed.git\n" };
+        if (args.includes("--show-current")) return { stdout: "codex/wrong-host-probe\n" };
+        throw new Error("unexpected repository probe");
+      },
+    };
+  });
+  const claimWrongHost = () => request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: {
+      rootThreadId,
+      ownedCodexHostId: "remote-builder",
+      expectedResumeToken,
+      safeActionId,
+      reservationLeaseId: `wrong-host-${probeMode}`,
+    },
+  });
+
+  for (const mode of ["success", "failure"]) {
+    probeMode = mode;
+    const before = snapshotDatabase();
+    const response = await claimWrongHost();
+    assert.equal(response.response.status, 409, mode);
+    assert.equal(response.body.error.code, "HOST_EXECUTOR_MISMATCH", mode);
+    assert.deepEqual(snapshotDatabase(), before, mode);
+  }
+  assert.equal(probeCalls, 6);
+});
+
+test("non-standing repository projection keeps snapshot and exact-host claim on one frontier", async () => {
+  let databasePath;
+  let taskId;
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  let probeCalls = 0;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const worktreePath = path.join(directory, "non-standing-worktree");
+    await mkdir(worktreePath, { recursive: true });
+    const database = new TaskboardDatabase(databasePath);
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const rootBinding = {
+      threadId: rootThreadId,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: worktreePath,
+    };
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{
+        id: "root", label: "Taskboard Root", owner: "Codex Root", source: "codex",
+        threadId: rootThreadId, taskType: "root_task", codexProjectId: "local-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: worktreePath,
+      }],
+      adapters: [],
+    });
+    const task = database.createTask({
+      projectId: "local",
+      title: "Project ordinary safe work without persisting a read",
+      description: "",
+      status: "todo",
+      priority: "high",
+      labels: ["agent-todo"],
+      workflowProfile: "vibe",
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor,
+      assignee: actor,
+      workflowId: null,
+      developmentContext: {
+        type: "worktree", path: worktreePath, branch: "codex/non-standing-projection",
+      },
+      workingLog: null,
+      startDate: null,
+      dueDate: null,
+      recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "local", kind: "test", state: "authorized", scope: "focused tests",
+          approver: "Owner", approvalRequest: "同意执行本地测试",
+          evidence: "Owner resumed", receipt: "turn:non-standing-projection",
+        }],
+        actions: [{
+          id: "test", order: 10, text: "Run focused tests", gate: "local",
+          target: "candidate", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootThreadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    taskId = task.id;
+    database.close();
+    return {
+      worktreeRepositoryTtlMs: 60_000,
+      worktreeRepositoryExecFile: async (_executable, args) => {
+        probeCalls += 1;
+        if (args.includes("--show-toplevel")) return { stdout: `${worktreePath}\n` };
+        if (args.includes("get-url")) return { stdout: "git@github.com:Owner/Projected.git\n" };
+        if (args.includes("--show-current")) return { stdout: "codex/non-standing-projection\n" };
+        throw new Error("unexpected repository probe");
+      },
+    };
+  });
+
+  const lanes = await request(baseUrl, "/api/local/projects/local/agent-lanes");
+  const todo = lanes.body.todos.find((candidate) => candidate.taskId === taskId);
+  const capsule = await request(baseUrl, `/api/tasks/${taskId}/capsule`);
+  const afterProjection = new DatabaseSync(databasePath, { readOnly: true });
+  const taskAfterProjection = { ...afterProjection.prepare(`
+    SELECT worktree_repository, worktree_repository_verified_at FROM tasks WHERE id = ?
+  `).get(taskId) };
+  afterProjection.close();
+  const claimBody = {
+    rootThreadId,
+    ownedCodexHostId: "local",
+    expectedResumeToken: capsule.body.capsule.resumeToken,
+    safeActionId: "test",
+    reservationLeaseId: "non-standing-reservation",
+  };
+  const stale = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST",
+    body: { ...claimBody, expectedResumeToken: "0".repeat(64) },
+  });
+  const afterStaleClaim = new DatabaseSync(databasePath, { readOnly: true });
+  const taskAfterStaleClaim = { ...afterStaleClaim.prepare(`
+    SELECT worktree_repository, worktree_repository_verified_at FROM tasks WHERE id = ?
+  `).get(taskId) };
+  const staleReceiptCount = afterStaleClaim.prepare(`
+    SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?
+  `).get(taskId).count;
+  afterStaleClaim.close();
+  const first = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST", body: claimBody,
+  });
+  const replay = await request(baseUrl, `/api/tasks/${taskId}/bootstrap-claim`, {
+    method: "POST", body: claimBody,
+  });
+  const afterClaims = new DatabaseSync(databasePath, { readOnly: true });
+  const persisted = afterClaims.prepare(`
+    SELECT worktree_repository, worktree_repository_verified_at FROM tasks WHERE id = ?
+  `).get(taskId);
+  const receiptCount = afterClaims.prepare(`
+    SELECT COUNT(*) AS count FROM task_safe_action_receipts WHERE task_id = ?
+  `).get(taskId).count;
+  afterClaims.close();
+
+  assert.deepEqual({
+    snapshotToken: todo?.readyWork.resumeToken,
+    capsuleToken: capsule.body.capsule.resumeToken,
+    capsuleRepository: capsule.body.capsule.executionTarget.repository,
+    taskAfterProjection,
+    taskAfterStaleClaim,
+    claimStatuses: [stale.response.status, first.response.status, replay.response.status],
+    claimErrors: [
+      stale.body?.error?.code ?? null,
+      first.body?.error?.code ?? null,
+      replay.body?.error?.code ?? null,
+    ],
+    staleReceiptCount,
+    persistedRepository: persisted.worktree_repository,
+    persistedVerifiedAt: Boolean(persisted.worktree_repository_verified_at),
+    receiptCount,
+    probeCalls,
+  }, {
+    snapshotToken: capsule.body.capsule.resumeToken,
+    capsuleToken: capsule.body.capsule.resumeToken,
+    capsuleRepository: "github.com/owner/projected",
+    taskAfterProjection: {
+      worktree_repository: null,
+      worktree_repository_verified_at: null,
+    },
+    taskAfterStaleClaim: {
+      worktree_repository: null,
+      worktree_repository_verified_at: null,
+    },
+    claimStatuses: [409, 200, 200],
+    claimErrors: ["RESUME_TOKEN_MISMATCH", null, null],
+    staleReceiptCount: 0,
+    persistedRepository: "github.com/owner/projected",
+    persistedVerifiedAt: true,
+    receiptCount: 1,
+    probeCalls: 12,
+  });
+  assert.equal(first.body.reused, false);
+  assert.equal(replay.body.reused, true);
 });
 
 test("the default host is loopback-only", () => {
@@ -886,6 +1511,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
   let deliveryAttempts = 0;
   let firstReceipt;
   const options = {
+    hostExecutor: { ownedCodexHostId: "local" },
     policy: { enabled: true, projectId: "local" },
     now: () => 0,
     readSnapshot: async () => (await request(baseUrl, "/api/local/projects/local/agent-lanes")).body,
@@ -899,6 +1525,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
           method: "POST",
           body: {
             rootThreadId: claim.rootThreadId,
+            ownedCodexHostId: claim.ownedCodexHostId,
             expectedResumeToken: claim.expectedResumeToken,
             safeActionId: claim.safeActionId,
             reservationLeaseId: "snapshot-reservation",
@@ -1115,6 +1742,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
     method: "POST",
     body: {
       rootThreadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: driftedCapsule.body.capsule.resumeToken,
       safeActionId: firstReceipt.safeActionId,
       reservationLeaseId: "next-reservation",
@@ -1464,11 +2092,13 @@ test("Root records one immutable Owner decision receipt from the project-level r
       ownerRootTaskId: "owner-root",
       tasks: [{
         id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
-        threadId: rootThreadId, taskType: "root_task", codexHostId: "local",
+        threadId: rootThreadId, taskType: "root_task",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
         workspacePath: ownerWorkspacePath,
       }, {
         id: "coordinator", label: "Coordinator", owner: "Codex Root", source: "codex",
-        threadId: coordinatorThreadId, taskType: "root_task", codexHostId: "local",
+        threadId: coordinatorThreadId, taskType: "root_task",
+        codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local",
         workspacePath: coordinatorWorkspacePath,
       }],
       adapters: [],
@@ -1521,6 +2151,8 @@ test("Root records one immutable Owner decision receipt from the project-level r
   const pending = lanes.body.coordination.ownerDecisionRequest;
   assert.equal(pending.identifier, task.identifier);
   assert.equal(pending.route.rootThreadId, rootThreadId);
+  assert.equal(pending.route.codexProjectId, "local-project");
+  assert.equal(pending.route.codexProjectKind, "local");
   assert.equal(pending.coordinatorEpoch, "lease:owner-decision-lease");
   assert.equal(lanes.body.todos.filter((todo) => todo.readyWork.approvalRequest).length, 1);
 
@@ -1531,6 +2163,10 @@ test("Root records one immutable Owner decision receipt from the project-level r
     ownerTurnId: "owner-turn-1",
     rootDecisionTurnId: "root-decision-turn-1",
     rootThreadId,
+    rootCodexProjectId: pending.route.codexProjectId,
+    rootCodexProjectKind: pending.route.codexProjectKind,
+    rootCodexHostId: pending.route.codexHostId,
+    rootWorkspacePath: pending.route.rootWorkspacePath,
     evidence: "Owner approved in the confirmed Root window",
     receipt: "owner-turn:decision-1",
     decidedAt: new Date().toISOString(),
@@ -1550,13 +2186,56 @@ test("Root records one immutable Owner decision receipt from the project-level r
     "x-codex-taskboard-injector-nonce": nonce,
     "x-codex-taskboard-injector-proof": createHmac("sha256", instanceSecret).update(nonce).digest("hex"),
   });
+  const publishRootRuntime = (nonce, overrides = {}) => request(baseUrl, "/api/local/host-runtime", {
+    method: "PUT",
+    headers: signedInjectorHeaders(instanceSecret, nonce),
+    body: {
+      threadId: rootThreadId,
+      threadRunning: true,
+      threadTodoProgress: null,
+      codexProjectId: "local-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath: ownerWorkspacePath,
+      ...overrides,
+    },
+  });
   const unsignedDelivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     body: pending,
   });
   assert.equal(unsignedDelivery.response.status, 403);
+  assert.equal((await publishRootRuntime("8".repeat(32), {
+    codexProjectId: "drifted-project",
+  })).response.status, 200);
+  const projectDriftDelivery = await request(
+    baseUrl,
+    "/api/local/projects/local/owner-decision-delivery/claim",
+    {
+      method: "POST",
+      headers: injectorHeaders("b".repeat(32)),
+      body: pending,
+    },
+  );
+  assert.equal(projectDriftDelivery.response.status, 409);
+  assert.equal(projectDriftDelivery.body.error.code, "OWNER_DECISION_ROUTE_STALE");
+  assert.equal((await publishRootRuntime("ab".repeat(16))).response.status, 200);
+  const kindDriftDelivery = await request(
+    baseUrl,
+    "/api/local/projects/local/owner-decision-delivery/claim",
+    {
+      method: "POST",
+      headers: injectorHeaders("bc".repeat(16)),
+      body: {
+        ...pending,
+        route: { ...pending.route, codexProjectKind: "remote" },
+      },
+    },
+  );
+  assert.equal(kindDriftDelivery.response.status, 400);
+  assert.equal(kindDriftDelivery.body.error.code, "INVALID_FIELD");
   for (const [nonce, route] of [
-    ["a".repeat(32), { ...pending.route, codexHostId: "wrong-host" }],
+    ["a".repeat(32), { ...pending.route, codexProjectKind: "remote", codexHostId: "wrong-host" }],
     ["9".repeat(32), { ...pending.route, rootWorkspacePath: "/tmp/wrong-owner-decision" }],
   ]) {
     const mismatchedDelivery = await request(
@@ -1630,6 +2309,15 @@ test("Root records one immutable Owner decision receipt from the project-level r
   assert.equal(delivery.body.claimed, true);
   assert.equal("attestationToken" in delivery.body.receipt, false);
   const fixtureDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.deepEqual({ ...fixtureDatabase.prepare(`
+    SELECT codex_project_id, codex_project_kind, codex_host_id, root_workspace_path
+    FROM owner_decision_deliveries WHERE id = ?
+  `).get(delivery.body.receipt.id) }, {
+    codex_project_id: pending.route.codexProjectId,
+    codex_project_kind: pending.route.codexProjectKind,
+    codex_host_id: pending.route.codexHostId,
+    root_workspace_path: pending.route.rootWorkspacePath,
+  });
   const protectedConfig = JSON.parse(fixtureDatabase.prepare(`
     SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'
   `).get().config_json);
@@ -1725,6 +2413,7 @@ test("Root records one immutable Owner decision receipt from the project-level r
   const restartedAddress = await restartedApp.listen({ port: 0 });
   runningApps.push({ app: restartedApp, directory: firstServer.directory });
   baseUrl = `http://127.0.0.1:${restartedAddress.port}`;
+  assert.equal((await publishRootRuntime("cd".repeat(16))).response.status, 200);
   const durableReplay = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     headers: injectorHeaders("f".repeat(32)),
@@ -1754,6 +2443,40 @@ test("Root records one immutable Owner decision receipt from the project-level r
   `).get(retriedDelivery.body.receipt.id).decision_expires_at, backfilledDecision.decision_expires_at);
   stableBackfillDatabase.close();
 
+  const kindDriftDecision = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("de".repeat(16)),
+    body: {
+      ...decisionBody,
+      rootCodexProjectKind: "remote",
+      deliveryId: retriedDelivery.body.receipt.id,
+    },
+  });
+  assert.equal(kindDriftDecision.response.status, 400);
+  assert.equal(kindDriftDecision.body.error.code, "INVALID_FIELD");
+  assert.equal((await publishRootRuntime("ef".repeat(16), {
+    codexProjectId: "drifted-project",
+  })).response.status, 200);
+  const projectDriftDecision = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
+    method: "POST",
+    headers: injectorHeaders("12".repeat(16)),
+    body: {
+      ...decisionBody,
+      deliveryId: retriedDelivery.body.receipt.id,
+    },
+  });
+  assert.equal(projectDriftDecision.response.status, 409);
+  assert.equal(projectDriftDecision.body.error.code, "OWNER_DECISION_ROOT_MISMATCH");
+  const unchangedDecisionDatabase = new DatabaseSync(path.join(dataDirectory, "taskboard.sqlite"));
+  assert.equal(unchangedDecisionDatabase.prepare(
+    "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+  ).get().count, 0);
+  unchangedDecisionDatabase.close();
+  const unchangedCapsule = await request(baseUrl, `/api/tasks/${task.identifier}/capsule`);
+  assert.equal(unchangedCapsule.body.capsule.readyWork.ownerDecisionRequest.requestId, pending.requestId);
+  assert.deepEqual(unchangedCapsule.body.capsule.readyWork.safeActions, []);
+  assert.equal((await publishRootRuntime("23".repeat(16))).response.status, 200);
+
   const recorded = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
     method: "POST",
     headers: injectorHeaders("1".repeat(32)),
@@ -1768,6 +2491,40 @@ test("Root records one immutable Owner decision receipt from the project-level r
   assert.deepEqual(recorded.body.capsule.readyWork.safeActions.map((action) => action.id), ["push"]);
   assert.equal(recorded.body.capsule.readyWork.ownerDecisionRequest, null);
 
+  await new Promise((resolve) => setTimeout(resolve, 3_100));
+  const expiredObservationReplay = await request(
+    baseUrl,
+    `/api/tasks/${task.identifier}/owner-decisions`,
+    {
+      method: "POST",
+      headers: injectorHeaders("24".repeat(16)),
+      body: {
+        ...decisionBody,
+        deliveryId: retriedDelivery.body.receipt.id,
+      },
+    },
+  );
+  assert.equal(expiredObservationReplay.response.status, 200, JSON.stringify(expiredObservationReplay.body));
+  assert.equal(expiredObservationReplay.body.applied, false);
+  const expiredObservationConflict = await request(
+    baseUrl,
+    `/api/tasks/${task.identifier}/owner-decisions`,
+    {
+      method: "POST",
+      headers: injectorHeaders("25".repeat(16)),
+      body: {
+        ...decisionBody,
+        deliveryId: retriedDelivery.body.receipt.id,
+        outcome: "denied",
+      },
+    },
+  );
+  assert.equal(expiredObservationConflict.response.status, 409);
+  assert.equal(expiredObservationConflict.body.error.code, "OWNER_DECISION_CONFLICT");
+
+  const recordedServer = runningApps.pop();
+  await recordedServer.app.close();
+
   const releasedRouteDatabase = new TaskboardDatabase(path.join(dataDirectory, "taskboard.sqlite"));
   assert.doesNotThrow(() => releasedRouteDatabase.upsertAgentLaneProject("local", {
     rootTaskId: "replacement",
@@ -1778,6 +2535,11 @@ test("Root records one immutable Owner decision receipt from the project-level r
     adapters: [],
   }));
   releasedRouteDatabase.close();
+
+  const replayApp = createTaskboardServer({ dataDirectory: recordedServer.directory, instanceSecret });
+  const replayAddress = await replayApp.listen({ port: 0 });
+  runningApps.push({ app: replayApp, directory: recordedServer.directory });
+  baseUrl = `http://127.0.0.1:${replayAddress.port}`;
 
   const replay = await request(baseUrl, `/api/tasks/${task.identifier}/owner-decisions`, {
     method: "POST",
@@ -1800,8 +2562,368 @@ test("Root records one immutable Owner decision receipt from the project-level r
     },
   });
   assert.equal(conflict.response.status, 409);
+  assert.equal(conflict.body.error.code, "OWNER_DECISION_CONFLICT");
   const after = await request(baseUrl, `/api/tasks/${task.identifier}/capsule`);
   assert.deepEqual(after.body.capsule.readyWork.safeActions.map((action) => action.id), ["push"]);
+});
+
+test("legacy Owner decision deliveries remain fail-closed after project identity migration", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-owner-decision-legacy-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const rootBinding = {
+    threadId: "legacy-owner-root-thread",
+    codexProjectId: "legacy-owner-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: path.resolve("/tmp/legacy-owner-decision-root"),
+  };
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  let database = new TaskboardDatabase(databasePath);
+  try {
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-owner-root",
+      ownerRootTaskId: "legacy-owner-root",
+      tasks: [{
+        id: "legacy-owner-root", label: "Legacy Owner Root", owner: "Codex Root", source: "codex",
+        threadId: rootBinding.threadId, taskType: "root_task",
+        codexProjectId: rootBinding.codexProjectId,
+        codexProjectKind: rootBinding.codexProjectKind,
+        codexHostId: rootBinding.codexHostId,
+        workspacePath: rootBinding.workspacePath,
+      }],
+      adapters: [],
+    });
+    const task = database.createTask({
+      projectId: "local", title: "Legacy Owner decision", description: "", status: "todo",
+      priority: "urgent", labels: [], workflowProfile: "vibe",
+      threadId: rootBinding.threadId, threadBinding: rootBinding, actor, assignee: actor,
+      developmentContext: { type: "worktree", path: rootBinding.workspacePath, branch: "codex/legacy-owner-decision" },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "push", kind: "push", state: "approval_required", scope: "exact commit",
+          approver: "Owner", approvalRequest: "同意 legacy exact push",
+        }],
+        actions: [{
+          id: "push", order: 10, text: "Push exact commit", gate: "push",
+          target: "origin", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const ownerRequest = database.getTaskCapsule(task.id).readyWork.ownerDecisionRequest;
+    assert.ok(ownerRequest);
+    database.close();
+
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec("PRAGMA foreign_keys = OFF");
+    legacy.exec("DROP TABLE owner_decision_deliveries");
+    legacy.exec(`
+      CREATE TABLE owner_decision_deliveries (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        expected_resume_token TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        codex_host_id TEXT NOT NULL,
+        root_workspace_path TEXT NOT NULL,
+        route_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'delivered')),
+        reservation_expires_at TEXT NOT NULL,
+        decision_expires_at TEXT,
+        claimed_at TEXT NOT NULL,
+        delivered_at TEXT,
+        delivery_turn_id TEXT
+      )
+    `);
+    legacy.prepare(`
+      INSERT INTO owner_decision_deliveries (
+        id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
+        root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+        state, reservation_expires_at, claimed_at
+      ) VALUES (?, ?, ?, 'local', ?, 'configured:legacy-owner-root', ?, ?, ?, ?, ?, 'reserved', ?, ?)
+    `).run(
+      "legacy-owner-delivery",
+      ownerRequest.requestId,
+      task.id,
+      ownerRequest.expectedResumeToken,
+      "legacy-owner-root",
+      rootBinding.threadId,
+      rootBinding.codexHostId,
+      rootBinding.workspacePath,
+      "legacy-route-key-without-project-identity",
+      new Date(Date.now() + 30_000).toISOString(),
+      new Date().toISOString(),
+    );
+    legacy.close();
+
+    database = new TaskboardDatabase(databasePath);
+    const migratedColumns = database.database.prepare(
+      "PRAGMA table_info(owner_decision_deliveries)",
+    ).all().map((column) => column.name);
+    assert.equal(migratedColumns.includes("codex_project_id"), true);
+    assert.equal(migratedColumns.includes("codex_project_kind"), true);
+    const route = {
+      rootTaskId: "legacy-owner-root",
+      rootThreadId: rootBinding.threadId,
+      codexProjectId: rootBinding.codexProjectId,
+      codexProjectKind: rootBinding.codexProjectKind,
+      codexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+    };
+    assert.throws(() => database.claimOwnerDecisionDelivery("local", {
+      taskId: task.id,
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      actionId: ownerRequest.actionId,
+      coordinatorEpoch: "configured:legacy-owner-root",
+      route,
+      observedRootBinding: rootBinding,
+    }), (error) => error?.code === "OWNER_DECISION_ROUTE_STALE");
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM owner_decision_deliveries",
+    ).get().count, 1);
+    assert.throws(() => database.confirmOwnerDecisionDelivery("local", {
+      deliveryId: "legacy-owner-delivery",
+      deliveryTurnId: "legacy-owner-turn",
+    }), (error) => error?.code === "OWNER_DECISION_ROUTE_STALE");
+
+    database.database.prepare(`
+      UPDATE owner_decision_deliveries
+      SET state = 'delivered', delivered_at = ?, delivery_turn_id = ?, decision_expires_at = ?
+      WHERE id = 'legacy-owner-delivery'
+    `).run(
+      new Date().toISOString(),
+      "legacy-owner-turn",
+      new Date(Date.now() + 30_000).toISOString(),
+    );
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      outcome: "authorized",
+      ownerTurnId: "legacy-owner-answer",
+      rootDecisionTurnId: "legacy-root-decision",
+      rootThreadId: rootBinding.threadId,
+      rootCodexProjectId: rootBinding.codexProjectId,
+      rootCodexProjectKind: rootBinding.codexProjectKind,
+      rootCodexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+      evidence: "Legacy delivery must not grant authority after migration",
+      deliveryId: "legacy-owner-delivery",
+      receipt: "legacy-owner-decision-receipt",
+      decidedAt: new Date().toISOString(),
+    }, rootBinding, actor), (error) => error?.code === "OWNER_DECISION_DELIVERY_REQUIRED");
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count, 0);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy recorded Owner decision receipts remain exactly replayable after identity migration", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-owner-decision-recorded-legacy-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const rootBinding = {
+    threadId: "legacy-recorded-owner-root-thread",
+    codexProjectId: "legacy-recorded-owner-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath: path.resolve("/tmp/legacy-recorded-owner-decision-root"),
+  };
+  const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+  let database = new TaskboardDatabase(databasePath);
+  try {
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "legacy-recorded-owner-root",
+      ownerRootTaskId: "legacy-recorded-owner-root",
+      tasks: [{
+        id: "legacy-recorded-owner-root", label: "Legacy Recorded Owner Root",
+        owner: "Codex Root", source: "codex", threadId: rootBinding.threadId,
+        taskType: "root_task", codexProjectId: rootBinding.codexProjectId,
+        codexProjectKind: rootBinding.codexProjectKind, codexHostId: rootBinding.codexHostId,
+        workspacePath: rootBinding.workspacePath,
+      }],
+      adapters: [],
+    });
+    const task = database.createTask({
+      projectId: "local", title: "Legacy recorded Owner decision", description: "", status: "todo",
+      priority: "urgent", labels: [], workflowProfile: "vibe",
+      threadId: rootBinding.threadId, threadBinding: rootBinding, actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: rootBinding.workspacePath, branch: "codex/legacy-recorded-owner-decision",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{
+          id: "push", kind: "push", state: "approval_required", scope: "exact commit",
+          approver: "Owner", approvalRequest: "同意 recorded legacy exact push",
+        }],
+        actions: [{
+          id: "push", order: 10, text: "Push exact commit", gate: "push",
+          target: "origin", status: "pending",
+        }],
+      })}\n\`\`\``,
+      threadId: rootBinding.threadId,
+      threadBinding: rootBinding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    const ownerRequest = database.getTaskCapsule(task.id).readyWork.ownerDecisionRequest;
+    assert.ok(ownerRequest);
+    const route = {
+      rootTaskId: "legacy-recorded-owner-root",
+      rootThreadId: rootBinding.threadId,
+      codexProjectId: rootBinding.codexProjectId,
+      codexProjectKind: rootBinding.codexProjectKind,
+      codexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+    };
+    const claimed = database.claimOwnerDecisionDelivery("local", {
+      taskId: task.id,
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      actionId: ownerRequest.actionId,
+      coordinatorEpoch: "configured:legacy-recorded-owner-root",
+      route,
+      observedRootBinding: rootBinding,
+    });
+    assert.equal(claimed.claimed, true);
+    database.confirmOwnerDecisionDelivery("local", {
+      deliveryId: claimed.receipt.id,
+      deliveryTurnId: "legacy-recorded-delivery-turn",
+    });
+    const decision = {
+      requestId: ownerRequest.requestId,
+      expectedResumeToken: ownerRequest.expectedResumeToken,
+      outcome: "authorized",
+      ownerTurnId: "legacy-recorded-owner-turn",
+      rootDecisionTurnId: "legacy-recorded-root-turn",
+      rootThreadId: rootBinding.threadId,
+      rootCodexProjectId: rootBinding.codexProjectId,
+      rootCodexProjectKind: rootBinding.codexProjectKind,
+      rootCodexHostId: rootBinding.codexHostId,
+      rootWorkspacePath: rootBinding.workspacePath,
+      evidence: "Owner approved before delivery identity columns were introduced",
+      deliveryId: claimed.receipt.id,
+      receipt: "legacy-recorded-owner-receipt",
+      decidedAt: new Date().toISOString(),
+    };
+    const recorded = database.recordTaskOwnerDecision(task.id, decision, rootBinding, actor);
+    assert.equal(recorded.applied, true);
+    database.close();
+
+    const legacy = new DatabaseSync(databasePath);
+    const persistedDelivery = legacy.prepare(`
+      SELECT * FROM owner_decision_deliveries WHERE id = ?
+    `).get(claimed.receipt.id);
+    legacy.exec("PRAGMA foreign_keys = OFF");
+    legacy.exec("DROP TABLE owner_decision_deliveries");
+    legacy.exec(`
+      CREATE TABLE owner_decision_deliveries (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        expected_resume_token TEXT NOT NULL,
+        coordinator_epoch TEXT NOT NULL,
+        root_task_id TEXT NOT NULL,
+        root_thread_id TEXT NOT NULL,
+        codex_host_id TEXT NOT NULL,
+        root_workspace_path TEXT NOT NULL,
+        route_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('reserved', 'delivered')),
+        reservation_expires_at TEXT NOT NULL,
+        decision_expires_at TEXT,
+        claimed_at TEXT NOT NULL,
+        delivered_at TEXT,
+        delivery_turn_id TEXT
+      )
+    `);
+    legacy.prepare(`
+      INSERT INTO owner_decision_deliveries (
+        id, request_id, task_id, project_id, expected_resume_token, coordinator_epoch,
+        root_task_id, root_thread_id, codex_host_id, root_workspace_path, route_key,
+        state, reservation_expires_at, decision_expires_at, claimed_at, delivered_at,
+        delivery_turn_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      persistedDelivery.id,
+      persistedDelivery.request_id,
+      persistedDelivery.task_id,
+      persistedDelivery.project_id,
+      persistedDelivery.expected_resume_token,
+      persistedDelivery.coordinator_epoch,
+      persistedDelivery.root_task_id,
+      persistedDelivery.root_thread_id,
+      persistedDelivery.codex_host_id,
+      persistedDelivery.root_workspace_path,
+      persistedDelivery.route_key,
+      persistedDelivery.state,
+      persistedDelivery.reservation_expires_at,
+      persistedDelivery.decision_expires_at,
+      persistedDelivery.claimed_at,
+      persistedDelivery.delivered_at,
+      persistedDelivery.delivery_turn_id,
+    );
+    legacy.close();
+
+    database = new TaskboardDatabase(databasePath);
+    assert.deepEqual({ ...database.database.prepare(`
+      SELECT codex_project_id, codex_project_kind
+      FROM owner_decision_deliveries WHERE id = ?
+    `).get(claimed.receipt.id) }, {
+      codex_project_id: rootBinding.codexProjectId,
+      codex_project_kind: rootBinding.codexProjectKind,
+    });
+    const beforeCount = database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count;
+    const replay = database.recordTaskOwnerDecision(task.id, decision, null, actor);
+    assert.equal(replay.applied, false);
+    assert.equal(replay.receipt.id, recorded.receipt.id);
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count, beforeCount);
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      ...decision,
+      rootCodexProjectId: "drifted-legacy-recorded-project",
+    }, null, actor), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      ...decision,
+      rootCodexProjectKind: "remote",
+    }, null, actor), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    assert.throws(() => database.recordTaskOwnerDecision(task.id, {
+      ...decision,
+      outcome: "denied",
+    }, null, actor), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    database.database.prepare(`
+      UPDATE owner_decision_deliveries
+      SET codex_project_id = NULL, codex_project_kind = NULL
+      WHERE id = ?
+    `).run(claimed.receipt.id);
+    assert.throws(() => database.recordTaskOwnerDecision(
+      task.id,
+      decision,
+      null,
+      actor,
+    ), (error) => error?.code === "OWNER_DECISION_CONFLICT");
+    assert.equal(database.database.prepare(
+      "SELECT COUNT(*) AS count FROM task_owner_decision_receipts",
+    ).get().count, beforeCount);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("project coordinator leases acquire and renew atomically without granting execution ownership", async () => {
@@ -2128,7 +3250,7 @@ test("Owner Root registration rejects an active legacy non-Root Global lease", a
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "4".repeat(32)),
     body: {
       threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-owner", workspacePath: "/tmp/owner-root",
     },
   });
@@ -2557,13 +3679,16 @@ test("removing a domain retires its recoverable expired attempt before reconfigu
         globalHolderThreadId: "global-thread", codexProjectId: "global-project",
         codexProjectKind: "local", codexHostId: "local",
         workspacePath: globalWorkspacePath,
+        ownedCodexHostId: "local",
       },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      first.attempt.id, "starting",
+      first.attempt.id, "starting", { ownedCodexHostId: "local" },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      first.attempt.id, "attach", { threadId: "01a-domain-policy-reset-first" },
+      first.attempt.id, "attach", {
+        threadId: "01a-domain-policy-reset-first", ownedCodexHostId: "local",
+      },
     );
     database.database.prepare(`
       UPDATE agent_domain_coordinator_provisioning_attempts
@@ -2584,7 +3709,9 @@ test("removing a domain retires its recoverable expired attempt before reconfigu
     });
     assert.equal(removed.applied, true);
     assert.equal(
-      database.getAgentLaneDomainCoordinatorProvisioningAttempt(projectId, "probe"),
+      database.getAgentLaneDomainCoordinatorProvisioningAttempt(
+        projectId, "probe", undefined, "local",
+      ),
       null,
     );
     const retired = database.database.prepare(`
@@ -2618,6 +3745,7 @@ test("removing a domain retires its recoverable expired attempt before reconfigu
         globalHolderThreadId: "global-thread", codexProjectId: "global-project",
         codexProjectKind: "local", codexHostId: "local",
         workspacePath: globalWorkspacePath,
+        ownedCodexHostId: "local",
       },
     );
     assert.notEqual(second.attempt.id, first.attempt.id);
@@ -2841,7 +3969,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
         {
           id: "coordinator", label: "Coordinator", owner: "Codex", source: "codex",
           threadId: "coordinator-thread", taskType: "root_task",
-          codexProjectId: "sbkk-project", codexProjectKind: "local",
+          codexProjectId: "sbkk-project", codexProjectKind: "remote",
           codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
         },
         {
@@ -2877,7 +4005,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "7".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "market-project", codexProjectKind: "local",
+      codexProjectId: "market-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
     },
   });
@@ -2888,19 +4016,20 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
   assert.equal(snapshot.body.coordination.lease.bindingValid, false);
   assert.equal(snapshot.body.coordination.assignment, "unassigned");
 
-  await request(baseUrl, "/api/local/host-runtime", {
+  const invalidGlobalKind = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "c".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "sbkk-project", codexProjectKind: "remote",
+      codexProjectId: "sbkk-project", codexProjectKind: "local",
       codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
     },
   });
+  assert.equal(invalidGlobalKind.response.status, 400);
   const globalKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(globalKindSnapshot.body.coordination.lease.bindingValid, false);
 
-  await request(baseUrl, "/api/local/host-runtime", {
+  const domainProjectDrift = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "8".repeat(32)),
     body: {
@@ -2909,11 +4038,12 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
       codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
     },
   });
+  assert.equal(domainProjectDrift.response.status, 200);
   const domainSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(domainSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
   assert.equal(domainSnapshot.body.coordination.domainCoordinators[0].assignment, "unassigned");
 
-  await request(baseUrl, "/api/local/host-runtime", {
+  const invalidDomainKind = await request(baseUrl, "/api/local/host-runtime", {
     method: "PUT",
     headers: signedInjectorHeaders(instanceSecret, "d".repeat(32)),
     body: {
@@ -2922,6 +4052,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
       codexHostId: "local", workspacePath: "/tmp/sbkk/frontend",
     },
   });
+  assert.equal(invalidDomainKind.response.status, 400);
   const domainKindSnapshot = await request(baseUrl, "/api/local/projects/local/agent-lanes");
   assert.equal(domainKindSnapshot.body.coordination.domainCoordinators[0].lease.bindingValid, false);
 
@@ -2930,7 +4061,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
     body: {
       threadId: "unrelated-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "unrelated-project", codexProjectKind: "local",
+      codexProjectId: "unrelated-project", codexProjectKind: "remote",
       codexHostId: "unrelated-host", workspacePath: "/tmp/unrelated",
     },
   });
@@ -2950,7 +4081,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "9".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "market-project", codexProjectKind: "local",
+      codexProjectId: "market-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator", workspacePath: "/tmp/sbkk",
     },
   });
@@ -2968,7 +4099,7 @@ test("a fresh host runtime drift makes persisted Global and domain coordinator b
     headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
     body: {
       threadId: "frontend-thread", threadRunning: false, threadTodoProgress: null,
-      codexProjectId: "market-project", codexProjectKind: "local",
+      codexProjectId: "market-project", codexProjectKind: "remote",
       codexHostId: "host-frontend", workspacePath: "/tmp/sbkk/frontend",
     },
   });
@@ -3348,6 +4479,7 @@ test("protected cross-domain clearance binds the exact target coordinator fronti
   assert.equal(afterDelivery.body.clearances[0].delivery.state, "delivered");
   const unprotected = await request(baseUrl, route, {
     method: "POST",
+    residentTaskctlCompat: false,
     body: {
       sourceTaskId: source.identifier, idempotencyKey: "api-clearance-1",
       holderTaskId: "backend", holderThreadId: "backend-thread",
@@ -3680,8 +4812,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
     expectedGlobalLeaseId: "global-lease", globalHolderTaskId: "global",
     globalHolderThreadId: "global-thread", codexProjectId: "domain-project",
     codexProjectKind: "remote", codexHostId: "domain-host",
-    workspacePath,
+    workspacePath, ownedCodexHostId: "domain-host",
   };
+  const domainExecutorBody = { ownedCodexHostId: "domain-host" };
   const created = await request(baseUrl, requestPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), requestPath, requestBody),
@@ -3695,27 +4828,36 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   assert.equal(unprotected.response.status, 403);
   const starting = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "2".repeat(32), startingPath, domainExecutorBody,
+    ),
+    body: domainExecutorBody,
   });
   assert.equal(starting.response.status, 200, JSON.stringify(starting.body));
   assert.equal(starting.body.attempt.status, "starting");
   const resetPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/reset`;
   const reset = await request(baseUrl, resetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), resetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "3".repeat(32), resetPath, domainExecutorBody,
+    ),
+    body: domainExecutorBody,
   });
   assert.equal(reset.response.status, 200, JSON.stringify(reset.body));
   assert.equal(reset.body.attempt.status, "pending");
   assert.equal(reset.body.attempt.retryCount, 1);
   await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), startingPath, domainExecutorBody,
+    ),
+    body: domainExecutorBody,
   });
   const attachPath = `/api/local/domain-coordinator-provisioning-attempts/${created.body.attempt.id}/attach`;
-  const attachBody = { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" };
+  const attachBody = {
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+    ownedCodexHostId: "domain-host",
+  };
   const attached = await request(baseUrl, attachPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), attachPath, attachBody),
@@ -3748,6 +4890,7 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const rebindBody = {
     expectedRevision: driftedWindows.body.revision,
     expectedGlobalLeaseId: "global-lease",
+    ownedCodexHostId: "domain-host",
   };
   const unprotectedRebind = await request(baseUrl, rebindPath, {
     method: "POST", body: rebindBody,
@@ -3814,9 +4957,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const expiredLookup = await request(baseUrl, lookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "9a".repeat(16), lookupPath, {},
+      instanceSecret, "9a".repeat(16), lookupPath, domainExecutorBody,
     ),
-    body: {},
+    body: domainExecutorBody,
   });
   assert.equal(expiredLookup.response.status, 200, JSON.stringify(expiredLookup.body));
   assert.equal(expiredLookup.body.attempt.id, created.body.attempt.id);
@@ -3828,9 +4971,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const deferredResume = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "7a".repeat(16), resumeExpiredPath, {},
+      instanceSecret, "7a".repeat(16), resumeExpiredPath, domainExecutorBody,
     ),
-    body: {},
+    body: domainExecutorBody,
   });
   assert.equal(deferredResume.response.status, 409, JSON.stringify(deferredResume.body));
   assert.equal(deferredResume.body.error.code, "DOMAIN_COORDINATOR_PROVISIONING_EXPIRED_RESUME_CONFLICT");
@@ -3873,6 +5016,7 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const epochRebindBody = {
     expectedRevision: recoveredWindows.body.revision,
     expectedGlobalLeaseId: recoveredGlobal.body.lease.id,
+    ownedCodexHostId: "domain-host",
   };
   const releasedFenceInspection = new DatabaseSync(databasePath);
   const attemptBeforeReleasedConflict = JSON.stringify(releasedFenceInspection.prepare(
@@ -3947,6 +5091,7 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
     const driftedEpochRebindBody = {
       expectedRevision: driftedEpochWindows.body.revision,
       expectedGlobalLeaseId: recoveredGlobal.body.lease.id,
+      ownedCodexHostId: "domain-host",
     };
     const rejectedDrift = await request(baseUrl, rebindPath, {
       method: "POST",
@@ -3990,9 +5135,9 @@ test("domain provisioning recovers a cross-host peer across a Global lease epoch
   const resumedExpired = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "7".repeat(32), resumeExpiredPath, {},
+      instanceSecret, "7".repeat(32), resumeExpiredPath, domainExecutorBody,
     ),
-    body: {},
+    body: domainExecutorBody,
   });
   assert.equal(resumedExpired.response.status, 200, JSON.stringify(resumedExpired.body));
   assert.equal(resumedExpired.body.attempt.id, created.body.attempt.id);
@@ -4105,13 +5250,14 @@ test("legacy attempts without a Global identity fail closed after cross-host lea
         globalHolderThreadId: "global-thread", codexProjectId: "domain-project",
         codexProjectKind: "remote", codexHostId: "domain-host",
         workspacePath: domainWorkspacePath,
+        ownedCodexHostId: "domain-host",
       },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      created.attempt.id, "starting",
+      created.attempt.id, "starting", { ownedCodexHostId: "domain-host" },
     );
     database.transitionAgentLaneDomainCoordinatorProvisioningAttempt(
-      created.attempt.id, "attach", { threadId: domainThreadId },
+      created.attempt.id, "attach", { threadId: domainThreadId, ownedCodexHostId: "domain-host" },
     );
     database.database.prepare(`
       UPDATE agent_domain_coordinator_provisioning_attempts
@@ -4176,6 +5322,7 @@ test("legacy attempts without a Global identity fail closed after cross-host lea
         {
           expectedRevision: recoveredRevision,
           expectedGlobalLeaseId: recoveredGlobal.lease.id,
+          ownedCodexHostId: "domain-host",
         },
       ),
       (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
@@ -4197,6 +5344,7 @@ test("legacy attempts without a Global identity fail closed after cross-host lea
         {
           expectedRevision: recoveredRevision,
           expectedGlobalLeaseId: recoveredGlobal.lease.id,
+          ownedCodexHostId: "domain-host",
         },
       ),
       (error) => error?.code === "DOMAIN_COORDINATOR_PROVISIONING_REBIND_CONFLICT",
@@ -4257,6 +5405,7 @@ test("resident provisioning persists one protected idempotent attempt before rep
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
+    ownedCodexHostId: "local",
     workspacePath,
   };
   const unprotected = await request(baseUrl, pathname, { method: "POST", body });
@@ -4280,7 +5429,7 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(replayed.body.applied, false);
   assert.equal(replayed.body.attempt.id, created.body.attempt.id);
   const lookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
-  const lookupBody = { idempotencyKey: body.idempotencyKey };
+  const lookupBody = { idempotencyKey: body.idempotencyKey, ownedCodexHostId: "local" };
   const lookup = await request(baseUrl, lookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "a".repeat(32), lookupPath, lookupBody),
@@ -4329,12 +5478,12 @@ test("resident provisioning persists one protected idempotent attempt before rep
     headers: { "x-taskboard-client": "taskctl" },
   });
   const rebindPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/rebind`;
-  const rebindBody = { expectedRevision: driftedWindows.body.revision };
+  const rebindBody = { expectedRevision: driftedWindows.body.revision, ownedCodexHostId: "local" };
   const unprotectedRebind = await request(baseUrl, rebindPath, {
     method: "POST", body: rebindBody,
   });
   assert.equal(unprotectedRebind.response.status, 403);
-  const staleRebindBody = { expectedRevision: windows.body.revision };
+  const staleRebindBody = { expectedRevision: windows.body.revision, ownedCodexHostId: "local" };
   const staleRebind = await request(baseUrl, rebindPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "e".repeat(32), rebindPath, staleRebindBody),
@@ -4381,8 +5530,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const startingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
   const starting = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), startingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(starting.response.status, 200, JSON.stringify(starting.body));
   assert.equal(starting.body.attempt.status, "starting");
@@ -4395,8 +5544,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const resetPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/reset`;
   const reset = await request(baseUrl, resetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), resetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "6".repeat(32), resetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(reset.response.status, 200, JSON.stringify(reset.body));
   assert.equal(reset.body.attempt.status, "pending");
@@ -4404,13 +5553,15 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.ok(Date.parse(reset.body.attempt.expiresAt) > Date.parse(shortExpiry) + 9 * 60_000);
   const restarted = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), startingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(restarted.response.status, 200, JSON.stringify(restarted.body));
   assert.equal(restarted.body.attempt.status, "starting");
   const attachPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/attach`;
-  const attachBody = { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" };
+  const attachBody = {
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", ownedCodexHostId: "local",
+  };
   const attached = await request(baseUrl, attachPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "8".repeat(32), attachPath, attachBody),
@@ -4430,8 +5581,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const resumeExpiredPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/resume-expired`;
   const activeResume = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "d1".repeat(16), resumeExpiredPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "d1".repeat(16), resumeExpiredPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(activeResume.response.status, 409);
   assert.equal(activeResume.body.error.code, "COORDINATOR_PROVISIONING_STATE_CONFLICT");
@@ -4456,9 +5607,9 @@ test("resident provisioning persists one protected idempotent attempt before rep
         instanceSecret,
         (index + 20).toString(16).padStart(2, "0").repeat(16),
         resumeExpiredPath,
-        {},
+        { ownedCodexHostId: "local" },
       ),
-      body: {},
+      body: { ownedCodexHostId: "local" },
     });
     assert.equal(rejectedResume.response.status, 409);
     const rejectedInspection = new DatabaseSync(databasePath);
@@ -4527,15 +5678,15 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const observeMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/observe-missing`;
   const observedMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b1".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b1".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(observedMissing.response.status, 200, JSON.stringify(observedMissing.body));
   assert.ok(Date.parse(observedMissing.body.attempt.missingSince));
   const observedMissingAgain = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b2".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b2".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(observedMissingAgain.response.status, 200, JSON.stringify(observedMissingAgain.body));
   assert.equal(
@@ -4545,13 +5696,13 @@ test("resident provisioning persists one protected idempotent attempt before rep
 
   const missingResetPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/reset-missing`;
   const unprotectedMissingReset = await request(baseUrl, missingResetPath, {
-    method: "POST", body: {},
+    method: "POST", body: { ownedCodexHostId: "local" },
   });
   assert.equal(unprotectedMissingReset.response.status, 403);
   const earlyMissingReset = await request(baseUrl, missingResetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b3".repeat(16), missingResetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b3".repeat(16), missingResetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(earlyMissingReset.response.status, 409);
   assert.equal(
@@ -4561,15 +5712,15 @@ test("resident provisioning persists one protected idempotent attempt before rep
   const clearMissingPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/clear-missing`;
   const clearedMissing = await request(baseUrl, clearMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b4".repeat(16), clearMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b4".repeat(16), clearMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(clearedMissing.response.status, 200, JSON.stringify(clearedMissing.body));
   assert.equal(clearedMissing.body.attempt.missingSince, null);
   const reobservedMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b5".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b5".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(reobservedMissing.response.status, 200, JSON.stringify(reobservedMissing.body));
   assert.notEqual(
@@ -4583,8 +5734,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   missingNoWorkInspection.close();
   const missingNoWorkReset = await request(baseUrl, missingResetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "ac".repeat(16), missingResetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ac".repeat(16), missingResetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(missingNoWorkReset.response.status, 409);
   assert.equal(
@@ -4602,8 +5753,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   restoreMissingWorkInspection.close();
   const missingReset = await request(baseUrl, missingResetPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "ab".repeat(16), missingResetPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "ab".repeat(16), missingResetPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(missingReset.response.status, 200, JSON.stringify(missingReset.body));
   assert.equal(missingReset.body.attempt.status, "pending");
@@ -4611,8 +5762,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.equal(missingReset.body.attempt.retryCount, 2);
   const missingRestart = await request(baseUrl, startingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "cd".repeat(16), startingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "cd".repeat(16), startingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(missingRestart.response.status, 200, JSON.stringify(missingRestart.body));
   const missingReattach = await request(baseUrl, attachPath, {
@@ -4632,8 +5783,8 @@ test("resident provisioning persists one protected idempotent attempt before rep
   expiredMissingInspection.close();
   const observedExpiredMissing = await request(baseUrl, observeMissingPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b6".repeat(16), observeMissingPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b6".repeat(16), observeMissingPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(
     observedExpiredMissing.response.status,
@@ -4644,13 +5795,13 @@ test("resident provisioning persists one protected idempotent attempt before rep
   assert.ok(Date.parse(observedExpiredMissing.body.attempt.missingSince));
 
   const unprotectedExpiredResume = await request(baseUrl, resumeExpiredPath, {
-    method: "POST", body: {},
+    method: "POST", body: { ownedCodexHostId: "local" },
   });
   assert.equal(unprotectedExpiredResume.response.status, 403);
   const resumedExpiredAttempt = await request(baseUrl, resumeExpiredPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "b7".repeat(16), resumeExpiredPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "b7".repeat(16), resumeExpiredPath, { ownedCodexHostId: "local" }),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(resumedExpiredAttempt.response.status, 200, JSON.stringify(resumedExpiredAttempt.body));
   assert.equal(resumedExpiredAttempt.body.attempt.status, "started");
@@ -4825,7 +5976,7 @@ test("resident provisioning atomically retires exact stale Coordinator windows",
     model: "gpt-5", reasoningEffort: "high", expectedRevision: before.body.revision,
     ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", ownedCodexHostId: "local", workspacePath: "/tmp/sbkk",
     retireCoordinatorWindows: [staleWindow],
   };
   const wrongBody = {
@@ -4869,16 +6020,20 @@ test("resident provisioning atomically retires exact stale Coordinator windows",
   const activeLookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
   const activeLookup = await request(baseUrl, activeLookupPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), activeLookupPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), activeLookupPath, { ownedCodexHostId: "local" },
+    ),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(activeLookup.response.status, 200, JSON.stringify(activeLookup.body));
   assert.equal(activeLookup.body.attempt.id, created.body.attempt.id);
   const recoveryPath = `/api/local/coordinator-provisioning-attempts/${created.body.attempt.id}/starting`;
   const recovered = await request(baseUrl, recoveryPath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "5".repeat(32), recoveryPath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "5".repeat(32), recoveryPath, { ownedCodexHostId: "local" },
+    ),
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(recovered.response.status, 200, JSON.stringify(recovered.body));
   assert.equal(recovered.body.attempt.status, "starting");
@@ -4984,7 +6139,7 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
     ownerRootTaskId: "owner-root",
     ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", ownedCodexHostId: "local", workspacePath: "/tmp/sbkk",
     retireCoordinatorWindows: [invalidOwnerPreflight.body.windows[1]],
   };
   const rejected = await request(baseUrl, rejectedPath, {
@@ -5020,7 +6175,7 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
     ownerRootTaskId: "owner-root",
     ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
     codexProjectId: "codex-project", codexProjectKind: "local",
-    codexHostId: "local", workspacePath: "/tmp/sbkk",
+    codexHostId: "local", ownedCodexHostId: "local", workspacePath: "/tmp/sbkk",
     retireCoordinatorWindows: [repairedPreflight.body.windows[1]],
   };
   const created = await request(baseUrl, provisioningPath, {
@@ -5039,9 +6194,9 @@ test("protected Coordinator provisioning preflight survives an invalid stale Age
   const lookup = await request(baseUrl, lookupPath, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(
-      instanceSecret, "a".repeat(32), lookupPath, {},
+      instanceSecret, "a".repeat(32), lookupPath, { ownedCodexHostId: "local" },
     ),
-    body: {},
+    body: { ownedCodexHostId: "local" },
   });
   assert.equal(lookup.response.status, 200, JSON.stringify(lookup.body));
   assert.equal(lookup.body.attempt.id, created.body.attempt.id);
@@ -5139,6 +6294,7 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
   expiredProvisioning.close();
   const pathname = "/api/local/projects/local/coordinator-shutdown-attempts";
   const body = {
+    ...localShutdownExecutor,
     idempotencyKey: "coordinator-shutdown-a",
     expectedRevision: windows.body.revision,
     expectedLeaseId: leaseId,
@@ -5153,8 +6309,42 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
+    ownedCodexHostId: "local",
     workspacePath: "/tmp/sbkk",
   };
+  const invalidExecutorRequests = [{
+    label: "missing", nonce: "a".repeat(32), body: (({ ownedCodexHostId, ...rest }) => rest)(body),
+    status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "control", nonce: "b".repeat(32), body: { ...body, ownedCodexHostId: "bad\nhost" },
+    status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "257 characters", nonce: "e".repeat(32),
+    body: { ...body, ownedCodexHostId: "h".repeat(257) }, status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "foreign", nonce: "6".repeat(32),
+    body: { ...body, ownedCodexHostId: "remote-builder" },
+    status: 409, code: "HOST_EXECUTOR_MISMATCH",
+  }];
+  for (const candidate of invalidExecutorRequests) {
+    const rejected = await request(baseUrl, pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, candidate.nonce, pathname, candidate.body,
+      ),
+      body: candidate.body,
+    });
+    assert.equal(rejected.response.status, candidate.status, candidate.label);
+    assert.equal(rejected.body.error.code, candidate.code, candidate.label);
+  }
+  const untouchedRequest = new DatabaseSync(databasePath);
+  assert.equal(untouchedRequest.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordinator_shutdown_attempts",
+  ).get().count, 0);
+  assert.equal(JSON.parse(untouchedRequest.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get().config_json).coordinatorLease.releasedAt ?? null, null);
+  untouchedRequest.close();
   const created = await request(baseUrl, pathname, {
     method: "POST",
     headers: signedCoordinatorRenewHeaders(instanceSecret, "c".repeat(32), pathname, body),
@@ -5215,6 +6405,7 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
     codexProjectId: "codex-project",
     codexProjectKind: "local",
     codexHostId: "local",
+    ownedCodexHostId: "local",
     workspacePath: "/tmp/sbkk",
   };
   const provisioningPath = "/api/local/projects/local/coordinator-provisioning-attempts";
@@ -5229,10 +6420,42 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
   assert.equal(blockedProvisioning.body.error.code, "COORDINATOR_SHUTDOWN_IN_PROGRESS");
 
   const releasePath = `/api/local/coordinator-shutdown-attempts/${created.body.attempt.id}/release`;
+  for (const candidate of [{
+    label: "missing", nonce: "7".repeat(32), body: {}, status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "control", nonce: "8".repeat(32), body: { ownedCodexHostId: "bad\u0000host" },
+    status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "foreign", nonce: "9".repeat(32), body: { ownedCodexHostId: "remote-builder" },
+    status: 409, code: "HOST_EXECUTOR_MISMATCH",
+  }]) {
+    const rejected = await request(baseUrl, releasePath, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, candidate.nonce, releasePath, candidate.body,
+      ),
+      body: candidate.body,
+    });
+    assert.equal(rejected.response.status, candidate.status, candidate.label);
+    assert.equal(rejected.body.error.code, candidate.code, candidate.label);
+  }
+  const untouchedTransition = new DatabaseSync(databasePath);
+  assert.equal(untouchedTransition.prepare(
+    "SELECT status FROM agent_coordinator_shutdown_attempts WHERE id = ?",
+  ).get(created.body.attempt.id).status, "pending");
+  assert.equal(untouchedTransition.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordinator_lease_receipts WHERE lease_id = ?",
+  ).get(leaseId).count, 0);
+  assert.equal(JSON.parse(untouchedTransition.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get().config_json).coordinatorLease.releasedAt ?? null, null);
+  untouchedTransition.close();
   const released = await request(baseUrl, releasePath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), releasePath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "1".repeat(32), releasePath, localShutdownExecutor,
+    ),
+    body: localShutdownExecutor,
   });
   assert.equal(released.response.status, 200, JSON.stringify(released.body));
   assert.equal(released.body.attempt.status, "released");
@@ -5240,8 +6463,10 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
   assert.equal(released.body.receipt.action, "released");
   const repeatedRelease = await request(baseUrl, releasePath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), releasePath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "2".repeat(32), releasePath, localShutdownExecutor,
+    ),
+    body: localShutdownExecutor,
   });
   assert.equal(repeatedRelease.response.status, 200);
   assert.equal(repeatedRelease.body.attempt.status, "released");
@@ -5250,15 +6475,19 @@ test("resident shutdown ignores a stale deferred receipt for reviewed work", asy
   const completePath = `/api/local/coordinator-shutdown-attempts/${created.body.attempt.id}/complete`;
   const completed = await request(baseUrl, completePath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), completePath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "3".repeat(32), completePath, localShutdownExecutor,
+    ),
+    body: localShutdownExecutor,
   });
   assert.equal(completed.response.status, 200, JSON.stringify(completed.body));
   assert.equal(completed.body.attempt.status, "completed");
   const completedReplay = await request(baseUrl, completePath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "4".repeat(32), completePath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), completePath, localShutdownExecutor,
+    ),
+    body: localShutdownExecutor,
   });
   assert.equal(completedReplay.response.status, 200);
   assert.equal(completedReplay.body.attempt.id, created.body.attempt.id);
@@ -5336,6 +6565,7 @@ test("resident shutdown cancels without releasing when durable work appears", as
   });
   const pathname = "/api/local/projects/local/coordinator-shutdown-attempts";
   const body = {
+    ...localShutdownExecutor,
     idempotencyKey: "coordinator-shutdown-work",
     expectedRevision: windows.body.revision,
     expectedLeaseId: leaseId,
@@ -5373,8 +6603,10 @@ test("resident shutdown cancels without releasing when durable work appears", as
   const releasePath = `/api/local/coordinator-shutdown-attempts/${created.body.attempt.id}/release`;
   const rejected = await request(baseUrl, releasePath, {
     method: "POST",
-    headers: signedCoordinatorRenewHeaders(instanceSecret, "7".repeat(32), releasePath, {}),
-    body: {},
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "7".repeat(32), releasePath, localShutdownExecutor,
+    ),
+    body: localShutdownExecutor,
   });
   assert.equal(rejected.response.status, 409);
   assert.equal(rejected.body.error.code, "COORDINATOR_SHUTDOWN_RELEASE_CONFLICT");
@@ -5445,6 +6677,7 @@ test("resident shutdown cancels before release for every Owner Root host binding
       });
       const pathname = "/api/local/projects/local/coordinator-shutdown-attempts";
       const body = {
+        ...localShutdownExecutor,
         idempotencyKey: `shutdown-owner-drift-${field}`,
         expectedRevision: windows.body.revision,
         expectedLeaseId: leaseId,
@@ -5484,8 +6717,10 @@ test("resident shutdown cancels before release for every Owner Root host binding
       const releasePath = `/api/local/coordinator-shutdown-attempts/${created.body.attempt.id}/release`;
       const rejected = await request(baseUrl, releasePath, {
         method: "POST",
-        headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), releasePath, {}),
-        body: {},
+        headers: signedCoordinatorRenewHeaders(
+          instanceSecret, "2".repeat(32), releasePath, localShutdownExecutor,
+        ),
+        body: localShutdownExecutor,
       });
       assert.equal(rejected.response.status, 409);
       assert.equal(rejected.body.error.code, "COORDINATOR_SHUTDOWN_BINDING_MISMATCH");
@@ -5536,6 +6771,7 @@ test("resident shutdown fences domain writes and cancels on coordination revisio
   });
   const expectedRevision = database.getAgentLaneCoordinationWindows("local").revision;
   const created = database.requestAgentLaneCoordinatorShutdownAttempt("local", {
+    ...localShutdownExecutor,
     idempotencyKey: "shutdown-revision-drift",
     expectedRevision,
     expectedLeaseId: leaseId,
@@ -5580,7 +6816,9 @@ test("resident shutdown fences domain writes and cancels on coordination revisio
 
   const reopened = new TaskboardDatabase(databasePath);
   assert.throws(
-    () => reopened.transitionAgentLaneCoordinatorShutdownAttempt(created.attempt.id, "release"),
+    () => reopened.transitionAgentLaneCoordinatorShutdownAttempt(
+      created.attempt.id, "release", localShutdownExecutor,
+    ),
     (error) => error?.status === 409 && error?.code === "COORDINATOR_SHUTDOWN_RELEASE_CONFLICT",
   );
   reopened.close();
@@ -5597,6 +6835,243 @@ test("resident shutdown fences domain writes and cancels on coordination revisio
   assert.equal(finalConfig.coordinatorLease.id, leaseId);
   assert.equal(finalConfig.coordinatorLease.releasedAt ?? null, null);
   inspection.close();
+});
+
+test("Coordinator shutdown transition rejects a foreign executor before every mutation", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-shutdown-host-fence-"));
+  const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+  const current = Date.now();
+  database.upsertAgentLaneProject("local", {
+    rootTaskId: "coordinator-a",
+    ownerRootTaskId: "owner-root",
+    tasks: [{
+      id: "owner-root", label: "Owner Root", owner: "Owner", source: "codex",
+      taskType: "root_task", threadId: "owner-thread", codexProjectId: "project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/owner",
+    }, {
+      id: "coordinator-a", label: "Coordinator", owner: "Coordinator", source: "codex",
+      taskType: "root_task", threadId: "coordinator-thread", codexProjectId: "project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/coordinator",
+    }],
+    adapters: [],
+    coordinatorLease: {
+      id: "lease-cap58", holderTaskId: "coordinator-a", holderThreadId: "coordinator-thread",
+      holderCodexHostId: "local", holderWorkspacePath: "/tmp/coordinator",
+      acquiredAt: new Date(current - 30_000).toISOString(),
+      expiresAt: new Date(current + 300_000).toISOString(),
+    },
+  });
+  const created = database.requestAgentLaneCoordinatorShutdownAttempt("local", {
+    ownedCodexHostId: "local",
+    idempotencyKey: "shutdown-host-fence", expectedRevision:
+      database.getAgentLaneCoordinationWindows("local").revision,
+    expectedLeaseId: "lease-cap58", holderTaskId: "coordinator-a",
+    holderThreadId: "coordinator-thread", ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "owner-thread", ownerRootCodexProjectId: "project",
+    ownerRootCodexProjectKind: "local", ownerRootCodexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/owner", codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/coordinator",
+  }).attempt;
+  const before = database.getAgentLaneProject("local");
+  let error = null;
+  try {
+    database.transitionAgentLaneCoordinatorShutdownAttempt(
+      created.id, "release", { ownedCodexHostId: "remote-builder" },
+    );
+  } catch (caught) {
+    error = caught;
+  }
+  const after = database.getAgentLaneProject("local");
+  const stored = database.database.prepare(
+    "SELECT status FROM agent_coordinator_shutdown_attempts WHERE id = ?",
+  ).get(created.id);
+  const receipts = database.database.prepare(
+    "SELECT COUNT(*) AS count FROM agent_coordinator_lease_receipts WHERE lease_id = ?",
+  ).get("lease-cap58").count;
+  database.close();
+  assert.deepEqual({
+    status: error?.status ?? null,
+    code: error?.code ?? null,
+    configUnchanged: JSON.stringify(after) === JSON.stringify(before),
+    attemptStatus: stored.status,
+    receipts,
+  }, {
+    status: 409,
+    code: "HOST_EXECUTOR_MISMATCH",
+    configUnchanged: true,
+    attemptStatus: "pending",
+    receipts: 0,
+  });
+});
+
+test("legacy shutdown fingerprints upgrade only for the exact holder executor replay", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-shutdown-legacy-host-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const database = new TaskboardDatabase(databasePath);
+  const current = Date.now();
+  const lease = (id, taskId, threadId, workspacePath, domainId = undefined) => ({
+    id, ...(domainId === undefined ? {} : { domainId }),
+    holderTaskId: taskId, holderThreadId: threadId,
+    holderCodexHostId: "local", holderWorkspacePath: workspacePath,
+    acquiredAt: new Date(current - 30_000).toISOString(),
+    expiresAt: new Date(current + 300_000).toISOString(),
+    ...(domainId === undefined ? {} : { writeScope: ["web"] }),
+  });
+  const route = (id, taskType, workspacePath) => ({
+    id, label: id, owner: id, source: "codex", taskType,
+    threadId: `${id}-thread`, codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath,
+  });
+
+  const globalProjectId = "cap58-legacy-global";
+  database.createProject({ id: globalProjectId, name: "CAP58 legacy global", workspacePath: null });
+  database.upsertAgentLaneProject(globalProjectId, {
+    rootTaskId: "global", ownerRootTaskId: "owner",
+    tasks: [route("owner", "root_task", "/tmp/legacy-owner"),
+      route("global", "root_task", "/tmp/legacy-global")],
+    adapters: [],
+    coordinatorLease: lease(
+      "legacy-global-lease", "global", "global-thread", "/tmp/legacy-global",
+    ),
+  });
+  const globalInput = {
+    ...localShutdownExecutor,
+    idempotencyKey: "legacy-global-replay",
+    expectedRevision: database.getAgentLaneCoordinationWindows(globalProjectId).revision,
+    expectedLeaseId: "legacy-global-lease", holderTaskId: "global",
+    holderThreadId: "global-thread", ownerRootTaskId: "owner",
+    ownerRootThreadId: "owner-thread", ownerRootCodexProjectId: "project",
+    ownerRootCodexProjectKind: "local", ownerRootCodexHostId: "local",
+    ownerRootWorkspacePath: "/tmp/legacy-owner", codexProjectId: "project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: "/tmp/legacy-global",
+  };
+  const globalCreated = database.requestAgentLaneCoordinatorShutdownAttempt(
+    globalProjectId, globalInput,
+  );
+
+  const domainProjectId = "cap58-legacy-domain";
+  database.createProject({ id: domainProjectId, name: "CAP58 legacy domain", workspacePath: null });
+  database.upsertAgentLaneProject(domainProjectId, {
+    rootTaskId: "global",
+    tasks: [route("global", "root_task", "/tmp/legacy-domain-global"),
+      route("frontend", "peer_task", "/tmp/legacy-domain-frontend")],
+    adapters: [],
+    coordinatorLease: lease(
+      "legacy-domain-global-lease", "global", "global-thread", "/tmp/legacy-domain-global",
+    ),
+    coordinationDomains: [{
+      id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+    }],
+    domainCoordinatorLeases: { frontend: lease(
+      "legacy-domain-lease", "frontend", "frontend-thread", "/tmp/legacy-domain-frontend",
+      "frontend",
+    ) },
+  });
+  const domainInput = {
+    ...localShutdownExecutor,
+    idempotencyKey: "legacy-domain-replay",
+    expectedRevision: database.getAgentLaneCoordinationWindows(domainProjectId).revision,
+    expectedLeaseId: "legacy-domain-lease", holderTaskId: "frontend",
+    holderThreadId: "frontend-thread", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", expectedGlobalLeaseId: "legacy-domain-global-lease",
+    codexProjectId: "project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/legacy-domain-frontend",
+  };
+  const domainCreated = database.requestAgentLaneDomainCoordinatorShutdownAttempt(
+    domainProjectId, "frontend", domainInput,
+  );
+  const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  const globalFingerprintPayload = {
+    projectId: globalProjectId,
+    idempotencyKey: globalInput.idempotencyKey,
+    expectedRevision: globalInput.expectedRevision,
+    expectedLeaseId: globalInput.expectedLeaseId,
+    holderTaskId: globalInput.holderTaskId,
+    holderThreadId: globalInput.holderThreadId,
+    ownerRootTaskId: globalInput.ownerRootTaskId,
+    ownerRootThreadId: globalInput.ownerRootThreadId,
+    ownerRootCodexProjectId: globalInput.ownerRootCodexProjectId,
+    ownerRootCodexProjectKind: globalInput.ownerRootCodexProjectKind,
+    ownerRootCodexHostId: globalInput.ownerRootCodexHostId,
+    ownerRootWorkspacePath: path.resolve(globalInput.ownerRootWorkspacePath),
+    codexProjectId: globalInput.codexProjectId,
+    codexProjectKind: globalInput.codexProjectKind,
+    codexHostId: globalInput.codexHostId,
+    workspacePath: path.resolve(globalInput.workspacePath),
+  };
+  const domainFingerprintPayload = {
+    projectId: domainProjectId, domainId: "frontend",
+    idempotencyKey: domainInput.idempotencyKey,
+    expectedRevision: domainInput.expectedRevision,
+    expectedLeaseId: domainInput.expectedLeaseId,
+    holderTaskId: domainInput.holderTaskId,
+    holderThreadId: domainInput.holderThreadId,
+    globalHolderTaskId: domainInput.globalHolderTaskId,
+    globalHolderThreadId: domainInput.globalHolderThreadId,
+    expectedGlobalLeaseId: domainInput.expectedGlobalLeaseId,
+    codexProjectId: domainInput.codexProjectId,
+    codexProjectKind: domainInput.codexProjectKind,
+    codexHostId: domainInput.codexHostId,
+    workspacePath: path.resolve(domainInput.workspacePath),
+  };
+  const legacyGlobalFingerprint = digest(globalFingerprintPayload);
+  const legacyDomainFingerprint = digest(domainFingerprintPayload);
+  database.database.prepare(`
+    UPDATE agent_coordinator_shutdown_attempts SET request_fingerprint = ? WHERE id = ?
+  `).run(legacyGlobalFingerprint, globalCreated.attempt.id);
+  database.database.prepare(`
+    UPDATE agent_domain_coordinator_shutdown_attempts SET request_fingerprint = ? WHERE id = ?
+  `).run(legacyDomainFingerprint, domainCreated.attempt.id);
+  database.close();
+
+  const reopened = new TaskboardDatabase(databasePath);
+  const cases = [{
+    label: "global", table: "agent_coordinator_shutdown_attempts",
+    attemptId: globalCreated.attempt.id, projectId: globalProjectId,
+    input: globalInput, legacyFingerprint: legacyGlobalFingerprint,
+    currentFingerprint: digest({
+      projectId: globalProjectId, ownedCodexHostId: "local", ...globalFingerprintPayload,
+    }),
+    replay: (input) => reopened.requestAgentLaneCoordinatorShutdownAttempt(globalProjectId, input),
+  }, {
+    label: "domain", table: "agent_domain_coordinator_shutdown_attempts",
+    attemptId: domainCreated.attempt.id, projectId: domainProjectId,
+    input: domainInput, legacyFingerprint: legacyDomainFingerprint,
+    currentFingerprint: digest({
+      projectId: domainProjectId, domainId: "frontend", ownedCodexHostId: "local",
+      ...Object.fromEntries(Object.entries(domainFingerprintPayload).slice(2)),
+    }),
+    replay: (input) => reopened.requestAgentLaneDomainCoordinatorShutdownAttempt(
+      domainProjectId, "frontend", input,
+    ),
+  }];
+  for (const candidate of cases) {
+    const beforeRow = reopened.database.prepare(
+      `SELECT request_fingerprint, status, updated_at, released_at, completed_at FROM ${candidate.table} WHERE id = ?`,
+    ).get(candidate.attemptId);
+    const beforeConfig = reopened.database.prepare(
+      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+    ).get(candidate.projectId).config_json;
+    assert.throws(
+      () => candidate.replay({ ...candidate.input, ownedCodexHostId: "remote-builder" }),
+      (error) => error?.status === 409 && error?.code === "HOST_EXECUTOR_MISMATCH",
+      candidate.label,
+    );
+    assert.deepEqual(reopened.database.prepare(
+      `SELECT request_fingerprint, status, updated_at, released_at, completed_at FROM ${candidate.table} WHERE id = ?`,
+    ).get(candidate.attemptId), beforeRow, candidate.label);
+    assert.equal(reopened.database.prepare(
+      "SELECT config_json FROM agent_lane_projects WHERE project_id = ?",
+    ).get(candidate.projectId).config_json, beforeConfig, candidate.label);
+    const replayed = candidate.replay(candidate.input);
+    assert.equal(replayed.applied, false, candidate.label);
+    assert.equal(replayed.attempt.id, candidate.attemptId, candidate.label);
+    assert.equal(reopened.database.prepare(
+      `SELECT request_fingerprint FROM ${candidate.table} WHERE id = ?`,
+    ).get(candidate.attemptId).request_fingerprint, candidate.currentFingerprint, candidate.label);
+  }
+  reopened.close();
+  await rm(directory, { recursive: true, force: true });
 });
 
 test("domain Coordinator shutdown releases only its exact idle lease and preserves every other lane", async () => {
@@ -5649,6 +7124,7 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
   database.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(activeTask.id);
   const expectedRevision = database.getAgentLaneCoordinationWindows("local").revision;
   const input = {
+    ...localShutdownExecutor,
     idempotencyKey: "frontend-idle-retirement", expectedRevision,
     expectedLeaseId: "frontend-lease", holderTaskId: "frontend",
     holderThreadId: "frontend-thread", globalHolderTaskId: "global",
@@ -5665,9 +7141,16 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
   assert.equal(created.applied, true);
   assert.equal(created.attempt.status, "pending");
   assert.equal(database.requestAgentLaneDomainCoordinatorShutdownAttempt("local", "frontend", input).applied, false);
-  const released = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(created.attempt.id, "release");
+  const released = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    created.attempt.id, "release", localShutdownExecutor,
+  );
   assert.equal(released.attempt.status, "released");
   assert.equal(released.receipt.action, "released");
+  const replayedRelease = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    created.attempt.id, "release", localShutdownExecutor,
+  );
+  assert.deepEqual(Object.keys(replayedRelease.receipt), Object.keys(released.receipt));
+  assert.deepEqual(replayedRelease.receipt, released.receipt);
   const afterRelease = database.getAgentLaneProject("local");
   assert.ok(afterRelease.domainCoordinatorLeases.frontend.releasedAt);
   assert.equal(afterRelease.domainCoordinatorLeases.backend.id, "backend-lease");
@@ -5692,7 +7175,7 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
     "UPDATE agent_lane_projects SET config_json = ? WHERE project_id = 'local'",
   ).run(JSON.stringify(expiredGlobal));
   const authorized = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
-    created.attempt.id, "authorize",
+    created.attempt.id, "authorize", localShutdownExecutor,
   );
   assert.equal(authorized.authorized, true);
   assert.equal(authorized.attempt.status, "authorized");
@@ -5728,10 +7211,12 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
     (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
   );
   const archiving = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
-    created.attempt.id, "begin-archive",
+    created.attempt.id, "begin-archive", localShutdownExecutor,
   );
   assert.equal(archiving.attempt.status, "archiving");
-  const completed = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(created.attempt.id, "complete");
+  const completed = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    created.attempt.id, "complete", localShutdownExecutor,
+  );
   assert.equal(completed.attempt.status, "completed");
   assert.equal(database.getAgentLaneProject("local").tasks.some((task) => task.id === "frontend"), true);
   const renewedGlobal = database.getAgentLaneProject("local");
@@ -5758,7 +7243,9 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
   ).attempt;
   database.database.prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?").run(activeTask.id);
   assert.throws(
-    () => database.transitionAgentLaneDomainCoordinatorShutdownAttempt(canceled.id, "release"),
+    () => database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+      canceled.id, "release", localShutdownExecutor,
+    ),
     (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_RELEASE_CONFLICT",
   );
   database.database.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(activeTask.id);
@@ -5768,13 +7255,17 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
   assert.equal(rearmed.applied, true);
   assert.equal(rearmed.attempt.id, canceled.id);
   assert.equal(rearmed.attempt.status, "pending");
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(canceled.id, "release");
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(canceled.id, "authorize");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    canceled.id, "release", localShutdownExecutor,
+  );
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    canceled.id, "authorize", localShutdownExecutor,
+  );
   database.database.prepare(`
     UPDATE agent_domain_coordinator_shutdown_attempts SET released_at = ? WHERE id = ?
   `).run(new Date(current - 10 * 60_000 - 1).toISOString(), canceled.id);
   const safelyCanceled = database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
-    canceled.id, "cancel",
+    canceled.id, "cancel", localShutdownExecutor,
   );
   assert.equal(safelyCanceled.attempt.status, "canceled");
   assert.equal(safelyCanceled.abandoned, true);
@@ -5792,7 +7283,9 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
       workspacePath: "/tmp/backend",
     },
   ).attempt;
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(backendAttempt.id, "release");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    backendAttempt.id, "release", localShutdownExecutor,
+  );
   const drifted = database.getAgentLaneProject("local");
   drifted.coordinatorLease = { ...drifted.coordinatorLease, id: "global-lease-next" };
   database.database.prepare(
@@ -5800,7 +7293,7 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
   ).run(JSON.stringify(drifted));
   assert.throws(
     () => database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
-      backendAttempt.id, "authorize",
+      backendAttempt.id, "authorize", localShutdownExecutor,
     ),
     (error) => error?.code === "DOMAIN_COORDINATOR_SHUTDOWN_BINDING_MISMATCH",
   );
@@ -5808,10 +7301,12 @@ test("domain Coordinator shutdown releases only its exact idle lease and preserv
 });
 
 test("protected domain Coordinator shutdown API replays one durable retirement", async () => {
+  let databasePath;
   const instanceSecret = "9".repeat(64);
   const current = Date.now();
   const baseUrl = await startServer(async (directory) => {
-    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
     database.upsertAgentLaneProject("local", {
       rootTaskId: "global",
       tasks: [
@@ -5844,6 +7339,7 @@ test("protected domain Coordinator shutdown API replays one durable retirement",
   });
   const pathname = "/api/local/projects/local/domain-coordinator-shutdown-attempts/frontend";
   const body = {
+    ...localShutdownExecutor,
     idempotencyKey: "frontend-api-retirement", expectedRevision: windows.body.revision,
     expectedLeaseId: "frontend-lease", holderTaskId: "frontend",
     holderThreadId: "frontend-thread", globalHolderTaskId: "global",
@@ -5855,6 +7351,35 @@ test("protected domain Coordinator shutdown API replays one durable retirement",
   const invalid = await request(baseUrl, invalidPath, { method: "POST", body });
   assert.equal(invalid.response.status, 400);
   assert.equal(invalid.body.error.code, "INVALID_COORDINATION_DOMAIN");
+  for (const candidate of [{
+    label: "missing", nonce: "0".repeat(32),
+    body: (({ ownedCodexHostId, ...rest }) => rest)(body), status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "control", nonce: "1".repeat(32),
+    body: { ...body, ownedCodexHostId: "bad\u007fhost" }, status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "foreign", nonce: "2".repeat(32),
+    body: { ...body, ownedCodexHostId: "remote-builder" },
+    status: 409, code: "HOST_EXECUTOR_MISMATCH",
+  }]) {
+    const rejected = await request(baseUrl, pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret, candidate.nonce, pathname, candidate.body,
+      ),
+      body: candidate.body,
+    });
+    assert.equal(rejected.response.status, candidate.status, candidate.label);
+    assert.equal(rejected.body.error.code, candidate.code, candidate.label);
+  }
+  const untouchedRequest = new DatabaseSync(databasePath);
+  assert.equal(untouchedRequest.prepare(
+    "SELECT COUNT(*) AS count FROM agent_domain_coordinator_shutdown_attempts",
+  ).get().count, 0);
+  assert.equal(JSON.parse(untouchedRequest.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get().config_json).domainCoordinatorLeases.frontend.releasedAt ?? null, null);
+  untouchedRequest.close();
   const create = (nonce) => request(baseUrl, pathname, {
     method: "POST", headers: signedCoordinatorRenewHeaders(instanceSecret, nonce, pathname, body), body,
   });
@@ -5862,15 +7387,45 @@ test("protected domain Coordinator shutdown API replays one durable retirement",
   assert.equal(created.response.status, 200, JSON.stringify(created.body));
   assert.equal(created.body.applied, true);
   assert.equal((await create("b".repeat(32))).body.applied, false);
-  const transition = async (action, nonce) => {
+  const transition = async (action, nonce, transitionBody = localShutdownExecutor) => {
     const target = `/api/local/domain-coordinator-shutdown-attempts/${created.body.attempt.id}/${action}`;
     return request(baseUrl, target, {
-      method: "POST", headers: signedCoordinatorRenewHeaders(instanceSecret, nonce, target, {}), body: {},
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(instanceSecret, nonce, target, transitionBody),
+      body: transitionBody,
     });
   };
+  for (const candidate of [{
+    label: "missing", nonce: "3".repeat(32), body: {}, status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "control", nonce: "4".repeat(32), body: { ownedCodexHostId: "bad\nhost" },
+    status: 400, code: "INVALID_FIELD",
+  }, {
+    label: "foreign", nonce: "5".repeat(32), body: { ownedCodexHostId: "remote-builder" },
+    status: 409, code: "HOST_EXECUTOR_MISMATCH",
+  }]) {
+    const rejected = await transition("release", candidate.nonce, candidate.body);
+    assert.equal(rejected.response.status, candidate.status, candidate.label);
+    assert.equal(rejected.body.error.code, candidate.code, candidate.label);
+  }
+  const untouchedTransition = new DatabaseSync(databasePath);
+  assert.equal(untouchedTransition.prepare(
+    "SELECT status FROM agent_domain_coordinator_shutdown_attempts WHERE id = ?",
+  ).get(created.body.attempt.id).status, "pending");
+  assert.equal(untouchedTransition.prepare(
+    "SELECT COUNT(*) AS count FROM agent_domain_coordinator_lease_receipts WHERE lease_id = ?",
+  ).get("frontend-lease").count, 0);
+  assert.equal(JSON.parse(untouchedTransition.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get().config_json).domainCoordinatorLeases.frontend.releasedAt ?? null, null);
+  untouchedTransition.close();
   const released = await transition("release", "c".repeat(32));
   assert.equal(released.response.status, 200, JSON.stringify(released.body));
   assert.equal(released.body.attempt.status, "released");
+  const replayedRelease = await transition("release", "6".repeat(32));
+  assert.equal(replayedRelease.response.status, 200, JSON.stringify(replayedRelease.body));
+  assert.deepEqual(Object.keys(replayedRelease.body.receipt), Object.keys(released.body.receipt));
+  assert.deepEqual(replayedRelease.body.receipt, released.body.receipt);
   const authorized = await transition("authorize", "e".repeat(32));
   assert.equal(authorized.response.status, 200, JSON.stringify(authorized.body));
   assert.equal(authorized.body.authorized, true);
@@ -5931,6 +7486,7 @@ test("Jira synchronization cannot recreate domain work inside an archive fence",
   database.syncJiraTasks([issue("done")], { projectName: "Jira", archiveMissing: true });
   const attempt = database.requestAgentLaneDomainCoordinatorShutdownAttempt(
     "jira-my-tasks", "frontend", {
+      ...localShutdownExecutor,
       idempotencyKey: "jira-domain-retirement",
       expectedRevision: database.getAgentLaneCoordinationWindows("jira-my-tasks").revision,
       expectedLeaseId: "frontend-lease", holderTaskId: "frontend",
@@ -5940,16 +7496,24 @@ test("Jira synchronization cannot recreate domain work inside an archive fence",
       workspacePath: "/tmp/frontend",
     },
   ).attempt;
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "release");
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "authorize");
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "begin-archive");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    attempt.id, "release", localShutdownExecutor,
+  );
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    attempt.id, "authorize", localShutdownExecutor,
+  );
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    attempt.id, "begin-archive", localShutdownExecutor,
+  );
   task = database.getTask("jira:origin:1");
   assert.throws(
     () => database.syncJiraTasks([issue("todo")], { projectName: "Jira", archiveMissing: true }),
     (error) => error?.code === "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE",
   );
   assert.deepEqual(database.getTask(task.id), task);
-  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(attempt.id, "complete");
+  database.transitionAgentLaneDomainCoordinatorShutdownAttempt(
+    attempt.id, "complete", localShutdownExecutor,
+  );
   database.close();
 });
 
@@ -6004,7 +7568,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "a".repeat(32)),
     body: {
       threadId: "owner-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-owner", workspacePath: ownerWorkspacePath,
     },
   });
@@ -6018,7 +7582,7 @@ test("protected window registration separates Owner Root from a replaceable coor
   assert.deepEqual(owner.body.configuration.windows.find((window) => window.taskId === "owner-root"), {
     taskId: "owner-root", label: "Owner conversation", role: "owner_root",
     threadId: "owner-thread", codexHostId: "host-owner",
-    codexProjectId: "codex-project", codexProjectKind: "local",
+    codexProjectId: "codex-project", codexProjectKind: "remote",
     workspacePath: ownerWorkspacePath,
   });
 
@@ -6045,7 +7609,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "b".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator", workspacePath: "/tmp/coordinator",
     },
   });
@@ -6080,7 +7644,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "f".repeat(32)),
     body: {
       threadId: "coordinator-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-coordinator-new", workspacePath: "/tmp/coordinator-new",
     },
   });
@@ -6114,7 +7678,7 @@ test("protected window registration separates Owner Root from a replaceable coor
     method: "PUT", headers: signedInjectorHeaders(instanceSecret, "e".repeat(32)),
     body: {
       threadId: "adapter-thread", threadRunning: true, threadTodoProgress: null,
-      codexProjectId: "codex-project", codexProjectKind: "local",
+      codexProjectId: "codex-project", codexProjectKind: "remote",
       codexHostId: "host-adapter", workspacePath: "/tmp/adapter-window",
     },
   });
@@ -6429,7 +7993,7 @@ test("active coordinator repairs one legacy Root binding from protected host ide
     body: {
       threadId: "root-thread", threadRunning: true, threadTodoProgress: null,
       codexProjectId: "codex-project", codexProjectKind: "local",
-      codexHostId: "drifted-host", workspacePath: "/tmp/drifted-repair-root",
+      codexHostId: "local", workspacePath: "/tmp/drifted-repair-root",
     },
   });
   const driftedHostRepair = await request(baseUrl, "/api/local/projects/local/coordinator-lease/repair-binding", {
@@ -6697,7 +8261,8 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
       tasks: [
         {
           id: "owner-root", label: "Owner Root", owner: "Codex Root", source: "codex",
-          threadId: ownerThreadId, taskType: "root_task", codexHostId: "local",
+          threadId: ownerThreadId, taskType: "root_task",
+          codexProjectId: "owner-project", codexProjectKind: "local", codexHostId: "local",
           workspacePath: "/tmp/owner-root-workspace",
         },
         {
@@ -6777,8 +8342,7 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
     headers: signedInjectorHeaders(instanceSecret, "01".repeat(32)),
     body: {
       ...hostBinding,
-      codexHostId: "replacement-host",
-      workspacePath: "/tmp/replaced-owner-root-workspace",
+      codexProjectId: "wrong-owner-project",
       threadRunning: false,
       threadTodoProgress: null,
     },
@@ -6844,6 +8408,8 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
   assert.deepEqual(snapshot.body.coordination.ownerRootRoute, {
     rootTaskId: "owner-root",
     rootThreadId: ownerThreadId,
+    codexProjectId: hostBinding.codexProjectId,
+    codexProjectKind: hostBinding.codexProjectKind,
     codexHostId: hostBinding.codexHostId,
     rootWorkspacePath: hostBinding.workspacePath,
   });
@@ -7105,6 +8671,7 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
       unsafeFinancialPlan.body.error.code,
     );
     const monitorResult = await runOwnerIntentPlanningMonitorOnce({
+      hostExecutor: localShutdownExecutor,
       policy: { enabled: true, projectId: "local" },
       readSnapshot: async () => ({
         projectId: "local",
@@ -7113,6 +8680,12 @@ test("Owner Intent ingest is host-bound, idempotent, and cannot widen task autho
             intentId: financialIntent.intentId,
             version: financialAdopted.version,
             adoptionReceipt: financialClaim.body.receipt,
+            route: {
+              coordinatorTaskId: "coordinator",
+              coordinatorThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+              codexHostId: "local",
+              coordinatorWorkspacePath: "/tmp/coordinator-workspace",
+            },
           },
         },
       }),
@@ -8622,7 +10195,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   assert.equal(repositoryProbeCalls, 3);
   const repeatedCapsule = await request(baseUrl, `/api/tasks/${task.id}/capsule`);
   assert.equal(repeatedCapsule.response.status, 200);
-  assert.equal(repositoryProbeCalls, 3);
+  assert.equal(repositoryProbeCalls, 6);
   assert.deepEqual(
     capsule.body.capsule.readyWork.safeActions.map((action) => action.id),
     ["push-branch", "delete-link", "edit-link"],
@@ -8637,6 +10210,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
     method: "POST",
     body: {
       rootThreadId: rootBinding.threadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "delete-link",
       reservationLeaseId: "escaped-delete-reservation",
@@ -8650,6 +10224,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
     method: "POST",
     body: {
       rootThreadId: rootBinding.threadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: capsule.body.capsule.resumeToken,
       safeActionId: "edit-link",
       reservationLeaseId: "escaped-edit-reservation",
@@ -8666,6 +10241,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
   let idleTurnStart = null;
   let repositoryProbesAfterConfirmation = null;
   const monitorResult = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: { ownedCodexHostId: "local" },
     policy: { enabled: true, projectId: "local" },
     readSnapshot: async () => laneSnapshot.body,
     claimReceipt: async (claim) => {
@@ -8673,6 +10249,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
         method: "POST",
         body: {
           rootThreadId: claim.rootThreadId,
+          ownedCodexHostId: claim.ownedCodexHostId,
           expectedResumeToken: claim.expectedResumeToken,
           safeActionId: claim.safeActionId,
           reservationLeaseId: "standing-reservation",
@@ -8829,6 +10406,7 @@ test("project standing authority is provenance-bound, idempotent, revocable, and
     method: "POST",
     body: {
       rootThreadId: rootBinding.threadId,
+      ownedCodexHostId: "local",
       expectedResumeToken: editCapsule.resumeToken,
       safeActionId: "edit-file",
       reservationLeaseId: "edit-file-reservation",
@@ -9294,4 +10872,1203 @@ test("task changes from one LAN client are broadcast to another client", async (
   assert.equal(listResult.response.status, 200);
   assert.equal(listResult.body.tasks.some((task) => task.id === createResult.body.task.id), true);
   await reader.cancel();
+});
+
+test("CAP-59 Global provisioning APIs require the exact owning host before every transition", async () => {
+  let databasePath;
+  const instanceSecret = "c".repeat(64);
+  const workspacePath = "/tmp/cap59-server-owner";
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        taskType: "root_task", codexProjectId: "cap59-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 durable work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null,
+      recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const provisionBody = {
+    idempotencyKey: "cap59-exact-attempt",
+    taskId: "cap59-coordinator",
+    label: "Taskboard Execution Coordinator",
+    threadSource: "cap59-coordinator-source",
+    model: "gpt-5",
+    reasoningEffort: "high",
+    expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root",
+    ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "cap59-project",
+    codexProjectKind: "local",
+    codexHostId: "local",
+    workspacePath,
+    ownedCodexHostId: "local",
+  };
+  const setup = new TaskboardDatabase(databasePath);
+  const baseConfiguration = setup.getAgentLaneProject("local");
+  const created = setup.requestAgentLaneCoordinatorProvisioningAttempt("local", provisionBody);
+  setup.close();
+  assert.equal(created.applied, true);
+
+  const attemptId = created.attempt.id;
+  const lookupPath = "/api/local/projects/local/coordinator-provisioning-attempts/lookup";
+  const requestPath = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const { ownedCodexHostId: _ownedCodexHostId, ...provisionBodyWithoutExecutor } = provisionBody;
+  const transitionStates = {
+    starting: {
+      status: "starting", threadId: null, expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+    attach: {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: "f".repeat(64),
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    reset: {
+      status: "starting", threadId: null, expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "observe-missing": {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "clear-missing": {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: "2026-09-07T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "reset-missing": {
+      status: "started", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: "2000-01-01T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+    "resume-expired": {
+      status: "expired", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", expectedRevision: windows.body.revision,
+      missingSince: null, expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+    rebind: {
+      status: "pending", threadId: null, expectedRevision: "f".repeat(64),
+      missingSince: null, expiresAt: "2099-01-01T00:00:00.000Z",
+    },
+  };
+  const storageSnapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const snapshot = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get(attemptId),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return snapshot;
+  };
+  const setTransitionState = (state) => {
+    const inspection = new DatabaseSync(databasePath);
+    inspection.prepare(`
+      UPDATE agent_coordinator_provisioning_attempts
+      SET status = ?, thread_id = ?, expected_revision = ?, missing_since = ?, expires_at = ?,
+          updated_at = '2000-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(
+      state.status, state.threadId, state.expectedRevision, state.missingSince, state.expiresAt, attemptId,
+    );
+    inspection.close();
+  };
+  const outcomes = [];
+  const expectedOutcomes = [];
+  const execute = async (label, pathname, body, status, code, state = null) => {
+    if (state) setTransitionState(state);
+    const before = storageSnapshot();
+    const response = await request(baseUrl, pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret,
+        `${outcomes.length + 1}`.padStart(2, "0").repeat(16),
+        pathname,
+        body,
+      ),
+      body,
+    });
+    outcomes.push([
+      label,
+      response.response.status,
+      response.body?.error?.code ?? null,
+      JSON.stringify(storageSnapshot()) === JSON.stringify(before),
+    ]);
+    expectedOutcomes.push([label, status, code, true]);
+  };
+
+  for (const [label, executorBody, status, code] of [
+    ["lookup:missing", {}, 400, "INVALID_FIELD"],
+    ["lookup:foreign", { ownedCodexHostId: "remote-builder" }, 409, "HOST_EXECUTOR_MISMATCH"],
+  ]) {
+    await execute(
+      label,
+      lookupPath,
+      executorBody,
+      status,
+      code,
+      label === "lookup:foreign" ? transitionStates.starting : null,
+    );
+  }
+  await execute(
+    "request:missing",
+    requestPath,
+    { ...provisionBodyWithoutExecutor, idempotencyKey: "cap59-missing-request" },
+    400,
+    "INVALID_FIELD",
+    { ...transitionStates.rebind, expectedRevision: windows.body.revision },
+  );
+  const staleCoordinator = {
+    id: "cap59-stale-coordinator", label: "Stale Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath: "/tmp/cap59-stale-coordinator",
+  };
+  const staleWindow = {
+    taskId: staleCoordinator.id, label: staleCoordinator.label, role: "coordinator",
+    threadId: staleCoordinator.threadId, codexProjectId: staleCoordinator.codexProjectId,
+    codexProjectKind: staleCoordinator.codexProjectKind, codexHostId: staleCoordinator.codexHostId,
+    workspacePath: staleCoordinator.workspacePath,
+  };
+  const staleSetup = new TaskboardDatabase(databasePath);
+  staleSetup.upsertAgentLaneProject("local", {
+    ...baseConfiguration,
+    tasks: [...baseConfiguration.tasks, staleCoordinator],
+  });
+  staleSetup.close();
+  const staleWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  await execute(
+    "request:foreign",
+    requestPath,
+    {
+      ...provisionBody,
+      idempotencyKey: "cap59-foreign-request",
+      expectedRevision: staleWindows.body.revision,
+      retireCoordinatorWindows: [staleWindow],
+      ownedCodexHostId: "remote-builder",
+    },
+    409,
+    "HOST_EXECUTOR_MISMATCH",
+    transitionStates.starting,
+  );
+  const restore = new TaskboardDatabase(databasePath);
+  restore.upsertAgentLaneProject("local", baseConfiguration);
+  restore.close();
+  const restoredWindows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  for (const state of Object.values(transitionStates)) {
+    if (state.expectedRevision === windows.body.revision) {
+      state.expectedRevision = restoredWindows.body.revision;
+    }
+  }
+  for (const [action, state] of Object.entries(transitionStates)) {
+    const pathname = `/api/local/coordinator-provisioning-attempts/${attemptId}/${action}`;
+    const transitionBody = action === "attach"
+      ? { threadId: state.threadId }
+      : action === "rebind"
+        ? { expectedRevision: restoredWindows.body.revision }
+        : {};
+    await execute(
+      `${action}:foreign`,
+      pathname,
+      { ...transitionBody, ownedCodexHostId: "remote-builder" },
+      409,
+      "HOST_EXECUTOR_MISMATCH",
+      state,
+    );
+  }
+  await execute(
+    "starting:missing",
+    `/api/local/coordinator-provisioning-attempts/${attemptId}/starting`,
+    {},
+    400,
+    "INVALID_FIELD",
+    transitionStates.starting,
+  );
+  await execute(
+    "reset:invalid",
+    `/api/local/coordinator-provisioning-attempts/${attemptId}/reset`,
+    { ownedCodexHostId: "bad\nhost" },
+    400,
+    "INVALID_FIELD",
+    transitionStates.reset,
+  );
+  assert.deepEqual(outcomes, expectedOutcomes);
+});
+
+test("CAP-60 Domain provisioning APIs require the exact owning host before every transition", async () => {
+  let databasePath;
+  let revision;
+  let attemptId;
+  const instanceSecret = "6".repeat(64);
+  const globalWorkspacePath = path.resolve("/tmp/cap60-domain-global");
+  const domainWorkspacePath = path.resolve("/tmp/cap60-domain-frontend");
+  const requestPath = "/api/local/projects/local/domain-coordinator-provisioning-attempts/frontend";
+  const lookupPath = `${requestPath}/lookup`;
+  let requestBody;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [{
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        threadId: "global-thread", taskType: "root_task",
+        codexProjectId: "cap60-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspacePath,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        threadId: "frontend-template-thread", taskType: "peer_task",
+        codexProjectId: "cap60-domain-project", codexProjectKind: "remote",
+        codexHostId: "domain-host", workspacePath: domainWorkspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap60-global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+    });
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    const task = database.createTask({
+      projectId: "local", title: "CAP-60 Domain host fence", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "global-thread",
+      threadBinding: {
+        threadId: "global-thread", codexProjectId: "cap60-global-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: domainWorkspacePath, branch: "codex/cap60-domain-host-fence",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("local", task.id, {
+      domainId: "frontend", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "cap60-global-lease",
+    });
+    revision = database.getAgentLaneCoordinationWindows("local").revision;
+    requestBody = {
+      idempotencyKey: "cap60-domain-exact-attempt", taskId: "frontend",
+      label: "Frontend Coordinator", threadSource: "cap60-domain-source",
+      model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+      expectedGlobalLeaseId: "cap60-global-lease", globalHolderTaskId: "global",
+      globalHolderThreadId: "global-thread", codexProjectId: "cap60-domain-project",
+      codexProjectKind: "remote", codexHostId: "domain-host",
+      workspacePath: domainWorkspacePath, ownedCodexHostId: "domain-host",
+    };
+    const created = database.requestAgentLaneDomainCoordinatorProvisioningAttempt(
+      "local", "frontend", requestBody,
+    );
+    attemptId = created.attempt.id;
+    database.close();
+    return { instanceSecret };
+  });
+  const storageSnapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const snapshot = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+      ).get(attemptId),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return snapshot;
+  };
+  const states = {
+    starting: { status: "pending", threadId: null, expiresAt: "2000-01-01T00:00:00.000Z" },
+    reset: { status: "starting", threadId: null, expiresAt: "2099-01-01T00:00:00.000Z" },
+    attach: { status: "starting", threadId: null, expiresAt: "2099-01-01T00:00:00.000Z" },
+    rebind: {
+      status: "expired", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+    "resume-expired": {
+      status: "expired", threadId: "01a062c1-fd2b-7f61-9114-d483e695640e",
+      expiresAt: "2000-01-01T00:00:00.000Z",
+    },
+  };
+  const setState = (state) => {
+    const inspection = new DatabaseSync(databasePath);
+    inspection.prepare(`
+      UPDATE agent_domain_coordinator_provisioning_attempts
+      SET status = ?, thread_id = ?, expected_revision = ?, expected_global_lease_id = ?,
+          missing_since = NULL, expires_at = ?, updated_at = '2000-01-01T00:00:00.000Z'
+      WHERE id = ?
+    `).run(
+      state.status, state.threadId, revision, "cap60-global-lease", state.expiresAt, attemptId,
+    );
+    inspection.close();
+  };
+  const outcomes = [];
+  const execute = async (label, pathname, body, expectedStatus, expectedCode, state) => {
+    setState(state);
+    const before = storageSnapshot();
+    const response = await request(baseUrl, pathname, {
+      method: "POST",
+      headers: signedCoordinatorRenewHeaders(
+        instanceSecret,
+        `${outcomes.length + 1}`.padStart(2, "0").repeat(16),
+        pathname,
+        body,
+      ),
+      body,
+    });
+    outcomes.push([
+      label,
+      response.response.status,
+      response.body?.error?.code ?? null,
+      JSON.stringify(storageSnapshot()) === JSON.stringify(before),
+    ]);
+    assert.deepEqual(outcomes.at(-1), [label, expectedStatus, expectedCode, true]);
+  };
+  const expiredState = states.starting;
+  const { ownedCodexHostId: _ownedCodexHostId, ...requestWithoutHost } = requestBody;
+  for (const [label, pathname, body, state] of [
+    ["lookup", lookupPath, { idempotencyKey: requestBody.idempotencyKey }, expiredState],
+    ["request", requestPath, requestWithoutHost, expiredState],
+  ]) {
+    await execute(`${label}:missing`, pathname, body, 400, "INVALID_FIELD", state);
+    await execute(
+      `${label}:foreign`, pathname, { ...body, ownedCodexHostId: "local" },
+      409, "HOST_EXECUTOR_MISMATCH", state,
+    );
+  }
+  for (const [action, state] of Object.entries(states)) {
+    const pathname = `/api/local/domain-coordinator-provisioning-attempts/${attemptId}/${action}`;
+    const actionBody = action === "attach"
+      ? { threadId: "01a062c1-fd2b-7f61-9114-d483e695640e" }
+      : action === "rebind"
+        ? { expectedRevision: revision, expectedGlobalLeaseId: "cap60-global-lease" }
+        : {};
+    await execute(`${action}:missing`, pathname, actionBody, 400, "INVALID_FIELD", state);
+    await execute(
+      `${action}:foreign`, pathname, { ...actionBody, ownedCodexHostId: "local" },
+      409, "HOST_EXECUTOR_MISMATCH", state,
+    );
+  }
+  await execute(
+    "reset:invalid",
+    `/api/local/domain-coordinator-provisioning-attempts/${attemptId}/reset`,
+    { ownedCodexHostId: "bad\nhost" },
+    400,
+    "INVALID_FIELD",
+    states.reset,
+  );
+  assert.equal(outcomes.length, 15);
+});
+
+test("CAP-60 runtime skips a real foreign expired attempt and provisions the later owned domain", async () => {
+  let databasePath;
+  let revision;
+  const instanceSecret = "7".repeat(64);
+  const globalThreadId = "01a050de-03c2-7f32-ba9c-4342b40ac18a";
+  const globalWorkspacePath = path.resolve("/tmp/cap60-expiry-global");
+  const domainWorkspacePath = path.resolve("/tmp/cap60-expiry-domain");
+  const backendWorkspacePath = path.resolve("/tmp/cap60-expiry-backend");
+  const foreignWorkspacePath = path.resolve("/tmp/cap60-expiry-foreign");
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "global",
+      tasks: [{
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        threadId: globalThreadId, taskType: "root_task",
+        codexProjectId: "cap60-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspacePath,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        threadId: "frontend-template-thread", taskType: "peer_task",
+        codexProjectId: "cap60-domain-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: domainWorkspacePath,
+      }, {
+        id: "backend", label: "Backend Coordinator", owner: "Codex", source: "codex",
+        threadId: "backend-template-thread", taskType: "peer_task",
+        codexProjectId: "cap60-backend-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: backendWorkspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap60-global-lease", holderTaskId: "global", holderThreadId: globalThreadId,
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspacePath,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }, {
+        id: "backend", label: "Backend", writeScope: ["server"], eligibleTaskIds: ["backend"],
+      }],
+    });
+    const actor = { type: "agent", id: "cap60-agent", name: "CAP-60", avatarUrl: null };
+    const task = database.createTask({
+      projectId: "local", title: "CAP-60 expiry work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: globalThreadId,
+      threadBinding: {
+        threadId: globalThreadId, codexProjectId: "cap60-global-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: domainWorkspacePath, branch: "codex/cap60-expiry-fence",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("local", task.id, {
+      domainId: "frontend", taskVersion: task.version,
+      holderTaskId: "global", holderThreadId: globalThreadId,
+      expectedCoordinatorLeaseId: "cap60-global-lease",
+    });
+    const backendTask = database.createTask({
+      projectId: "local", title: "CAP-60 backend work", description: "", status: "todo",
+      priority: "high", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: globalThreadId,
+      threadBinding: {
+        threadId: globalThreadId, codexProjectId: "cap60-global-project",
+        codexProjectKind: "local", codexHostId: "local", workspacePath: globalWorkspacePath,
+      },
+      actor, assignee: actor,
+      developmentContext: {
+        type: "worktree", path: backendWorkspacePath, branch: "codex/cap60-backend-fence",
+      },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("local", backendTask.id, {
+      domainId: "backend", taskVersion: backendTask.version,
+      holderTaskId: "global", holderThreadId: globalThreadId,
+      expectedCoordinatorLeaseId: "cap60-global-lease",
+    });
+    revision = database.getAgentLaneCoordinationWindows("local").revision;
+    database.database.prepare(`
+      INSERT INTO agent_domain_coordinator_provisioning_attempts (
+        id, project_id, domain_id, idempotency_key, request_fingerprint,
+        task_id, label, thread_source, model, reasoning_effort,
+        expected_revision, expected_global_lease_id,
+        global_holder_task_id, global_holder_thread_id,
+        global_holder_codex_project_id, global_holder_codex_project_kind,
+        global_holder_codex_host_id, global_holder_workspace_path,
+        codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+        write_scope_json, status, thread_id, retry_count, missing_since,
+        created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        'starting', NULL, 0, NULL, ?, ?, ?)
+    `).run(
+      "cap60-foreign-expired", "local", "frontend", "cap60-foreign-old-key",
+      "cap60-foreign-fingerprint", "frontend", "Frontend Coordinator",
+      "cap60-foreign-old-source", "gpt-5", "high", "cap60-foreign-revision",
+      "cap60-global-lease", "global", globalThreadId, "cap60-global-project",
+      "local", "local", globalWorkspacePath, "cap60-foreign-project", "remote",
+      "remote-builder", foreignWorkspacePath, JSON.stringify(["web"]),
+      "2026-09-07T00:00:00.000Z", "2026-09-07T00:01:00.000Z",
+      "2000-01-01T00:00:00.000Z",
+    );
+    database.close();
+    return { instanceSecret };
+  });
+  const pathname = "/api/local/projects/local/domain-coordinator-provisioning-attempts/frontend";
+  const body = {
+    idempotencyKey: "cap60-local-new-key", taskId: "frontend",
+    label: "Frontend Coordinator", threadSource: "cap60-local-new-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: revision,
+    expectedGlobalLeaseId: "cap60-global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: globalThreadId, codexProjectId: "cap60-domain-project",
+    codexProjectKind: "local", codexHostId: "local", workspacePath: domainWorkspacePath,
+    ownedCodexHostId: "local",
+  };
+  const snapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const state = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts WHERE id = ?",
+      ).get("cap60-foreign-expired"),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_domain_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_domain_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return state;
+  };
+  const before = snapshot();
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "9".repeat(32), pathname, body),
+    body,
+  });
+  assert.deepEqual(
+    [response.response.status, response.body?.error?.code ?? null, snapshot()],
+    [409, "HOST_EXECUTOR_MISMATCH", before],
+  );
+  let nonce = 10;
+  const mutateProvisioning = async (requestPath, requestBody) => {
+    const apiResponse = await fetch(`${baseUrl}${requestPath}`, {
+      method: "POST",
+      headers: {
+        ...signedCoordinatorRenewHeaders(
+          instanceSecret,
+          `${nonce++}`.padStart(32, "0"),
+          requestPath,
+          requestBody,
+        ),
+        "content-type": "application/json",
+        "x-taskboard-client": "taskctl",
+      },
+      body: JSON.stringify(requestBody),
+    });
+    return coordinatorProvisioningResponseJson(apiResponse);
+  };
+  const transition = (attemptId, action, transitionBody) => mutateProvisioning(
+    `/api/local/domain-coordinator-provisioning-attempts/${attemptId}/${action}`,
+    transitionBody,
+  );
+  const deliveries = [];
+  const threadId = "01a09999-a749-7b53-81e2-af2d477f93ae";
+  const runtimeResult = await runDomainCoordinatorProvisioningMonitorOnce({
+    hostExecutor: localShutdownExecutor,
+    policy: { enabled: true, projectId: "local", model: "gpt-5", reasoningEffort: "high" },
+    readSnapshot: async () => ({
+      projectId: "local",
+      coordination: {
+        coordinatorTaskId: "global",
+        lease: { id: "cap60-global-lease", status: "active", bindingValid: true },
+        domainCoordinators: [{
+          domainId: "frontend", assignment: "unassigned", durableWorkPending: true,
+          eligibleTaskIds: ["frontend"], writeScope: ["web"],
+        }, {
+          domainId: "backend", assignment: "unassigned", durableWorkPending: true,
+          eligibleTaskIds: ["backend"], writeScope: ["server"],
+        }],
+      },
+      taskLanes: [{
+        id: "global", source: "codex", taskType: "root_task", threadId: globalThreadId,
+        codexProjectId: "cap60-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspacePath,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "frontend-template-thread",
+        codexProjectId: "cap60-domain-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: domainWorkspacePath,
+      }, {
+        id: "backend", label: "Backend Coordinator", source: "codex",
+        taskType: "peer_task", threadId: "backend-template-thread",
+        codexProjectId: "cap60-backend-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: backendWorkspacePath,
+      }],
+    }),
+    readWindows: async () => ({ projectId: "local", revision }),
+    getAttempt: ({ projectId, domainId, idempotencyKey, ownedCodexHostId }) => (
+      mutateProvisioning(
+        `/api/local/projects/${projectId}/domain-coordinator-provisioning-attempts/${domainId}/lookup`,
+        { ...(idempotencyKey ? { idempotencyKey } : {}), ownedCodexHostId },
+      )
+    ),
+    requestAttempt: ({ projectId, domainId, ...requestInput }) => mutateProvisioning(
+      `/api/local/projects/${projectId}/domain-coordinator-provisioning-attempts/${domainId}`,
+      requestInput,
+    ),
+    rebindAttempt: ({ attemptId, expectedRevision, expectedGlobalLeaseId, ownedCodexHostId }) => (
+      transition(attemptId, "rebind", {
+        expectedRevision, expectedGlobalLeaseId, ownedCodexHostId,
+      })
+    ),
+    findThread: async () => null,
+    readThread: async () => null,
+    markStarting: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "starting", { ownedCodexHostId })
+    ),
+    startThread: async ({ cwd, threadSource }) => ({
+      thread: { id: threadId, cwd, threadSource },
+    }),
+    attachThread: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "attach", { threadId, ownedCodexHostId })
+    ),
+    resetAttempt: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "reset", { ownedCodexHostId })
+    ),
+    resumeExpiredAttempt: ({ attemptId, ownedCodexHostId }) => (
+      transition(attemptId, "resume-expired", { ownedCodexHostId })
+    ),
+    deliverInstruction: async ({ attempt, domainId }) => {
+      deliveries.push([attempt.id, domainId]);
+      return { delivery: "started", turnId: "cap60-backend-turn" };
+    },
+  });
+  assert.equal(runtimeResult.provisioned, true);
+  assert.equal(runtimeResult.domainId, "backend");
+  assert.equal(runtimeResult.threadId, threadId);
+  const after = snapshot();
+  assert.deepEqual(after.target, before.target);
+  assert.equal(after.configJson, before.configJson);
+  assert.equal(after.attemptCount, 2);
+  const backendAttempt = after.attempts.find((attempt) => attempt.domain_id === "backend");
+  assert.deepEqual(
+    [backendAttempt?.status, backendAttempt?.codex_host_id, backendAttempt?.thread_id],
+    ["started", "local", threadId],
+  );
+  assert.deepEqual(deliveries, [[backendAttempt.id, "backend"]]);
+});
+
+test("CAP-59 Global request rejects a foreign stale Coordinator before retirement", async () => {
+  let databasePath;
+  const instanceSecret = "5".repeat(64);
+  const workspacePath = "/tmp/cap59-owner-local";
+  const foreignCoordinator = {
+    id: "cap59-foreign-stale", label: "Foreign stale Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-foreign-project", codexProjectKind: "remote",
+    codexHostId: "remote-builder", workspacePath: "/tmp/cap59-foreign-stale",
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-owner-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }, foreignCoordinator],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap59-foreign-stale-lease", holderTaskId: foreignCoordinator.id,
+        holderThreadId: foreignCoordinator.threadId, holderCodexHostId: "remote-builder",
+        holderWorkspacePath: foreignCoordinator.workspacePath,
+        acquiredAt: "2026-09-07T00:00:00.000Z", expiresAt: "2026-09-07T00:05:00.000Z",
+        releasedAt: "2026-09-07T00:05:00.000Z",
+      },
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 durable work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "cap59-local-retires-foreign", taskId: "cap59-local-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-local-retires-foreign",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "cap59-owner-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath, ownedCodexHostId: "local",
+    retireCoordinatorWindows: [{
+      taskId: foreignCoordinator.id, label: foreignCoordinator.label, role: "coordinator",
+      threadId: foreignCoordinator.threadId, codexProjectId: foreignCoordinator.codexProjectId,
+      codexProjectKind: foreignCoordinator.codexProjectKind,
+      codexHostId: foreignCoordinator.codexHostId, workspacePath: foreignCoordinator.workspacePath,
+    }],
+  };
+  const snapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const state = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get("cap59-local-retires-foreign"),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return state;
+  };
+  const before = snapshot();
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), pathname, body),
+    body,
+  });
+  assert.deepEqual(
+    [response.response.status, response.body?.error?.code ?? null, snapshot()],
+    [409, "HOST_EXECUTOR_MISMATCH", before],
+  );
+  await runCap59DuplicateCoordinatorTaskIdScenario();
+});
+
+test("CAP-59 Global request fences a foreign expired nonterminal attempt before expiry", async () => {
+  let databasePath;
+  const instanceSecret = "6".repeat(64);
+  const workspacePath = "/tmp/cap59-expiry-owner";
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-expiry-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 expiry work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.database.prepare(`
+      INSERT INTO agent_coordinator_provisioning_attempts (
+        id, project_id, idempotency_key, request_fingerprint, task_id, label,
+        thread_source, model, reasoning_effort, expected_revision,
+        owner_root_task_id, owner_root_thread_id,
+        codex_project_id, codex_project_kind, codex_host_id, workspace_path,
+        status, thread_id, retry_count, created_at, updated_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'starting', NULL, 0, ?, ?, ?)
+    `).run(
+      "cap59-foreign-expired", "local", "cap59-foreign-old-key", "cap59-foreign-fingerprint",
+      "cap59-foreign-coordinator", "Foreign expired Coordinator", "cap59-foreign-old-source",
+      "gpt-5", "high", "cap59-foreign-revision", "owner-root", "owner-thread",
+      "cap59-foreign-project", "remote", "remote-builder", "/tmp/cap59-foreign-expired",
+      "2026-09-07T00:00:00.000Z", "2026-09-07T00:01:00.000Z", "2000-01-01T00:00:00.000Z",
+    );
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "cap59-local-new-key", taskId: "cap59-local-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-local-new-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "cap59-expiry-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath, ownedCodexHostId: "local",
+  };
+  const snapshot = () => {
+    const inspection = new DatabaseSync(databasePath);
+    const state = {
+      target: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts WHERE id = ?",
+      ).get("cap59-foreign-expired"),
+      attemptCount: inspection.prepare(
+        "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+      ).get().count,
+      attempts: inspection.prepare(
+        "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+      ).all(),
+      configJson: inspection.prepare(
+        "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+      ).get().config_json,
+    };
+    inspection.close();
+    return state;
+  };
+  const before = snapshot();
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), pathname, body),
+    body,
+  });
+  assert.deepEqual(
+    [response.response.status, response.body?.error?.code ?? null, snapshot()],
+    [409, "HOST_EXECUTOR_MISMATCH", before],
+  );
+});
+
+test("CAP-59 Global stale retirement restores legacy rootTaskId to Owner Root", async () => {
+  let databasePath;
+  const instanceSecret = "7".repeat(64);
+  const workspacePath = "/tmp/cap59-legacy-owner";
+  const staleCoordinator = {
+    id: "cap59-legacy-stale", label: "Legacy stale Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-legacy-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/cap59-legacy-stale",
+  };
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: staleCoordinator.id,
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-legacy-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }, staleCoordinator],
+      adapters: [],
+      coordinatorLease: {
+        id: "cap59-legacy-stale-lease", holderTaskId: staleCoordinator.id,
+        holderThreadId: staleCoordinator.threadId, holderCodexHostId: "local",
+        holderWorkspacePath: staleCoordinator.workspacePath,
+        acquiredAt: "2026-09-07T00:00:00.000Z", expiresAt: "2026-09-07T00:05:00.000Z",
+        releasedAt: "2026-09-07T00:05:00.000Z",
+      },
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 legacy work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const windows = await request(baseUrl, "/api/local/projects/local/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const pathname = "/api/local/projects/local/coordinator-provisioning-attempts";
+  const body = {
+    idempotencyKey: "cap59-legacy-root-repair", taskId: "cap59-local-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-legacy-root-repair",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: windows.body.revision,
+    ownerRootTaskId: "owner-root", ownerRootThreadId: "owner-thread",
+    codexProjectId: "cap59-legacy-project", codexProjectKind: "local", codexHostId: "local",
+    workspacePath, ownedCodexHostId: "local",
+    retireCoordinatorWindows: [{
+      taskId: staleCoordinator.id, label: staleCoordinator.label, role: "coordinator",
+      threadId: staleCoordinator.threadId, codexProjectId: staleCoordinator.codexProjectId,
+      codexProjectKind: staleCoordinator.codexProjectKind, codexHostId: "local",
+      workspacePath: staleCoordinator.workspacePath,
+    }],
+  };
+  const response = await request(baseUrl, pathname, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), pathname, body),
+    body,
+  });
+  const inspection = new DatabaseSync(databasePath);
+  const config = JSON.parse(inspection.prepare(
+    "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+  ).get().config_json);
+  inspection.close();
+  assert.deepEqual(
+    [response.response.status, response.body?.applied ?? false, config.rootTaskId,
+      config.ownerRootTaskId, config.tasks.map((task) => task.id)],
+    [200, true, "owner-root", "owner-root", ["owner-root"]],
+  );
+});
+
+async function runCap59DuplicateCoordinatorTaskIdScenario() {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "cap59-duplicate-coordinator-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const workspacePath = "/tmp/cap59-duplicate-owner";
+  const localCoordinator = {
+    id: "cap59-duplicate-coordinator", label: "Local Coordinator", owner: "Codex",
+    source: "codex", connection: "connected",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640e", taskType: "root_task",
+    codexProjectId: "cap59-duplicate-project", codexProjectKind: "local",
+    codexHostId: "local", workspacePath: "/tmp/cap59-duplicate-local",
+  };
+  const remoteCoordinator = {
+    ...localCoordinator,
+    label: "Remote Coordinator",
+    threadId: "01a062c1-fd2b-7f61-9114-d483e695640f",
+    codexProjectId: "cap59-duplicate-remote-project",
+    codexProjectKind: "remote",
+    codexHostId: "remote-builder",
+    workspacePath: "/tmp/cap59-duplicate-remote",
+  };
+  let database;
+  try {
+    database = new TaskboardDatabase(databasePath);
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "owner-root",
+      ownerRootTaskId: "owner-root",
+      tasks: [{
+        id: "owner-root", label: "Owner Root", owner: "Codex Owner Root", source: "codex",
+        connection: "connected", threadId: "owner-thread", taskType: "root_task",
+        codexProjectId: "cap59-duplicate-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath,
+      }, localCoordinator, remoteCoordinator],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    const actor = { type: "agent", id: "cap59-agent", name: "CAP-59", avatarUrl: null };
+    database.createTask({
+      projectId: "local", title: "CAP-59 duplicate task work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    const expectedRevision = database.getAgentLaneCoordinationWindows("local").revision;
+    const body = {
+      idempotencyKey: "cap59-duplicate-coordinator-request",
+      taskId: "cap59-duplicate-replacement",
+      label: "Taskboard Execution Coordinator",
+      threadSource: "cap59-duplicate-coordinator-source",
+      model: "gpt-5",
+      reasoningEffort: "high",
+      expectedRevision,
+      ownerRootTaskId: "owner-root",
+      ownerRootThreadId: "owner-thread",
+      codexProjectId: "cap59-duplicate-project",
+      codexProjectKind: "local",
+      codexHostId: "local",
+      workspacePath,
+      ownedCodexHostId: "local",
+      retireCoordinatorWindows: [{
+        taskId: localCoordinator.id,
+        label: localCoordinator.label,
+        role: "coordinator",
+        threadId: localCoordinator.threadId,
+        codexProjectId: localCoordinator.codexProjectId,
+        codexProjectKind: localCoordinator.codexProjectKind,
+        codexHostId: localCoordinator.codexHostId,
+        workspacePath: localCoordinator.workspacePath,
+      }],
+    };
+    const snapshot = () => {
+      const inspection = new DatabaseSync(databasePath);
+      const state = {
+        target: inspection.prepare(
+          "SELECT * FROM agent_coordinator_provisioning_attempts WHERE project_id = ? AND idempotency_key = ?",
+        ).get("local", body.idempotencyKey),
+        attemptCount: inspection.prepare(
+          "SELECT COUNT(*) AS count FROM agent_coordinator_provisioning_attempts",
+        ).get().count,
+        attempts: inspection.prepare(
+          "SELECT * FROM agent_coordinator_provisioning_attempts ORDER BY created_at, id",
+        ).all(),
+        tasks: inspection.prepare(
+          "SELECT * FROM tasks WHERE project_id = 'local' ORDER BY id",
+        ).all(),
+        configJson: inspection.prepare(
+          "SELECT config_json FROM agent_lane_projects WHERE project_id = 'local'",
+        ).get().config_json,
+      };
+      inspection.close();
+      return state;
+    };
+    const before = snapshot();
+    let responseStatus = null;
+    let responseCode = null;
+    try {
+      database.requestAgentLaneCoordinatorProvisioningAttempt("local", body);
+      responseStatus = 200;
+    } catch (error) {
+      responseStatus = error?.status ?? null;
+      responseCode = error?.code ?? null;
+    }
+    assert.deepEqual(
+      [responseStatus, responseCode, snapshot()],
+      [409, "COORDINATOR_PROVISIONING_STALE_WINDOW_CONFLICT", before],
+    );
+  } finally {
+    database?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+test("CAP-59 accepts an exact remote Global executor while preserving Domain API bodies", async () => {
+  const instanceSecret = "d".repeat(64);
+  let databasePath;
+  const remoteWorkspace = "/tmp/cap59-remote-owner";
+  const domainWorkspace = "/tmp/cap59-domain-peer";
+  const globalWorkspace = "/tmp/cap59-domain-global";
+  let domainRevision;
+  const baseUrl = await startServer(async (directory) => {
+    databasePath = path.join(directory, "taskboard.sqlite");
+    const database = new TaskboardDatabase(databasePath);
+    const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
+    database.createProject({ id: "remote", name: "CAP-59 remote", workspacePath: null });
+    database.upsertAgentLaneProject("remote", {
+      rootTaskId: "remote-owner",
+      ownerRootTaskId: "remote-owner",
+      tasks: [{
+        id: "remote-owner", label: "Remote Owner Root", owner: "Codex", source: "codex",
+        connection: "connected", threadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+        taskType: "root_task", codexProjectId: "cap59-remote-project", codexProjectKind: "remote",
+        codexHostId: "remote-builder", workspacePath: remoteWorkspace,
+      }],
+      adapters: [],
+      coordinatorLease: null,
+    });
+    database.createTask({
+      projectId: "remote", title: "CAP-59 remote durable work", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: null, threadBinding: null, actor, assignee: actor,
+      developmentContext: null, workingLog: null, startDate: null, dueDate: null,
+      recurrence: null,
+    });
+    database.createProject({ id: "domain", name: "CAP-59 Domain", workspacePath: null });
+    database.upsertAgentLaneProject("domain", {
+      rootTaskId: "global",
+      tasks: [{
+        id: "global", label: "Global", owner: "Codex", source: "codex",
+        connection: "connected", threadId: "global-thread", taskType: "root_task",
+        codexProjectId: "cap59-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspace,
+      }, {
+        id: "frontend", label: "Frontend Coordinator", owner: "Codex", source: "codex",
+        connection: "connected", threadId: "frontend-thread", taskType: "peer_task",
+        codexProjectId: "cap59-domain-project", codexProjectKind: "remote",
+        codexHostId: "domain-builder", workspacePath: domainWorkspace,
+      }],
+      adapters: [],
+      coordinatorLease: {
+        id: "domain-global-lease", holderTaskId: "global", holderThreadId: "global-thread",
+        holderCodexHostId: "local", holderWorkspacePath: globalWorkspace,
+        acquiredAt: new Date(Date.now() - 60_000).toISOString(),
+        expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      },
+      coordinationDomains: [{
+        id: "frontend", label: "Frontend", writeScope: ["web"], eligibleTaskIds: ["frontend"],
+      }],
+    });
+    const domainTask = database.createTask({
+      projectId: "domain", title: "CAP-59 Domain compatibility", description: "", status: "todo",
+      priority: "medium", labels: ["agent-todo"], workflowProfile: "vibe",
+      threadId: "global-thread",
+      threadBinding: {
+        threadId: "global-thread", codexProjectId: "cap59-global-project", codexProjectKind: "local",
+        codexHostId: "local", workspacePath: globalWorkspace,
+      },
+      actor, assignee: actor,
+      developmentContext: { type: "worktree", path: domainWorkspace, branch: "cap59-domain" },
+      workingLog: null, startDate: null, dueDate: null, recurrence: null,
+    });
+    database.setAgentTaskDomain("domain", domainTask.id, {
+      domainId: "frontend", taskVersion: domainTask.version,
+      holderTaskId: "global", holderThreadId: "global-thread",
+      expectedCoordinatorLeaseId: "domain-global-lease",
+    });
+    domainRevision = database.getAgentLaneCoordinationWindows("domain").revision;
+    database.close();
+    return { instanceSecret };
+  });
+  const remoteWindows = await request(baseUrl, "/api/local/projects/remote/coordination-windows", {
+    headers: { "x-taskboard-client": "taskctl" },
+  });
+  const remotePath = "/api/local/projects/remote/coordinator-provisioning-attempts";
+  const remoteBody = {
+    idempotencyKey: "cap59-remote-exact", taskId: "cap59-remote-coordinator",
+    label: "Taskboard Execution Coordinator", threadSource: "cap59-remote-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: remoteWindows.body.revision,
+    ownerRootTaskId: "remote-owner", ownerRootThreadId: "01a050de-03c2-7f32-ba9c-4342b40ac18a",
+    codexProjectId: "cap59-remote-project", codexProjectKind: "remote",
+    codexHostId: "remote-builder", workspacePath: remoteWorkspace,
+    ownedCodexHostId: "remote-builder",
+  };
+  const outcomes = [];
+  const remote = await request(baseUrl, remotePath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "1".repeat(32), remotePath, remoteBody),
+    body: remoteBody,
+  });
+  const remoteInspection = new DatabaseSync(databasePath);
+  const remoteRow = remoteInspection.prepare(`
+    SELECT codex_host_id AS codexHostId FROM agent_coordinator_provisioning_attempts
+    WHERE project_id = 'remote' ORDER BY created_at, id
+  `).get();
+  remoteInspection.close();
+  outcomes.push(["remote-exact", remote.response.status, remote.body?.attempt?.status ?? null, remoteRow?.codexHostId ?? null]);
+
+  const domainPath = "/api/local/projects/domain/domain-coordinator-provisioning-attempts/frontend";
+  const domainBody = {
+    idempotencyKey: "cap59-domain-compat", taskId: "frontend",
+    label: "Frontend Coordinator", threadSource: "cap59-domain-source",
+    model: "gpt-5", reasoningEffort: "high", expectedRevision: domainRevision,
+    expectedGlobalLeaseId: "domain-global-lease", globalHolderTaskId: "global",
+    globalHolderThreadId: "global-thread", codexProjectId: "cap59-domain-project",
+    codexProjectKind: "remote", codexHostId: "domain-builder", workspacePath: domainWorkspace,
+    ownedCodexHostId: "domain-builder",
+  };
+  const domainCreated = await request(baseUrl, domainPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "2".repeat(32), domainPath, domainBody),
+    body: domainBody,
+  });
+  outcomes.push(["domain-request", domainCreated.response.status, domainCreated.body?.attempt?.status ?? null]);
+  const domainLookupPath = `${domainPath}/lookup`;
+  const domainLookupBody = {
+    idempotencyKey: domainBody.idempotencyKey, ownedCodexHostId: "domain-builder",
+  };
+  const domainLookup = await request(baseUrl, domainLookupPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(instanceSecret, "3".repeat(32), domainLookupPath, domainLookupBody),
+    body: domainLookupBody,
+  });
+  outcomes.push(["domain-lookup", domainLookup.response.status, domainLookup.body?.attempt?.id ?? null]);
+  const domainStartingPath = `/api/local/domain-coordinator-provisioning-attempts/${domainCreated.body?.attempt?.id ?? "missing"}/starting`;
+  const domainStarting = await request(baseUrl, domainStartingPath, {
+    method: "POST",
+    headers: signedCoordinatorRenewHeaders(
+      instanceSecret, "4".repeat(32), domainStartingPath,
+      { ownedCodexHostId: "domain-builder" },
+    ),
+    body: { ownedCodexHostId: "domain-builder" },
+  });
+  outcomes.push(["domain-transition", domainStarting.response.status, domainStarting.body?.attempt?.status ?? null]);
+  assert.deepEqual(outcomes, [
+    ["remote-exact", 200, "pending", "remote-builder"],
+    ["domain-request", 200, "pending"],
+    ["domain-lookup", 200, domainCreated.body?.attempt?.id ?? null],
+    ["domain-transition", 200, "starting"],
+  ]);
 });

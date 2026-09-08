@@ -201,7 +201,7 @@ Each comment JSON object independently records the most recent conversation that
 
 ## Structured handoffs
 
-Append a compact, durable Sub-Agent-to-Root handoff only from the Sub-Agent that holds the task's active exact claim. Read events to replay/recover them, then acknowledge a `requiresAck` event from the parent Root identity:
+Append a compact, durable Sub-Agent-to-Root handoff from the Sub-Agent that holds the task's active exact claim. For a final completion handoff, first complete `run finish`, then use the same Sub-Agent identity and pass the returned Run id as `--causation-id`; Taskboard permits exactly one such final event while the task remains `in_review`. Read events to replay/recover them, then acknowledge a `requiresAck` event from the parent Root identity:
 
 ```bash
 taskctl handoff add ISSUE_ID \
@@ -232,7 +232,7 @@ taskctl handoff ack EVENT_ID \
 
 `handoff add` reads the sender conversation from `CODEX_THREAD_ID` unless `--thread-id` is explicit. `--parent-task` is the exact durable parent task id and must be omitted when the task has no parent. `--evidence-ref` accepts at most 32 unique comma-separated references; store only compact pointers, never credentials, complete prompts, or sensitive payloads.
 
-The service persists the structured event and its compact Task Comment atomically. Repeating an idempotency key with the identical envelope returns the same receipt; changing the envelope conflicts. Handoffs and acknowledgements are append-only and do not change the task version/status, active run, claim, coordinator lease, Ready Work, or authorization boundary. `handoff ack` accepts only the `/root` agent path and the exact parent Root conversation for an event that requires acknowledgement.
+The service persists the structured event and its compact Task Comment atomically. Repeating an idempotency key with the identical envelope returns the same receipt; changing the envelope conflicts. The post-finish final event is accepted only when the task is still `in_review`, the latest Run and claim are both completed at the same instant, their agent path/thread match the sender, `causationId` equals that exact Run id, and no final event already exists for the Run. Handoffs and acknowledgements are append-only and do not change the task version/status, active run, claim, coordinator lease, Ready Work, or authorization boundary. `handoff ack` accepts only the `/root` agent path and the exact parent Root conversation for an event that requires acknowledgement.
 
 ## Attachments
 

@@ -43,6 +43,86 @@ test("the resident injector authenticates its launcher-managed Taskboard service
   assert.match(runtimeSource, /request\.frameCapability/);
 });
 
+test("bootstrap claim accepts only the exact unavailable coordinator-lease variant", async () => {
+  const start = source.indexOf("async function claimBackgroundContinuationReceipt");
+  const end = source.indexOf("\n\nasync function confirmBackgroundContinuationDelivery", start);
+  assert.notEqual(start, -1, "bootstrap claim helper must exist");
+  assert.notEqual(end, -1, "bootstrap claim helper source boundary must exist");
+  const taskId = "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e";
+  const currentRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const claim = {
+    todoId: "CAP-44",
+    taskId,
+    rootThreadId: currentRootThreadId,
+    ownedCodexHostId: "local",
+    expectedResumeToken: "e".repeat(64),
+    safeActionId: "safe-action",
+  };
+  const unavailable = {
+    reused: true,
+    available: false,
+    completed: false,
+    recovering: false,
+    coordinatorLeaseChanged: true,
+    receipt: {
+      taskId,
+      safeActionId: "safe-action",
+      admissionAttemptId: "global-attempt",
+      rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
+      resumeToken: "d".repeat(64),
+    },
+  };
+  const invoke = async (result) => {
+    const fetch = async () => ({
+      status: 200,
+      ok: true,
+      json: async () => result,
+    });
+    const claimBackgroundContinuationReceipt = vm.runInNewContext(
+      `(() => { ${source.slice(start, end)}; return claimBackgroundContinuationReceipt; })()`,
+      {
+        fetch,
+        randomUUID: () => "current-reservation",
+        taskboardBaseUrl: "http://127.0.0.1:47823",
+        residentHostExecutorFenceHeaders: () => ({}),
+        AbortSignal,
+      },
+    );
+    return claimBackgroundContinuationReceipt(claim);
+  };
+
+  assert.deepEqual(await invoke(unavailable), unavailable);
+  const withoutRecovering = { ...unavailable };
+  delete withoutRecovering.recovering;
+  const malformedRecoveringResults = await Promise.allSettled([
+    withoutRecovering,
+    { ...unavailable, recovering: null },
+    { ...unavailable, recovering: "false" },
+    { ...unavailable, recovering: 0 },
+    { ...unavailable, recovering: true },
+  ].map(invoke));
+  assert.deepEqual(
+    malformedRecoveringResults.map(({ status }) => status),
+    ["rejected", "rejected", "rejected", "rejected", "rejected"],
+  );
+  for (const result of malformedRecoveringResults) {
+    assert.match(
+      result.reason.message,
+      /Taskboard returned an invalid bootstrap reservation receipt/,
+    );
+  }
+  for (const malformed of [
+    { ...unavailable, reused: false },
+    { ...unavailable, available: true },
+    { ...unavailable, completed: true },
+  ]) {
+    await assert.rejects(
+      invoke(malformed),
+      /Taskboard returned an invalid bootstrap reservation receipt/,
+    );
+  }
+});
+
 test("the CDP bridge accepts service ensure and native task conversation start actions", () => {
   assert.match(source, /const hostBindingName = "__codexTaskboardHostV1"/);
   assert.match(source, /hostRequestQueueName/);
@@ -59,7 +139,7 @@ test("the CDP bridge accepts service ensure and native task conversation start a
   assert.match(runtimeSource, /request\.action === "open-external"/);
   assert.match(runtimeSource, /request\.taskId/);
   assert.match(runtimeSource, /request\.previousThreadId\.length <= 240/);
-  assert.match(runtimeSource, /request\.codexHostId\.length <= 240/);
+  assert.match(runtimeSource, /isCanonicalCodexHostId\(request\.codexHostId\)/);
   assert.match(runtimeSource, /request\.targetRoot\.length <= 4_096/);
   assert.match(runtimeSource, /payload\.length > 4_194_304/);
   assert.match(runtimeSource, /request\.instruction\.length <= 4_000_000/);
@@ -794,15 +874,21 @@ test("the package injection command remains resident for tab-triggered recovery"
   assert.match(source, /__codexTaskboardHostStartupTokenV1/);
 });
 
-test("launch mode opens a dedicated debuggable Codex instance beside the native app", () => {
+test("resident macOS launch keeps one visible Codex and owns monitors headlessly", () => {
+  assert.match(source, /localCodexThreadRpcEnabled = shouldUseLocalCodexThreadRpc/);
+  assert.match(source, /platform: process\.platform,[\s\S]*?watch: options\.watch,[\s\S]*?launch: options\.launch,[\s\S]*?cdpPipe: options\.cdpPipe/);
   assert.match(
     source,
-    /spawn\(\s*"\/usr\/bin\/open",\s*\[\s*"-n",\s*"-a",\s*appPath/,
+    /if \(localCodexThreadRpcEnabled\) \{[\s\S]*?stopManagedCodex\(legacyManagedCodex\)[\s\S]*?ensureLocalCodexThreadRpcTransport\(\)[\s\S]*?nativeCodexBrowser = true;/,
   );
+  assert.match(source, /startResidentCoordinatorMonitors\(null/);
   assert.match(
     source,
-    /if \(runningCodex\.length > 0\) \{[\s\S]*?if \(debuggingCodexFound\) return false;[\s\S]*?if \(!options\.launch\) \{[\s\S]*?nativeCodexBrowser = true;/,
+    /shouldRetireLocalCodexThreadRpcTransport\(error\)[\s\S]*?localCodexThreadRpcLifecycle\?\.retire\(transport\)/,
   );
+  assert.match(source, /if \(!localCodexThreadRpcEnabled\) \{[\s\S]*?scheduleCoordinatorIdentityHandshakeFastLane\(\)[\s\S]*?scheduleBackgroundContinuationFastLane\(\)[\s\S]*?scheduleBackgroundContinuation\(\)/);
+  assert.match(source, /if \(nativeCodexBrowser\) \{[\s\S]*?nativeTaskboardPanelOpener\.openOrFocus\(\)[\s\S]*?let launchCoordinatorRoute/);
+  assert.match(source, /disposeResidentCoordinatorMonitors\?\.\(\);[\s\S]*?await closeLocalCodexThreadRpcTransport\(\);/);
   assert.match(source, /startupTimeoutMs: 120_000,[\s\S]*?unhealthyChildGraceMs: 120_000,/);
   assert.match(source, /Timed out publishing the Taskboard host heartbeat[\s\S]*?30_000/);
   assert.match(source, /waitForHostHeartbeat\(cdp, startupToken, timeoutMs = 30_000\)/);

@@ -100,6 +100,7 @@ function monitorFixture({
     calls,
     todo,
     options: {
+      hostExecutor: { ownedCodexHostId: targetHostId },
       policy: {
         enabled: true,
         projectId,
@@ -573,6 +574,7 @@ test("continuation fast lane gives every project one shared per-tick budget", as
   let complete;
   const completed = new Promise((resolve) => { complete = resolve; });
   runTaskboardContinuationFastLane({
+    hostExecutor: { ownedCodexHostId: "local" },
     projects: [
       { projectId: "budget-contract-a", continuationEnabled: true },
       { projectId: "budget-contract-b", continuationEnabled: true },
