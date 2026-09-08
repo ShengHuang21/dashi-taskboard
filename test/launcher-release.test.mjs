@@ -11,6 +11,18 @@ const packagedTaskctlVerifier = await readFile(
   new URL("../scripts/verify-packaged-taskctl.mjs", import.meta.url),
   "utf8",
 );
+const prepareTauriApp = await readFile(
+  new URL("../scripts/prepare-tauri-app.mjs", import.meta.url),
+  "utf8",
+);
+const linuxPackageVerifier = await readFile(
+  new URL("../scripts/verify-linux-packages.mjs", import.meta.url),
+  "utf8",
+);
+const packagedInjectorPreflight = await readFile(
+  new URL("../scripts/packaged-injector-preflight.mjs", import.meta.url),
+  "utf8",
+);
 
 test("the macOS launcher preserves the visible Codex app and serializes lifecycle changes", () => {
   assert.match(launcherSource, /libc::flock/);
@@ -95,6 +107,14 @@ test("the packaged taskctl preflight attributes issue updates through its enviro
   const updateInvocation = packagedTaskctlVerifier.slice(updateStart, updateEnd);
   assert.doesNotMatch(updateInvocation, /--thread-id/);
   assert.match(packagedTaskctlVerifier, /CODEX_THREAD_ID:/);
+});
+
+test("packaged launchers retain and load-check every injector runtime dependency", () => {
+  assert.match(prepareTauriApp, /"host-resource-observer\.mjs"/);
+  assert.match(prepareTauriApp, /verifyPackagedInjectorModuleGraph/);
+  assert.match(packagedTaskctlVerifier, /verifyPackagedInjectorModuleGraph/);
+  assert.match(linuxPackageVerifier, /verifyPackagedInjectorModuleGraph/);
+  assert.match(packagedInjectorPreflight, /--packaged-injector-import-preflight/);
 });
 
 test("the launcher minimum system version matches the current Codex client requirement", () => {
