@@ -28,6 +28,8 @@ const COORDINATOR_PROVISIONING_MISSING_THREAD_GRACE_MS = 60_000;
 const DOMAIN_COORDINATOR_SHUTDOWN_ABANDON_MS = 10 * 60_000;
 const LOCAL_HOST_EXECUTOR_ADAPTER_ID = "local-codex-app-server-v1";
 const REMOTE_HOST_EXECUTOR_ADAPTER_ID = "codex-renderer-rpc-v1";
+const HOST_EXECUTOR_REPLAY_TTL_MS = 24 * 60 * 60 * 1_000;
+const HOST_EXECUTOR_RETENTION_BATCH_SIZE = 4_096;
 
 export class ApiError extends Error {
   constructor(status, code, message, details) {
@@ -1481,6 +1483,7 @@ export class TaskboardDatabase {
     // Migration may change schemas after preparing introspection statements.
     // Runtime statements are cached from a clean post-migration boundary.
     this.statementCache.clear();
+    this.#pruneHostExecutorHistory();
     this.interruptAbandonedAiChatRuns();
   }
 
@@ -1744,6 +1747,9 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS host_executor_lease_receipts_host_created
         ON host_executor_lease_receipts(codex_host_id, created_at, id);
 
+      CREATE INDEX IF NOT EXISTS host_executor_lease_receipts_created
+        ON host_executor_lease_receipts(created_at, id);
+
       CREATE TABLE IF NOT EXISTS host_executor_effects (
         effect_key TEXT PRIMARY KEY,
         codex_host_id TEXT NOT NULL,
@@ -1762,6 +1768,9 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS host_executor_effects_host_status
         ON host_executor_effects(codex_host_id, status, updated_at, effect_key);
+
+      CREATE INDEX IF NOT EXISTS host_executor_effects_status_updated
+        ON host_executor_effects(status, updated_at, effect_key);
 
       CREATE TABLE IF NOT EXISTS host_executor_proof_nonces (
         nonce TEXT PRIMARY KEY,
@@ -3765,6 +3774,95 @@ export class TaskboardDatabase {
     };
   }
 
+  #hostExecutorRetentionExpired(timestamp, observedAtMs) {
+    const timestampMs = Date.parse(timestamp);
+    return Number.isFinite(timestampMs)
+      && timestampMs < observedAtMs - HOST_EXECUTOR_REPLAY_TTL_MS;
+  }
+
+  #pruneHostExecutorHistoryInTransaction(observedAtMs, codexHostId = null) {
+    const cutoff = new Date(observedAtMs - HOST_EXECUTOR_REPLAY_TTL_MS).toISOString();
+    const hostPredicate = codexHostId === null ? "" : "AND codex_host_id = ?";
+    const parameters = (limit) => codexHostId === null
+      ? [cutoff, limit]
+      : [cutoff, codexHostId, limit];
+    const receipts = this.#prepare(`
+      DELETE FROM host_executor_lease_receipts WHERE rowid IN (
+        SELECT rowid FROM host_executor_lease_receipts
+        WHERE created_at < ? AND julianday(created_at) IS NOT NULL
+          ${hostPredicate}
+        ORDER BY created_at, rowid
+        LIMIT ?
+      )
+    `).run(...parameters(HOST_EXECUTOR_RETENTION_BATCH_SIZE));
+    const resolvedEffects = this.#prepare(`
+      DELETE FROM host_executor_effects WHERE rowid IN (
+        SELECT rowid FROM host_executor_effects
+        WHERE status IN ('reserved', 'completed')
+          AND updated_at < ? AND julianday(updated_at) IS NOT NULL
+          ${hostPredicate}
+        ORDER BY updated_at, rowid
+        LIMIT ?
+      )
+    `).run(...parameters(HOST_EXECUTOR_RETENTION_BATCH_SIZE));
+    const scrubbedEffects = this.#prepare(`
+      UPDATE host_executor_effects
+      SET operations_json = '[]', result_json = NULL
+      WHERE rowid IN (
+        SELECT rowid FROM host_executor_effects
+        WHERE status IN ('dispatched', 'uncertain')
+          AND updated_at < ? AND julianday(updated_at) IS NOT NULL
+          AND (operations_json <> '[]' OR result_json IS NOT NULL)
+          ${hostPredicate}
+        ORDER BY updated_at, rowid
+        LIMIT ?
+      )
+    `).run(...parameters(HOST_EXECUTOR_RETENTION_BATCH_SIZE));
+    return {
+      receipts: Number(receipts.changes),
+      resolvedEffects: Number(resolvedEffects.changes),
+      scrubbedEffects: Number(scrubbedEffects.changes),
+    };
+  }
+
+  #pruneHostExecutorHistory() {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { observedAtMs } = this.#hostExecutorTime();
+      const result = this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #retainHostExecutorEffectRow(row, observedAtMs) {
+    if (!row || !this.#hostExecutorRetentionExpired(row.updated_at, observedAtMs)) {
+      return row;
+    }
+    if (["reserved", "completed"].includes(row.status)) {
+      this.#prepare(`
+        DELETE FROM host_executor_effects
+        WHERE effect_key = ? AND status IN ('reserved', 'completed')
+      `).run(row.effect_key);
+      return null;
+    }
+    if (["dispatched", "uncertain"].includes(row.status)
+      && (row.operations_json !== "[]" || row.result_json !== null)) {
+      this.#prepare(`
+        UPDATE host_executor_effects
+        SET operations_json = '[]', result_json = NULL
+        WHERE effect_key = ? AND status IN ('dispatched', 'uncertain')
+      `).run(row.effect_key);
+      return this.#prepare(`
+        SELECT * FROM host_executor_effects WHERE effect_key = ?
+      `).get(row.effect_key);
+    }
+    return row;
+  }
+
   registerHostExecutor(input) {
     if (!isCanonicalCodexHostId(input?.codexHostId)) {
       throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
@@ -4041,8 +4139,13 @@ export class TaskboardDatabase {
     const input = this.#hostExecutorEffectRequest(rawInput);
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const { execution, registration } = this.#requireActiveHostExecutorFence(input.execution);
-      const { timestamp } = this.#hostExecutorTime();
+      const {
+        execution,
+        registration,
+        observedAtMs,
+      } = this.#requireActiveHostExecutorFence(input.execution);
+      const timestamp = new Date(observedAtMs).toISOString();
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, execution.codexHostId);
       const expectedAdapterId = execution.codexHostId === "local"
         ? LOCAL_HOST_EXECUTOR_ADAPTER_ID
         : REMOTE_HOST_EXECUTOR_ADAPTER_ID;
@@ -4061,9 +4164,9 @@ export class TaskboardDatabase {
           "The registered host executor does not allow one or more requested RPC methods",
         );
       }
-      const existing = this.#prepare(`
+      const existing = this.#retainHostExecutorEffectRow(this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
-      `).get(input.effectKey);
+      `).get(input.effectKey), observedAtMs);
       if (existing) {
         if (existing.request_fingerprint !== input.requestFingerprint) {
           throw new ApiError(
@@ -4162,11 +4265,12 @@ export class TaskboardDatabase {
     const input = this.#hostExecutorEffectRequest(rawInput);
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const { execution } = this.#requireActiveHostExecutorFence(input.execution);
-      const { timestamp } = this.#hostExecutorTime();
-      const row = this.#prepare(`
+      const { execution, observedAtMs } = this.#requireActiveHostExecutorFence(input.execution);
+      const timestamp = new Date(observedAtMs).toISOString();
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, execution.codexHostId);
+      const row = this.#retainHostExecutorEffectRow(this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
-      `).get(input.effectKey);
+      `).get(input.effectKey), observedAtMs);
       if (!row || row.request_fingerprint !== input.requestFingerprint) {
         throw new ApiError(
           409,
@@ -4216,10 +4320,16 @@ export class TaskboardDatabase {
     const resultJson = JSON.stringify(result);
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const { timestamp } = this.#hostExecutorTime();
-      const row = this.#prepare(`
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      let row = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
+      if (row) {
+        this.#pruneHostExecutorHistoryInTransaction(observedAtMs, row.codex_host_id);
+        row = this.#retainHostExecutorEffectRow(this.#prepare(`
+          SELECT * FROM host_executor_effects WHERE effect_key = ?
+        `).get(effectKey), observedAtMs);
+      }
       if (!row || row.dispatch_token !== dispatchToken
         || !["dispatched", "completed"].includes(row.status)) {
         throw new ApiError(
@@ -4257,10 +4367,16 @@ export class TaskboardDatabase {
     const dispatchToken = hostExecutorIdentifier(dispatchTokenInput, "dispatchToken");
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const { timestamp } = this.#hostExecutorTime();
-      const row = this.#prepare(`
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      let row = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
+      if (row) {
+        this.#pruneHostExecutorHistoryInTransaction(observedAtMs, row.codex_host_id);
+        row = this.#retainHostExecutorEffectRow(this.#prepare(`
+          SELECT * FROM host_executor_effects WHERE effect_key = ?
+        `).get(effectKey), observedAtMs);
+      }
       if (!row || row.dispatch_token !== dispatchToken || row.status !== "dispatched") {
         throw new ApiError(
           409,
@@ -4288,10 +4404,16 @@ export class TaskboardDatabase {
     const dispatchToken = hostExecutorIdentifier(dispatchTokenInput, "dispatchToken");
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const { timestamp } = this.#hostExecutorTime();
-      const row = this.#prepare(`
+      const { observedAtMs, timestamp } = this.#hostExecutorTime();
+      let row = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
+      if (row) {
+        this.#pruneHostExecutorHistoryInTransaction(observedAtMs, row.codex_host_id);
+        row = this.#retainHostExecutorEffectRow(this.#prepare(`
+          SELECT * FROM host_executor_effects WHERE effect_key = ?
+        `).get(effectKey), observedAtMs);
+      }
       if (!row || row.dispatch_token !== dispatchToken || row.status !== "dispatched") {
         throw new ApiError(
           409,
@@ -4371,11 +4493,17 @@ export class TaskboardDatabase {
     };
   }
 
-  #replayHostExecutorLease(input) {
+  #replayHostExecutorLease(input, observedAtMs) {
     const row = this.#prepare(`
       SELECT * FROM host_executor_lease_receipts WHERE idempotency_key = ?
     `).get(input.idempotencyKey);
     if (!row) return null;
+    if (this.#hostExecutorRetentionExpired(row.created_at, observedAtMs)) {
+      this.#prepare(`
+        DELETE FROM host_executor_lease_receipts WHERE id = ?
+      `).run(row.id);
+      return null;
+    }
     if (row.request_fingerprint !== input.requestFingerprint) {
       throw new ApiError(
         409,
@@ -4416,7 +4544,8 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { observedAtMs, timestamp } = this.#hostExecutorTime();
-      const replay = this.#replayHostExecutorLease(input);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, input.codexHostId);
+      const replay = this.#replayHostExecutorLease(input, observedAtMs);
       if (replay) {
         this.database.exec("COMMIT");
         return replay;
@@ -4494,7 +4623,8 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { observedAtMs, timestamp } = this.#hostExecutorTime();
-      const replay = this.#replayHostExecutorLease(input);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, input.codexHostId);
+      const replay = this.#replayHostExecutorLease(input, observedAtMs);
       if (replay) {
         this.database.exec("COMMIT");
         return replay;
@@ -4560,7 +4690,8 @@ export class TaskboardDatabase {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { observedAtMs, timestamp } = this.#hostExecutorTime();
-      const replay = this.#replayHostExecutorLease(input);
+      this.#pruneHostExecutorHistoryInTransaction(observedAtMs, input.codexHostId);
+      const replay = this.#replayHostExecutorLease(input, observedAtMs);
       if (replay) {
         this.database.exec("COMMIT");
         return replay;

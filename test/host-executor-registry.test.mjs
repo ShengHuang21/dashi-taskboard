@@ -532,6 +532,244 @@ test("host executor lease acquisition is atomic per host and independent across 
   inspection.close();
 });
 
+test("host executor lease replay is inclusive for 24 hours and receipts then stay bounded", async () => {
+  const initialTime = Date.parse("2026-09-08T02:30:00.000Z");
+  let currentTime = initialTime;
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-executor-retention-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const database = new TaskboardDatabase(databasePath, {
+    hostExecutorClock: () => currentTime,
+  });
+  try {
+    const registration = database.registerHostExecutor({
+      codexHostId: "remote-retention",
+      executorInstanceId: "executor-retention",
+      adapterId: "codex-renderer-rpc-v1",
+      capabilities: ["thread/read"],
+      idempotencyKey: "register-retention",
+    }).registration;
+    const acquireInput = {
+      codexHostId: "remote-retention",
+      executorInstanceId: registration.executorInstanceId,
+      registrationFingerprint: registration.fingerprint,
+      expectedLeaseId: null,
+      leaseDurationSeconds: 60,
+      idempotencyKey: "acquire-retention",
+    };
+    const acquired = database.acquireHostExecutorLease(acquireInput);
+
+    for (let index = 1; index <= 2_880; index += 1) {
+      currentTime += 30_000;
+      const renewed = database.renewHostExecutorLease({
+        codexHostId: "remote-retention",
+        executorInstanceId: registration.executorInstanceId,
+        registrationFingerprint: registration.fingerprint,
+        expectedLeaseId: acquired.lease.id,
+        leaseDurationSeconds: 60,
+        idempotencyKey: `renew-retention-${index}`,
+      });
+      assert.equal(renewed.lease.id, acquired.lease.id);
+    }
+
+    const replayAtBoundary = database.acquireHostExecutorLease(acquireInput);
+    assert.equal(replayAtBoundary.applied, false);
+    assert.deepEqual(replayAtBoundary.receipt, acquired.receipt);
+
+    currentTime += 30_000;
+    database.renewHostExecutorLease({
+      codexHostId: "remote-retention",
+      executorInstanceId: registration.executorInstanceId,
+      registrationFingerprint: registration.fingerprint,
+      expectedLeaseId: acquired.lease.id,
+      leaseDurationSeconds: 60,
+      idempotencyKey: "renew-retention-after-boundary",
+    });
+    assert.throws(
+      () => database.acquireHostExecutorLease(acquireInput),
+      (error) => error?.code === "HOST_EXECUTOR_LEASE_CONFLICT",
+    );
+
+    const inspection = new DatabaseSync(databasePath);
+    const receiptStats = inspection.prepare(`
+      SELECT COUNT(*) AS count, MIN(created_at) AS oldest
+      FROM host_executor_lease_receipts
+      WHERE codex_host_id = 'remote-retention'
+    `).get();
+    assert.deepEqual({ ...receiptStats }, {
+      count: 2_881,
+      oldest: new Date(initialTime + 30_000).toISOString(),
+    });
+    assert.deepEqual({ ...inspection.prepare(`
+      SELECT lease_id, executor_instance_id FROM host_executor_leases
+      WHERE codex_host_id = 'remote-retention'
+    `).get() }, {
+      lease_id: acquired.lease.id,
+      executor_instance_id: registration.executorInstanceId,
+    });
+    inspection.close();
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("host executor retention removes resolved payloads and preserves unresolved tombstones", async () => {
+  const initialTime = Date.parse("2026-09-08T03:30:00.000Z");
+  let currentTime = initialTime;
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-effect-retention-"));
+  const databasePath = path.join(directory, "taskboard.sqlite");
+  const openDatabase = () => new TaskboardDatabase(databasePath, {
+    hostExecutorClock: () => currentTime,
+  });
+  let database = openDatabase();
+  try {
+    const registration = database.registerHostExecutor({
+      codexHostId: "remote-effect-retention",
+      executorInstanceId: "executor-effect-retention",
+      adapterId: "codex-renderer-rpc-v1",
+      capabilities: ["thread/start"],
+      idempotencyKey: "register-effect-retention",
+    }).registration;
+    const lease = database.acquireHostExecutorLease({
+      codexHostId: "remote-effect-retention",
+      executorInstanceId: registration.executorInstanceId,
+      registrationFingerprint: registration.fingerprint,
+      expectedLeaseId: null,
+      leaseDurationSeconds: 60,
+      idempotencyKey: "acquire-effect-retention",
+    }).lease;
+    const execution = {
+      codexHostId: lease.codexHostId,
+      executorInstanceId: lease.executorInstanceId,
+      registrationFingerprint: lease.registrationFingerprint,
+      leaseId: lease.id,
+    };
+    const operations = [{
+      method: "thread/start",
+      params: { cwd: "/tmp/worktree", prompt: "CAP65_OWNER_PROMPT_SENTINEL" },
+    }];
+    const effectInput = (effectKey, targetExecution = execution, targetOperations = operations) => ({
+      effectKey,
+      execution: targetExecution,
+      operations: targetOperations,
+    });
+
+    database.reserveHostExecutorEffect(effectInput("retention-reserved"));
+    database.reserveHostExecutorEffect(effectInput("retention-completed"));
+    const completedDispatch = database.beginHostExecutorEffectDispatch(
+      effectInput("retention-completed"),
+    );
+    database.completeHostExecutorEffect(
+      "retention-completed",
+      completedDispatch.dispatchToken,
+      [{ thread: { id: "completed-thread" }, prompt: "CAP65_RESULT_SENTINEL" }],
+    );
+    database.reserveHostExecutorEffect(effectInput("retention-dispatched"));
+    const retainedDispatch = database.beginHostExecutorEffectDispatch(
+      effectInput("retention-dispatched"),
+    );
+    database.reserveHostExecutorEffect(effectInput("retention-uncertain"));
+    const uncertainDispatch = database.beginHostExecutorEffectDispatch(
+      effectInput("retention-uncertain"),
+    );
+    database.markHostExecutorEffectUncertain(
+      "retention-uncertain",
+      uncertainDispatch.dispatchToken,
+    );
+
+    database.close();
+    currentTime = initialTime + 24 * 60 * 60 * 1_000;
+    database = openDatabase();
+    let inspection = new DatabaseSync(databasePath);
+    const boundaryRows = inspection.prepare(`
+      SELECT effect_key, operations_json FROM host_executor_effects ORDER BY effect_key
+    `).all();
+    assert.equal(boundaryRows.length, 4);
+    assert.equal(
+      boundaryRows.every((row) => row.operations_json.includes("CAP65_OWNER_PROMPT_SENTINEL")),
+      true,
+    );
+    inspection.close();
+
+    database.close();
+    currentTime += 1;
+    database = openDatabase();
+    inspection = new DatabaseSync(databasePath);
+    const retainedRows = inspection.prepare(`
+      SELECT effect_key, status, operations_json, result_json
+      FROM host_executor_effects ORDER BY effect_key
+    `).all();
+    assert.deepEqual(retainedRows.map((row) => ({ ...row })), [
+      {
+        effect_key: "retention-dispatched",
+        status: "dispatched",
+        operations_json: "[]",
+        result_json: null,
+      },
+      {
+        effect_key: "retention-uncertain",
+        status: "uncertain",
+        operations_json: "[]",
+        result_json: null,
+      },
+    ]);
+    inspection.close();
+
+    const nextLease = database.acquireHostExecutorLease({
+      codexHostId: "remote-effect-retention",
+      executorInstanceId: registration.executorInstanceId,
+      registrationFingerprint: registration.fingerprint,
+      expectedLeaseId: lease.id,
+      leaseDurationSeconds: 60,
+      idempotencyKey: "acquire-effect-retention-after-ttl",
+    }).lease;
+    const nextExecution = {
+      codexHostId: nextLease.codexHostId,
+      executorInstanceId: nextLease.executorInstanceId,
+      registrationFingerprint: nextLease.registrationFingerprint,
+      leaseId: nextLease.id,
+    };
+    assert.throws(
+      () => database.reserveHostExecutorEffect(
+        effectInput("retention-uncertain", nextExecution),
+      ),
+      (error) => error?.code === "HOST_EXECUTOR_EFFECT_UNCERTAIN",
+    );
+    assert.throws(
+      () => database.reserveHostExecutorEffect(effectInput(
+        "retention-uncertain",
+        nextExecution,
+        [{ method: "thread/start", params: { cwd: "/tmp/changed" } }],
+      )),
+      (error) => error?.code === "HOST_EXECUTOR_EFFECT_IDEMPOTENCY_CONFLICT",
+    );
+
+    const lateResult = [{ thread: { id: "late-completion" } }];
+    const lateCompletion = database.completeHostExecutorEffect(
+      "retention-dispatched",
+      retainedDispatch.dispatchToken,
+      lateResult,
+    );
+    assert.equal(lateCompletion.status, "completed");
+    assert.deepEqual(lateCompletion.operations, []);
+    const lateReplay = database.reserveHostExecutorEffect(
+      effectInput("retention-dispatched", nextExecution),
+    );
+    assert.equal(lateReplay.replayed, true);
+    assert.deepEqual(lateReplay.effect.result, lateResult);
+
+    assert.equal(database.reserveHostExecutorEffect(
+      effectInput("retention-reserved", nextExecution),
+    ).applied, true);
+    assert.equal(database.reserveHostExecutorEffect(
+      effectInput("retention-completed", nextExecution),
+    ).applied, true);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("host executor mutations require a fresh request-bound proof", async () => {
   const instanceSecret = "d".repeat(64);
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-executor-proof-"));
