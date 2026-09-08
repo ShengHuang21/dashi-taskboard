@@ -4233,6 +4233,30 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     const expiredPendingAdmission = ["awaiting_admission", "prepared"].includes(admission?.state)
       && Number.isFinite(Date.parse(admission?.deadlineAt ?? ""))
       && Date.parse(admission.deadlineAt) <= replacementRecoveryObservedAt;
+    const exactDomainReplacement = admission?.globalCoordinatorLeaseId == null
+      && admission?.globalCoordinatorTaskId == null
+      && admission?.globalCoordinatorThreadId == null
+      && admission?.coordinationDomainId === assignment?.domainId
+      && admission?.domainCoordinatorTaskId === assignment?.coordinatorTaskId
+      && admission?.domainCoordinatorLeaseId !== assignment?.leaseId
+      && admission?.domainCoordinatorThreadId === admission?.rootThreadId
+      && typeof admission?.rootWorkspacePath === "string"
+      && path.isAbsolute(admission.rootWorkspacePath)
+      && typeof target?.rootWorkspacePath === "string"
+      && path.isAbsolute(target.rootWorkspacePath)
+      && path.resolve(admission.rootWorkspacePath) === path.resolve(target.rootWorkspacePath);
+    const exactGlobalToDomainTransition = admission?.coordinationDomainId == null
+      && admission?.domainCoordinatorLeaseId == null
+      && admission?.domainCoordinatorTaskId == null
+      && admission?.domainCoordinatorThreadId == null
+      && typeof admission?.globalCoordinatorLeaseId === "string"
+      && admission.globalCoordinatorLeaseId
+      && admission.globalCoordinatorLeaseId === assignment?.assignedByLeaseId
+      && admission?.globalCoordinatorTaskId === assignment?.assignedByTaskId
+      && admission?.globalCoordinatorThreadId === assignment?.assignedByThreadId
+      && admission?.globalCoordinatorThreadId === admission?.rootThreadId
+      && typeof admission?.rootWorkspacePath === "string"
+      && path.isAbsolute(admission.rootWorkspacePath);
     const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
       && (admission?.state === "admission_uncertain" || expiredPendingAdmission)
@@ -4245,17 +4269,8 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && typeof target.rootWorkspacePath === "string" && path.isAbsolute(target.rootWorkspacePath)
       && typeof target.worktreePath === "string" && path.isAbsolute(target.worktreePath)
       && assignment?.status === "active"
-      && admission.coordinationDomainId === assignment.domainId
-      && admission.domainCoordinatorTaskId === assignment.coordinatorTaskId
-      && admission.domainCoordinatorLeaseId !== assignment.leaseId
-      && admission.domainCoordinatorThreadId === admission.rootThreadId
-      && admission.globalCoordinatorLeaseId == null
-      && admission.globalCoordinatorTaskId == null
-      && admission.globalCoordinatorThreadId == null
+      && (exactDomainReplacement || exactGlobalToDomainTransition)
       && admission.rootHostId === target.codexHostId
-      && typeof admission.rootWorkspacePath === "string"
-      && path.isAbsolute(admission.rootWorkspacePath)
-      && path.resolve(admission.rootWorkspacePath) === path.resolve(target.rootWorkspacePath)
       && RESUME_TOKEN_PATTERN.test(admission.resumeToken ?? "")
       && COORDINATION_ID_PATTERN.test(admission.safeActionId ?? "");
     if (!eligible) return false;

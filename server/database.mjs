@@ -10247,7 +10247,8 @@ export class TaskboardDatabase {
           this.database.exec("COMMIT");
           return {
             receipt: this.#taskSafeActionReceipt(existing), reused: true,
-            available: false, completed: false, coordinatorLeaseChanged: true,
+            available: false, completed: false, recovering: false,
+            coordinatorLeaseChanged: true,
           };
         }
         if (existing.status === "delivered") {
@@ -11300,14 +11301,15 @@ export class TaskboardDatabase {
     const exactIdentity = row.project_id === rootRun.projectId
       && row.root_thread_id !== rootRun.rootThreadId
       && row.root_host_id === rootRun.rootHostId
-      && typeof row.root_workspace_path === "string"
-      && path.isAbsolute(row.root_workspace_path)
-      && path.resolve(row.root_workspace_path) === path.resolve(rootRun.rootWorkspacePath)
       && typeof row.worktree_path === "string"
       && path.isAbsolute(row.worktree_path)
       && path.resolve(row.worktree_path) === path.resolve(rootRun.worktreePath)
       && row.worktree_branch === rootRun.worktreeBranch;
-    const exactDomainReplacement = row.global_coordinator_lease_id === null
+    const exactOldRootWorkspace = typeof row.root_workspace_path === "string"
+      && path.isAbsolute(row.root_workspace_path);
+    const exactDomainReplacement = exactOldRootWorkspace
+      && path.resolve(row.root_workspace_path) === path.resolve(rootRun.rootWorkspacePath)
+      && row.global_coordinator_lease_id === null
       && row.global_coordinator_task_id === null
       && row.global_coordinator_thread_id === null
       && typeof row.domain_coordinator_lease_id === "string"
@@ -11318,8 +11320,27 @@ export class TaskboardDatabase {
       && row.coordination_domain_id === rootRun.domainId
       && row.domain_coordinator_task_id === rootRun.domainCoordinatorTaskId
       && row.domain_coordinator_thread_id === row.root_thread_id;
-    if (!exactIdentity || !exactDomainReplacement) {
-      throw new ApiError(409, "DOMAIN_COORDINATOR_REPLACEMENT_MISMATCH", "Admission attempt does not belong to the exact replaced Domain Coordinator route");
+    const assignment = this.getAgentTaskDomainAssignment(row.task_id);
+    const exactGlobalToDomainTransition = exactOldRootWorkspace
+      && assignment?.taskId === row.task_id
+      && assignment?.projectId === row.project_id
+      && assignment?.domainId === rootRun.domainId
+      && typeof row.global_coordinator_lease_id === "string"
+      && row.global_coordinator_lease_id
+      && assignment?.assignedByLeaseId === row.global_coordinator_lease_id
+      && assignment?.assignedByTaskId === row.global_coordinator_task_id
+      && assignment?.assignedByThreadId === row.global_coordinator_thread_id
+      && row.global_coordinator_thread_id === row.root_thread_id
+      && row.coordination_domain_id === null
+      && row.domain_coordinator_lease_id === null
+      && row.domain_coordinator_task_id === null
+      && row.domain_coordinator_thread_id === null
+      && typeof rootRun.domainCoordinatorLeaseId === "string"
+      && rootRun.domainCoordinatorLeaseId
+      && typeof rootRun.domainCoordinatorTaskId === "string"
+      && rootRun.domainCoordinatorTaskId;
+    if (!exactIdentity || (!exactDomainReplacement && !exactGlobalToDomainTransition)) {
+      throw new ApiError(409, "DOMAIN_COORDINATOR_REPLACEMENT_MISMATCH", "Admission attempt does not belong to an exact recoverable coordinator route transition");
     }
   }
 

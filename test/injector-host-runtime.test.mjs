@@ -5203,6 +5203,211 @@ test("background continuation retires an absent child only through the original 
   });
 });
 
+test("background continuation recovers a Global admission after exact domain assignment and delivers once", async () => {
+  const globalRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const domainRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  const taskId = "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e";
+  const globalToken = "d".repeat(64);
+  const domainToken = "e".repeat(64);
+  let stage = "global-admission";
+  let deliveries = 0;
+  const todo = () => ({
+    id: "CAP-44",
+    taskId,
+    run: null,
+    dispatchTarget: {
+      rootThreadId: domainRootThreadId,
+      codexHostId: "local",
+      rootWorkspacePath: "/tmp/domain-root",
+      worktreePath: "/tmp/taskboard/project",
+    },
+    domainAssignment: {
+      status: "active",
+      domainId: "frontend",
+      leaseId: "frontend-lease",
+      coordinatorTaskId: "frontend-coordinator",
+      assignedByLeaseId: "global-lease",
+      assignedByTaskId: "global-coordinator",
+      assignedByThreadId: globalRootThreadId,
+    },
+    ...(stage === "global-admission" ? {
+      admission: {
+        receiptId: "global-receipt",
+        attemptId: "global-attempt",
+        state: "awaiting_admission",
+        deadlineAt: "2026-08-31T00:01:00.000Z",
+        rootThreadId: globalRootThreadId,
+        rootHostId: "local",
+        rootWorkspacePath: "/tmp/global-root",
+        resumeToken: globalToken,
+        safeActionId: "safe-action",
+        globalCoordinatorLeaseId: "global-lease",
+        globalCoordinatorTaskId: "global-coordinator",
+        globalCoordinatorThreadId: globalRootThreadId,
+        coordinationDomainId: null,
+        domainCoordinatorLeaseId: null,
+        domainCoordinatorTaskId: null,
+        domainCoordinatorThreadId: null,
+        agentPath: "/root/task_admission_1234",
+      },
+    } : stage === "ready" ? {
+      admission: null,
+      readyWork: {
+        eligible: true,
+        safeActions: [{ id: "safe-action", text: "Run exact work" }],
+        resumeToken: domainToken,
+      },
+    } : {
+      admission: {
+        receiptId: "domain-receipt",
+        attemptId: "domain-attempt",
+        state: "awaiting_admission",
+        deadlineAt: "2099-01-01T00:00:00.000Z",
+        rootThreadId: domainRootThreadId,
+        rootHostId: "local",
+        rootWorkspacePath: "/tmp/domain-root",
+        resumeToken: domainToken,
+        safeActionId: "safe-action",
+        coordinationDomainId: "frontend",
+        domainCoordinatorLeaseId: "frontend-lease",
+        domainCoordinatorTaskId: "frontend-coordinator",
+        domainCoordinatorThreadId: domainRootThreadId,
+      },
+    }),
+  });
+  const options = {
+    hostExecutor: localHostExecutor,
+    policy: { enabled: true, projectId: "taskboard-core" },
+    now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+    readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo()] }),
+    claimReplacementAdmissionProbe: async (request) => {
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      assert.equal(request.expectedResumeToken, globalToken);
+      return {
+        receipt: {
+          admissionProbeId: "global-domain-probe",
+          admissionProbeRequestedAt: "2026-08-31T00:02:00.000Z",
+        },
+        observationTarget: {
+          rootThreadId: globalRootThreadId,
+          codexHostId: "local",
+          rootWorkspacePath: "/tmp/global-root",
+        },
+      };
+    },
+    deliverAdmissionRecovery: async (request) => {
+      assert.equal(request.mode, "probe");
+      assert.equal(request.rootThreadId, globalRootThreadId);
+      return { delivery: "observed", turnId: "global-probe-turn" };
+    },
+    reconcileReplacementAdmission: async (request) => {
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      stage = "ready";
+      return { outcome: "absent", receipt: { admissionState: "deferred" } };
+    },
+    claimReceipt: async (request) => {
+      assert.equal(stage, "ready");
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      assert.equal(request.expectedResumeToken, domainToken);
+      return {
+        reused: false,
+        available: true,
+        completed: false,
+        receipt: {
+          id: "domain-receipt",
+          taskId,
+          safeActionId: "safe-action",
+          admissionAttemptId: "domain-attempt",
+          rootThreadId: domainRootThreadId,
+          resumeToken: domainToken,
+          reservationLeaseId: "domain-reservation",
+        },
+      };
+    },
+    confirmDelivery: async () => ({
+      worktreePath: "/tmp/taskboard/project",
+      branch: "codex/global-domain-recovery",
+    }),
+    deliver: async (request) => {
+      deliveries += 1;
+      assert.equal(request.rootThreadId, domainRootThreadId);
+      stage = "current-admission";
+      return { delivery: "started", turnId: "domain-delivery-turn" };
+    },
+    completeDelivery: async () => ({ completed: false, awaitingAdmission: true }),
+  };
+
+  const retired = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(retired, {
+    delivered: false,
+    todoId: "CAP-44",
+    reason: "replacement-admission-deferred",
+  });
+  const delivered = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(delivered, { delivered: true, todoId: "CAP-44", actionId: "safe-action" });
+  const replay = await runTaskboardContinuationMonitorOnce(options);
+  assert.deepEqual(replay, { delivered: false, reason: "awaiting-admission" });
+  assert.equal(deliveries, 1);
+});
+
+test("background continuation rejects Global-to-domain recovery without exact assignment provenance", async () => {
+  const globalRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const domainRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  for (const [field, value] of [
+    ["assignedByLeaseId", "unrelated-global-lease"],
+    ["assignedByTaskId", "unrelated-global-task"],
+    ["assignedByThreadId", "01a004bd-a749-7b53-81e2-af2d477f93aa"],
+  ]) {
+    let probed = false;
+    const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor,
+      policy: { enabled: true, projectId: "taskboard-core" },
+      now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+      readSnapshot: async () => ({
+        projectId: "taskboard-core",
+        todos: [{
+          id: "CAP-44",
+          taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+          dispatchTarget: {
+            rootThreadId: domainRootThreadId,
+            codexHostId: "local",
+            rootWorkspacePath: "/tmp/domain-root",
+            worktreePath: "/tmp/taskboard/project",
+          },
+          domainAssignment: {
+            status: "active", domainId: "frontend", leaseId: "frontend-lease",
+            coordinatorTaskId: "frontend-coordinator",
+            assignedByLeaseId: "global-lease",
+            assignedByTaskId: "global-coordinator",
+            assignedByThreadId: globalRootThreadId,
+            [field]: value,
+          },
+          admission: {
+            receiptId: "global-receipt", attemptId: "global-attempt",
+            state: "awaiting_admission", deadlineAt: "2026-08-31T00:01:00.000Z",
+            rootThreadId: globalRootThreadId, rootHostId: "local",
+            rootWorkspacePath: "/tmp/global-root", resumeToken: "d".repeat(64),
+            safeActionId: "safe-action", globalCoordinatorLeaseId: "global-lease",
+            globalCoordinatorTaskId: "global-coordinator",
+            globalCoordinatorThreadId: globalRootThreadId,
+            coordinationDomainId: null, domainCoordinatorLeaseId: null,
+            domainCoordinatorTaskId: null, domainCoordinatorThreadId: null,
+          },
+        }],
+      }),
+      claimReceipt: async () => assert.fail("stale provenance must not reserve ordinary work"),
+      confirmDelivery: async () => assert.fail("stale provenance must not confirm work"),
+      deliver: async () => assert.fail("stale provenance must not deliver work"),
+      completeDelivery: async () => assert.fail("stale provenance must not complete work"),
+      claimReplacementAdmissionProbe: async () => { probed = true; },
+      reconcileReplacementAdmission: async () => assert.fail("stale provenance must not reconcile"),
+      deliverAdmissionRecovery: async () => assert.fail("stale provenance must not probe the old Root"),
+    });
+    assert.deepEqual(result, { delivered: false, reason: "no-eligible-work" }, field);
+    assert.equal(probed, false, field);
+  }
+});
+
 test("replacement recovery never reconciles an unconfirmed admission probe delivery", async () => {
   const oldRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const replacementRootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93af";
