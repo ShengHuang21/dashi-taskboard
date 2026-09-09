@@ -5,6 +5,8 @@ import { mkdir, mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+import { verifyPackagedInjectorModuleGraph } from "./packaged-injector-preflight.mjs";
+
 const debPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
 const appImagePath = process.argv[3] ? path.resolve(process.argv[3]) : null;
 if (!debPath || !appImagePath || process.argv.length !== 4) {
@@ -65,6 +67,7 @@ async function verifyPackageRoot(root, label) {
     "app/inject/codex-taskboard.user.js",
     "app/node_modules/smol-toml/package.json",
     "app/scripts/codex-injector.mjs",
+    "app/scripts/host-resource-observer.mjs",
     "app/server/app.mjs",
     "app/server/index.mjs",
     "app/shared/codex-executable.mjs",
@@ -92,6 +95,20 @@ async function verifyPackageRoot(root, label) {
   if (nodeVersion !== "v22.23.2") {
     throw new Error(`${label} contains unexpected Node.js ${nodeVersion}`);
   }
+  verifyPackagedInjectorModuleGraph({
+    nodePath,
+    appRoot: path.join(resourceRoot, "app"),
+    label,
+    env: {
+      ...process.env,
+      CODEX_TASKBOARD_DATA_DIR: path.join(root, ".taskboard-preflight"),
+      CODEX_TASKBOARD_RUNTIME_FILE: path.join(
+        root,
+        ".taskboard-preflight",
+        "launcher-runtime.json",
+      ),
+    },
+  });
 }
 
 const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "codex-taskboard-linux-packages."));

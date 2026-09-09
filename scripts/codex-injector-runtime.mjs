@@ -9,6 +9,7 @@ const coordinationDeliveries = new Map();
 const COORDINATION_DEDUPLICATION_MS = 60_000;
 const continuationMonitorRuns = new Map();
 const continuationFastLaneRuns = new Map();
+const hostResourceAdmissionBudgetBarriers = new WeakMap();
 const ownerDecisionMonitorRuns = new Map();
 const ownerIntentCaptureMonitorRuns = new Map();
 const ownerIntentAdoptionMonitorRuns = new Map();
@@ -38,6 +39,10 @@ const COORDINATOR_DELIVERY_MODEL_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_MODEL_
 const COORDINATOR_DELIVERY_EFFORT_MARKER = "TASKBOARD_COORDINATOR_DELIVERY_EFFORT_V1:";
 const COORDINATOR_DELIVERY_RETRY_BASE_MS = 15_000;
 const COORDINATOR_DELIVERY_RETRY_MAX_MS = 300_000;
+const NO_START_COORDINATION_DELIVERY_STATUSES = new Set([
+  "observed",
+  "not-observed",
+]);
 function normalizeHostExecutor(value) {
   const ownedCodexHostId = value?.ownedCodexHostId;
   if (!isCanonicalCodexHostId(ownedCodexHostId)) return null;
@@ -3398,6 +3403,47 @@ export async function runTaskboardProjectMonitorSequence(monitors) {
   return results;
 }
 
+function createHostResourceAdmissionBudget(participantProjectIds) {
+  const budget = new Map();
+  let resolveReady;
+  const ready = new Promise((resolve) => { resolveReady = resolve; });
+  hostResourceAdmissionBudgetBarriers.set(budget, {
+    participants: new Map(participantProjectIds.map((projectId) => [projectId, "pending"])),
+    reservations: new Map(),
+    finalized: false,
+    ready,
+    resolveReady,
+  });
+  return budget;
+}
+
+function finalizeHostResourceAdmissionBudget(budget) {
+  const barrier = hostResourceAdmissionBudgetBarriers.get(budget);
+  if (!barrier || barrier.finalized
+    || [...barrier.participants.values()].some((state) => state === "pending")) {
+    return;
+  }
+  const limits = new Map();
+  for (const reservation of barrier.reservations.values()) {
+    limits.set(
+      reservation.hostId,
+      Math.min(limits.get(reservation.hostId) ?? reservation.headroomAgents, reservation.headroomAgents),
+    );
+  }
+  for (const [hostId, limit] of limits) {
+    budget.set(hostId, { limit, used: 0 });
+  }
+  barrier.finalized = true;
+  barrier.resolveReady();
+}
+
+function completeHostResourceAdmissionBudgetParticipant(budget, projectId) {
+  const barrier = hostResourceAdmissionBudgetBarriers.get(budget);
+  if (!barrier || barrier.participants.get(projectId) !== "pending") return;
+  barrier.participants.set(projectId, "complete");
+  finalizeHostResourceAdmissionBudget(budget);
+}
+
 export function runTaskboardContinuationFastLane({
   projects,
   runContinuation,
@@ -3415,6 +3461,16 @@ export function runTaskboardContinuationFastLane({
     project?.continuationEnabled === true
     && COORDINATION_ID_PATTERN.test(project?.projectId ?? "")
   ));
+  const startableProjectIds = [];
+  const startableRunKeys = new Set();
+  for (const project of eligible) {
+    const runKey = `${hostExecutor.ownedCodexHostId}:${project.projectId}`;
+    if (!continuationFastLaneRuns.has(runKey) && !startableRunKeys.has(runKey)) {
+      startableRunKeys.add(runKey);
+      startableProjectIds.push(project.projectId);
+    }
+  }
+  const hostResourceAdmissionBudget = createHostResourceAdmissionBudget(startableProjectIds);
   return eligible.map((project) => {
     const projectId = project.projectId;
     const runKey = `${hostExecutor.ownedCodexHostId}:${projectId}`;
@@ -3422,7 +3478,7 @@ export function runTaskboardContinuationFastLane({
       return { projectId, state: "in_flight" };
     }
     const run = Promise.resolve()
-      .then(() => runContinuation(projectId))
+      .then(() => runContinuation(projectId, hostResourceAdmissionBudget))
       .then(
         (result) => ({ projectId, ok: true, result }),
         (error) => ({
@@ -3433,6 +3489,7 @@ export function runTaskboardContinuationFastLane({
       );
     continuationFastLaneRuns.set(runKey, run);
     void run.then((result) => {
+      completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, projectId);
       if (continuationFastLaneRuns.get(runKey) === run) {
         continuationFastLaneRuns.delete(runKey);
       }
@@ -4129,15 +4186,167 @@ export async function runTaskboardContinuationMonitorOnce(options) {
   }
 }
 
+export function evaluateHostResourceAdmission({
+  target,
+  policy,
+  observation,
+  observedAtMs,
+}) {
+  if (policy?.enabled !== true) return { available: true, applied: false };
+  const validPolicy = typeof policy.localHostId === "string"
+    && policy.localHostId.length > 0
+    && policy.localHostId.length <= 240
+    && !/[\u0000-\u001f\u007f]/.test(policy.localHostId)
+    && Number.isSafeInteger(policy.observationMaxAgeMs)
+    && policy.observationMaxAgeMs >= 1
+    && policy.observationMaxAgeMs <= 15 * 60_000
+    && Number.isFinite(policy.targetCpuRatio)
+    && policy.targetCpuRatio > 0
+    && policy.targetCpuRatio < 1
+    && Number.isFinite(policy.criticalCpuRatio)
+    && policy.criticalCpuRatio >= policy.targetCpuRatio
+    && policy.criticalCpuRatio <= 1
+    && Number.isFinite(policy.memoryReserveRatio)
+    && policy.memoryReserveRatio > 0
+    && policy.memoryReserveRatio < 1
+    && Number.isFinite(policy.criticalMemoryRatio)
+    && policy.criticalMemoryRatio >= 0
+    && policy.criticalMemoryRatio < policy.memoryReserveRatio
+    && Number.isSafeInteger(policy.minimumMemoryReserveBytes)
+    && policy.minimumMemoryReserveBytes >= 0
+    && Number.isSafeInteger(policy.memoryPerAgentBytes)
+    && policy.memoryPerAgentBytes > 0
+    && Number.isFinite(policy.cpuPerAgent)
+    && policy.cpuPerAgent > 0;
+  if (!validPolicy) {
+    return { available: false, applied: true, reason: "invalid-host-resource-policy" };
+  }
+  if (target?.codexHostId !== policy.localHostId) {
+    return { available: true, applied: false };
+  }
+
+  const cpu = observation?.cpu;
+  const memory = observation?.memory;
+  const observationAt = Date.parse(observation?.observedAt ?? "");
+  const validEnvelope = observation?.schemaVersion === 1
+    && observation?.source === "resident-injector"
+    && observation?.hostId === policy.localHostId
+    && ["darwin", "linux", "win32"].includes(observation?.platform)
+    && Number.isFinite(observationAt)
+    && cpu && typeof cpu === "object"
+    && Number.isSafeInteger(cpu.capacity)
+    && cpu.capacity >= 1
+    && cpu.capacity <= 4096
+    && memory && typeof memory === "object"
+    && Number.isSafeInteger(memory.totalBytes)
+    && memory.totalBytes > 0
+    && Number.isSafeInteger(memory.availableBytes)
+    && memory.availableBytes >= 0
+    && memory.availableBytes <= memory.totalBytes
+    && Number.isFinite(memory.availableRatio)
+    && memory.availableRatio >= 0
+    && memory.availableRatio <= 1
+    && Math.abs(memory.availableRatio - (memory.availableBytes / memory.totalBytes)) <= 0.000001
+    && ["linux-meminfo", "macos-memory-pressure", "windows-os-freemem"].includes(memory.source);
+  if (!validEnvelope) {
+    return { available: false, applied: true, reason: "host-resource-observation-unavailable" };
+  }
+  if (observationAt > observedAtMs
+    || observedAtMs - observationAt > policy.observationMaxAgeMs) {
+    return { available: false, applied: true, reason: "host-resource-observation-stale" };
+  }
+  if (!Number.isFinite(cpu.busyRatio)
+    || cpu.busyRatio < 0
+    || cpu.busyRatio > 1
+    || !Number.isSafeInteger(cpu.sampleWindowMs)
+    || cpu.sampleWindowMs < 1
+    || cpu.sampleWindowMs > policy.observationMaxAgeMs) {
+    return { available: false, applied: true, reason: "host-resource-observation-warming" };
+  }
+
+  const cpuHeadroom = Math.max(
+    0,
+    (cpu.capacity * policy.targetCpuRatio) - (cpu.capacity * cpu.busyRatio),
+  );
+  const cpuHeadroomAgents = Math.floor(cpuHeadroom / policy.cpuPerAgent);
+  const memoryReserveBytes = Math.max(
+    policy.minimumMemoryReserveBytes,
+    Math.ceil(memory.totalBytes * policy.memoryReserveRatio),
+  );
+  const memoryHeadroomAgents = Math.floor(
+    Math.max(0, memory.availableBytes - memoryReserveBytes) / policy.memoryPerAgentBytes,
+  );
+  const headroomAgents = Math.min(cpuHeadroomAgents, memoryHeadroomAgents);
+  const critical = cpu.busyRatio >= policy.criticalCpuRatio
+    || memory.availableRatio <= policy.criticalMemoryRatio;
+  const warning = !critical && (
+    cpu.busyRatio >= policy.targetCpuRatio
+    || memory.availableBytes <= memoryReserveBytes
+  );
+  const result = {
+    available: headroomAgents >= 1,
+    applied: true,
+    ...(headroomAgents >= 1 ? {} : { reason: "waiting-host-resources" }),
+    pressure: critical ? "critical" : warning ? "warning" : "healthy",
+    cpuHeadroomAgents,
+    memoryHeadroomAgents,
+    headroomAgents,
+  };
+  return result;
+}
+
+async function reserveHostResourceAdmissionBudget({ budget, projectId, target, headroomAgents }) {
+  if (!(budget instanceof Map)) {
+    return { available: false, reason: "host-resource-budget-unavailable" };
+  }
+  if (!Number.isSafeInteger(headroomAgents) || headroomAgents < 1) {
+    return { available: false, reason: "waiting-host-resources" };
+  }
+  const hostId = target?.codexHostId;
+  const barrier = hostResourceAdmissionBudgetBarriers.get(budget);
+  if (barrier) {
+    if (barrier.participants.get(projectId) !== "pending") {
+      return { available: false, reason: "host-resource-budget-unavailable" };
+    }
+    barrier.participants.set(projectId, "reservation");
+    barrier.reservations.set(projectId, { hostId, headroomAgents });
+    finalizeHostResourceAdmissionBudget(budget);
+    await barrier.ready;
+  }
+  const current = budget.get(hostId);
+  const state = current ?? { limit: headroomAgents, used: 0 };
+  if (!Number.isSafeInteger(state.limit)
+    || state.limit < 1
+    || !Number.isSafeInteger(state.used)
+    || state.used < 0) {
+    return { available: false, reason: "host-resource-budget-unavailable" };
+  }
+  state.limit = Math.min(state.limit, headroomAgents);
+  budget.set(hostId, state);
+  if (state.used >= state.limit) {
+    return { available: false, reason: "waiting-host-resources" };
+  }
+  state.used += 1;
+  let released = false;
+  return {
+    available: true,
+    release() {
+      if (released) return;
+      released = true;
+      state.used = Math.max(0, state.used - 1);
+    },
+  };
+}
+
 function continuationCapacity(snapshot, target, policy, observedAtMs) {
-  if (policy.maxActiveAgents === undefined) return { available: true };
+  if (policy.maxActiveAgents === undefined) return { available: true, headroomAgents: null };
   if (!Number.isSafeInteger(policy.maxActiveAgents)
     || policy.maxActiveAgents < 1
     || policy.maxActiveAgents > 64
     || !Number.isSafeInteger(policy.capacityObservationMaxAgeMs)
     || policy.capacityObservationMaxAgeMs < 1
     || policy.capacityObservationMaxAgeMs > 15 * 60_000) {
-    return { available: false, reason: "invalid-capacity-policy" };
+    return { available: false, reason: "invalid-capacity-policy", headroomAgents: 0 };
   }
   const tree = Array.isArray(snapshot.windowSubagentTrees)
     ? snapshot.windowSubagentTrees.find((candidate) => (
@@ -4151,7 +4360,12 @@ function continuationCapacity(snapshot, target, policy, observedAtMs) {
     || !Number.isSafeInteger(active)
     || active < 0
     || !Number.isFinite(capacityObservedAt)) {
-    return { available: false, reason: "capacity-unobserved", observationId: "unobserved" };
+    return {
+      available: false,
+      reason: "capacity-unobserved",
+      observationId: "unobserved",
+      headroomAgents: 0,
+    };
   }
   if (capacityObservedAt > observedAtMs
     || observedAtMs - capacityObservedAt > policy.capacityObservationMaxAgeMs) {
@@ -4159,12 +4373,14 @@ function continuationCapacity(snapshot, target, policy, observedAtMs) {
       available: false,
       reason: "capacity-observation-stale",
       observationId: tree.capacityObservation.observedAt,
+      headroomAgents: 0,
     };
   }
   const childSlotLimit = Math.max(0, policy.maxActiveAgents - 1);
-  return active < childSlotLimit
-    ? { available: true }
-    : { available: false, reason: "waiting-capacity" };
+  const headroomAgents = Math.max(0, childSlotLimit - active);
+  return headroomAgents >= 1
+    ? { available: true, headroomAgents }
+    : { available: false, reason: "waiting-capacity", headroomAgents };
 }
 
 function durableModelCapacityRetry(snapshot, candidate, target, readyWork, safeAction, observedAtMs) {
@@ -4224,6 +4440,8 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   reconcileReplacementAdmission,
   deliverAdmissionRecovery,
   requestCapacityObservation,
+  readHostResourceObservation,
+  hostResourceAdmissionBudget,
   now = Date.now,
 }) {
   if (
@@ -4295,6 +4513,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     return true;
   });
   if (replacementRecoveryTodo) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
     if (typeof claimReplacementAdmissionProbe !== "function"
       || typeof reconcileReplacementAdmission !== "function"
       || typeof deliverAdmissionRecovery !== "function") {
@@ -4375,6 +4594,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     return true;
   });
   if (recoveryTodo) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
     const admission = recoveryTodo.admission;
     const recovery = {
       projectId: policy.projectId,
@@ -4455,8 +4675,22 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       reason: "admission-recovery-instructed",
     };
   }
+  let hostResourceObservation = null;
+  const hostResourcePolicy = policy.hostResourceAdmission;
+  const hasLocalCandidate = hostResourcePolicy?.enabled === true
+    && snapshot.todos.some((candidate) => (
+      candidate?.dispatchTarget?.codexHostId === hostResourcePolicy.localHostId
+    ));
+  if (hasLocalCandidate && typeof readHostResourceObservation === "function") {
+    try {
+      hostResourceObservation = await readHostResourceObservation();
+    } catch {
+      hostResourceObservation = null;
+    }
+  }
   let capacityReason = null;
   let capacityProbe = null;
+  let selectedHostResourceHeadroom = null;
   const capacityObservedAt = now();
   const todo = snapshot.todos.find((candidate) => {
     const target = candidate?.dispatchTarget;
@@ -4498,10 +4732,23 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       capacityReason ??= "model-capacity-backoff";
       return false;
     }
+    const hostResourceCapacity = evaluateHostResourceAdmission({
+      target,
+      policy: hostResourcePolicy,
+      observation: hostResourceObservation,
+      observedAtMs: capacityObservedAt,
+    });
     const capacity = continuationCapacity(snapshot, target, policy, capacityObservedAt);
     if (!capacity.available) {
       if (modelRetry?.due
         && ["capacity-unobserved", "capacity-observation-stale"].includes(capacity.reason)) {
+        if (!hostResourceCapacity.available) {
+          capacityReason ??= hostResourceCapacity.reason;
+          return false;
+        }
+        if (hostResourceCapacity.applied === true) {
+          selectedHostResourceHeadroom = hostResourceCapacity.headroomAgents;
+        }
         return true;
       }
       if (!capacityProbe
@@ -4529,9 +4776,20 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       capacityReason ??= capacity.reason;
       return false;
     }
+    // This gates only new starts. It is not a hard resource lease and never preempts existing agents.
+    if (!hostResourceCapacity.available) {
+      capacityReason ??= hostResourceCapacity.reason;
+      return false;
+    }
+    if (hostResourceCapacity.applied === true) {
+      selectedHostResourceHeadroom = Number.isSafeInteger(capacity.headroomAgents)
+        ? Math.min(hostResourceCapacity.headroomAgents, capacity.headroomAgents)
+        : hostResourceCapacity.headroomAgents;
+    }
     return true;
   });
   if (!todo) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
     if (capacityProbe) {
       const capacityDelivery = await requestCapacityObservation(capacityProbe);
       return {
@@ -4551,6 +4809,21 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     };
   }
 
+  if (selectedHostResourceHeadroom == null) {
+    completeHostResourceAdmissionBudgetParticipant(hostResourceAdmissionBudget, policy.projectId);
+  }
+  const hostResourceReservation = selectedHostResourceHeadroom == null
+    ? null
+    : await reserveHostResourceAdmissionBudget({
+        budget: hostResourceAdmissionBudget,
+        projectId: policy.projectId,
+        target: todo.dispatchTarget,
+        headroomAgents: selectedHostResourceHeadroom,
+      });
+  if (hostResourceReservation?.available === false) {
+    return { delivered: false, reason: hostResourceReservation.reason };
+  }
+  const releaseHostResourceReservation = () => hostResourceReservation?.release();
   const safeAction = todo.readyWork.safeActions[0];
   const authorization = {
     todoId: todo.id,
@@ -4560,11 +4833,19 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     safeActionId: safeAction.id,
     expectedResumeToken: todo.readyWork.resumeToken,
   };
-  const reservation = await claimReceipt(authorization);
+  let reservation;
+  try {
+    reservation = await claimReceipt(authorization);
+  } catch (error) {
+    releaseHostResourceReservation();
+    throw error;
+  }
   if (reservation?.completed === true) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "already-delivered" };
   }
   if (reservation?.available !== true || !reservation.receipt?.id) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "reservation-unavailable" };
   }
   const recoveryRoute = reservation.recovering === true ? reservation.recoveryRoute : null;
@@ -4574,8 +4855,12 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     || typeof recoveryRoute.codexHostId !== "string" || !recoveryRoute.codexHostId
     || typeof recoveryRoute.rootWorkspacePath !== "string" || !path.isAbsolute(recoveryRoute.rootWorkspacePath)
     || typeof recoveryRoute.worktreePath !== "string" || !path.isAbsolute(recoveryRoute.worktreePath)
-  )) return { delivered: false, reason: "invalid-recovery-route" };
+  )) {
+    releaseHostResourceReservation();
+    return { delivered: false, reason: "invalid-recovery-route" };
+  }
   if (!hostExecutorOwnsRoute(hostExecutor, dispatch)) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "host-executor-unavailable" };
   }
   if (recoveryRoute) {
@@ -4585,9 +4870,15 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   authorization.deliveryReceipt = reservation.receipt;
   authorization.recoveryLeaseId = reservation.recoveryLeaseId
     ?? reservation.receipt.reservationLeaseId;
-  const executionIdentity = recoveryRoute
-    ? reservation.executionIdentity
-    : await confirmDelivery(authorization);
+  let executionIdentity;
+  try {
+    executionIdentity = recoveryRoute
+      ? reservation.executionIdentity
+      : await confirmDelivery(authorization);
+  } catch (error) {
+    releaseHostResourceReservation();
+    throw error;
+  }
   const standingAuthority = safeAction.standingAuthority === true;
   if (!executionIdentity
     || typeof executionIdentity.worktreePath !== "string"
@@ -4598,6 +4889,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       typeof executionIdentity.repository !== "string"
       || !/^(?:github\.com|gitlab\.com)\/[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(executionIdentity.repository)
     ))) {
+    releaseHostResourceReservation();
     return { delivered: false, reason: "delivery-unavailable" };
   }
   let delivery;
@@ -4618,7 +4910,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       executionIdentity: { ...executionIdentity, standingAuthority },
     });
   } catch (error) {
-    if (!isSelectedModelCapacityError(error) || typeof deferAdmission !== "function") throw error;
+    if (!isSelectedModelCapacityError(error)) throw error;
+    releaseHostResourceReservation();
+    if (typeof deferAdmission !== "function") throw error;
     const deferred = await deferAdmission({
       ...authorization,
       admissionReceiptId: reservation.receipt.id,
@@ -4634,13 +4928,25 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       reason: "model-capacity-deferred",
     };
   }
+  const definitelyDidNotStart = NO_START_COORDINATION_DELIVERY_STATUSES.has(
+    delivery?.delivery,
+  );
   if (reservation.observeOnly === true && delivery?.delivery !== "observed") {
+    if (definitelyDidNotStart) releaseHostResourceReservation();
     return { delivered: false, reason: "manual-recovery-required" };
   }
-  const completion = await completeDelivery(authorization, delivery);
+  let completion;
+  try {
+    completion = await completeDelivery(authorization, delivery);
+  } catch (error) {
+    if (definitelyDidNotStart) releaseHostResourceReservation();
+    throw error;
+  }
   if (completion?.completed !== true && completion?.awaitingAdmission !== true) {
+    if (definitelyDidNotStart) releaseHostResourceReservation();
     throw new Error("Taskboard did not record the Root coordination delivery");
   }
+  if (definitelyDidNotStart) releaseHostResourceReservation();
   return { delivered: true, todoId: todo.id, actionId: safeAction.id };
 }
 

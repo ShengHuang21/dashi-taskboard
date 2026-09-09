@@ -17,6 +17,8 @@ import {
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
+import { verifyPackagedInjectorModuleGraph } from "./packaged-injector-preflight.mjs";
+
 const nodeVersion = "22.23.2";
 const nodeArchitectures = ["arm64", "x64"];
 const nodeArchiveSha256 = {
@@ -246,6 +248,11 @@ async function copyApplicationResources() {
     "codex-injector.mjs",
     "codex-injector-runtime.mjs",
     "codex-rate-limits.mjs",
+    "host-executor-api.mjs",
+    "host-executor-lifecycle.mjs",
+    "host-resource-observer.mjs",
+    "remote-host-executor-runtime.mjs",
+    "taskboard-panel-open.mjs",
     "taskboard-supervisor.mjs",
   ]) {
     await copyFile(
@@ -314,6 +321,10 @@ exec "$CONTENTS_DIR/MacOS/node" "$CONTENTS_DIR/Resources/app/cli/taskctl.mjs" "$
 
 await mkdir(runtimeCacheDirectory, { recursive: true });
 await copyApplicationResources();
+verifyPackagedInjectorModuleGraph({
+  appRoot: path.join(resourcesDirectory, "app"),
+  label: `Prepared Tauri resources for ${target}`,
+});
 if (target === windowsTarget) await prepareWindowsNodeRuntime();
 else if (target === linuxTarget) await prepareLinuxNodeRuntime();
 else await prepareMacNodeRuntime();
