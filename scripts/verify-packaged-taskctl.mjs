@@ -7,6 +7,8 @@ import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import { verifyPackagedInjectorModuleGraph } from "./packaged-injector-preflight.mjs";
+
 const appPath = process.argv[2] ? path.resolve(process.argv[2]) : null;
 if (!appPath) throw new Error("Usage: verify-packaged-taskctl.mjs <App.app>");
 
@@ -49,6 +51,18 @@ const nodePath = path.join(appPath, "Contents", "MacOS", "node");
 const appRoot = path.join(appPath, "Contents", "Resources", "app");
 const wrapperPath = path.join(appPath, "Contents", "Resources", "bin", "taskctl");
 await stat(path.join(appRoot, "node_modules", "smol-toml", "package.json"));
+await stat(path.join(appRoot, "scripts", "host-resource-observer.mjs"));
+verifyPackagedInjectorModuleGraph({
+  nodePath,
+  appRoot,
+  label: "Packaged macOS App",
+  env: {
+    ...process.env,
+    HOME: temporaryHome,
+    CODEX_TASKBOARD_DATA_DIR: dataDirectory,
+    CODEX_TASKBOARD_RUNTIME_FILE: runtimeFile,
+  },
+});
 const reservation = createServer();
 await new Promise((resolve, reject) => {
   reservation.once("error", reject);
