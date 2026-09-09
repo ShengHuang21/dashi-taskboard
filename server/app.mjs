@@ -33,6 +33,7 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { inspectExternalAgentCard } from "./external-agent-card.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
 import { createHostExecutorDispatcher } from "./host-executor-dispatcher.mjs";
@@ -3332,6 +3333,23 @@ export function resolveServerOptions(options = {}) {
   if (instanceToken && !/^[a-f0-9-]{32,128}$/i.test(instanceSecret)) {
     throw new Error("CODEX_TASKBOARD_INSTANCE_SECRET must be set in launcher mode");
   }
+  const externalAgentCardPath = String(
+    options.externalAgentCardPath ?? process.env.CODEX_TASKBOARD_EXTERNAL_AGENT_CARD_PATH ?? "",
+  ).trim();
+  if (externalAgentCardPath && !path.isAbsolute(externalAgentCardPath)) {
+    throw new Error("CODEX_TASKBOARD_EXTERNAL_AGENT_CARD_PATH must be absolute");
+  }
+  const rawExternalAgentCardMaxAgeMs = options.externalAgentCardMaxAgeMs
+    ?? process.env.CODEX_TASKBOARD_EXTERNAL_AGENT_CARD_MAX_AGE_MS;
+  const externalAgentCardMaxAgeMs = rawExternalAgentCardMaxAgeMs === undefined
+    ? undefined
+    : Number(rawExternalAgentCardMaxAgeMs);
+  if (externalAgentCardMaxAgeMs !== undefined
+    && (!Number.isInteger(externalAgentCardMaxAgeMs)
+      || externalAgentCardMaxAgeMs < 1_000
+      || externalAgentCardMaxAgeMs > 7 * 24 * 60 * 60 * 1_000)) {
+    throw new Error("CODEX_TASKBOARD_EXTERNAL_AGENT_CARD_MAX_AGE_MS must be an integer from 1000 through 604800000");
+  }
   return {
     dataDirectory,
     databasePath: options.databasePath ?? path.join(dataDirectory, "taskboard.sqlite"),
@@ -3358,6 +3376,8 @@ export function resolveServerOptions(options = {}) {
     agentLaneConfigPath: options.agentLaneConfigPath
       ?? process.env.CODEX_TASKBOARD_AGENT_LANE_CONFIG_PATH
       ?? path.join(dataDirectory, "agent-lanes.json"),
+    externalAgentCardPath: externalAgentCardPath || null,
+    externalAgentCardMaxAgeMs,
   };
 }
 
@@ -5755,6 +5775,18 @@ export function createTaskboardServer(options = {}) {
           throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/agent-capabilities does not accept query parameters");
         }
         return sendJson(response, 200, createAgentCapabilityCatalog({ version: resolved.version }));
+      }
+
+      if (pathname === "/api/agent-capabilities/external") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertLoopbackRequest(request);
+        if ([...url.searchParams.keys()].length > 0) {
+          throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/agent-capabilities/external does not accept query parameters");
+        }
+        return sendJson(response, 200, await inspectExternalAgentCard({
+          sourcePath: resolved.externalAgentCardPath,
+          maxAgeMs: resolved.externalAgentCardMaxAgeMs,
+        }));
       }
 
       if (pathname === "/api/local/ai/catalog") {
