@@ -143,8 +143,8 @@ test("external Agent Card normalizes a current local fixture against stable Task
     ],
   });
   assert.deepEqual(result.body.comparison.capabilityIds, {
-    supported: ["taskboard.task-capsule.read"],
-    planned: ["external.agent-card.inspect"],
+    supported: ["taskboard.task-capsule.read", "external.agent-card.inspect"],
+    planned: [],
     unknown: ["provider.private-research"],
   });
   assert.deepEqual(result.body.comparison.transport, {

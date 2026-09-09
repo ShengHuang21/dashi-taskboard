@@ -244,7 +244,7 @@ test("agent capability catalog publishes stable supported and planned boundaries
       ["taskboard.work.route", "supported"],
       ["taskboard.execution.claim", "supported"],
       ["taskboard.handoff.record", "supported"],
-      ["external.agent-card.inspect", "planned"],
+      ["external.agent-card.inspect", "supported"],
       ["external.task.dispatch", "planned"],
     ],
   );
