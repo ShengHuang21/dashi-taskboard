@@ -57,7 +57,7 @@ import { BoardColumn } from "./components/BoardColumn";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
 import { AgentLaneBoard } from "./components/AgentLaneBoard";
 import { BoardCardDisplayMenu } from "./components/BoardCardDisplayMenu";
-import { DashboardView } from "./components/DashboardView";
+import { OwnerGoalsView } from "./components/OwnerGoalsView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
@@ -762,7 +762,6 @@ export function App() {
   const [filters, setFilters] = useState(readTaskFilters);
   const [boardView, setBoardView] = useState<BoardView>(() => readProjectBoardView(initialProjectId));
   const [boardCardDisplay, setBoardCardDisplay] = useState<BoardCardDisplay>(readBoardCardDisplay);
-  const [dashboardSummaryAnimatedProjectId, setDashboardSummaryAnimatedProjectId] = useState<string | null>(null);
   const [ganttZoom, setGanttZoom] = useState<GanttZoom>("week");
   const [ganttHideCompleted, setGanttHideCompleted] = useState(false);
   const [ganttTodayRequest, setGanttTodayRequest] = useState(0);
@@ -862,10 +861,6 @@ export function App() {
   const setAnnouncement = useCallback((message: string) => {
     setUndoNotice(null);
     setAnnouncementValue(message);
-  }, []);
-
-  const markDashboardSummaryAnimationStarted = useCallback((projectId: string) => {
-    setDashboardSummaryAnimatedProjectId(projectId);
   }, []);
 
   const rememberDeviceWorkspacePath = useCallback((projectId: string, workspacePath: string) => {
@@ -1547,7 +1542,7 @@ export function App() {
     setDetailTaskIdentifier(null);
     if (sourceProjectId !== selectedProjectId) {
       setSelectedProjectId(sourceProjectId);
-      setBoardView(sourceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(sourceProjectId));
+      setBoardView(readProjectBoardView(sourceProjectId));
     }
     const url = buildIssueUrl(window.location.href, sourceProjectId, null);
     window.history.replaceState(window.history.state, "", url);
@@ -1600,9 +1595,7 @@ export function App() {
       setDetailTaskIdentifier(routeIssueIdentifier);
       if (routeProjectId === selectedProjectId) return;
       const routeProject = projects.find((project) => project.id === routeProjectId);
-      setBoardView(routeProjectId === ALL_PROJECTS_ID
-        ? "issues"
-        : readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
+      setBoardView(readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
       setSelectedProjectId(routeProjectId);
     }
 
@@ -1627,17 +1620,9 @@ export function App() {
 
   useEffect(() => {
     if (selectedProjectId) {
-      setBoardView(selectedProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(selectedProjectId));
+      setBoardView(readProjectBoardView(selectedProjectId));
     }
   }, [selectedProjectId]);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setDashboardSummaryAnimatedProjectId(null);
-    } else if (boardView !== "dashboard") {
-      setDashboardSummaryAnimatedProjectId(selectedProjectId);
-    }
-  }, [boardView, selectedProjectId]);
 
   useEffect(() => {
     writeTaskFilters(filters);
@@ -3151,9 +3136,7 @@ export function App() {
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
     const project = projects.find((candidate) => candidate.id === projectId);
-    setBoardView(projectId === ALL_PROJECTS_ID
-      ? "issues"
-      : readProjectBoardView(projectId, project?.agentLanesConfigured));
+    setBoardView(readProjectBoardView(projectId, project?.agentLanesConfigured));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -3543,7 +3526,7 @@ export function App() {
               aria-pressed={boardView === "dashboard"}
               onClick={() => selectBoardView("dashboard")}
             >
-              {text("仪表盘", "Dashboard")}
+              {text("我的任务", "My tasks")}
             </button>
             <button
               className={`view-tab${boardView === "issues" ? " active" : ""}`}
@@ -3728,7 +3711,7 @@ export function App() {
         ) : boardView !== "readme"
           && hasLoadedTasks
           && tasks.length === 0
-          && (boardView !== "dashboard" || referenceTasks.length === 0)
+          && boardView !== "dashboard"
           && selectedProject
           && aiImportReadyProjectId === selectedProject.id ? (
           <div className="page-empty">
@@ -3773,19 +3756,12 @@ export function App() {
             onError={setActionError}
           />
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
-          <DashboardView
+          <OwnerGoalsView
             key={selectedProjectId}
-            projectId={selectedProjectId}
-            projectCreatedAt={selectedProject?.createdAt ?? null}
-            isAllProjects={isAllProjects}
-            tasks={tasks}
             referenceTasks={referenceTasks}
             presentations={taskPresentations}
-            currentUser={currentUser}
-            animateSummary={dashboardSummaryAnimatedProjectId !== selectedProjectId}
-            onSummaryAnimationStart={markDashboardSummaryAnimationStarted}
             onOpenTask={openTaskDetail}
-            onOpenConversation={openTaskConversation}
+            onOpenAgentDetails={() => selectBoardView("issues")}
           />
         ) : boardView === "list" ? (
           <IssueListView
