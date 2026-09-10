@@ -41,6 +41,19 @@
   color: var(--text-secondary);
 }
 
+.task-progress-change {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.task-progress-change time {
+  white-space: nowrap;
+}
+
 .issue-delivery-progress {
   display: grid;
   gap: 8px;

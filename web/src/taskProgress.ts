@@ -1,10 +1,11 @@
-import type { Task } from "./types";
+import type { Task, TaskProgressChange } from "./types";
 
 export interface DeliveryProgress {
   completed: number;
   total: number;
   percent: number | null;
   reason: "unplanned" | "incomplete" | "canceled" | null;
+  latestChange?: TaskProgressChange;
 }
 
 export function createTaskProgressModel(referenceTasks: Task[]) {
@@ -24,7 +25,30 @@ export function createTaskProgressModel(referenceTasks: Task[]) {
     if (parentId) childIds.get(parentId)?.add(task.id);
   }
 
-  function progressFor(ids: string[]): DeliveryProgress {
+  const changes = tasks.flatMap((task) => [
+    ...(task.progressChanges ?? []),
+    { id: `created:${task.id}`, kind: "created", createdAt: task.createdAt } as TaskProgressChange,
+  ].map((change) => ({ taskId: task.id, change }))).sort((left, right) => (
+    right.change.createdAt.localeCompare(left.change.createdAt)
+    || Number(left.change.kind === "created") - Number(right.change.kind === "created")
+    || right.change.id.localeCompare(left.change.id)
+  ));
+
+  function latestChangeFor(subtree: Set<string>, rootId?: string): TaskProgressChange | undefined {
+    if (!rootId) return changes[0]?.change;
+    const identifiers = new Set(tasks.filter((task) => subtree.has(task.id)).map((task) => task.identifier));
+    return changes.find(({ taskId, change }) => {
+      if (change.kind === "parent") {
+        return taskId !== rootId && (
+          (change.beforeParentIdentifier !== null && identifiers.has(change.beforeParentIdentifier))
+          || (change.afterParentIdentifier !== null && identifiers.has(change.afterParentIdentifier))
+        );
+      }
+      return subtree.has(taskId) && (change.kind !== "created" || taskId !== rootId);
+    })?.change;
+  }
+
+  function progressFor(ids: string[], rootId?: string): DeliveryProgress {
     const visited = new Set<string>();
     const leaves = new Map<string, Task>();
     let incomplete = false;
@@ -52,19 +76,21 @@ export function createTaskProgressModel(referenceTasks: Task[]) {
       percent: incomplete || total === 0 ? null
         : completed === total ? 100 : Math.min(99, Math.round((completed / total) * 100)),
       reason: incomplete ? "incomplete" : total === 0 ? "unplanned" : null,
+      latestChange: latestChangeFor(visited, rootId),
     };
   }
 
   function forTask(id: string): DeliveryProgress {
     const task = taskById.get(id);
     if (!task) return { completed: 0, total: 0, percent: null, reason: "incomplete" };
+    const progress = progressFor([id], id);
     if (task.status === "canceled") {
-      return { completed: 0, total: 0, percent: null, reason: "canceled" };
+      return { ...progress, completed: 0, total: 0, percent: null, reason: "canceled" };
     }
     if (childIds.get(id)!.size === 0 && task.status !== "done") {
-      return { completed: 0, total: 0, percent: null, reason: "unplanned" };
+      return { ...progress, completed: 0, total: 0, percent: null, reason: "unplanned" };
     }
-    return progressFor([id]);
+    return progress;
   }
 
   const roadmap: { task: Task; depth: number }[] = [];

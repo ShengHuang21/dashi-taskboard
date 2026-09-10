@@ -945,6 +945,33 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
   task.conversationRefs = conversationRefs;
   task.participants = participants;
   task.previewImage = previewImage;
+  task.progressChanges = orderedActivities.flatMap((activity) => (
+    JSON.parse(activity.changes).flatMap((change, index) => {
+      const record = { id: `${activity.id}:${index}`, createdAt: activity.created_at };
+      if (change.field === "status") {
+        if (change.after === "canceled" && change.before !== "canceled") {
+          return [{ ...record, kind: "canceled" }];
+        }
+        if (change.before === "canceled" && change.after !== "canceled") {
+          return [{ ...record, kind: "restored" }];
+        }
+        if (change.before === "done"
+          && ["backlog", "todo", "in_progress", "in_review", "blocked"].includes(change.after)) {
+          return [{ ...record, kind: "reopened" }];
+        }
+      }
+      if (change.field === "relation"
+        && (change.before?.type === "parent" || change.after?.type === "parent")) {
+        return [{
+          ...record,
+          kind: "parent",
+          beforeParentIdentifier: change.before?.type === "parent" ? change.before.identifier : null,
+          afterParentIdentifier: change.after?.type === "parent" ? change.after.identifier : null,
+        }];
+      }
+      return [];
+    })
+  ));
   task.activityKey = JSON.stringify({
     version: 1,
     task: [task.id, task.version, task.updatedAt],
@@ -13435,7 +13462,7 @@ export class TaskboardDatabase {
       const placeholders = chunk.map(() => "?").join(", ");
       const rows = this.#prepare(`
         SELECT
-          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, created_at
+          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
         FROM task_activities
         WHERE task_id IN (${placeholders})
         ORDER BY task_id, created_at, id
