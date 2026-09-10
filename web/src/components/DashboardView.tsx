@@ -17,6 +17,7 @@ import { PriorityIcon } from "./SemanticIcons";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
 
 interface DashboardViewProps {
   projectId: string;
@@ -588,7 +589,6 @@ export function DashboardView({
             <div className="dashboard-roadmap-list">
               {progressModel.roadmap.map(({ task, depth }) => {
                 const isRecent = new Date(task.createdAt).getTime() >= recentlyAddedAfter;
-                const running = presentations[task.id]?.processing.running === true;
                 return (
                   <button
                     type="button"
@@ -603,11 +603,7 @@ export function DashboardView({
                       {task.archivedAt ? <small>{text("已归档", "Archived")}</small>
                         : isRecent ? <small>{text("新加入", "New")}</small> : null}
                     </span>
-                    <span className="dashboard-roadmap-status">{running
-                      ? text("Agent 正在运行", "Agent running")
-                      : task.status === "in_progress"
-                        ? text("进行中 · 当前未运行", "In progress · not running now")
-                        : taskStatusLabel(language, task.status)}</span>
+                    <TaskExecutionStatus state={presentations[task.id].execution} className="dashboard-roadmap-status" />
                     <TaskProgress
                       progress={progressModel.forTask(task.id)}
                       label={text(`${task.identifier} 交付完成度`, `${task.identifier} delivery completion`)}

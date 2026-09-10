@@ -99,6 +99,8 @@ import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
+import type { TaskExecutionState } from "../taskConversations";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -106,6 +108,7 @@ interface TaskDetailProps {
   task: Task;
   tasks: Task[];
   referenceTasks: Task[];
+  execution: TaskExecutionState;
   currentUser: ActorIdentity;
   availableLabels: string[];
   developmentScan: DevelopmentScan;
@@ -367,6 +370,7 @@ export function TaskDetail({
   task,
   tasks,
   referenceTasks,
+  execution,
   currentUser,
   availableLabels,
   developmentScan,
@@ -1212,6 +1216,7 @@ export function TaskDetail({
                 progress={deliveryProgress}
                 label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
               />
+              <TaskExecutionStatus state={execution} />
               {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
             </section>
 

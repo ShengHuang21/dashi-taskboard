@@ -11,6 +11,7 @@ import { LinearIcon } from "./LinearIcon";
 import { DeleteIcon, PlusIcon, RefreshIcon, StatusIcon } from "./SemanticIcons";
 import { TaskCard } from "./TaskCard";
 import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { DeliveryProgress } from "../taskProgress";
 
 function archivedDate(
@@ -27,6 +28,7 @@ function archivedDate(
 interface ArchivedTaskCardProps {
   task: Task;
   deliveryProgress: DeliveryProgress;
+  presentation: TaskCardPresentation;
   busy: boolean;
   restoring: boolean;
   onRestore: (task: Task) => void;
@@ -36,6 +38,7 @@ interface ArchivedTaskCardProps {
 function ArchivedTaskCard({
   task,
   deliveryProgress,
+  presentation,
   busy,
   restoring,
   onRestore,
@@ -56,6 +59,9 @@ function ArchivedTaskCard({
           progress={deliveryProgress}
           label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} deliverable completion`)}
         />
+      </div>
+      <div className="task-processing-row">
+        <TaskExecutionStatus state={presentation.execution} className="task-processing-label" />
       </div>
       <div className="archived-task-footer">
         <span className="archived-task-status">
@@ -286,6 +292,7 @@ export function OtherTasksPanel({
             key={task.id}
             task={task}
             deliveryProgress={deliveryProgressByTask[task.id]}
+            presentation={presentations[task.id]}
             busy={restoringTaskId !== null || deletingTaskId !== null}
             restoring={restoringTaskId === task.id}
             onRestore={onRestore}

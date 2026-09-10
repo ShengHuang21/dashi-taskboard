@@ -24,6 +24,7 @@ import {
   deleteProjectLabel as deleteProjectLabelRequest,
   deleteProject as deleteProjectRequest,
   getAiChatCatalog,
+  getAgentLaneSnapshot,
   getCodexThreadProgress,
   getHostRuntime,
   getJiraConnection,
@@ -121,6 +122,7 @@ import {
   type ActorIdentity,
   type AiChatModel,
   type AiChatThread,
+  type AgentLaneSnapshot,
   type CodexProjectIdentity,
   type CodexThreadBinding,
   type CoordinationDispatchTarget,
@@ -743,6 +745,7 @@ export function App() {
   const [selectedProjectId, setSelectedProjectId] = useState(initialProjectId);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
+  const [executionSnapshot, setExecutionSnapshot] = useState<AgentLaneSnapshot | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [hasLoadedTasks, setHasLoadedTasks] = useState(false);
   const [projectLoadError, setProjectLoadError] = useState<ProjectLoadError | null>(null);
@@ -2234,7 +2237,9 @@ export function App() {
             JSON.stringify(current) === JSON.stringify(progress) ? current : progress
           ));
         }
-      } catch {}
+      } catch {
+        if (!disposed) setCodexThreadProgress({});
+      }
     };
     void sync();
     const timer = window.setInterval(sync, 2_000);
@@ -2243,6 +2248,34 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [trackedCodexThreadIdsKey]);
+
+  const executionProjectId = selectedProject?.agentLanesConfigured ? selectedProject.id : null;
+  useEffect(() => {
+    setExecutionSnapshot(null);
+    if (!executionProjectId) return;
+    let disposed = false;
+    let pending = false;
+    const controller = new AbortController();
+    const sync = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const snapshot = await getAgentLaneSnapshot(executionProjectId, controller.signal);
+        if (!disposed) setExecutionSnapshot(snapshot.projectId === executionProjectId ? snapshot : null);
+      } catch {
+        if (!disposed) setExecutionSnapshot(null);
+      } finally {
+        pending = false;
+      }
+    };
+    void sync();
+    const timer = window.setInterval(sync, 15_000);
+    return () => {
+      disposed = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [executionProjectId]);
 
   const tasksByStatus = useMemo(() => {
     return Object.fromEntries(
@@ -2259,7 +2292,7 @@ export function App() {
   const otherTasksColumnCount = mainStatuses.length + 1;
   const otherTasksWidth = `clamp(300px, calc(${100 / otherTasksColumnCount}% - ${(36 + (mainStatuses.length * 24)) / otherTasksColumnCount}px), 400px)`;
 
-  const taskPresentations = useMemo(() => Object.fromEntries(tasks.map((task) => {
+  const taskPresentations = useMemo(() => Object.fromEntries(referenceTasks.map((task) => {
     const unread = (task.status === "in_review" || task.status === "blocked")
       && readActivityKeys[task.id] !== task.activityKey;
     const runningNativeThreadId = hostContext?.threadRunning
@@ -2273,15 +2306,20 @@ export function App() {
       runningNativeThreadId,
       hostContext?.threadTodoProgress ?? null,
       taskThreadId ? codexThreadProgress[taskThreadId] ?? null : undefined,
+      executionSnapshot?.projectId === executionProjectId && executionSnapshot.projectId === task.projectId
+        ? executionSnapshot.todos.find((todo) => todo.taskId === task.id) ?? null
+        : null,
     )];
   })) as Record<string, TaskCardPresentation>, [
     aiThreads,
     codexThreadProgress,
+    executionProjectId,
+    executionSnapshot,
     hostContext?.threadId,
     hostContext?.threadRunning,
     hostContext?.threadTodoProgress,
     readActivityKeys,
-    tasks,
+    referenceTasks,
   ]);
   const hasRunningTask = useMemo(
     () => Object.values(taskPresentations).some((presentation) => presentation.processing.running),
@@ -3663,6 +3701,7 @@ export function App() {
             task={detailTask}
             tasks={tasks.filter((task) => task.projectId === detailTask.projectId)}
             referenceTasks={referenceTasks.filter((task) => task.projectId === detailTask.projectId)}
+            execution={taskPresentations[detailTask.id].execution}
             currentUser={currentUser}
             availableLabels={availableLabels}
             developmentScan={developmentScan}
