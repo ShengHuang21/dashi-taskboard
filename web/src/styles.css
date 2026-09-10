@@ -10940,6 +10940,13 @@ kbd {
   padding: 12px 10px 24px;
 }
 
+.issue-list-description {
+  margin: 4px 8px 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .issue-list-groups {
   display: grid;
   gap: 8px;

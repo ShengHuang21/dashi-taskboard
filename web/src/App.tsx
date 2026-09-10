@@ -1146,16 +1146,14 @@ export function App() {
         codexIdentity: projectCodexIdentities[project.id] ?? null,
       });
     }
-    const recentOrder = new Map(recentProjectIds.map((projectId, index) => [projectId, index]));
     const sortedChoices = choices.sort((left, right) => (
-      (recentOrder.get(left.id) ?? recentProjectIds.length)
-      - (recentOrder.get(right.id) ?? recentProjectIds.length)
+      left.name.localeCompare(right.name) || left.id.localeCompare(right.id)
     ));
     return [
       ...sortedChoices.filter((project) => project.issueCount > 0),
       ...sortedChoices.filter((project) => project.issueCount === 0),
     ];
-  }, [hostContext?.projects, projectCodexIdentities, projects, recentProjectIds, text]);
+  }, [hostContext?.projects, projectCodexIdentities, projects, text]);
   const projectMenuChoices = projectChoices.filter(
     (project) => project.id !== GLOBAL_PROJECT_ID || project.issueCount > 0,
   );
@@ -3534,7 +3532,7 @@ export function App() {
               aria-pressed={boardView === "issues"}
               onClick={() => selectBoardView("issues")}
             >
-              {text("议题看板", "Issue board")}
+              {text("执行看板", "Execution board")}
             </button>
             <button
               className={`view-tab${boardView === "list" ? " active" : ""}`}
@@ -3542,7 +3540,7 @@ export function App() {
               aria-pressed={boardView === "list"}
               onClick={() => selectBoardView("list")}
             >
-              {text("列表视图", "List")}
+              {text("执行列表", "Execution list")}
             </button>
             <button
               className={`view-tab${boardView === "gantt" ? " active" : ""}`}
@@ -3758,6 +3756,7 @@ export function App() {
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
           <OwnerGoalsView
             key={selectedProjectId}
+            projectName={isAllProjects ? null : headerProjectName}
             referenceTasks={referenceTasks}
             presentations={taskPresentations}
             onOpenTask={openTaskDetail}

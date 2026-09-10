@@ -8,6 +8,7 @@ import { TaskProgress } from "./TaskProgress";
 import "./OwnerGoalsView.css";
 
 interface OwnerGoalsViewProps {
+  projectName: string | null;
   referenceTasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
   onOpenTask: (task: Task) => void;
@@ -15,6 +16,7 @@ interface OwnerGoalsViewProps {
 }
 
 export function OwnerGoalsView({
+  projectName,
   referenceTasks,
   presentations,
   onOpenTask,
@@ -57,10 +59,12 @@ export function OwnerGoalsView({
         <header className="owner-goals-heading">
           <div>
             <h1>{text("我的任务", "My tasks")}</h1>
-            <p>{text("你提出的任务，每项进度单独看。", "Your requested tasks, each with its own progress.")}</p>
+            <p>{projectName === null
+              ? text("所有项目 · 只看你提出的任务，每项进度单独看。", "All projects · Only your requests, each with its own progress.")
+              : text(`${projectName} · 只看你提出的任务，每项进度单独看。`, `${projectName} · Only your requests, each with its own progress.`)}</p>
           </div>
           <button className="button secondary" type="button" onClick={onOpenAgentDetails}>
-            {text("Agent 内部明细", "Agent details")}
+            {text("查看执行明细", "View execution details")}
           </button>
         </header>
         {goals.length > 0 ? (
@@ -86,10 +90,15 @@ export function OwnerGoalsView({
           </div>
         ) : (
           <div className="owner-goals-empty">
-            <h2>{text("你提出的任务尚未整理", "Your requested tasks have not been organized yet")}</h2>
-            <p>{text(
-              "由 Agent 根据你的原始要求整理；内部子任务不会混进来。",
-              "Agents organize this view from your original requests; internal subtasks stay separate.",
+            <h2>{referenceTasks.length > 0
+              ? text("暂时没有可显示的「我的任务」", "No requests to show here yet")
+              : text("这里还没有任务", "No tasks here yet")}</h2>
+            <p>{referenceTasks.length > 0 ? text(
+              "已有执行记录，但还未关联到你提出的任务。这一步由 Agent 补齐，你无需整理。",
+              "Execution records exist, but are not yet linked to your requests. Agents handle this step; you do not need to organize them.",
+            ) : text(
+              "当前范围还没有任务记录。你只需在聊天窗口说出目标，不用在这里手动建卡。",
+              "There are no task records in this scope. Share your goal in the chat; you do not need to create cards here.",
             )}</p>
           </div>
         )}
