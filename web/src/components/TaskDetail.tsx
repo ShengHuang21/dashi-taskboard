@@ -97,6 +97,8 @@ import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
+import { createTaskProgressModel } from "../taskProgress";
+import { TaskProgress } from "./TaskProgress";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -434,6 +436,10 @@ export function TaskDetail({
   const commentInlineImages = inlineMediaImages(commentSegments);
   const editingDraft = serializeInlineMedia(editingSegments);
   const displayIdentifier = currentTask.externalKey ?? currentTask.identifier;
+  const deliveryProgress = createTaskProgressModel([
+    ...referenceTasks.filter((item) => item.id !== currentTask.id),
+    currentTask,
+  ]).forTask(currentTask.id);
   const editingInlineImages = inlineMediaImages(editingSegments);
 
   useEffect(() => {
@@ -1199,6 +1205,15 @@ export function TaskDetail({
                 </div>
               )}
             </article>
+
+            <section className="issue-delivery-progress" aria-label={text("交付完成度", "Delivery completion")}>
+              <span>{text("交付完成度 · 按完成项计算，不代表剩余时间", "Delivery completion · item count, not a time estimate")}</span>
+              <TaskProgress
+                progress={deliveryProgress}
+                label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
+              />
+              {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
+            </section>
 
             <IssueSubIssues
               task={currentTask}

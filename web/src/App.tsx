@@ -3674,6 +3674,7 @@ export function App() {
         ) : boardView !== "readme"
           && hasLoadedTasks
           && tasks.length === 0
+          && (boardView !== "dashboard" || referenceTasks.length === 0)
           && selectedProject
           && aiImportReadyProjectId === selectedProject.id ? (
           <div className="page-empty">
@@ -3724,6 +3725,7 @@ export function App() {
             projectCreatedAt={selectedProject?.createdAt ?? null}
             isAllProjects={isAllProjects}
             tasks={tasks}
+            referenceTasks={referenceTasks}
             presentations={taskPresentations}
             currentUser={currentUser}
             animateSummary={dashboardSummaryAnimatedProjectId !== selectedProjectId}
