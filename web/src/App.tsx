@@ -107,6 +107,7 @@ import {
   type TaskCardPresentation,
   type TaskConversationItem,
 } from "./taskConversations";
+import { createTaskProgressModel, type DeliveryProgress } from "./taskProgress";
 import {
   EMPTY_TASK_FILTERS,
   matchesTaskFilters,
@@ -1078,6 +1079,20 @@ export function App() {
     };
   }, [automationProjectContext, hostContext, manageTaskboardSkillPath, selectedProject]);
   const referenceTasks = useMemo(() => [...tasks, ...archivedTasks], [archivedTasks, tasks]);
+  const deliveryProgressByTask = useMemo(() => {
+    const tasksByProject = new Map<string, Task[]>();
+    for (const task of referenceTasks) {
+      const projectTasks = tasksByProject.get(task.projectId) ?? [];
+      projectTasks.push(task);
+      tasksByProject.set(task.projectId, projectTasks);
+    }
+    const progress: Record<string, DeliveryProgress> = {};
+    for (const projectTasks of tasksByProject.values()) {
+      const model = createTaskProgressModel(projectTasks);
+      for (const task of projectTasks) progress[task.id] = model.forTask(task.id);
+    }
+    return progress;
+  }, [referenceTasks]);
   const detailTask = detailTaskIdentifier
     ? referenceTasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
     : null;
@@ -3797,6 +3812,7 @@ export function App() {
                         status={status}
                         tasks={tasksByStatus[status]}
                         presentations={taskPresentations}
+                        deliveryProgressByTask={deliveryProgressByTask}
                         now={processingNow}
                         emptyMessage={hasActiveTaskFilters
                           ? text("当前筛选下无匹配议题", "No issues match the current filters")
@@ -3835,6 +3851,7 @@ export function App() {
                     tasksByStatus={tasksByStatus}
                     archivedTasks={filteredArchivedTasks}
                     presentations={taskPresentations}
+                    deliveryProgressByTask={deliveryProgressByTask}
                     now={processingNow}
                     hasActiveFilters={hasActiveTaskFilters}
                     isDropTarget={otherTasksTab !== "archived" && dropTarget === otherTasksTab}

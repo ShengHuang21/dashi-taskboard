@@ -26,11 +26,14 @@ import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import completeIcon from "../assets/figma-taskboard/card-complete.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
+import { TaskProgress } from "./TaskProgress";
+import type { DeliveryProgress } from "../taskProgress";
 
 interface TaskCardProps {
   task: Task;
   variant?: "main" | "sidebar";
   presentation: TaskCardPresentation;
+  deliveryProgress: DeliveryProgress;
   now: number;
   isDragging: boolean;
   dragShift: number;
@@ -387,6 +390,7 @@ export function TaskCard({
   task,
   variant = "main",
   presentation,
+  deliveryProgress,
   now,
   isDragging,
   dragShift,
@@ -508,6 +512,14 @@ export function TaskCard({
       </div>
 
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
+
+      <div className="card-delivery-progress">
+        <span>{text("交付完成度", "Deliverable completion")}</span>
+        <TaskProgress
+          progress={deliveryProgress}
+          label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} deliverable completion`)}
+        />
+      </div>
 
       {body && <p className="task-card-description">{body}</p>}
 

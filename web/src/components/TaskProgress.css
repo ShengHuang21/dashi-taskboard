@@ -54,3 +54,27 @@
   color: var(--text-tertiary);
   font-size: 12px;
 }
+
+.card-delivery-progress {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin: 4px 0 8px;
+}
+
+.card-delivery-progress > span:first-child {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.card-delivery-progress .task-progress {
+  gap: 5px;
+}
+
+.card-delivery-progress .task-progress-text b {
+  font-size: 14px;
+}
+
+.card-delivery-progress .task-progress-track {
+  height: 4px;
+}
