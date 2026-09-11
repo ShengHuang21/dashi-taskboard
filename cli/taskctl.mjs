@@ -96,6 +96,7 @@ const COMMAND_OPTIONS = new Map([
   ["issue list", new Set(["project", "status", "archived", "json"])],
   ["issue get", new Set(["json"])],
   ["issue bootstrap", new Set(["json"])],
+  ["issue progress", new Set(["json"])],
   [
     "issue create",
     new Set([
@@ -261,7 +262,7 @@ Commands:
   activation apply-workflow-profile ISSUE_ID --if-version N
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|bootstrap|create|update|move|archive|restore|relation
+  issue list|get|bootstrap|create|update|move|archive|restore|relation|progress
   dependency-handoff status PROJECT_ID TARGET_ISSUE_ID
   dependency-handoff accept PROJECT_ID TARGET_ISSUE_ID --source SOURCE_ISSUE_ID
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
@@ -284,6 +285,7 @@ Global options:
 
 Examples:
   taskctl issue bootstrap LOCAL-275 --json
+  taskctl issue progress LOCAL-275 --json
   taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
@@ -294,6 +296,7 @@ Actions:
   list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
   get ISSUE_ID [--json]
   bootstrap ISSUE_ID [--json]
+  progress ISSUE_ID [--json]
   create --project PROJECT_ID --title TITLE
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
@@ -340,6 +343,11 @@ Actions:
 
 Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
+
+Progress reads recorded excerpts through one Capsule GET; it never sends a message
+or starts a task. queriedAt is retrieval time, not a work checkpoint. Each record
+retains its own version/time; requirementsRevision is not a Git, QA, or run revision.
+Live execution is unknown. Use the full bootstrap before executing work.
 
 Example:
   taskctl issue bootstrap LOCAL-275 --json`],
@@ -561,7 +569,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -815,6 +823,11 @@ async function execute(parsed, overrides) {
     case "issue bootstrap":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
+    case "issue progress": {
+      expectOperandCount(parsed, 1);
+      const { capsule } = await api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
+      return { progress: recordedProgress(capsule) };
+    }
     case "issue create":
       expectOperandCount(parsed, 0);
       return createIssue(api, parsed.options, overrides);
@@ -939,6 +952,65 @@ async function execute(parsed, overrides) {
     default:
       throw usageError(`Unsupported command: ${command}`);
   }
+}
+
+function recordedProgress(capsule) {
+  if (!capsule?.task) {
+    throw new TaskctlError("Taskboard service returned a Capsule without a task", {
+      code: "INVALID_RESPONSE",
+      exitCode: 4,
+    });
+  }
+  const task = capsule.task;
+  const comment = [...(capsule.comments ?? [])].sort((left, right) => (
+    right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id)
+  ))[0];
+  const run = Number.isInteger(capsule.latestRun?.version)
+    && typeof capsule.latestRun.status === "string"
+    ? capsule.latestRun
+    : null;
+  const handoff = capsule.handoffs?.latestEvent;
+  return {
+    queriedAt: new Date().toISOString(),
+    task: {
+      id: task.id,
+      identifier: task.identifier,
+      projectId: task.projectId,
+      ...progressText("title", task.title),
+      status: task.status,
+      version: task.version,
+    },
+    requirementsRevision: capsule.requirementsRevision,
+    latestComment: comment ? {
+      id: comment.id,
+      version: comment.version,
+      createdAt: comment.createdAt,
+      updatedAt: comment.updatedAt,
+      ...progressText("body", comment.body),
+    } : null,
+    latestRun: run ? {
+      id: run.id,
+      version: run.version,
+      status: run.status,
+      updatedAt: run.updatedAt,
+      ...progressText("summary", run.summary),
+      ...progressText("nextAction", run.nextAction),
+    } : null,
+    latestHandoff: handoff ? {
+      eventId: handoff.eventId,
+      createdAt: handoff.createdAt,
+      ...progressText("summary", handoff.envelope?.summary),
+      ...progressText("nextAction", handoff.envelope?.nextAction),
+    } : null,
+    liveExecution: "unknown",
+  };
+}
+
+function progressText(field, value) {
+  return {
+    [field]: typeof value === "string" ? value.slice(0, 2_000) : null,
+    [`${field}Truncated`]: typeof value === "string" && value.length > 2_000,
+  };
 }
 
 function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
