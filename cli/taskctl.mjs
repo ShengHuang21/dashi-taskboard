@@ -183,6 +183,8 @@ const COMMAND_OPTIONS = new Map([
   ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["handoff list", new Set(["json"])],
+  ["continuation record", new Set(["record-file", "json"])],
+  ["continuation assess", new Set(["json"])],
   ["handoff publish", new Set([
     "consumer", "event-id", "idempotency-key", "content", "content-file", "evidence-ref", "thread-id", "json",
   ])],
@@ -273,6 +275,8 @@ Commands:
   dependency-handoff status PROJECT_ID TARGET_ISSUE_ID
   dependency-handoff accept PROJECT_ID TARGET_ISSUE_ID --source SOURCE_ISSUE_ID
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
+  continuation record ISSUE_ID --record-file FILE [--json]
+  continuation assess ISSUE_ID [--json]
   handoff list ISSUE_ID
   handoff publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
     (--content TEXT | --content-file PATH)
@@ -446,6 +450,21 @@ Actions:
 Audit is read-only. Apply accepts only one recorded legacy candidate and is
 optimistic and idempotent. Legacy Root bindings remain a separate coordinator
 repair-binding action.`],
+  ["continuation", `Usage: taskctl continuation ACTION [arguments] [options]
+
+Actions:
+  record ISSUE_ID --record-file FILE [--json]
+  assess ISSUE_ID [--json]
+
+Record appends an existing agreement/checkpoint from a JSON file. Required fields:
+eventId, idempotencyKey, expectedRecordId (null for first record, else exact event ID),
+expectedResumeToken, goal, sourceRefs, authorizationSource (null or commentId/commentVersion),
+actionIds, stopBoundary, status (active/paused/canceled/endpoint_reached), and checkpoint
+(summary, nextActionId, waitingKind, waitingDetail, retryAt). Nullable fields must be explicit.
+The literal string "none" is an ID, not null. senderThreadId always comes from CODEX_THREAD_ID.
+Reads use the protected local service. Assessment never resumes, wakes, claims, or grants
+authority: liveExecution is always unknown and eligibleForDispatch is always false.
+After conflict, reread the Capsule and latest record; never silently rewrite a stale request.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
@@ -561,7 +580,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl continuation, taskctl handoff, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -591,7 +610,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, handoff list/add/ack/publish/read/adopt, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess, handoff list/add/ack/publish/read/adopt, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -607,6 +626,7 @@ async function execute(parsed, overrides) {
     || command.startsWith("domain-coordinator ")
     || command.startsWith("domain-todo ")
     || command.startsWith("dependency-handoff ")
+    || command.startsWith("continuation ")
     || ["handoff publish", "handoff read", "handoff adopt"].includes(command)
     || command.startsWith("activation ");
   const api = createApiClient(overrides, {
@@ -893,6 +913,27 @@ async function execute(parsed, overrides) {
     case "run finish":
       expectOperandCount(parsed, 1);
       return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "continuation assess":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`);
+    case "continuation record": {
+      expectOperandCount(parsed, 1);
+      const filename = resolveInputPath(requiredOption(parsed.options, "record-file"), overrides);
+      let body;
+      try {
+        const source = await (overrides.readFile ?? readFile)(filename, "utf8");
+        if (Buffer.byteLength(source, "utf8") > 262_144) throw new Error("Record file exceeds 262144 UTF-8 bytes");
+        body = JSON.parse(source);
+      } catch (error) {
+        throw new TaskctlError("Cannot read continuation JSON record", {
+          code: "INVALID_RECORD_FILE", details: error.message,
+        });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw usageError("Record file must be a JSON object");
+      return api.request("POST", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`, {
+        ...body, senderThreadId: resolveThreadId({}, overrides),
+      });
+    }
     case "handoff list":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);

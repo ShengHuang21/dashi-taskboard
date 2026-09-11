@@ -8,7 +8,8 @@ import {
   JIRA_PROJECT_ID,
   isCanonicalCodexHostId,
 } from "../shared/domain.mjs";
-import { createTaskCapsule } from "./task-capsule.mjs";
+import { createTaskCapsule, evaluateTaskAuthorization } from "./task-capsule.mjs";
+import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord } from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -10093,6 +10094,11 @@ export class TaskboardDatabase {
   }
 
   getTaskCapsule(id, { worktreeRepositoryProbe = null } = {}) {
+    const inputs = this.#taskCapsuleInputs(id, worktreeRepositoryProbe);
+    return inputs ? createTaskCapsule(inputs) : null;
+  }
+
+  #taskCapsuleInputs(id, worktreeRepositoryProbe = null) {
     let task = this.getTask(id);
     if (!task) return null;
     if (worktreeRepositoryProbe) {
@@ -10111,7 +10117,7 @@ export class TaskboardDatabase {
       codexHostId: globalLease.holderCodexHostId,
       workspacePath: globalLease.holderWorkspacePath,
     } : null;
-    return createTaskCapsule({
+    return {
       task,
       comments: this.listComments(task.id),
       attachments: this.listAttachments(task.id),
@@ -10126,7 +10132,92 @@ export class TaskboardDatabase {
       domainRoute: domainAssignment ? this.getAgentTaskDomainRoute(task.id) : null,
       globalCoordinatorFrontier,
       dependencyClearances: this.listCrossDomainDependencyClearances(task.id),
-    });
+      latestContinuationRecord: this.#latestTaskContinuation(task.id),
+    };
+  }
+
+  #latestTaskContinuation(taskId) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+      ORDER BY rowid DESC LIMIT 1
+    `).get(taskId);
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  #taskContinuationContext(taskId) {
+    const inputs = this.#taskCapsuleInputs(taskId);
+    if (!inputs) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+    const timestamp = new Date();
+    const evaluation = evaluateTaskAuthorization({ ...inputs, now: timestamp });
+    const capsule = createTaskCapsule({ ...inputs, now: timestamp, authorizationEvaluation: evaluation });
+    return { capsule, evaluation, currentClaim: inputs.currentClaim, record: inputs.latestContinuationRecord };
+  }
+
+  getTaskContinuation(taskId) {
+    this.database.exec("BEGIN");
+    try {
+      const result = assessTaskContinuation(this.#taskContinuationContext(taskId));
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendTaskContinuation(taskId, body) {
+    let input;
+    try {
+      input = normalizeContinuationRecord(body);
+    } catch (error) {
+      throw new ApiError(400, "INVALID_FIELD", error.message);
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      if (!task.threadBinding || task.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "CONTINUATION_SENDER_MISMATCH", "The sender must be the task's current bound Root");
+      }
+      const request = { ...input, eventType: "continuation_record", taskId: task.id };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const existing = this.#prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+      `).all(input.eventId, task.id, input.idempotencyKey);
+      if (existing.length > 0) {
+        const event = existing[0].envelope_json ? JSON.parse(existing[0].envelope_json) : null;
+        if (existing.length !== 1 || existing[0].task_id !== task.id
+          || event?.eventType !== "continuation_record" || event.senderThreadId !== input.senderThreadId
+          || event.requestSha256 !== requestSha256) {
+          throw new ApiError(409, "CONTINUATION_CONFLICT", "The event or key already belongs to another request");
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, event };
+      }
+      if (task.archivedAt !== null) throw new ApiError(409, "TASK_ARCHIVED", "Cannot record an archived task");
+      const context = this.#taskContinuationContext(task.id);
+      if (context.capsule.resumeToken !== input.expectedResumeToken
+        || (context.record?.eventId ?? null) !== input.expectedRecordId) {
+        throw new ApiError(409, "CONTINUATION_STALE", "Reread the current Capsule and continuation before recording", {
+          currentRecordId: context.record?.eventId ?? null,
+        });
+      }
+      const event = {
+        ...request, projectId: task.projectId, requestSha256, previousRecordId: context.record?.eventId ?? null,
+        basis: continuationBasis(context.capsule, context.evaluation), createdAt: context.evaluation.evaluatedAt,
+      };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (
+          event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+      `).run(event.eventId, task.projectId, task.id, event.idempotencyKey, JSON.stringify(event), event.createdAt);
+      this.database.exec("COMMIT");
+      return { applied: true, event };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   #assertTaskSafeActionHostExecutor(rootRun, ownedCodexHostId) {

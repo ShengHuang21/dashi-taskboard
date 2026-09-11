@@ -6416,6 +6416,23 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const continuationRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/continuation$/);
+      if (continuationRoute) {
+        const taskId = decodeRouteSegment(continuationRoute[1], "Task id");
+        assertNoQuery(url.searchParams, "Task continuation");
+        if (request.method === "GET") {
+          return sendJson(response, 200, database.getTaskContinuation(taskId));
+        }
+        if (request.method === "POST") {
+          if (request.headers["x-taskboard-client"] !== "taskctl") {
+            throw new ApiError(403, "TASKCTL_REQUIRED", "Continuation records require protected taskctl");
+          }
+          const result = database.appendTaskContinuation(taskId, await readJson(request));
+          return sendJson(response, result.applied ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
       const resultHandoffRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/result-handoffs\/([^/]+)(\/adoptions)?$/);
       if (resultHandoffRoute) {
         const producerTaskId = decodeRouteSegment(resultHandoffRoute[1], "Producer task id");
