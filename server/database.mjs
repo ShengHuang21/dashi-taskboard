@@ -13024,6 +13024,120 @@ export class TaskboardDatabase {
     }
   }
 
+  #requireResultHandoffPair(producerTaskId, consumerTaskId) {
+    const producer = this.#requireTask(producerTaskId);
+    const consumer = this.#requireTask(consumerTaskId);
+    if (producer.projectId !== consumer.projectId) {
+      throw new ApiError(409, "RESULT_HANDOFF_PROJECT_MISMATCH", "Result handoffs require tasks in the same current project");
+    }
+    return { producer, consumer };
+  }
+
+  #getResultHandoffEvent(producerTaskId, consumerTaskId, eventType, eventId = null) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE task_id = ?
+        AND json_extract(envelope_json, '$.eventType') = ?
+        AND json_extract(envelope_json, '$.producerTaskId') = ?
+        AND json_extract(envelope_json, '$.consumerTaskId') = ?
+        AND (? IS NULL OR event_id = ?)
+      ORDER BY rowid DESC LIMIT 1
+    `).get(
+      eventType === "result_publication" ? producerTaskId : consumerTaskId,
+      eventType, producerTaskId, consumerTaskId, eventId, eventId,
+    );
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  getTaskResultHandoff(producerTaskId, consumerTaskId, publicationEventId = null) {
+    this.database.exec("BEGIN");
+    try {
+      const { producer, consumer } = this.#requireResultHandoffPair(producerTaskId, consumerTaskId);
+      const publication = (id = null) => this.#getResultHandoffEvent(
+        producer.id, consumer.id, "result_publication", id,
+      );
+      const latestPublication = publication();
+      const selectedPublication = publicationEventId === null ? latestPublication : publication(publicationEventId);
+      if (publicationEventId !== null && !selectedPublication) {
+        throw new ApiError(404, "RESULT_PUBLICATION_NOT_FOUND", "The requested publication is not retained for this task pair");
+      }
+      const currentAdoption = this.#getResultHandoffEvent(producer.id, consumer.id, "result_adoption");
+      const adoptedPublication = currentAdoption ? publication(currentAdoption.publicationEventId) : null;
+      const syncStatus = !latestPublication ? "no_publication"
+        : !currentAdoption ? "awaiting_adoption"
+          : currentAdoption.publicationEventId === latestPublication.eventId ? "adopted" : "pending_sync";
+      const result = {
+        queriedAt: now(), latestPublication, selectedPublication, currentAdoption, adoptedPublication, syncStatus,
+      };
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendTaskResultHandoff(producerTaskId, consumerTaskId, eventType, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { producer, consumer } = this.#requireResultHandoffPair(producerTaskId, consumerTaskId);
+      const publishing = eventType === "result_publication";
+      const task = publishing ? producer : consumer;
+      if (!task.threadBinding || task.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "RESULT_HANDOFF_SENDER_MISMATCH", "The sender must be the task's current bound Root");
+      }
+      const request = { ...input, eventType, taskId: task.id, producerTaskId: producer.id, consumerTaskId: consumer.id };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const existing = this.#prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+      `).all(input.eventId, task.id, input.idempotencyKey);
+      if (existing.length > 0) {
+        const event = existing[0].envelope_json ? JSON.parse(existing[0].envelope_json) : null;
+        if (existing.length !== 1 || existing[0].task_id !== task.id
+          || event?.eventType !== eventType || event.requestSha256 !== requestSha256) {
+          throw new ApiError(409, "RESULT_HANDOFF_CONFLICT", "The event or idempotency key is already bound to another request");
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, event };
+      }
+      let captured;
+      if (publishing) {
+        const previous = this.#getResultHandoffEvent(producer.id, consumer.id, "result_publication");
+        captured = {
+          contentSha256: createHash("sha256").update(input.content, "utf8").digest("hex"),
+          sourceTaskVersion: producer.version,
+          previousPublicationId: previous?.eventId ?? null,
+        };
+      } else {
+        const publication = this.#getResultHandoffEvent(
+          producer.id, consumer.id, "result_publication", input.publicationEventId,
+        );
+        if (!publication) {
+          throw new ApiError(404, "RESULT_PUBLICATION_NOT_FOUND", "The requested publication is not retained for this task pair");
+        }
+        const current = this.#getResultHandoffEvent(producer.id, consumer.id, "result_adoption");
+        if ((current?.eventId ?? null) !== input.expectedAdoptionId) {
+          throw new ApiError(409, "RESULT_ADOPTION_CONFLICT", "Read the current adoption before choosing its replacement", {
+            currentAdoptionId: current?.eventId ?? null,
+          });
+        }
+        captured = {};
+      }
+      const event = { ...request, ...captured, requestSha256, createdAt: now() };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (
+          event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+      `).run(event.eventId, task.projectId, task.id, event.idempotencyKey, JSON.stringify(event), event.createdAt);
+      this.database.exec("COMMIT");
+      return { applied: true, event };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   appendTaskCoordinationEvent(taskId, envelope, actor) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -13094,6 +13208,7 @@ export class TaskboardDatabase {
       const priorEnvelopes = this.#prepare(`
         SELECT envelope_json FROM agent_event_receipts
         WHERE task_id = ? AND envelope_json IS NOT NULL
+          AND json_extract(envelope_json, '$.eventType') = 'handoff'
         ORDER BY created_at DESC, rowid DESC
       `).all(task.id).map((row) => JSON.parse(row.envelope_json));
       if (completedRun && envelope.causationId !== completedRun.id) {
@@ -13175,6 +13290,7 @@ export class TaskboardDatabase {
     const row = this.#prepare(`
       SELECT * FROM agent_event_receipts
       WHERE event_id = ? AND envelope_json IS NOT NULL
+        AND json_extract(envelope_json, '$.eventType') = 'handoff'
     `).get(eventId);
     if (!row) return null;
     const acknowledgements = this.#prepare(`
@@ -13190,6 +13306,7 @@ export class TaskboardDatabase {
     return this.#prepare(`
       SELECT * FROM agent_event_receipts
       WHERE task_id = ? AND envelope_json IS NOT NULL
+        AND json_extract(envelope_json, '$.eventType') = 'handoff'
       ORDER BY created_at, rowid
     `).all(task.id).map((row) => this.getTaskCoordinationEvent(row.event_id));
   }
@@ -13200,6 +13317,7 @@ export class TaskboardDatabase {
       const row = this.#prepare(`
         SELECT * FROM agent_event_receipts
         WHERE event_id = ? AND envelope_json IS NOT NULL
+          AND json_extract(envelope_json, '$.eventType') = 'handoff'
       `).get(eventId);
       if (!row) {
         throw new ApiError(404, "COORDINATION_EVENT_NOT_FOUND", `Coordination event '${eventId}' does not exist`);

@@ -183,6 +183,13 @@ const COMMAND_OPTIONS = new Map([
   ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["handoff list", new Set(["json"])],
+  ["handoff publish", new Set([
+    "consumer", "event-id", "idempotency-key", "content", "content-file", "evidence-ref", "thread-id", "json",
+  ])],
+  ["handoff read", new Set(["consumer", "version", "json"])],
+  ["handoff adopt", new Set([
+    "consumer", "version", "expected-adoption", "event-id", "idempotency-key", "boundary", "thread-id", "json",
+  ])],
   ["handoff add", new Set([
     "event-id", "idempotency-key", "parent-task", "agent-path", "thread-id", "sequence",
     "timestamp", "summary", "evidence-ref", "blocker", "next-action", "requires-ack",
@@ -267,6 +274,11 @@ Commands:
   dependency-handoff accept PROJECT_ID TARGET_ISSUE_ID --source SOURCE_ISSUE_ID
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
   handoff list ISSUE_ID
+  handoff publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
+    (--content TEXT | --content-file PATH)
+  handoff read SOURCE --consumer TARGET [--version PUBLICATION_EVENT_ID]
+  handoff adopt SOURCE --consumer TARGET --version PUBLICATION_EVENT_ID
+    --expected-adoption none|ADOPTION_EVENT_ID --event-id ID --idempotency-key KEY --boundary TEXT
   handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
     --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
   handoff ack EVENT_ID --acknowledgement-id ID --agent-path /root
@@ -438,6 +450,12 @@ repair-binding action.`],
 
 Actions:
   list ISSUE_ID [--json]
+  publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
+    (--content TEXT | --content-file PATH) [--evidence-ref REF[,REF]] [--thread-id ID] [--json]
+  read SOURCE --consumer TARGET [--version PUBLICATION_EVENT_ID] [--json]
+  adopt SOURCE --consumer TARGET --version PUBLICATION_EVENT_ID
+    --expected-adoption none|ADOPTION_EVENT_ID --event-id ID --idempotency-key KEY
+    --boundary TEXT [--thread-id ID] [--json]
   add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
     --sequence N [--timestamp ISO] --summary TEXT [--evidence-ref REF[,REF]]
     [--blocker TEXT] --next-action TEXT --requires-ack true|false
@@ -445,7 +463,11 @@ Actions:
     [--thread-id ID] [--json]
   ack EVENT_ID --acknowledgement-id ID --agent-path /root [--thread-id ID] [--json]
 
-Handoff add uses CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
+Publish/read/adopt use the protected local Taskboard service. Publish freezes up to
+64 KiB of UTF-8 text exactly; references remain declarations, not frozen artifacts.
+Read is observer-only. Adopt records the consumer Root's explicit exact version
+and prior adoption; a later publication never changes an earlier adoption.
+Handoff writes use CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
 when the durable task has no parent relation.`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
@@ -569,7 +591,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, handoff list/add/ack/publish/read/adopt, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -585,6 +607,7 @@ async function execute(parsed, overrides) {
     || command.startsWith("domain-coordinator ")
     || command.startsWith("domain-todo ")
     || command.startsWith("dependency-handoff ")
+    || ["handoff publish", "handoff read", "handoff adopt"].includes(command)
     || command.startsWith("activation ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
@@ -873,6 +896,18 @@ async function execute(parsed, overrides) {
     case "handoff list":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);
+    case "handoff publish":
+      expectOperandCount(parsed, 1);
+      return publishTaskResult(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff read": {
+      expectOperandCount(parsed, 1);
+      const search = new URLSearchParams();
+      if (parsed.options.version !== undefined) search.set("version", requiredOption(parsed.options, "version"));
+      return api.request("GET", `${resultHandoffPath(parsed.operands[0], parsed.options)}${search.size ? `?${search}` : ""}`);
+    }
+    case "handoff adopt":
+      expectOperandCount(parsed, 1);
+      return adoptTaskResult(api, parsed.operands[0], parsed.options, overrides);
     case "handoff add":
       expectOperandCount(parsed, 1);
       return addTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
@@ -1808,6 +1843,52 @@ function parseEvidenceRefs(raw) {
     throw usageError("--evidence-ref must contain at most 32 unique comma-separated references");
   }
   return references;
+}
+
+function resultHandoffPath(taskId, options) {
+  return `/api/local/tasks/${encodeURIComponent(taskId)}/result-handoffs/${encodeURIComponent(requiredOption(options, "consumer"))}`;
+}
+
+async function publishTaskResult(api, taskId, options, overrides) {
+  const pathname = resultHandoffPath(taskId, options);
+  if ((options.content === undefined) === (options["content-file"] === undefined)) {
+    throw usageError("Use exactly one of --content or --content-file");
+  }
+  let content = options.content;
+  if (options["content-file"] !== undefined) {
+    const read = overrides.readFile ?? readFile;
+    try {
+      content = await read(resolveInputPath(requiredOption(options, "content-file"), overrides), "utf8");
+    } catch (error) {
+      throw new TaskctlError("Cannot read result content file", {
+        code: "FILE_READ_FAILED", exitCode: 2,
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (typeof content !== "string" || content.length === 0 || Buffer.byteLength(content, "utf8") > 65_536) {
+    throw usageError("Content must contain 1 to 65536 UTF-8 bytes");
+  }
+  return api.request("POST", pathname, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    content,
+    evidenceRefs: parseEvidenceRefs(options["evidence-ref"]),
+  });
+}
+
+function adoptTaskResult(api, taskId, options, overrides) {
+  const expected = requiredOption(options, "expected-adoption").trim();
+  if (!expected || expected.length > 256) throw usageError("--expected-adoption must be none or an exact adoption event id");
+  return api.request("POST", `${resultHandoffPath(taskId, options)}/adoptions`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    publicationEventId: requiredOption(options, "version"),
+    expectedAdoptionId: expected === "none" ? null : expected,
+    adoptionBoundary: requiredOption(options, "boundary"),
+  });
 }
 
 async function addTaskHandoff(api, taskId, options, overrides) {
