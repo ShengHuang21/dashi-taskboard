@@ -569,6 +569,17 @@ function deterministicAdmissionAgentName(task, admissionAttemptId) {
   return `${taskPart || "task"}_admission_${attemptPart}`;
 }
 
+function spawnConfigForModelRouting(modelRouting, taskName) {
+  const selected = modelRouting?.selectedExecution;
+  if (!selected) return null;
+  return {
+    taskName,
+    model: selected.model,
+    reasoningEffort: selected.reasoningEffort,
+    forkTurns: "none",
+  };
+}
+
 function normalizeWorkingLog(workingLog, developmentContext) {
   if (!workingLog) return null;
   if (developmentContext?.type !== "worktree" || !developmentContext.path) {
@@ -10645,6 +10656,17 @@ export class TaskboardDatabase {
         || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
         throw new ApiError(409, "ADMISSION_FRONTIER_CHANGED", "Task Capsule changed before admission preparation");
       }
+      if (capsule.modelRouting?.state === "invalid") {
+        throw new ApiError(409, "MODEL_ROUTING_INVALID", "Task model routing must be corrected before admission preparation");
+      }
+      if (capsule.modelRouting?.state === "valid"
+        && capsule.modelRouting.selectionState !== "matched") {
+        throw new ApiError(409, "MODEL_ROUTING_SAFE_ACTION_MISMATCH", "Task model routing does not match the current safe action");
+      }
+      const spawnConfig = spawnConfigForModelRouting(
+        capsule.modelRouting,
+        row.admission_agent_name ?? deterministicAdmissionAgentName(task, admissionAttemptId),
+      );
       if (rootRun.domainWriteScope && normalizedWriteScope.some((entry) => !scopeIsContainedBy(
         entry,
         rootRun.domainWriteScope,
@@ -10657,7 +10679,11 @@ export class TaskboardDatabase {
           throw new ApiError(409, "ADMISSION_WRITE_SCOPE_MISMATCH", "Admission was already prepared with another write scope");
         }
         this.database.exec("COMMIT");
-        return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
+        return {
+          applied: false,
+          receipt: this.#taskSafeActionReceipt(row),
+          spawnConfig,
+        };
       }
       if (row.status !== "delivering" || row.admission_state !== "awaiting_admission") {
         throw new ApiError(409, "ADMISSION_NOT_AWAITING", "Only the current awaiting admission attempt can be prepared");
@@ -10731,7 +10757,11 @@ export class TaskboardDatabase {
       }
       const prepared = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
-      return { applied: true, receipt: this.#taskSafeActionReceipt(prepared) };
+      return {
+        applied: true,
+        receipt: this.#taskSafeActionReceipt(prepared),
+        spawnConfig,
+      };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;

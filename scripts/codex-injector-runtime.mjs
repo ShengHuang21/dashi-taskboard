@@ -2565,6 +2565,75 @@ function isSelectedModelCapacityError(error) {
   );
 }
 
+function selectedTaskModelRouting(modelRouting, safeActionId) {
+  if (!modelRouting || modelRouting.state === "absent") {
+    return { configured: false, value: null };
+  }
+  const selected = modelRouting.selectedExecution;
+  const expectedProfile = {
+    simple: "fast",
+    standard: "balanced",
+    complex: "capable",
+  }[selected?.difficulty];
+  if (modelRouting.state !== "valid" || modelRouting.selectionState !== "matched"
+    || typeof selected?.safeActionId !== "string" || selected.safeActionId !== safeActionId
+    || !["simple", "standard", "complex"].includes(selected.difficulty)
+    || !["fast", "balanced", "capable"].includes(selected.profile)
+    || selected.profile !== expectedProfile
+    || typeof selected.model !== "string" || !selected.model
+    || typeof selected.reasoningEffort !== "string" || !selected.reasoningEffort) {
+    return { configured: true, value: null };
+  }
+  return {
+    configured: true,
+    value: {
+      source: modelRouting.source ?? null,
+      safeActionId: selected.safeActionId,
+      difficulty: selected.difficulty,
+      profile: selected.profile,
+      reason: typeof selected.reason === "string" ? selected.reason : "",
+      model: selected.model,
+      reasoningEffort: selected.reasoningEffort,
+    },
+  };
+}
+
+async function readTaskModelCatalog(rpc) {
+  const models = [];
+  let cursor = null;
+  for (let page = 0; page < 10; page += 1) {
+    const result = await rpc("model/list", {
+      includeHidden: false,
+      limit: 100,
+      ...(cursor ? { cursor } : {}),
+    });
+    if (!Array.isArray(result?.data)) {
+      throw new Error("Codex did not return a model catalog for Task Model Routing");
+    }
+    models.push(...result.data);
+    cursor = typeof result.nextCursor === "string" && result.nextCursor ? result.nextCursor : null;
+    if (!cursor) return models;
+  }
+  throw new Error("Codex model catalog pagination was not exhausted for Task Model Routing");
+}
+
+async function validateTaskModelRoutingCatalog(rpc, modelRouting) {
+  if (!modelRouting) return;
+  const models = await readTaskModelCatalog(rpc);
+  const matches = models.filter((model) => model?.id === modelRouting.model && model.hidden !== true);
+  if (matches.length !== 1) {
+    throw new Error("Task Model Routing model is not available in the complete Codex catalog");
+  }
+  const efforts = Array.isArray(matches[0].supportedReasoningEfforts)
+    ? matches[0].supportedReasoningEfforts.map((entry) => (
+        typeof entry === "string" ? entry : entry?.reasoningEffort
+      )).filter((value) => typeof value === "string" && value)
+    : [];
+  if (!efforts.includes(modelRouting.reasoningEffort)) {
+    throw new Error("Task Model Routing reasoning effort is not supported by the configured model");
+  }
+}
+
 function isCoordinatorProvisioningHostExecutorMismatch(error) {
   return error?.status === 409 && error?.code === "HOST_EXECUTOR_MISMATCH";
 }
@@ -4712,6 +4781,11 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       && path.isAbsolute(target.worktreePath)
     );
     if (!eligible) return false;
+    const modelRouting = selectedTaskModelRouting(candidate?.modelRouting, safeAction.id);
+    if (modelRouting.configured && modelRouting.value === null) {
+      capacityReason ??= "model-routing-invalid";
+      return false;
+    }
     if (!hostExecutorOwnsRoute(hostExecutor, target)) {
       hostExecutorUnavailable = true;
       return false;
@@ -4825,6 +4899,11 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   }
   const releaseHostResourceReservation = () => hostResourceReservation?.release();
   const safeAction = todo.readyWork.safeActions[0];
+  const modelRouting = selectedTaskModelRouting(todo.modelRouting, safeAction.id);
+  if (modelRouting.configured && modelRouting.value === null) {
+    releaseHostResourceReservation();
+    return { delivered: false, reason: "model-routing-invalid" };
+  }
   const authorization = {
     todoId: todo.id,
     taskId: todo.taskId,
@@ -4908,6 +4987,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       recoveryLeaseId: authorization.recoveryLeaseId,
       observeOnly: reservation.observeOnly === true,
       executionIdentity: { ...executionIdentity, standingAuthority },
+      modelRouting: modelRouting.value,
     });
   } catch (error) {
     if (!isSelectedModelCapacityError(error)) throw error;
@@ -5037,13 +5117,17 @@ async function deliverTaskboardCoordinationOnce(
     `Admission receipt id: ${request.deliveryReceipt.id}`,
     `Admission attempt id: ${request.deliveryReceipt.admissionAttemptId}`,
     `Exact execution worktree: ${targetRoot}`,
+    ...(request.modelRouting ? [
+      `Task Model Routing comment: ${request.modelRouting.source?.commentId ?? "unknown"} version ${request.modelRouting.source?.commentVersion ?? "unknown"}`,
+      `Selected execution: ${request.modelRouting.difficulty}/${request.modelRouting.profile} -> ${request.modelRouting.model} (${request.modelRouting.reasoningEffort})`,
+    ] : []),
     ...(request.executionIdentity ? [
       `Verified execution repository: ${request.executionIdentity.repository ?? "not-required"}`,
       `Verified execution branch: ${request.executionIdentity.branch}`,
     ] : []),
     "Before editing or testing, verify the exact execution worktree is a Git worktree and use it for all repository commands. The Root coordination cwd may be different and must not be treated as the execution worktree.",
-    "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
-    "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, choose the smallest explicit bounded write scope from current source evidence, then run taskctl issue admission-prepare with the exact Root thread, Capsule token, safe action, receipt, attempt, and --write-scope. If preparation returns rerouted=true, do not spawn or claim: Taskboard durably assigned the Todo to the unique containing domain and will deliver a fresh fenced attempt there. Otherwise, only after preparation succeeds, spawn exactly one smallest useful Sub-Agent using the returned exact admissionAgentName. Claim the Todo with that exact Sub-Agent path and thread identity, a future lease, the exact prepared write scope, the exact Root thread above (--root-thread-id), and both exact admission ids above (--admission-receipt-id and --admission-attempt-id). The Root delivery turn is not admission; only that exact durable claim admits the child. If platform capacity rejects the spawn, use issue admission-defer with the exact receipt and attempt ids instead of claiming or blindly retrying. Collect the admitted Sub-Agent result back into Root.",
+    "Read the returned Task Capsule and require all of: its resumeToken exactly matches the expected token; readyWork.eligible is true; readyWork.safeActions[0].id exactly matches the authorized safe action id. If Task Model Routing is configured above, also require modelRouting.state=valid, modelRouting.selectionState=matched, and its source/comment and selected execution exactly match the delivered values. If any check fails, stop and report the mismatch; do not claim, spawn, or dispatch work.",
+    "Execute only readyWork.safeActions[0]. Never execute any readyWork.deferredActions. Coordinate that one bounded action as Root: finish any current safe boundary, choose the smallest explicit bounded write scope from current source evidence, then run taskctl issue admission-prepare with the exact Root thread, Capsule token, safe action, receipt, attempt, and --write-scope. If preparation returns rerouted=true, do not spawn or claim: Taskboard durably assigned the Todo to the unique containing domain and will deliver a fresh fenced attempt there. Otherwise read its spawnConfig. When spawnConfig is present, call collaboration.spawn_agent exactly once with its taskName as task_name, exact model and reasoningEffort as model and reasoning_effort, fork_turns: \"none\", and a useful prompt that tells the child to make the exact prepared claim before work. When spawnConfig is null, preserve the unconfigured-task behavior: use the returned exact admissionAgentName and fork_turns: \"none\" without adding a model or reasoning override. Claim the Todo only with that exact Sub-Agent path and returned child thread identity, a future lease, the exact prepared write scope, the exact Root thread above (--root-thread-id), and both exact admission ids above (--admission-receipt-id and --admission-attempt-id). The Root delivery turn is not admission; only that exact durable claim admits the child. After the exact claim, use the existing Taskboard comment to record the requested parameters and real spawn/claim tool-call evidence only; do not fabricate host-observed or session-collector evidence. If platform capacity rejects the spawn, use issue admission-defer with the exact receipt and attempt ids instead of claiming or blindly retrying. Collect the admitted Sub-Agent result back into Root.",
     "Preserve one writer. Do not start Claude or Pi. Do not broaden permissions, deploy, merge, push, install dependencies, use secrets, mutate shared runtimes, or perform financial actions unless separately authorized.",
   ].join("\n");
   const turns = Array.isArray(threadResult.thread.turns) ? threadResult.thread.turns : [];
@@ -5058,6 +5142,7 @@ async function deliverTaskboardCoordinationOnce(
     ))));
   if (observed?.id) return { delivery: "observed", turnId: observed.id };
   if (request.observeOnly === true) return { delivery: "not-observed", turnId: null };
+  await validateTaskModelRoutingCatalog(rpc, request.modelRouting);
   await validateExecutionTarget(targetRoot, request.executionIdentity);
   const durableInstruction = `${coordinationDeliveryMarker(
     deliveryId,
