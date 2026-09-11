@@ -212,6 +212,31 @@ Without `--after`, `comment list` returns the full list. Its response includes `
 
 Each comment JSON object independently records the most recent conversation that created or changed that comment as `threadId`. Comment operations never change the parent issue's `threadId`.
 
+## Versioned text result handoffs
+
+```bash
+taskctl handoff publish SOURCE --consumer TARGET \
+  --event-id PUBLICATION_ID --idempotency-key KEY \
+  (--content TEXT | --content-file PATH) \
+  [--evidence-ref REF[,REF]] [--thread-id PRODUCER_ROOT] [--json]
+taskctl handoff read SOURCE --consumer TARGET [--version PUBLICATION_ID] [--json]
+taskctl handoff adopt SOURCE --consumer TARGET --version PUBLICATION_ID \
+  --expected-adoption none|ADOPTION_ID --event-id ADOPTION_ID --idempotency-key KEY \
+  --boundary TEXT [--thread-id CONSUMER_ROOT] [--json]
+```
+
+Publish/read/adopt resolve the configured protected local service; legacy list/add/ack routing is unchanged. They use `POST`/`GET /api/local/tasks/:source/result-handoffs/:consumer` and `POST .../adoptions`. Both tasks must exist in the same current project. Publish requires the current producer Root, adopt the current consumer Root; writes use `CODEX_THREAD_ID` unless `--thread-id` is explicit. These are the existing caller/thread checks, not a new host-attestation mechanism. Reads do not require a thread identity or create adoption authority.
+
+Publish stores the exact text, including leading/trailing whitespace, with a limit of 65,536 UTF-8 bytes (non-empty). `--content-file` reads only the caller's explicit path as UTF-8; the server receives text, never a path to open. The event includes `contentSha256`, `createdAt`, `sourceTaskVersion`, `previousPublicationId`, and resolved producer/consumer task UUIDs. At most 32 unique evidence references (each up to 2,048 characters) are declarations; the service does not fetch or freeze their files/URLs. Do not include credentials or sensitive customer data.
+
+Read returns `queriedAt`, `latestPublication`, `selectedPublication`, `currentAdoption`, `adoptedPublication`, and `syncStatus`. Without `--version`, selected equals latest; with it, the exact retained publication must belong to this pair. The statuses are `no_publication` (none currently retained), `awaiting_adoption` (published, no adoption), `pending_sync` (latest differs from adopted), or `adopted` (same exact publication). Read creates no receipt/comment/run/claim/status change and never messages, starts, wakes, or steers a task.
+
+Adopt requires an exact publication id and explicit expected current adoption id (`none` only when absent). Its boundary is a non-empty statement up to 2,000 characters, not server proof of an idle thread or completed document update. A replacement appends another adoption; publishing P2 does not rewrite A1 → P1. An explicit adoption may select an older publication and remain `pending_sync` against latest. On CAS conflict, reread and reconcile before choosing again.
+
+Publish/adopt return `{ applied, event }`. An identical event id, key, and normalized input returns the original event with `applied: false`; a conflicting input or event/key collision fails without another record. After uncertain transport, authoritative readback or the exact same request can determine the recorded outcome. Generated time, content hash, and captured source version are not new replay inputs.
+
+Result publications/adoptions are not legacy handoffs, acknowledgements, Capsule execution-frontier entries, or Ready Work. Existing task/project cascading deletion controls retention; even after a task moves, deletion of its original project can delete its receipts. No permanent-retention, crash-recovery, cloud deployment, or frozen-artifact claim follows from these records.
+
 ## Structured handoffs
 
 Append a compact, durable Sub-Agent-to-Root handoff from the Sub-Agent that holds the task's active exact claim. For a final completion handoff, first complete `run finish`, then use the same Sub-Agent identity and pass the returned Run id as `--causation-id`; Taskboard permits exactly one such final event while the task remains `in_review`. Read events to replay/recover them, then acknowledge a `requiresAck` event from the parent Root identity:

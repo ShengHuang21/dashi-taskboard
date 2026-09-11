@@ -2405,6 +2405,47 @@ function assertNoSensitiveCoordinationText(values) {
   }
 }
 
+function parseResultHandoff(body, { adoption = false } = {}) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "eventId", "idempotencyKey", "senderThreadId",
+    ...(adoption ? ["publicationEventId", "expectedAdoptionId", "adoptionBoundary"] : ["content", "evidenceRefs"]),
+  ]));
+  const input = {
+    eventId: stringField(body.eventId, "eventId", { required: true, maxLength: 256 }),
+    idempotencyKey: stringField(body.idempotencyKey, "idempotencyKey", { required: true, maxLength: 256 }),
+    senderThreadId: stringField(body.senderThreadId, "senderThreadId", { required: true, maxLength: 256 }),
+  };
+  if (adoption) {
+    if (input.eventId === "none") {
+      throw new ApiError(400, "INVALID_FIELD", "'eventId' cannot be the reserved adoption value 'none'");
+    }
+    return {
+      ...input,
+      publicationEventId: stringField(body.publicationEventId, "publicationEventId", { required: true, maxLength: 256 }),
+      expectedAdoptionId: body.expectedAdoptionId === null ? null : stringField(
+        body.expectedAdoptionId, "expectedAdoptionId", { required: true, maxLength: 256 },
+      ),
+      adoptionBoundary: stringField(body.adoptionBoundary, "adoptionBoundary", { required: true, maxLength: 2_000 }),
+    };
+  }
+  // Content is the snapshot: never trim it or measure it in UTF-16 characters.
+  if (typeof body.content !== "string" || body.content.length === 0 || Buffer.byteLength(body.content, "utf8") > 65_536) {
+    throw new ApiError(400, "INVALID_FIELD", "'content' must contain 1 to 65536 UTF-8 bytes");
+  }
+  const references = body.evidenceRefs === undefined ? [] : body.evidenceRefs;
+  if (!Array.isArray(references) || references.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'evidenceRefs' must contain at most 32 references");
+  }
+  const evidenceRefs = references.map((reference) => (
+    stringField(reference, "evidenceRefs", { required: true, maxLength: 2048 })
+  ));
+  if (new Set(evidenceRefs).size !== evidenceRefs.length) {
+    throw new ApiError(400, "INVALID_FIELD", "'evidenceRefs' must be unique");
+  }
+  return { ...input, content: body.content, evidenceRefs };
+}
+
 function parseCoordinationEnvelope(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -6373,6 +6414,31 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, result.applied ? 201 : 200, result);
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const resultHandoffRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/result-handoffs\/([^/]+)(\/adoptions)?$/);
+      if (resultHandoffRoute) {
+        const producerTaskId = decodeRouteSegment(resultHandoffRoute[1], "Producer task id");
+        const consumerTaskId = decodeRouteSegment(resultHandoffRoute[2], "Consumer task id");
+        const adoption = Boolean(resultHandoffRoute[3]);
+        if (request.method === "GET" && !adoption) {
+          assertAllowedQuery(url.searchParams, new Set(["version"]), "GET result handoff");
+          const version = url.searchParams.has("version")
+            ? stringField(url.searchParams.get("version"), "version", { required: true, maxLength: 256 }) : null;
+          return sendJson(response, 200, database.getTaskResultHandoff(producerTaskId, consumerTaskId, version));
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST result handoff");
+          if (request.headers["x-taskboard-client"] !== "taskctl") {
+            throw new ApiError(403, "TASKCTL_REQUIRED", "Result publication and adoption require protected taskctl");
+          }
+          const result = database.appendTaskResultHandoff(
+            producerTaskId, consumerTaskId, adoption ? "result_adoption" : "result_publication",
+            parseResultHandoff(await readJson(request), { adoption }),
+          );
+          return sendJson(response, result.applied ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, adoption ? ["POST"] : ["GET", "POST"]);
       }
 
       const taskCoordinationEventsRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/coordination-events$/);

@@ -112,6 +112,16 @@ This command makes one read-only Capsule GET and returns a compact `progress` ob
 
 Report unrecorded work or uncertain freshness as unknown. Full `issue bootstrap` and its complete current requirements remain mandatory before executing or adopting work; this compact query grants no execution authority and does not publish, adopt, acknowledge, or validate an artifact version. Versioned artifact adoption and safe-boundary clarification delivery are separate workflows, not effects of this command.
 
+## Publish and adopt a text result without interrupting another task
+
+Use `handoff publish SOURCE --consumer TARGET` from the producer task's current bound Root at its chosen checkpoint, then `handoff read SOURCE --consumer TARGET` from the consumer. These three new commands use the protected local Taskboard HTTP API; they do not add cloud support. Both tasks must currently share a project. The service stores exact UTF-8 text (1–65,536 bytes, including whitespace), its SHA-256, server time, source task version, and the exact task UUID pair. Optional evidence references are producer declarations, not frozen files, images, Git trees, review, or deployment proof. Never publish credentials or sensitive customer data.
+
+Before adopting, bootstrap the consumer's current requirements and read the publication. At a consumer-chosen boundary, its current bound Root explicitly runs `handoff adopt` with the exact publication event id, `--expected-adoption none` for the first adoption or the current adoption event id for a replacement, and `--boundary TEXT`. The boundary is the consumer's declaration, not proof that a thread is idle or a document was updated. See [references/cli.md](references/cli.md) for full syntax.
+
+`handoff read` is observer-only: no receipt, comment, status, run, claim, message, wake, or steer. It returns latest and selected publication separately from current adoption and adopted publication. Later publication P2 leaves adoption A1 → P1 unchanged (`pending_sync`) until an explicit adoption. Historical selection does not change adoption. On a conflict, reread and reconcile; on uncertain transport, read back or retry the same exact event id, key, and input. Replays return the original record; changed input conflicts.
+
+These result records are separate from legacy `handoff list/add/ack`, Capsule handoffs, and Ready Work. They remain append-only only while retained under the existing task/project deletion lifecycle; project moves and later deletion of the original project can remove receipts. `no_publication` means no currently retained publication, not that none ever existed. No permanent retention or artifact recovery is promised.
+
 ## Other operations
 
 - Run `taskctl project readme get [PROJECT_ID]` to inspect project architecture, constraints, and conventions before planning or executing complex tasks.
