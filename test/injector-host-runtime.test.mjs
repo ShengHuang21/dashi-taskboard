@@ -4461,6 +4461,7 @@ test("background continuation delivers one eligible first safe action without a 
     recoveryLeaseId: "lease",
     observeOnly: false,
     executionIdentity: { ...confirmedIdentity, standingAuthority: false },
+    modelRouting: null,
   });
 });
 
@@ -8126,7 +8127,7 @@ test("Agent Todo coordination steers an active Root turn", async () => {
   assert.match(calls[1][1].input[0].text, /safeActions\[0\]\.id/);
   assert.match(calls[1][1].input[0].text, /Never execute any readyWork\.deferredActions/);
   assert.match(calls[1][1].input[0].text, /Todo: TASKBOARD-17/);
-  assert.match(calls[1][1].input[0].text, /spawn exactly one smallest useful Sub-Agent/);
+  assert.match(calls[1][1].input[0].text, /call collaboration\.spawn_agent exactly once with its taskName as task_name/);
   assert.match(calls[1][1].input[0].text, /--admission-receipt-id and --admission-attempt-id/);
   assert.match(calls[1][1].input[0].text, /Admission attempt id: admission-attempt/);
   assert.match(calls[1][1].input[0].text, /issue admission-prepare/);

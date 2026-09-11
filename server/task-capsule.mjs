@@ -9,6 +9,13 @@ import {
 
 const CAPSULE_VERSION = "TaskCapsuleV1";
 const AUTHORIZATION_MARKER = "Task Authorization Envelope V1";
+const MODEL_ROUTING_MARKER = "Task Model Routing V1";
+const MODEL_ROUTING_PROFILES = new Set(["fast", "balanced", "capable"]);
+const MODEL_ROUTING_DIFFICULTIES = new Map([
+  ["simple", "fast"],
+  ["standard", "balanced"],
+  ["complex", "capable"],
+]);
 const AUTHORIZATION_GATE_KINDS = new Set([
   "inspect",
   "edit",
@@ -121,6 +128,113 @@ function hasDuplicateJsonKeys(source) {
   } catch {
     return true;
   }
+}
+
+function modelRoutingFor(comments) {
+  const markerLinePattern = new RegExp(`(?:^|\\n)${MODEL_ROUTING_MARKER}[ \\t]*(?:\\n|$)`, "g");
+  const routingPattern = new RegExp(
+    `(?:^|\\n)${MODEL_ROUTING_MARKER}\\s*` + "```json\\s*([\\s\\S]*?)\\s*```",
+    "g",
+  );
+  const sources = comments.flatMap((comment) => (
+    [...comment.body.matchAll(markerLinePattern)].map(() => comment)
+  ));
+  if (sources.length === 0) return { state: "absent", source: null, plan: null };
+  if (new Set(sources.map((comment) => comment.id)).size !== sources.length) {
+    return { state: "invalid", source: null, plan: null };
+  }
+  const source = sources.at(-1);
+  const matches = [...source.body.matchAll(routingPattern)];
+  if (matches.length !== 1 || hasDuplicateJsonKeys(matches[0][1])) {
+    return { state: "invalid", source: null, plan: null };
+  }
+
+  let plan;
+  try {
+    plan = JSON.parse(matches[0][1]);
+  } catch {
+    return { state: "invalid", source: null, plan: null };
+  }
+  if (!plan || plan.workflow !== "ai-coding-end-to-end"
+    || !plan.profiles || typeof plan.profiles !== "object" || Array.isArray(plan.profiles)
+    || !nonEmptyString(plan.profileSource)
+    || plan.planningProfile !== "capable" || plan.validationProfile !== "capable"
+    || !plan.execution || typeof plan.execution !== "object" || Array.isArray(plan.execution)
+    || !nonEmptyString(plan.execution.safeActionId)
+    || !MODEL_ROUTING_DIFFICULTIES.has(plan.execution.difficulty)
+    || !nonEmptyString(plan.execution.reason)) {
+    return { state: "invalid", source: null, plan: null };
+  }
+  for (const profile of MODEL_ROUTING_PROFILES) {
+    const configuration = plan.profiles[profile];
+    if (!configuration || typeof configuration !== "object" || Array.isArray(configuration)
+      || !nonEmptyString(configuration.model) || !nonEmptyString(configuration.reasoningEffort)) {
+      return { state: "invalid", source: null, plan: null };
+    }
+  }
+  if (plan.execution.profile !== MODEL_ROUTING_DIFFICULTIES.get(plan.execution.difficulty)) {
+    return { state: "invalid", source: null, plan: null };
+  }
+  return {
+    state: "valid",
+    source: { commentId: source.id, commentVersion: source.version },
+    plan,
+  };
+}
+
+function selectedModelRouting(plan, readyWork) {
+  if (plan.state !== "valid") {
+    return { state: plan.state, source: plan.source, selectedExecution: null };
+  }
+  const safeActionId = readyWork.safeActions[0]?.id ?? null;
+  if (!safeActionId) {
+    return {
+      state: "valid",
+      source: plan.source,
+      workflow: plan.plan.workflow,
+      profiles: plan.plan.profiles,
+      profileSource: plan.plan.profileSource,
+      planningProfile: plan.plan.planningProfile,
+      validationProfile: plan.plan.validationProfile,
+      execution: plan.plan.execution,
+      selectionState: "no_safe_action",
+      selectedExecution: null,
+    };
+  }
+  if (safeActionId !== plan.plan.execution.safeActionId) {
+    return {
+      state: "valid",
+      source: plan.source,
+      workflow: plan.plan.workflow,
+      profiles: plan.plan.profiles,
+      profileSource: plan.plan.profileSource,
+      planningProfile: plan.plan.planningProfile,
+      validationProfile: plan.plan.validationProfile,
+      execution: plan.plan.execution,
+      selectionState: "safe_action_mismatch",
+      selectedExecution: null,
+    };
+  }
+  const profile = plan.plan.profiles[plan.plan.execution.profile];
+  return {
+    state: "valid",
+    source: plan.source,
+    workflow: plan.plan.workflow,
+    profiles: plan.plan.profiles,
+    profileSource: plan.plan.profileSource,
+    planningProfile: plan.plan.planningProfile,
+    validationProfile: plan.plan.validationProfile,
+    execution: plan.plan.execution,
+    selectionState: "matched",
+    selectedExecution: {
+      safeActionId,
+      difficulty: plan.plan.execution.difficulty,
+      profile: plan.plan.execution.profile,
+      reason: plan.plan.execution.reason,
+      model: profile.model,
+      reasoningEffort: profile.reasoningEffort,
+    },
+  };
 }
 
 function authorizationFor(task, comments) {
@@ -883,6 +997,7 @@ export function createTaskCapsule({
     attachments: orderedAttachments.map((attachment) => [attachment.id, attachment.changeRevision ?? 0]),
   });
   const execution = executionFor(task);
+  const plannedModelRouting = modelRoutingFor(orderedComments);
   const authorization = authorizationFor(task, orderedComments);
   const ownerDecisionResolution = applyOwnerDecisionReceipts(authorization, ownerDecisionReceipts);
   const effectiveAuthorization = ownerDecisionResolution.authorization;
@@ -905,6 +1020,7 @@ export function createTaskCapsule({
     requirementsRevision,
     dependencyClearances,
   );
+  const modelRouting = selectedModelRouting(plannedModelRouting, readyWork);
   const workflow = workflowFor(task);
   const currentFrontier = {
     ...readyWork.nextAction,
@@ -940,6 +1056,7 @@ export function createTaskCapsule({
       } : task.developmentContext,
       workingLog: task.workingLog,
       workflow,
+      modelRouting,
       authorization,
       ownerDecisionReceipts: ownerDecisionResolution.applied.map((receipt) => ({
         id: receipt.id,
@@ -1007,6 +1124,7 @@ export function createTaskCapsule({
     worktree: task.developmentContext?.type === "worktree" ? task.developmentContext : null,
     workingLog: task.workingLog,
     workflow,
+    modelRouting,
     authorization,
     ownerDecisions: {
       appliedReceipts: ownerDecisionResolution.applied.map((receipt) => ({

@@ -38,6 +38,36 @@ Open only the relevant section of [references/cli.md](references/cli.md) when co
 11. Move an issue from `in_review` to `done` only when the user explicitly confirms acceptance or explicitly asks to mark it complete. Codex self-verification alone is not sufficient.
 12. Move work that cannot continue to `blocked`, and work that will not continue to `canceled`.
 
+## Difficulty-selected execution model
+
+Before a Root reserves or delivers a planned Safe Action, write its explicit routing plan as one Task Comment with `taskctl comment add --body-file`, then run `taskctl issue bootstrap` again. The comment must contain one `Task Model Routing V1` marker immediately followed by a `json` code fence whose body has this shape:
+
+```json
+{
+  "workflow": "ai-coding-end-to-end",
+  "profiles": {
+    "fast": { "model": "<current-host-model>", "reasoningEffort": "<supported-effort>" },
+    "balanced": { "model": "<current-host-model>", "reasoningEffort": "<supported-effort>" },
+    "capable": { "model": "<current-host-model>", "reasoningEffort": "<supported-effort>" }
+  },
+  "profileSource": "explicit planner source and current Host catalog",
+  "planningProfile": "capable",
+  "validationProfile": "capable",
+  "execution": {
+    "safeActionId": "exact-current-safe-action-id",
+    "difficulty": "simple",
+    "profile": "fast",
+    "reason": "short action-specific explanation"
+  }
+}
+```
+
+The only execution mappings are `simple -> fast`, `standard -> balanced`, and `complex -> capable`. `profileSource` is a non-empty provenance explanation, not a bearer token or a fixed literal. Do not invent a model ranking or use a model/effort that the target Host does not currently advertise.
+
+`issue bootstrap` returns `modelRouting`, including the source comment id/version and the selected execution only when its `safeActionId` still matches the current Safe Action. A supplied malformed plan or action mismatch is a stop condition, never a reason to fall back to an unpinned child. Unconfigured tasks retain the existing model-dispatch behavior.
+
+After `issue admission-prepare`, do not spawn when `rerouted=true`. Otherwise consume its `spawnConfig`: when it is present, invoke `collaboration.spawn_agent` with the exact task name, model, reasoning effort, and `fork_turns: "none"`; when it is null, preserve the unconfigured behavior without a model override while still using `fork_turns: "none"`. On capacity rejection, retain that exact model/effort and use the existing defer/retry path; do not select another profile or model. The child must make the exact prepared claim before work. Only after that claim, add the existing Taskboard comment recording requested parameters and real spawn/claim tool-call evidence; never fabricate Host-observed or session-collector evidence.
+
 For a durable Sub-Agent-to-Root transfer during execution, use `handoff add` only while the task has an active exact claim for that Sub-Agent. For the final completion transfer, first complete `run finish`, then immediately append exactly one final handoff from that same Sub-Agent with `--causation-id` set to the completed Run id. This narrow post-finish exception exists only while the task remains `in_review`; it rejects a different sender, Run, or second final event. Use `handoff list` to recover ordered events and `handoff ack` only from the parent Root identity. A handoff appends a compact Task Comment and structured event; it does not replace Working Log evidence, change task status, finish a run, or grant Git authority. Reusing the same idempotency key must describe the same event.
 
 An Owner decision receipt is different from a comment or handoff. It is an immutable host-observed binding among the exact Root thread, the actual Owner input turn, the Root decision turn, and the current Taskboard delivery. The authenticated Injector records it automatically; `taskctl` cannot create one. After delivery, Taskboard protects that exact Root coordinator route for a bounded human-response window until the decision is recorded; never describe this as Agent approval or self-approval.

@@ -422,6 +422,51 @@ function taskTodoState(task, readyWork, claim, run) {
   return readyWork.eligible ? "ready" : "blocked";
 }
 
+function modelRoutingForTodo(capsule) {
+  const routing = capsule?.modelRouting;
+  if (!routing || routing.state === "absent") {
+    return { state: "absent", source: null, selectionState: null, selectedExecution: null };
+  }
+  const profiles = routing.profiles && typeof routing.profiles === "object"
+    ? Object.fromEntries(["fast", "balanced", "capable"].flatMap((profile) => {
+        const configuration = routing.profiles[profile];
+        return configuration?.model && configuration?.reasoningEffort
+          ? [[profile, {
+              model: text(configuration.model),
+              reasoningEffort: text(configuration.reasoningEffort),
+            }]]
+          : [];
+      }))
+    : null;
+  const selected = routing.selectedExecution;
+  return {
+    state: text(routing.state),
+    source: routing.source?.commentId && routing.source?.commentVersion !== undefined
+      ? { commentId: text(routing.source.commentId), commentVersion: routing.source.commentVersion }
+      : null,
+    workflow: text(routing.workflow),
+    profiles,
+    profileSource: compact(routing.profileSource, 240),
+    planningProfile: text(routing.planningProfile),
+    validationProfile: text(routing.validationProfile),
+    execution: routing.execution?.safeActionId ? {
+      safeActionId: text(routing.execution.safeActionId),
+      difficulty: text(routing.execution.difficulty),
+      profile: text(routing.execution.profile),
+      reason: compact(routing.execution.reason, 240),
+    } : null,
+    selectionState: text(routing.selectionState),
+    selectedExecution: selected?.safeActionId && selected?.model && selected?.reasoningEffort ? {
+      safeActionId: text(selected.safeActionId),
+      difficulty: text(selected.difficulty),
+      profile: text(selected.profile),
+      reason: compact(selected.reason, 240),
+      model: text(selected.model),
+      reasoningEffort: text(selected.reasoningEffort),
+    } : null,
+  };
+}
+
 function readyWorkForTodo(capsule) {
   const readyWork = capsule?.readyWork;
   const action = (item) => ({
@@ -457,6 +502,7 @@ function readyWorkForTodo(capsule) {
         expectedResumeToken: text(request.expectedResumeToken),
       }
       : null,
+    modelRouting: modelRoutingForTodo(capsule),
     resumeToken: text(capsule?.resumeToken),
   };
 }
@@ -600,6 +646,7 @@ async function taskTodoProjection(
       domainCoordinatorThreadId: admission.domainCoordinatorThreadId,
     } : null,
     readyWork,
+    modelRouting: readyWork.modelRouting,
     dependencyClearances: capsule?.dependencyClearances ?? [],
     inbox: capsule?.inbox ?? { pendingCount: 0, latestReceipt: null },
     handoffs: capsule?.handoffs ?? { pendingAcknowledgementCount: 0, latestEvent: null },

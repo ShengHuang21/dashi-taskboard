@@ -90,6 +90,19 @@ Read the current revision immediately before every configuration write. Scopes m
 
 Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
 
+For a difficulty-selected child model, plan before reservation/delivery by adding one structured comment through the existing command, then bootstrap again:
+
+```bash
+taskctl comment add ISSUE_ID --body-file /absolute/path/task-model-routing-v1.md [--thread-id ROOT_THREAD] [--json]
+taskctl issue bootstrap ISSUE_ID [--json]
+```
+
+The body file contains one `Task Model Routing V1` marker immediately followed by a `json` code fence. Its JSON requires `workflow: "ai-coding-end-to-end"`; `fast`, `balanced`, and `capable` profiles, each with a Host-advertised `model` and `reasoningEffort`; a non-empty `profileSource`; `planningProfile` and `validationProfile` both `capable`; plus one execution `{ safeActionId, difficulty, profile, reason }`. The only mappings are `simple -> fast`, `standard -> balanced`, and `complex -> capable`.
+
+The re-bootstrapped Capsule exposes `modelRouting` with the source comment id/version and `selectedExecution` only when the configured `safeActionId` equals the current Safe Action. A malformed supplied route or mismatch stops routing; it must not degrade to an unpinned model choice. When no routing marker is supplied, existing dispatch behavior remains unchanged.
+
+Use the existing `issue admission-prepare` command with the exact re-bootstrapped token and action. If its response is not rerouted, it includes `spawnConfig`: use its `taskName`, `model`, `reasoningEffort`, and `forkTurns: "none"` exactly for the child spawn. A null `spawnConfig` means the task is unconfigured, so retain the existing no-model-override dispatch behavior while using the returned admission agent identity. On capacity rejection, retain the requested model and effort through the existing defer/retry path; do not reselect a profile or model. After the child makes the exact prepared claim, use the existing comment command to record requested parameters and real spawn/claim tool-call evidence only.
+
 If the Capsule returns `readyWork.ownerDecisionRequest`, do not send the Owner to Taskboard and do not let a Sub-Agent ask them. The authenticated host Injector reserves the exact current request and Root route atomically, delivers the question once, and reads the delivery id back from the exact Root thread after uncertain transport. Once delivery is confirmed, Taskboard keeps that exact Root coordinator route protected for a bounded human-response window until the decision is recorded. After the Owner replies, Root bootstraps again and follows the injected instruction to emit one `TASKBOARD_OWNER_DECISION_V1` marker only when the request remains current. The Injector accepts that marker only after a real Owner input in the exact Root thread and records the immutable receipt through its host-authenticated route. `taskctl` has no Owner-decision mutation command. This is Root-attested Owner provenance, not Agent self-approval.
 
 ## Create issues
