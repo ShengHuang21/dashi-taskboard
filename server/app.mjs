@@ -2417,6 +2417,9 @@ function parseResultHandoff(body, { adoption = false } = {}) {
     senderThreadId: stringField(body.senderThreadId, "senderThreadId", { required: true, maxLength: 256 }),
   };
   if (adoption) {
+    if (input.eventId === "none") {
+      throw new ApiError(400, "INVALID_FIELD", "'eventId' cannot be the reserved adoption value 'none'");
+    }
     return {
       ...input,
       publicationEventId: stringField(body.publicationEventId, "publicationEventId", { required: true, maxLength: 256 }),
