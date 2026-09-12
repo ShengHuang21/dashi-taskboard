@@ -24,7 +24,9 @@ const sourceRuntimeFile = path.resolve(
   ".data",
   "launcher-runtime.json",
 );
-const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "clear-working-log", "help"]);
+const BOOLEAN_OPTIONS = new Set([
+  "json", "clear-binding-thread", "clear-working-log", "help", "no-published-basis", "no-observed-publication",
+]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
@@ -185,6 +187,15 @@ const COMMAND_OPTIONS = new Map([
   ["handoff list", new Set(["json"])],
   ["continuation record", new Set(["record-file", "json"])],
   ["continuation assess", new Set(["json"])],
+  ["clarification list", new Set(["json"])],
+  ["clarification enqueue", new Set([
+    "consumer", "event-id", "idempotency-key", "basis-publication", "no-published-basis",
+    "question", "evidence-ref", "thread-id", "json",
+  ])],
+  ["clarification resolve", new Set([
+    "event-id", "idempotency-key", "observed-publication", "no-observed-publication",
+    "outcome", "result", "boundary", "thread-id", "json",
+  ])],
   ["handoff publish", new Set([
     "consumer", "event-id", "idempotency-key", "content", "content-file", "evidence-ref", "thread-id", "json",
   ])],
@@ -223,6 +234,9 @@ const HELP_TEXT = new Map([
   ["", `Usage: taskctl RESOURCE ACTION [options]
 
 Commands:
+  clarification enqueue PRODUCER --consumer CONSUMER (see clarification --help)
+  clarification list ISSUE_ID [--json]
+  clarification resolve CANONICAL_REQUEST_ID (see clarification --help)
   context current [--cwd PATH] [--json]
   project list
   project create --name NAME [--id ID] [--workspace-path PATH]
@@ -488,6 +502,29 @@ Read is observer-only. Adopt records the consumer Root's explicit exact version
 and prior adoption; a later publication never changes an earlier adoption.
 Handoff writes use CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
 when the durable task has no parent relation.`],
+  ["clarification", `Usage: taskctl clarification ACTION [arguments] [options]
+
+Actions:
+  enqueue PRODUCER --consumer CONSUMER --event-id ID --idempotency-key KEY
+    (--basis-publication ID | --no-published-basis) --question TEXT
+    [--evidence-ref REF[,REF]] [--thread-id ID] [--json]
+  list ISSUE_ID [--json]
+  resolve CANONICAL_REQUEST_ID --event-id ID --idempotency-key KEY
+    (--observed-publication ID | --no-observed-publication)
+    --outcome answered|needs_reconfirmation --result TEXT --boundary TEXT
+    [--thread-id ID] [--json]
+
+Enqueue is written by the consumer's current bound Root; resolve by the producer's.
+Both tasks must share a project. These commands use protected local Taskboard only.
+Null publication state requires the explicit no-publication flag; the string none is an ID.
+Question text and ordered evidence references are exact. New delivery keys for identical
+requests coalesce durably, including handled requests; conflicting reuse is rejected.
+List and Capsule discovery do not consume, wake, send, start, or steer any task.
+Resolve only at a caller-chosen natural safe point; --boundary is a declaration, not
+proof of idle or execution permission. Observe the latest publication for this exact
+producer-consumer pair. Stale requests require needs_reconfirmation, not answered.
+Handling is immutable and never automatically adopts a result or reopens a request.
+Writes use CODEX_THREAD_ID unless --thread-id is explicit.`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -580,7 +617,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl continuation, taskctl handoff, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl continuation, taskctl handoff, taskctl clarification, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -610,7 +647,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess, handoff list/add/ack/publish/read/adopt, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess, handoff list/add/ack/publish/read/adopt, clarification enqueue/list/resolve, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -628,6 +665,7 @@ async function execute(parsed, overrides) {
     || command.startsWith("dependency-handoff ")
     || command.startsWith("continuation ")
     || ["handoff publish", "handoff read", "handoff adopt"].includes(command)
+    || command.startsWith("clarification ")
     || command.startsWith("activation ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
@@ -937,6 +975,15 @@ async function execute(parsed, overrides) {
     case "handoff list":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);
+    case "clarification list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/clarifications`);
+    case "clarification enqueue":
+      expectOperandCount(parsed, 1);
+      return enqueueTaskClarification(api, parsed.operands[0], parsed.options, overrides);
+    case "clarification resolve":
+      expectOperandCount(parsed, 1);
+      return resolveTaskClarification(api, parsed.operands[0], parsed.options, overrides);
     case "handoff publish":
       expectOperandCount(parsed, 1);
       return publishTaskResult(api, parsed.operands[0], parsed.options, overrides);
@@ -1884,6 +1931,37 @@ function parseEvidenceRefs(raw) {
     throw usageError("--evidence-ref must contain at most 32 unique comma-separated references");
   }
   return references;
+}
+
+function explicitPublicationOption(options, idOption, nullOption) {
+  if ((options[idOption] !== undefined) === (options[nullOption] === true)) {
+    throw usageError(`Use exactly one of --${idOption} or --${nullOption}`);
+  }
+  return options[nullOption] === true ? null : requiredOption(options, idOption);
+}
+
+function enqueueTaskClarification(api, producerTaskId, options, overrides) {
+  const consumerTaskId = requiredOption(options, "consumer");
+  return api.request("POST", `/api/local/tasks/${encodeURIComponent(producerTaskId)}/clarifications/${encodeURIComponent(consumerTaskId)}`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    basisPublicationEventId: explicitPublicationOption(options, "basis-publication", "no-published-basis"),
+    question: requiredOption(options, "question"),
+    evidenceRefs: options["evidence-ref"] === undefined ? [] : options["evidence-ref"].split(","),
+  });
+}
+
+function resolveTaskClarification(api, canonicalRequestId, options, overrides) {
+  return api.request("POST", `/api/local/clarifications/${encodeURIComponent(canonicalRequestId)}/resolution`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    observedLatestPublicationEventId: explicitPublicationOption(options, "observed-publication", "no-observed-publication"),
+    outcome: requiredOption(options, "outcome"),
+    result: requiredOption(options, "result"),
+    safeBoundary: requiredOption(options, "boundary"),
+  });
 }
 
 function resultHandoffPath(taskId, options) {
