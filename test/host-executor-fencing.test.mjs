@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { request as createHttpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -24,7 +25,7 @@ afterEach(async () => {
   }
 });
 
-function signedHeaders(secret, pathname, body, sequence) {
+function signedHeaders(secret, pathname, body, sequence, method = "POST") {
   const nonce = sequence.toString(16).padStart(32, "0");
   const issuedAt = String(Date.now());
   return {
@@ -32,7 +33,7 @@ function signedHeaders(secret, pathname, body, sequence) {
     "x-codex-taskboard-injector-nonce": nonce,
     "x-codex-taskboard-injector-issued-at": issuedAt,
     "x-codex-taskboard-injector-proof": createHmac("sha256", secret)
-      .update(JSON.stringify({ nonce, issuedAt, method: "POST", pathname, body }))
+      .update(JSON.stringify({ nonce, issuedAt, method, pathname, body }))
       .digest("hex"),
   };
 }
@@ -155,6 +156,21 @@ function createReadyTask(harness) {
   });
   const capsule = harness.app.database.getTaskCapsule(task.id);
   return { task, binding, capsule };
+}
+
+function recordedEffectMetadata(harness, effectKey) {
+  const row = harness.app.database.database.prepare(`
+    SELECT * FROM host_executor_effects WHERE effect_key = ?
+  `).get(effectKey);
+  assert.ok(row, "the fixture has an authoritative effect record");
+  return {
+    effectKey: row.effect_key,
+    codexHostId: row.codex_host_id,
+    requestFingerprint: row.request_fingerprint,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 async function postBootstrapClaim(harness, ready, execution, reservationLeaseId) {
@@ -284,6 +300,191 @@ test("a non-capacity RPC rejection becomes uncertain and is never re-dispatched"
     (error) => error?.status === 409 && error?.code === "HOST_EXECUTOR_EFFECT_UNCERTAIN",
   );
   assert.equal(harness.calls.length, 1, "an uncertain mutation is never sent twice");
+});
+
+test("effect inspection recovers recorded completion after the outer execute response is lost", async () => {
+  const harness = await launchHarness({
+    currentTime: Date.parse("2026-09-08T09:48:00.000Z"),
+  });
+  const executor = harness.lifecycle("executor-lost-response");
+  await executor.start();
+  const effectKey = "inspection:lost-response";
+  let expected;
+  let dropped = false;
+  const api = createHostExecutorApi({
+    baseUrl: harness.baseUrl,
+    instanceSecret: harness.secret,
+    fetchImpl: async (url, options) => {
+      const response = await fetch(url, options);
+      if (options.method === "POST") {
+        expected = recordedEffectMetadata(harness, effectKey);
+        assert.equal(expected.status, "completed", "the authority commit precedes response loss");
+        await response.body.cancel();
+        dropped = true;
+        throw new Error("outer execute response lost");
+      }
+      assert.equal(options.cache, "no-store");
+      assert.ok(options.signal instanceof AbortSignal);
+      assert.equal(options.body, undefined);
+      return response;
+    },
+  });
+  await assert.rejects(() => api.executeEffect({
+    effectKey,
+    execution: executor.executionEnvelope(),
+    operations: [{ method: "turn/start", params: { threadId: "synthetic-root" } }],
+  }), /outer execute response lost/);
+  assert.equal(dropped, true);
+  const inspection = await api.inspectEffect({ codexHostId: "local", effectKey });
+  assert.deepEqual(inspection, {
+    found: true,
+    effect: expected,
+    queriedAt: new Date(harness.clock.value).toISOString(),
+    observationOnly: true,
+  });
+  assert.equal(harness.calls.length, 1, "inspection never redispatches the completed effect");
+});
+
+test("effect inspection reports an uncertain record without redispatch", async () => {
+  const harness = await launchHarness({
+    currentTime: Date.parse("2026-09-08T09:48:10.000Z"),
+    requestReady: () => Promise.reject(new CodexAppServerError(
+      "Synthetic uncertain RPC result", null, { definitiveRejection: true },
+    )),
+  });
+  const executor = harness.lifecycle("executor-inspect-uncertain");
+  await executor.start();
+  const effectKey = "inspection:uncertain";
+  await assert.rejects(() => harness.api.executeEffect({
+    effectKey,
+    execution: executor.executionEnvelope(),
+    operations: [{ method: "turn/start", params: { threadId: "synthetic-root" } }],
+  }), (error) => error?.status === 502 && error?.code === "HOST_EXECUTOR_RPC_REJECTED");
+  const expected = recordedEffectMetadata(harness, effectKey);
+  assert.equal(expected.status, "uncertain");
+  assert.deepEqual(await harness.api.inspectEffect({ codexHostId: "local", effectKey }), {
+    found: true,
+    effect: expected,
+    queriedAt: new Date(harness.clock.value).toISOString(),
+    observationOnly: true,
+  });
+  assert.equal(harness.calls.length, 1, "inspection does not retry an uncertain RPC");
+});
+
+test("effect inspection preserves old records and expired leases on found, absent and wrong-host reads", async () => {
+  const harness = await launchHarness({
+    currentTime: Date.parse("2026-09-08T09:48:20.000Z"),
+  });
+  createReadyTask(harness);
+  const executor = harness.lifecycle("executor-inspect-expired");
+  const started = await executor.start();
+  const effectKey = "inspection:retained";
+  await harness.api.executeEffect({
+    effectKey,
+    execution: executor.executionEnvelope(),
+    operations: [{ method: "turn/start", params: { threadId: "synthetic-root" } }],
+  });
+  const expected = recordedEffectMetadata(harness, effectKey);
+  harness.clock.value += 25 * 60 * 60 * 1_000;
+  assert.ok(harness.clock.value > Date.parse(started.lease.expiresAt));
+  const snapshot = () => Object.fromEntries([
+    "tasks", "host_executor_effects", "host_executor_leases",
+    "host_executor_registrations", "host_executor_lease_receipts",
+  ].map((table) => [table, harness.app.database.database.prepare(
+    `SELECT * FROM ${table} ORDER BY rowid`,
+  ).all().map((row) => ({ ...row }))]));
+  const nonceCount = () => harness.app.database.database.prepare(
+    "SELECT COUNT(*) AS count FROM host_executor_proof_nonces",
+  ).get().count;
+  const before = snapshot();
+  const noncesBefore = nonceCount();
+  assert.deepEqual(await harness.api.inspectEffect({ codexHostId: "local", effectKey }), {
+    found: true,
+    effect: expected,
+    queriedAt: new Date(harness.clock.value).toISOString(),
+    observationOnly: true,
+  });
+  for (const input of [
+    { codexHostId: "local", effectKey: "inspection:absent" },
+    { codexHostId: "remote-builder", effectKey },
+  ]) {
+    assert.deepEqual(await harness.api.inspectEffect(input), {
+      found: false,
+      effect: null,
+      queriedAt: new Date(harness.clock.value).toISOString(),
+      observationOnly: true,
+    });
+  }
+  assert.deepEqual(snapshot(), before, "inspection changes no task, effect or lease state");
+  assert.equal(nonceCount(), noncesBefore + 3, "only request-proof nonce bookkeeping changes");
+  assert.equal(harness.calls.length, 1);
+});
+
+test("effect inspection requires fresh proof and exposes only bounded metadata", async () => {
+  const harness = await launchHarness({
+    currentTime: Date.parse("2026-09-08T09:48:30.000Z"),
+  });
+  const executor = harness.lifecycle("executor-inspect-proof");
+  await executor.start();
+  const effectKey = "inspection:protected";
+  await harness.api.executeEffect({
+    effectKey,
+    execution: executor.executionEnvelope(),
+    operations: [{ method: "turn/start", params: { threadId: "synthetic-private-payload" } }],
+  });
+  const pathname = `/api/local/host-executors/local/effects/${encodeURIComponent(effectKey)}`;
+  const get = async (route, headers) => {
+    const response = await fetch(`${harness.baseUrl}${route}`, { headers });
+    return { status: response.status, body: await response.json() };
+  };
+  const missingProof = await get(pathname);
+  assert.deepEqual([missingProof.status, missingProof.body?.error?.code], [403, "INJECTOR_PROOF_REQUIRED"]);
+  const invalidProof = await get(pathname, {
+    ...signedHeaders(harness.secret, pathname, null, 901, "GET"),
+    "x-codex-taskboard-injector-proof": "0".repeat(64),
+  });
+  assert.deepEqual([invalidProof.status, invalidProof.body?.error?.code], [403, "INJECTOR_PROOF_REQUIRED"]);
+  const headers = signedHeaders(harness.secret, pathname, null, 902, "GET");
+  const fresh = await get(pathname, headers);
+  assert.equal(fresh.status, 200);
+  assert.deepEqual(Object.keys(fresh.body).sort(), ["effect", "found", "observationOnly", "queriedAt"]);
+  assert.deepEqual(Object.keys(fresh.body.effect).sort(), [
+    "codexHostId", "createdAt", "effectKey", "requestFingerprint", "status", "updatedAt",
+  ]);
+  assert.deepEqual(fresh.body.effect, recordedEffectMetadata(harness, effectKey));
+  const replay = await get(pathname, headers);
+  assert.deepEqual([replay.status, replay.body?.error?.code], [403, "INJECTOR_PROOF_REQUIRED"]);
+
+  let sequence = 903;
+  for (const [route, code] of [
+    ["/api/local/host-executors/%20bad-host/effects/key", "INVALID_FIELD"],
+    ["/api/local/host-executors/local/effects/%20invalid", "INVALID_FIELD"],
+    [`${pathname}?unexpected=1`, "UNKNOWN_QUERY_PARAMETER"],
+  ]) {
+    const rejected = await get(route, signedHeaders(harness.secret, route, null, sequence++, "GET"));
+    assert.deepEqual([rejected.status, rejected.body?.error?.code], [400, code]);
+  }
+  const requestBody = JSON.stringify({ notSignedAsNull: true });
+  const bodyResponse = await new Promise((resolve, reject) => {
+    const request = createHttpRequest(`${harness.baseUrl}${pathname}`, {
+      method: "GET",
+      headers: {
+        ...signedHeaders(harness.secret, pathname, null, sequence++, "GET"),
+        "content-length": Buffer.byteLength(requestBody),
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+      }));
+    });
+    request.on("error", reject);
+    request.end(requestBody);
+  });
+  assert.deepEqual([bodyResponse.status, bodyResponse.body?.error?.code], [400, "INVALID_BODY"]);
+  assert.equal(harness.calls.length, 1);
 });
 
 test("an unfenced resident HTTP mutation fails closed before the first registration", async () => {
