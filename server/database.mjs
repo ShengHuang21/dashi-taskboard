@@ -10117,6 +10117,7 @@ export class TaskboardDatabase {
       attachments: this.listAttachments(task.id),
       inboxReceipts: this.listTaskInboxDeliveryReceipts(task.id),
       coordinationEvents: this.listTaskCoordinationEvents(task.id),
+      clarifications: this.getTaskClarificationMetadata(task.id),
       currentClaim: this.getAgentTaskClaim(task.id),
       currentRun: this.getOpenTaskAgentRun(task.id),
       latestRun: this.getLatestTaskAgentRun(task.id),
@@ -13136,6 +13137,203 @@ export class TaskboardDatabase {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  #getClarificationRequest(canonicalRequestId) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE json_extract(envelope_json, '$.eventType') = 'clarification_request'
+        AND json_extract(envelope_json, '$.canonicalRequestId') = ?
+    `).get(canonicalRequestId);
+    if (!row) {
+      throw new ApiError(404, "CLARIFICATION_NOT_FOUND", "The canonical clarification request is not retained");
+    }
+    return JSON.parse(row.envelope_json);
+  }
+
+  #getClarificationResolution(canonicalRequestId) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE json_extract(envelope_json, '$.eventType') = 'clarification_resolution'
+        AND json_extract(envelope_json, '$.canonicalRequestId') = ?
+    `).get(canonicalRequestId);
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  #clarificationView(request) {
+    const resolution = this.#getClarificationResolution(request.canonicalRequestId);
+    const latestPublicationEventId = this.#getResultHandoffEvent(
+      request.producerTaskId, request.consumerTaskId, "result_publication",
+    )?.eventId ?? null;
+    const relevance = request.basisPublicationEventId === null && latestPublicationEventId === null
+      ? "no_published_basis"
+      : request.basisPublicationEventId === latestPublicationEventId ? "current" : "needs_reconfirmation";
+    return {
+      canonicalRequestId: request.canonicalRequestId,
+      request,
+      resolution,
+      status: resolution ? "handled" : "queued",
+      basisPublicationEventId: request.basisPublicationEventId,
+      latestPublicationEventId,
+      relevance,
+    };
+  }
+
+  #clarificationReplay(taskId, input, requestSha256, eventTypes) {
+    const rows = this.#prepare(`
+      SELECT * FROM agent_event_receipts
+      WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+    `).all(input.eventId, taskId, input.idempotencyKey);
+    if (rows.length === 0) return null;
+    const event = rows[0].envelope_json ? JSON.parse(rows[0].envelope_json) : null;
+    if (rows.length !== 1 || rows[0].task_id !== taskId
+      || !eventTypes.includes(event?.eventType) || event.requestSha256 !== requestSha256) {
+      throw new ApiError(409, "CLARIFICATION_CONFLICT", "The event or idempotency key is already bound to another request");
+    }
+    return event;
+  }
+
+  #insertClarificationReceipt(task, event) {
+    this.#prepare(`
+      INSERT INTO agent_event_receipts (
+        event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+    `).run(event.eventId, task.projectId, task.id, event.idempotencyKey, JSON.stringify(event), event.createdAt);
+  }
+
+  enqueueTaskClarification(producerTaskId, consumerTaskId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { producer, consumer } = this.#requireResultHandoffPair(producerTaskId, consumerTaskId);
+      if (!consumer.threadBinding || consumer.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "CLARIFICATION_SENDER_MISMATCH", "Enqueue requires the consumer task's current bound Root");
+      }
+      const logical = {
+        producerTaskId: producer.id, consumerTaskId: consumer.id,
+        basisPublicationEventId: input.basisPublicationEventId,
+        question: input.question, evidenceRefs: input.evidenceRefs,
+      };
+      const request = { ...input, ...logical };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const replay = this.#clarificationReplay(
+        consumer.id, input, requestSha256, ["clarification_request", "clarification_alias"],
+      );
+      if (replay) {
+        const result = this.#clarificationView(this.#getClarificationRequest(replay.canonicalRequestId));
+        this.database.exec("COMMIT");
+        return { applied: false, receipt: replay, ...result };
+      }
+      if (input.basisPublicationEventId !== null && !this.#getResultHandoffEvent(
+        producer.id, consumer.id, "result_publication", input.basisPublicationEventId,
+      )) {
+        throw new ApiError(404, "RESULT_PUBLICATION_NOT_FOUND", "The basis publication is not retained for this task pair");
+      }
+      const logicalSha256 = createHash("sha256").update(JSON.stringify(logical)).digest("hex");
+      const existing = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'clarification_request'
+          AND json_extract(envelope_json, '$.logicalSha256') = ?
+      `).get(consumer.id, logicalSha256);
+      const canonical = existing ? JSON.parse(existing.envelope_json) : null;
+      const receipt = {
+        ...request,
+        eventType: canonical ? "clarification_alias" : "clarification_request",
+        canonicalRequestId: canonical?.canonicalRequestId ?? randomUUID(),
+        logicalSha256, requestSha256, createdAt: now(),
+      };
+      this.#insertClarificationReceipt(consumer, receipt);
+      const result = this.#clarificationView(canonical ?? receipt);
+      this.database.exec("COMMIT");
+      return { applied: true, receipt, ...result };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  resolveTaskClarification(canonicalRequestId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const request = this.#getClarificationRequest(canonicalRequestId);
+      const { producer, consumer } = this.#requireResultHandoffPair(request.producerTaskId, request.consumerTaskId);
+      if (!producer.threadBinding || producer.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "CLARIFICATION_SENDER_MISMATCH", "Resolve requires the producer task's current bound Root");
+      }
+      const delivery = {
+        ...input, canonicalRequestId, producerTaskId: producer.id, consumerTaskId: consumer.id,
+      };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(delivery)).digest("hex");
+      const replay = this.#clarificationReplay(producer.id, input, requestSha256, ["clarification_resolution"]);
+      if (replay) {
+        const result = this.#clarificationView(request);
+        this.database.exec("COMMIT");
+        return { applied: false, receipt: replay, ...result };
+      }
+      const current = this.#clarificationView(request);
+      if (current.resolution) {
+        throw new ApiError(409, "CLARIFICATION_ALREADY_HANDLED", "A clarification has one immutable terminal resolution");
+      }
+      if (input.observedLatestPublicationEventId !== current.latestPublicationEventId) {
+        throw new ApiError(409, "CLARIFICATION_PUBLICATION_CONFLICT", "Read the latest publication before resolving", {
+          latestPublicationEventId: current.latestPublicationEventId,
+        });
+      }
+      if (input.outcome === "answered" && current.relevance === "needs_reconfirmation") {
+        throw new ApiError(409, "CLARIFICATION_RECONFIRMATION_REQUIRED", "A stale request must be explicitly handled as needs_reconfirmation");
+      }
+      const receipt = { ...delivery, eventType: "clarification_resolution", requestSha256, createdAt: now() };
+      this.#insertClarificationReceipt(producer, receipt);
+      this.database.exec("COMMIT");
+      return { applied: true, receipt, ...current, resolution: receipt, status: "handled" };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listTaskClarifications(taskId) {
+    this.database.exec("BEGIN");
+    try {
+      const task = this.#requireTask(taskId);
+      const requests = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE json_extract(envelope_json, '$.eventType') = 'clarification_request'
+          AND (json_extract(envelope_json, '$.producerTaskId') = ?
+            OR json_extract(envelope_json, '$.consumerTaskId') = ?)
+        ORDER BY rowid
+      `).all(task.id, task.id).map((row) => JSON.parse(row.envelope_json));
+      const clarifications = requests.map((request) => ({
+        ...this.#clarificationView(request),
+        incoming: request.producerTaskId === task.id,
+        outgoing: request.consumerTaskId === task.id,
+      }));
+      const result = { taskId: task.id, clarifications, queriedAt: now() };
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskClarificationMetadata(taskId) {
+    // Capsule callers may already hold a claim/safe-action transaction. This is one read only.
+    const counts = this.#prepare(`
+      SELECT
+        COALESCE(SUM(json_extract(request.envelope_json, '$.producerTaskId') = ?), 0) AS incomingPendingCount,
+        COALESCE(SUM(json_extract(request.envelope_json, '$.consumerTaskId') = ?), 0) AS outgoingPendingCount
+      FROM agent_event_receipts AS request
+      WHERE json_extract(request.envelope_json, '$.eventType') = 'clarification_request'
+        AND (json_extract(request.envelope_json, '$.producerTaskId') = ?
+          OR json_extract(request.envelope_json, '$.consumerTaskId') = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_event_receipts AS resolution
+          WHERE json_extract(resolution.envelope_json, '$.eventType') = 'clarification_resolution'
+            AND json_extract(resolution.envelope_json, '$.canonicalRequestId')
+              = json_extract(request.envelope_json, '$.canonicalRequestId')
+        )
+    `).get(taskId, taskId, taskId, taskId);
+    return { ...counts, readInstruction: `taskctl clarification list ${taskId} --json` };
   }
 
   appendTaskCoordinationEvent(taskId, envelope, actor) {

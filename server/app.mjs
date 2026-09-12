@@ -2446,6 +2446,51 @@ function parseResultHandoff(body, { adoption = false } = {}) {
   return { ...input, content: body.content, evidenceRefs };
 }
 
+function parseClarification(body, { resolving = false } = {}) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set([
+    "eventId", "idempotencyKey", "senderThreadId",
+    ...(resolving
+      ? ["observedLatestPublicationEventId", "outcome", "result", "safeBoundary"]
+      : ["basisPublicationEventId", "question", "evidenceRefs"]),
+  ]));
+  // Validate without rewriting bound text: whitespace and reference order are significant.
+  const exactText = (value, name, maxBytes) => {
+    if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value, "utf8") > maxBytes) {
+      throw new ApiError(400, "INVALID_FIELD", `'${name}' must be nonblank text of at most ${maxBytes} UTF-8 bytes`);
+    }
+    return value;
+  };
+  const publicationField = resolving ? "observedLatestPublicationEventId" : "basisPublicationEventId";
+  if (!Object.hasOwn(body, publicationField)) {
+    throw new ApiError(400, "INVALID_FIELD", `'${publicationField}' must be an explicit publication id or null`);
+  }
+  const input = {
+    eventId: exactText(body.eventId, "eventId", 256),
+    idempotencyKey: exactText(body.idempotencyKey, "idempotencyKey", 256),
+    senderThreadId: exactText(body.senderThreadId, "senderThreadId", 256),
+    [publicationField]: body[publicationField] === null ? null : exactText(body[publicationField], publicationField, 256),
+  };
+  if (resolving) {
+    if (!["answered", "needs_reconfirmation"].includes(body.outcome)) {
+      throw new ApiError(400, "INVALID_FIELD", "'outcome' must be answered or needs_reconfirmation");
+    }
+    return {
+      ...input, outcome: body.outcome,
+      result: exactText(body.result, "result", 65_536),
+      safeBoundary: exactText(body.safeBoundary, "safeBoundary", 2_000),
+    };
+  }
+  if (!Array.isArray(body.evidenceRefs) || body.evidenceRefs.length > 32) {
+    throw new ApiError(400, "INVALID_FIELD", "'evidenceRefs' must be an ordered array of at most 32 references");
+  }
+  return {
+    ...input,
+    question: exactText(body.question, "question", 65_536),
+    evidenceRefs: body.evidenceRefs.map((reference) => exactText(reference, "evidenceRefs", 2048)),
+  };
+}
+
 function parseCoordinationEnvelope(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
@@ -6439,6 +6484,33 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, result.applied ? 201 : 200, result);
         }
         return methodNotAllowed(response, adoption ? ["POST"] : ["GET", "POST"]);
+      }
+
+      const clarificationListRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/clarifications$/);
+      if (clarificationListRoute) {
+        assertNoQuery(url.searchParams, "GET clarification list");
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        return sendJson(response, 200, database.listTaskClarifications(
+          decodeRouteSegment(clarificationListRoute[1], "Task id"),
+        ));
+      }
+
+      const clarificationEnqueueRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/clarifications\/([^/]+)$/);
+      const clarificationResolveRoute = pathname.match(/^\/api\/local\/clarifications\/([^/]+)\/resolution$/);
+      if (clarificationEnqueueRoute || clarificationResolveRoute) {
+        assertNoQuery(url.searchParams, "POST clarification");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if (request.headers["x-taskboard-client"] !== "taskctl") {
+          throw new ApiError(403, "TASKCTL_REQUIRED", "Clarification writes require protected taskctl");
+        }
+        const input = parseClarification(await readJson(request), { resolving: Boolean(clarificationResolveRoute) });
+        const result = clarificationResolveRoute
+          ? database.resolveTaskClarification(decodeRouteSegment(clarificationResolveRoute[1], "Canonical request id"), input)
+          : database.enqueueTaskClarification(
+            decodeRouteSegment(clarificationEnqueueRoute[1], "Producer task id"),
+            decodeRouteSegment(clarificationEnqueueRoute[2], "Consumer task id"), input,
+          );
+        return sendJson(response, result.applied ? 201 : 200, result);
       }
 
       const taskCoordinationEventsRoute = pathname.match(/^\/api\/tasks\/([^/]+)\/coordination-events$/);
