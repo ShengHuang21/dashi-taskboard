@@ -748,6 +748,7 @@ export function App() {
   const [executionSnapshot, setExecutionSnapshot] = useState<AgentLaneSnapshot | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [hasLoadedTasks, setHasLoadedTasks] = useState(false);
+  const [loadedTasksScopeProjectId, setLoadedTasksScopeProjectId] = useState<string | null>(null);
   const [projectLoadError, setProjectLoadError] = useState<ProjectLoadError | null>(null);
   const [tasksLoadError, setTasksLoadError] = useState<TasksLoadError | null>(null);
   const loadError: LoadError | null = projectLoadError ?? tasksLoadError;
@@ -1999,6 +2000,7 @@ export function App() {
       if (requestId !== tasksRequestRef.current) return;
       setTasks(sortTasks(nextTasks));
       setArchivedTasks(sortTasks(nextArchivedTasks));
+      setLoadedTasksScopeProjectId(projectId);
       setProjects((current) => current.map((project) => {
         if (project.id !== projectId || project.source !== "jira") return project;
         const labels = [...new Set(nextTasks.flatMap((task) => task.labels))];
@@ -2024,6 +2026,7 @@ export function App() {
       setTasks([]);
       setArchivedTasks([]);
       setHasLoadedTasks(false);
+      setLoadedTasksScopeProjectId(null);
       return;
     }
     setHasLoadedTasks(false);
@@ -2317,6 +2320,10 @@ export function App() {
       ? hostContext.threadId ?? null
       : null;
     const taskThreadId = normalizeCodexThreadId(task.threadId);
+    const executionSnapshotMatches = executionSnapshot?.projectId === executionProjectId
+      && executionSnapshot.projectId === task.projectId;
+    const executionObservationAvailable = projects.find((project) => project.id === task.projectId)?.agentLanesConfigured === false
+      || executionSnapshotMatches;
     return [task.id, taskCardPresentation(
       task,
       aiThreads,
@@ -2324,9 +2331,10 @@ export function App() {
       runningNativeThreadId,
       hostContext?.threadTodoProgress ?? null,
       taskThreadId ? codexThreadProgress[taskThreadId] ?? null : undefined,
-      executionSnapshot?.projectId === executionProjectId && executionSnapshot.projectId === task.projectId
+      executionSnapshotMatches
         ? executionSnapshot.todos.find((todo) => todo.taskId === task.id) ?? null
         : null,
+      executionObservationAvailable,
     )];
   })) as Record<string, TaskCardPresentation>, [
     aiThreads,
@@ -2336,6 +2344,7 @@ export function App() {
     hostContext?.threadId,
     hostContext?.threadRunning,
     hostContext?.threadTodoProgress,
+    projects,
     readActivityKeys,
     referenceTasks,
   ]);
@@ -3802,15 +3811,23 @@ export function App() {
             onError={setActionError}
           />
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
-          <OwnerGoalsView
-            key={selectedProjectId}
-            scrollRef={ownerGoalsRef}
-            projectName={isAllProjects ? null : headerProjectName}
-            referenceTasks={referenceTasks}
-            presentations={taskPresentations}
-            onOpenTask={openTaskDetail}
-            onOpenAgentDetails={() => selectBoardView("issues")}
-          />
+          hasLoadedTasks && loadedTasksScopeProjectId === taskScopeProjectId ? (
+            <OwnerGoalsView
+              key={selectedProjectId}
+              scrollRef={ownerGoalsRef}
+              projectName={isAllProjects ? null : headerProjectName}
+              referenceTasks={referenceTasks}
+              presentations={taskPresentations}
+              onOpenTask={openTaskDetail}
+              onOpenAgentDetails={() => selectBoardView("issues")}
+            />
+          ) : (
+            <div className="page-empty" role="status" aria-busy={tasksLoading}>
+              <p>{tasksLoadError && !tasksLoading
+                ? text("未能读取这个项目的任务，请点击上方重试。", "Could not load this project's tasks. Please retry above.")
+                : text("正在读取任务…", "Loading tasks…")}</p>
+            </div>
+          )
         ) : boardView === "list" ? (
           <IssueListView
             scrollRef={issueListRef}

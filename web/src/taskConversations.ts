@@ -47,6 +47,7 @@ function taskExecutionState(
   processing: TaskProcessingPresentation,
   aiThreads: AiChatThread[],
   todo: CoordinationTodoSnapshot | null,
+  executionObservationAvailable: boolean,
 ): TaskExecutionState {
   if (task.status === "done") return "completed";
   if (task.status === "canceled") return "canceled";
@@ -72,6 +73,7 @@ function taskExecutionState(
   if (latestRun?.status === "interrupted") return "interrupted";
   if (todo?.state === "ready" && todo.readyWork.eligible) return "awaiting_claim";
   if (task.status === "blocked") return "blocked";
+  if (!executionObservationAvailable && (task.status === "todo" || task.status === "in_progress")) return "uncertain";
   if (task.status === "in_progress") return "not_running";
   return task.status === "backlog" ? "not_planned" : "not_started";
 }
@@ -212,6 +214,7 @@ export function taskCardPresentation(
     running: boolean;
   } | null | undefined = undefined,
   coordinationTodo: CoordinationTodoSnapshot | null = null,
+  executionObservationAvailable = true,
 ): TaskCardPresentation {
   const conversations = taskConversations(task, aiThreads);
   const runningAi = conversations
@@ -250,6 +253,6 @@ export function taskCardPresentation(
     unread,
     processing,
     execution: taskExecutionState(task, processing, aiThreads,
-      coordinationTodo?.taskId === task.id ? coordinationTodo : null),
+      coordinationTodo?.taskId === task.id ? coordinationTodo : null, executionObservationAvailable),
   };
 }
