@@ -4472,6 +4472,14 @@ export class TaskboardDatabase {
           SET status = 'completed', result_json = ?, updated_at = ?
           WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
         `).run(resultJson, timestamp, effectKey, dispatchToken);
+        this.database.exec("SAVEPOINT continuation_effect_origin");
+        try {
+          this.#recordContinuationEffectOrigins(row, result, timestamp);
+          this.database.exec("RELEASE continuation_effect_origin");
+        } catch {
+          // Observation failure must not turn an already-successful native RPC into an uncertain effect.
+          this.database.exec("ROLLBACK TO continuation_effect_origin; RELEASE continuation_effect_origin");
+        }
       } else if (row.result_json !== resultJson) {
         throw new ApiError(
           409,
@@ -4487,6 +4495,44 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    }
+  }
+
+  #recordContinuationEffectOrigins(effect, results, recordedAt) {
+    if (effect.codex_host_id !== "local" || effect.adapter_id !== LOCAL_HOST_EXECUTOR_ADAPTER_ID) return;
+    const operations = JSON.parse(effect.operations_json);
+    if (!Array.isArray(operations) || operations.length !== 1 || operations[0]?.method !== "turn/start"
+      || !Array.isArray(results) || results.length !== 1) return;
+    const threadId = hostExecutorIdentifier(operations[0].params?.threadId, "threadId");
+    const turnId = hostExecutorIdentifier(results[0]?.turn?.id, "turnId");
+    const source = "taskboard-local-host-effect-completion";
+    const enrolled = this.#prepare(`
+      SELECT tasks.id FROM tasks
+      WHERE thread_id = ? AND thread_codex_host_id = 'local'
+        AND EXISTS (
+          SELECT 1 FROM agent_event_receipts
+          WHERE task_id = tasks.id AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+        )
+    `).all(threadId);
+    for (const { id } of enrolled) {
+      const context = this.#taskContinuationContext(id);
+      const binding = context.capsule.execution.threadBinding;
+      if (!binding || binding.codexHostId !== "local" || binding.threadId !== threadId) continue;
+      const projectId = context.capsule.task.projectId;
+      const eventId = `continuation-effect-origin:v1:${createHash("sha256").update(JSON.stringify([
+        source, id, projectId, "local", effect.effect_key, effect.request_fingerprint,
+        effect.dispatch_token, 0, threadId, turnId,
+      ])).digest("hex")}`;
+      if (this.#prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) continue;
+      const event = {
+        eventId, eventType: "continuation_effect_origin", taskId: id, projectId, source, codexHostId: "local",
+        threadId, turnId, effectKey: effect.effect_key, requestFingerprint: effect.request_fingerprint,
+        operationIndex: 0, continuationRecordId: context.record.eventId, bindingAtObservation: binding, recordedAt,
+      };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+        VALUES (?, ?, ?, NULL, ?, ?)
+      `).run(eventId, projectId, id, JSON.stringify(event), recordedAt);
     }
   }
 
@@ -10164,8 +10210,18 @@ export class TaskboardDatabase {
         WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_owned_terminal'
         ORDER BY rowid DESC LIMIT 1
       `).get(context.capsule.task.id);
+      const terminalCheckpoint = row ? JSON.parse(row.envelope_json) : null;
+      const terminalEffectOrigins = terminalCheckpoint ? this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_effect_origin'
+          AND json_extract(envelope_json, '$.codexHostId') = 'local'
+          AND json_extract(envelope_json, '$.threadId') = ?
+          AND json_extract(envelope_json, '$.turnId') = ?
+        ORDER BY rowid
+      `).all(context.capsule.task.id, terminalCheckpoint.threadId, terminalCheckpoint.turnId)
+        .map((origin) => JSON.parse(origin.envelope_json)) : [];
       const result = assessTaskContinuation({
-        ...context, terminalCheckpoint: row ? JSON.parse(row.envelope_json) : null,
+        ...context, terminalCheckpoint, terminalEffectOrigins,
       });
       this.database.exec("COMMIT");
       return result;

@@ -358,6 +358,205 @@ function stateOutsideEventReceipts(harness) {
       .update(JSON.stringify(db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all())).digest("hex")]));
 }
 
+function effectOriginRows(harness) {
+  return harness.app.database.database.prepare(`
+    SELECT envelope_json FROM agent_event_receipts
+    WHERE json_extract(envelope_json, '$.eventType') = 'continuation_effect_origin' ORDER BY rowid
+  `).all().map((row) => JSON.parse(row.envelope_json));
+}
+
+test("effect terminal D1: protected execute joins both notification orders with exactly the recorded origin fields", async () => {
+  for (const terminalFirst of [false, true]) {
+    const subscription = terminalSubscription();
+    const turnId = terminalFirst ? "terminal-before-response" : "response-before-terminal";
+    const harness = await launchHarness({ subscribe: subscription.subscribe, requestReady() {
+      if (terminalFirst) subscription.emit(terminalNotification(turnId));
+      return Promise.resolve({ turn: { id: turnId, status: "inProgress", output: "private-result" } });
+    } });
+    const ready = createReadyTask(harness);
+    const agreement = enrollTerminalTask(harness, ready);
+    const executor = harness.lifecycle("origin-executor");
+    await executor.start();
+    const operations = [{ method: "turn/start", params: { threadId: ready.binding.threadId, input: "private-prompt" } }];
+    const response = await postEffect(harness.baseUrl, harness.secret, "origin-order", executor.executionEnvelope(), operations, 801);
+    assert.equal(response.status, 200, JSON.stringify(response.body));
+    assert.equal(response.body.effect.status, "completed");
+    assert.equal(response.body.results[0].turn.id, turnId);
+    const beforeObservation = stateOutsideEventReceipts(harness);
+    if (!terminalFirst) subscription.emit(terminalNotification(turnId));
+    const assessmentResponse = await fetch(`${harness.baseUrl}/api/local/tasks/${ready.task.id}/continuation`);
+    const assessment = await assessmentResponse.json();
+    assert.equal(assessmentResponse.status, 200);
+    assert.equal(assessment.recordedTerminalEffectOrigin.status, "matched");
+    const origin = assessment.recordedTerminalEffectOrigin.origin;
+    assert.deepEqual(Object.keys(origin).sort(), [
+      "eventId", "eventType", "taskId", "projectId", "source", "codexHostId", "threadId", "turnId", "effectKey",
+      "requestFingerprint", "operationIndex", "continuationRecordId", "bindingAtObservation", "recordedAt",
+    ].sort());
+    assert.equal(origin.eventType, "continuation_effect_origin");
+    assert.equal(origin.source, "taskboard-local-host-effect-completion");
+    assert.equal(origin.operationIndex, 0);
+    assert.equal(origin.turnId, turnId);
+    assert.equal(origin.effectKey, "origin-order");
+    assert.equal(origin.continuationRecordId, agreement.eventId);
+    assert.deepEqual(origin.bindingAtObservation, ready.binding);
+    const row = harness.app.database.database.prepare("SELECT * FROM host_executor_effects WHERE effect_key = ?").get(origin.effectKey);
+    assert.equal(origin.requestFingerprint, row.request_fingerprint);
+    assert.equal(JSON.stringify(origin).includes(row.dispatch_token), false);
+    assert.equal(JSON.stringify(origin).includes("private-"), false);
+    assert.ok(Number.isFinite(Date.parse(origin.recordedAt)));
+    assert.deepEqual(assessment.recordedTerminalCheckpoint.turnId, turnId);
+    assert.equal(assessment.liveExecution, "unknown");
+    assert.equal(assessment.eligibleForDispatch, false);
+    assert.deepEqual(stateOutsideEventReceipts(harness), beforeObservation);
+    assert.equal(harness.calls.length, 1);
+  }
+});
+
+test("effect terminal D2: completed replay never backfills enrollment or reattributes changed agreement and binding", async () => {
+  const subscription = terminalSubscription();
+  const harness = await launchHarness({ subscribe: subscription.subscribe });
+  const ready = createReadyTask(harness);
+  enrollTerminalTask(harness, ready);
+  const executor = harness.lifecycle("origin-replay-executor");
+  await executor.start();
+  const execution = executor.executionEnvelope();
+  const operations = [{ method: "turn/start", params: { threadId: ready.binding.threadId } }];
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "origin-replay", execution, operations, 811)).status, 200);
+  const first = effectOriginRows(harness);
+  const laterEnrolled = createReadyTask(harness);
+  enrollTerminalTask(harness, laterEnrolled);
+  const replay = await postEffect(harness.baseUrl, harness.secret, "origin-replay", execution, operations, 812);
+  assert.equal(replay.body.replayed, true);
+  assert.equal(harness.calls.length, 1);
+  assert.deepEqual(effectOriginRows(harness), first);
+  enrollTerminalTask(harness, ready, "changed-agreement");
+  subscription.emit(terminalNotification("turn-1"));
+  assert.deepEqual(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalEffectOrigin,
+    { status: "unavailable", origin: null });
+  assert.deepEqual(harness.app.database.getTaskContinuation(laterEnrolled.task.id).recordedTerminalEffectOrigin,
+    { status: "unavailable", origin: null });
+
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "origin-binding", execution, operations, 813)).status, 200);
+  const captured = effectOriginRows(harness);
+  const current = harness.app.database.getTask(ready.task.id);
+  harness.app.database.updateTask(current.id, current.version, {}, undefined,
+    { ...ready.binding, workspacePath: `${harness.worktreePath}-new` });
+  subscription.emit(terminalNotification("turn-2"));
+  const changed = harness.app.database.getTaskContinuation(ready.task.id);
+  assert.equal(changed.recordedTerminalCheckpoint.turnId, "turn-2");
+  assert.deepEqual(changed.recordedTerminalEffectOrigin, { status: "unavailable", origin: null });
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "origin-binding", execution, operations, 814)).body.replayed, true);
+  assert.deepEqual(effectOriginRows(harness), captured);
+  assert.equal(harness.calls.length, 2);
+});
+
+test("effect terminal D3: receipts survive pruning and key reuse is a distinct ambiguous dispatch generation", async () => {
+  const subscription = terminalSubscription();
+  const initialTime = Date.parse("2026-09-12T12:00:00Z");
+  const requestReady = () => Promise.resolve({ turn: { id: "shared-native-turn" } });
+  let harness = await launchHarness({ currentTime: initialTime, subscribe: subscription.subscribe, requestReady });
+  const ready = createReadyTask(harness);
+  enrollTerminalTask(harness, ready);
+  let executor = harness.lifecycle("origin-generation-a");
+  await executor.start();
+  const operations = [{ method: "turn/start", params: { threadId: ready.binding.threadId } }];
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "reusable-origin-key", executor.executionEnvelope(), operations, 821)).status, 200);
+  const first = effectOriginRows(harness)[0];
+  await harness.app.close();
+  running.find((entry) => entry.app === harness.app).closed = true;
+  harness = await launchHarness({
+    currentTime: initialTime + 24 * 60 * 60 * 1_000 + 1,
+    subscribe: subscription.subscribe, requestReady, reopenDirectory: harness.directory,
+  });
+  assert.deepEqual(effectOriginRows(harness), [first]);
+  assert.equal(harness.app.database.database.prepare("SELECT COUNT(*) AS count FROM host_executor_effects").get().count, 0);
+  const replacement = enrollTerminalTask(harness, ready, "new-generation-agreement");
+  executor = harness.lifecycle("origin-generation-b");
+  await executor.start();
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "reusable-origin-key", executor.executionEnvelope(), operations, 822)).status, 200);
+  const origins = effectOriginRows(harness);
+  assert.equal(origins.length, 2);
+  assert.notEqual(origins[1].eventId, first.eventId);
+  assert.equal(origins[1].effectKey, first.effectKey);
+  assert.equal(origins[1].requestFingerprint, first.requestFingerprint);
+  assert.equal(origins[1].continuationRecordId, replacement.eventId);
+  subscription.emit(terminalNotification("shared-native-turn"));
+  const assessment = harness.app.database.getTaskContinuation(ready.task.id);
+  assert.equal(assessment.recordedTerminalCheckpoint.continuationRecordId, replacement.eventId);
+  assert.deepEqual(assessment.recordedTerminalEffectOrigin, { status: "ambiguous", origin: null },
+    "an older-context generation must not be hidden before counting origins");
+  subscription.emit(terminalNotification("newer-unmatched-terminal"));
+  assert.deepEqual(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalEffectOrigin,
+    { status: "unavailable", origin: null }, "do not fall back to the older correlated terminal");
+});
+
+test("effect terminal D4: optional receipt failure preserves successful effect and excluded inputs remain unavailable", async () => {
+  const subscription = terminalSubscription();
+  let rpcResult = { turn: { id: "capture-fails" } };
+  const harness = await launchHarness({ subscribe: subscription.subscribe, requestReady: () => Promise.resolve(rpcResult) });
+  const db = harness.app.database;
+  const ready = createReadyTask(harness);
+  enrollTerminalTask(harness, ready);
+  const executor = harness.lifecycle("origin-failure-executor");
+  await executor.start();
+  const execution = executor.executionEnvelope();
+  const operation = { method: "turn/start", params: { threadId: ready.binding.threadId } };
+  db.database.exec(`CREATE TEMP TRIGGER fail_origin_receipt BEFORE INSERT ON agent_event_receipts
+    WHEN json_extract(NEW.envelope_json, '$.eventType') = 'continuation_effect_origin'
+    BEGIN SELECT RAISE(ABORT, 'synthetic optional-origin failure'); END`);
+  const response = await postEffect(harness.baseUrl, harness.secret, "origin-insert-abort", execution, [operation], 831);
+  assert.equal(response.status, 200, JSON.stringify(response.body));
+  assert.equal(response.body.effect.status, "completed");
+  assert.deepEqual(response.body.results, [rpcResult]);
+  db.database.exec("DROP TRIGGER fail_origin_receipt");
+  subscription.emit(terminalNotification("capture-fails"));
+  assert.deepEqual(db.getTaskContinuation(ready.task.id).recordedTerminalEffectOrigin, { status: "unavailable", origin: null });
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "origin-insert-abort", execution, [operation], 832)).body.replayed, true);
+  assert.equal(harness.calls.length, 1, "capture failure does not retry a successful native effect");
+  let sequence = 833;
+  for (const [operations, result] of [
+    [[{ method: "thread/resume", params: { threadId: ready.binding.threadId } }], { turn: { id: "other-method" } }],
+    [[operation, operation], { turn: { id: "batch" } }],
+    [[{ method: "turn/start", params: {} }], { turn: { id: "missing-thread" } }],
+    [[operation], {}],
+    [[operation], { turn: { id: " invalid " } }],
+    [[{ method: "turn/start", params: { threadId: "not-enrolled" } }], { turn: { id: "not-enrolled" } }],
+  ]) {
+    rpcResult = result;
+    const resultResponse = await postEffect(harness.baseUrl, harness.secret, `excluded-${sequence}`, execution, operations, sequence++);
+    assert.equal(resultResponse.status, 200, JSON.stringify(resultResponse.body));
+    assert.equal(resultResponse.body.effect.status, "completed");
+  }
+  const incomplete = createReadyTask(harness);
+  const incompleteBinding = { ...incomplete.binding, threadId: "incomplete-origin-thread" };
+  db.updateTask(incomplete.task.id, incomplete.task.version, {}, undefined, incompleteBinding);
+  enrollTerminalTask(harness, incomplete);
+  const incompleteCurrent = db.getTask(incomplete.task.id);
+  db.updateTask(incompleteCurrent.id, incompleteCurrent.version, {}, undefined, { ...incompleteBinding, workspacePath: null });
+  rpcResult = { turn: { id: "incomplete-origin-turn" } };
+  assert.equal((await postEffect(harness.baseUrl, harness.secret, "excluded-incomplete-binding", execution,
+    [{ method: "turn/start", params: { threadId: incompleteBinding.threadId } }], sequence++)).status, 200);
+  const remoteRegistration = db.registerHostExecutor({ codexHostId: "remote-synthetic", executorInstanceId: "origin-remote",
+    adapterId: "codex-renderer-rpc-v1", capabilities: ["turn/start"], idempotencyKey: "remote-registration" }).registration;
+  const remoteLease = db.acquireHostExecutorLease({ codexHostId: "remote-synthetic", executorInstanceId: "origin-remote",
+    registrationFingerprint: remoteRegistration.fingerprint, idempotencyKey: "remote-acquire", expectedLeaseId: null,
+    leaseDurationSeconds: 30 }).lease;
+  const remoteInput = { effectKey: "excluded-remote", operations: [operation], execution: {
+    codexHostId: "remote-synthetic", executorInstanceId: "origin-remote", registrationFingerprint: remoteRegistration.fingerprint,
+    leaseId: remoteLease.id,
+  } };
+  db.reserveHostExecutorEffect(remoteInput);
+  const remoteDispatch = db.beginHostExecutorEffectDispatch(remoteInput);
+  assert.equal(db.completeHostExecutorEffect(remoteInput.effectKey, remoteDispatch.dispatchToken, [{ turn: { id: "remote-turn" } }]).status, "completed");
+  const scrubbedInput = { effectKey: "excluded-scrubbed", execution, operations: [operation] };
+  db.reserveHostExecutorEffect(scrubbedInput);
+  const scrubbedDispatch = db.beginHostExecutorEffectDispatch(scrubbedInput);
+  harness.clock.value += 24 * 60 * 60 * 1_000 + 1;
+  assert.equal(db.completeHostExecutorEffect(scrubbedInput.effectKey, scrubbedDispatch.dispatchToken, [{ turn: { id: "scrubbed-turn" } }]).status, "completed");
+  assert.deepEqual(effectOriginRows(harness), []);
+});
+
 test("owned terminal D1: default adapter notification is a whitelisted historical checkpoint, not dispatch authority", async () => {
   const harness = await launchHarness({ useDefaultAdapter: true });
   const ready = createReadyTask(harness);
