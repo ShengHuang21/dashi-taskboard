@@ -9,7 +9,7 @@ import {
   isCanonicalCodexHostId,
 } from "../shared/domain.mjs";
 import { createTaskCapsule, evaluateTaskAuthorization } from "./task-capsule.mjs";
-import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord } from "./task-continuation.mjs";
+import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord, normalizeOwnedTerminalNotification } from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -10158,9 +10158,68 @@ export class TaskboardDatabase {
   getTaskContinuation(taskId) {
     this.database.exec("BEGIN");
     try {
-      const result = assessTaskContinuation(this.#taskContinuationContext(taskId));
+      const context = this.#taskContinuationContext(taskId);
+      const row = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_owned_terminal'
+        ORDER BY rowid DESC LIMIT 1
+      `).get(context.capsule.task.id);
+      const result = assessTaskContinuation({
+        ...context, terminalCheckpoint: row ? JSON.parse(row.envelope_json) : null,
+      });
       this.database.exec("COMMIT");
       return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordOwnedTerminalCheckpoint(notification) {
+    const terminal = normalizeOwnedTerminalNotification(notification);
+    if (!terminal) return [];
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const enrolled = this.#prepare(`
+        SELECT tasks.id FROM tasks
+        WHERE thread_id = ? AND thread_codex_host_id = 'local'
+          AND EXISTS (
+            SELECT 1 FROM agent_event_receipts
+            WHERE task_id = tasks.id AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+          )
+      `).all(terminal.threadId);
+      const observedAt = now();
+      const source = "taskboard-server-owned-app-server";
+      const receipts = [];
+      for (const { id } of enrolled) {
+        const context = this.#taskContinuationContext(id);
+        const binding = context.capsule.execution.threadBinding;
+        if (!binding || binding.codexHostId !== "local" || binding.threadId !== terminal.threadId) continue;
+        const eventId = `continuation-owned-terminal:${createHash("sha256")
+          .update(JSON.stringify([source, id, "local", terminal.threadId, terminal.turnId])).digest("hex")}`;
+        const existing = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE event_id = ?").get(eventId);
+        if (existing) {
+          const event = JSON.parse(existing.envelope_json);
+          receipts.push({ applied: false, conflict: event.turnStatus !== terminal.turnStatus, event });
+          continue;
+        }
+        // The native notification proves thread/turn/status only. Binding and agreement are DB context at receipt time.
+        const event = {
+          eventId, eventType: "continuation_owned_terminal", taskId: id, projectId: context.capsule.task.projectId,
+          source, codexHostId: "local", ...terminal,
+          continuationRecordId: context.record.eventId,
+          bindingAtObservation: binding,
+          requirementsRevision: context.capsule.requirementsRevision,
+          observedAt,
+        };
+        this.#prepare(`
+          INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+          VALUES (?, ?, ?, NULL, ?, ?)
+        `).run(eventId, event.projectId, id, JSON.stringify(event), observedAt);
+        receipts.push({ applied: true, conflict: false, event });
+      }
+      this.database.exec("COMMIT");
+      return receipts;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;

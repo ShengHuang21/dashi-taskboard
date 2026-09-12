@@ -79,8 +79,23 @@ export function continuationBasis(capsule, evaluation) {
   };
 }
 
-export function assessTaskContinuation({ record, capsule, evaluation, currentClaim }) {
+export function normalizeOwnedTerminalNotification(notification) {
+  if (notification?.method !== "turn/completed" || Object.hasOwn(notification, "id")) return null;
+  const { threadId, turn } = notification.params ?? {};
+  const identifier = (value) => typeof value === "string" && value.length > 0 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+  if (!identifier(threadId) || !identifier(turn?.id)
+    || !["completed", "interrupted", "failed"].includes(turn?.status)) return null;
+  return { threadId, turnId: turn.id, turnStatus: turn.status };
+}
+
+export function assessTaskContinuation({ record, capsule, evaluation, currentClaim, terminalCheckpoint = null }) {
   const current = continuationBasis(capsule, evaluation);
+  const recordedTerminalCheckpoint = record && terminalCheckpoint
+    && terminalCheckpoint.continuationRecordId === record.eventId
+    && terminalCheckpoint.projectId === current.projectId
+    && JSON.stringify(terminalCheckpoint.bindingAtObservation) === JSON.stringify(current.binding)
+    ? terminalCheckpoint : null;
   const result = (assessment, reason, nextCoordinationAction) => ({
     record, assessment, reasonCodes: [reason], agreementEventId: record?.eventId ?? null,
     basis: { current, recorded: record?.basis ?? null },
@@ -91,6 +106,7 @@ export function assessTaskContinuation({ record, capsule, evaluation, currentCla
     stopBoundary: record?.stopBoundary ?? null,
     nextCoordinationAction, queriedAt: evaluation.evaluatedAt,
     liveExecution: "unknown", eligibleForDispatch: false,
+    recordedTerminalCheckpoint,
   });
   if (!record) return result("not_enrolled", "continuation_not_recorded", "record_existing_agreement");
   if (capsule.task.archivedAt !== null || ["canceled", "done"].includes(capsule.task.status)) {

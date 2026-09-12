@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +19,7 @@ const running = [];
 afterEach(async () => {
   while (running.length > 0) {
     const entry = running.pop();
-    await entry.app.close();
+    if (!entry.closed) await entry.app.close();
     await rm(entry.directory, { recursive: true, force: true });
   }
 });
@@ -60,13 +60,14 @@ async function postEffect(baseUrl, secret, effectKey, execution, operations, seq
   return { status: response.status, body: await response.json() };
 }
 
-async function launchHarness({ currentTime, afterReserve, requestReady } = {}) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-host-fence-"));
+async function launchHarness({ currentTime, afterReserve, requestReady, subscribe, useDefaultAdapter = false, reopenDirectory } = {}) {
+  const directory = reopenDirectory ?? await mkdtemp(path.join(os.tmpdir(), "taskboard-host-fence-"));
   const worktreePath = path.join(directory, "worktree");
-  await mkdir(worktreePath);
+  await mkdir(worktreePath, { recursive: true });
   const secret = "d".repeat(64);
   const calls = [];
   const adapter = {
+    ...(subscribe ? { subscribe } : {}),
     async ensureReady() {},
     requestReady(codexHostId, method, params) {
       calls.push({ codexHostId, method, params });
@@ -74,12 +75,15 @@ async function launchHarness({ currentTime, afterReserve, requestReady } = {}) {
       return Promise.resolve({ turn: { id: `turn-${calls.length}` } });
     },
   };
-  const clock = { value: currentTime };
+  const clock = { value: currentTime ?? Date.now() };
   const app = createTaskboardServer({
     dataDirectory: directory,
+    codexExecutable: "/usr/bin/false",
+    codexStatePath: path.join(directory, "codex-state"),
+    codexSessionsDirectory: path.join(directory, "sessions"),
     instanceSecret: secret,
     hostExecutorClock: () => clock.value,
-    hostExecutorRpcAdapter: adapter,
+    hostExecutorRpcAdapter: useDefaultAdapter ? undefined : adapter,
     hostExecutorDispatchHooks: afterReserve ? { afterReserve } : undefined,
     worktreeRepositoryExecFile: async () => {
       throw new Error("repository probe intentionally unavailable in the fence harness");
@@ -306,6 +310,200 @@ test("an unfenced resident HTTP mutation fails closed before the first registrat
     { "x-taskboard-client": "taskctl" },
   );
   assert.equal(manual.status, 200, JSON.stringify(manual.body));
+});
+
+function enrollTerminalTask(harness, ready, suffix = "first") {
+  const db = harness.app.database;
+  return db.appendTaskContinuation(ready.task.id, {
+    eventId: `agreement-${ready.task.id}-${suffix}`,
+    idempotencyKey: `agreement-${suffix}`,
+    senderThreadId: db.getTask(ready.task.id).threadId,
+    expectedRecordId: db.getTaskContinuation(ready.task.id).record?.eventId ?? null,
+    expectedResumeToken: db.getTaskCapsule(ready.task.id).resumeToken,
+    goal: "Observe a bound thread without dispatching",
+    sourceRefs: ["test:owned-terminal"], authorizationSource: null, actionIds: [],
+    stopBoundary: "No automatic continuation", status: "active",
+    checkpoint: { summary: "Enrolled", nextActionId: null, waitingKind: "none", waitingDetail: null, retryAt: null },
+  }).event;
+}
+
+function terminalNotification(turnId, status = "completed", threadId = "root-thread") {
+  return { method: "turn/completed", params: { threadId, turn: { id: turnId, status } } };
+}
+
+function terminalSubscription() {
+  const listeners = new Set();
+  return {
+    listeners,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    emit(notification) { return [...listeners].flatMap((listener) => listener(notification)); },
+  };
+}
+
+function terminalReceiptRows(harness) {
+  return harness.app.database.database.prepare(`
+    SELECT envelope_json FROM agent_event_receipts
+    WHERE json_extract(envelope_json, '$.eventType') = 'continuation_owned_terminal' ORDER BY rowid
+  `).all().map((row) => JSON.parse(row.envelope_json));
+}
+
+function stateOutsideEventReceipts(harness) {
+  const db = harness.app.database.database;
+  return Object.fromEntries(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all()
+    .filter(({ name }) => name !== "agent_event_receipts")
+    .map(({ name }) => [name, createHash("sha256")
+      .update(JSON.stringify(db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all())).digest("hex")]));
+}
+
+test("owned terminal D1: default adapter notification is a whitelisted historical checkpoint, not dispatch authority", async () => {
+  const harness = await launchHarness({ useDefaultAdapter: true });
+  const ready = createReadyTask(harness);
+  const agreement = enrollTerminalTask(harness, ready);
+  const before = stateOutsideEventReceipts(harness);
+  const resumeToken = harness.app.database.getTaskCapsule(ready.task.id).resumeToken;
+  const notification = terminalNotification("terminal-1");
+  notification.params.turn.error = { message: "private-error-must-not-be-retained" };
+  notification.params.item = { text: "private-item-must-not-be-retained" };
+  notification.params.source = "untrusted-producer";
+  for (const listener of harness.app.aiChat.appServer.listeners) listener(notification);
+  const response = await fetch(`${harness.baseUrl}/api/local/tasks/${ready.task.id}/continuation`);
+  assert.equal(response.status, 200);
+  const assessment = await response.json();
+  const checkpoint = assessment.recordedTerminalCheckpoint;
+  assert.deepEqual(Object.keys(checkpoint).sort(), [
+    "eventId", "eventType", "taskId", "projectId", "source", "codexHostId", "threadId", "turnId", "turnStatus",
+    "continuationRecordId", "bindingAtObservation", "requirementsRevision", "observedAt",
+  ].sort());
+  assert.equal(checkpoint.eventType, "continuation_owned_terminal");
+  assert.equal(checkpoint.source, "taskboard-server-owned-app-server");
+  assert.equal(checkpoint.continuationRecordId, agreement.eventId);
+  assert.deepEqual(checkpoint.bindingAtObservation, ready.binding);
+  assert.equal(checkpoint.requirementsRevision, harness.app.database.getTaskCapsule(ready.task.id).requirementsRevision);
+  assert.equal(checkpoint.turnStatus, "completed");
+  assert.ok(Number.isFinite(Date.parse(checkpoint.observedAt)));
+  assert.equal(assessment.liveExecution, "unknown");
+  assert.equal(assessment.eligibleForDispatch, false);
+  assert.deepEqual(stateOutsideEventReceipts(harness), before);
+  assert.equal(harness.app.database.getTaskCapsule(ready.task.id).resumeToken, resumeToken);
+  assert.equal(harness.app.aiChat.appServer.child, null);
+  assert.deepEqual(harness.calls, []);
+});
+
+test("owned terminal D2: statuses and exact enrolled local binding scope use only the selected adapter", async () => {
+  const subscription = terminalSubscription();
+  const harness = await launchHarness({ subscribe: subscription.subscribe });
+  const first = createReadyTask(harness);
+  const shared = createReadyTask(harness);
+  const remote = createReadyTask(harness);
+  const otherThread = createReadyTask(harness);
+  const incomplete = createReadyTask(harness);
+  const unenrolled = createReadyTask(harness);
+  for (const ready of [first, shared, remote, otherThread, incomplete]) enrollTerminalTask(harness, ready);
+  for (const [ready, change] of [
+    [remote, { codexHostId: "remote-host", codexProjectKind: "remote" }],
+    [otherThread, { threadId: "other-thread" }],
+    [incomplete, { workspacePath: null }],
+  ]) {
+    harness.app.database.updateTask(ready.task.id, ready.task.version, {}, undefined, { ...ready.binding, ...change });
+  }
+  for (const notification of [
+    null, {}, { method: "item/completed" }, terminalNotification("", "completed"),
+    terminalNotification("t", "running"), terminalNotification("t", "unknown"),
+    terminalNotification("t", "completed", ""), { ...terminalNotification("t"), id: 1 },
+    { method: "turn/completed", params: { threadId: "root-thread" } },
+  ]) assert.deepEqual(subscription.emit(notification), []);
+  assert.equal(terminalReceiptRows(harness).length, 0);
+  for (const status of ["completed", "interrupted", "failed"]) {
+    subscription.emit(terminalNotification(`turn-${status}`, status));
+    for (const ready of [first, shared]) {
+      assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint.turnStatus, status);
+    }
+  }
+  assert.deepEqual(new Set(terminalReceiptRows(harness).map((event) => event.taskId)), new Set([first.task.id, shared.task.id]));
+  assert.equal(terminalReceiptRows(harness).length, 6);
+  for (const ready of [remote, otherThread, incomplete, unenrolled]) {
+    assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint, null);
+  }
+  assert.deepEqual(harness.calls, []);
+
+  const unavailable = await launchHarness(); // Explicit override without subscribe must not fall back to aiChat.
+  const notObserved = createReadyTask(unavailable);
+  enrollTerminalTask(unavailable, notObserved);
+  for (const listener of unavailable.app.aiChat.appServer.listeners) listener(terminalNotification("unavailable"));
+  assert.equal(unavailable.app.database.getTaskContinuation(notObserved.task.id).recordedTerminalCheckpoint, null);
+  assert.equal(terminalReceiptRows(unavailable).length, 0);
+});
+
+test("owned terminal D3: first receipt survives replay, conflict and reopen without rebinding to changed context", async () => {
+  const subscription = terminalSubscription();
+  let harness = await launchHarness({ subscribe: subscription.subscribe });
+  const ready = createReadyTask(harness);
+  enrollTerminalTask(harness, ready);
+  const notification = terminalNotification("stable-turn", "interrupted");
+  subscription.emit(notification);
+  const first = harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint;
+  harness.app.database.updateTask(ready.task.id, ready.task.version,
+    { description: "Changed requirements" }, undefined, undefined, ready.task.assignee);
+  assert.equal(subscription.emit(notification)[0].applied, false);
+  assert.equal(subscription.emit(terminalNotification("stable-turn", "failed"))[0].conflict, true);
+  assert.deepEqual(terminalReceiptRows(harness), [first]);
+  await harness.app.close();
+  running.find((entry) => entry.app === harness.app).closed = true;
+  harness = await launchHarness({ subscribe: subscription.subscribe, reopenDirectory: harness.directory });
+  assert.deepEqual(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint, first);
+  assert.equal(subscription.emit(notification)[0].applied, false);
+
+  const replacement = enrollTerminalTask(harness, ready, "replacement");
+  assert.notEqual(replacement.eventId, first.continuationRecordId);
+  assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint, null);
+  subscription.emit(notification);
+  assert.deepEqual(terminalReceiptRows(harness), [first]);
+  assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint, null);
+  subscription.emit(terminalNotification("new-context"));
+  const next = harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint;
+  assert.equal(next.continuationRecordId, replacement.eventId);
+  assert.notEqual(next.requirementsRevision, first.requirementsRevision);
+  const current = harness.app.database.getTask(ready.task.id);
+  harness.app.database.updateTask(current.id, current.version, {}, undefined, {
+    ...ready.binding, workspacePath: `${harness.worktreePath}-changed`,
+  });
+  assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint, null);
+  subscription.emit(terminalNotification("new-context"));
+  assert.deepEqual(terminalReceiptRows(harness), [first, next]);
+  assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint, null);
+});
+
+test("owned terminal D4: latest means receipt order and the listener unsubscribes before database close", async () => {
+  const subscription = terminalSubscription();
+  let harness;
+  let unsubscribedWithOpenDatabase = false;
+  harness = await launchHarness({ subscribe(listener) {
+    const unsubscribe = subscription.subscribe(listener);
+    return () => {
+      assert.equal(harness.app.database.database.prepare("SELECT 1 AS value").get().value, 1);
+      unsubscribedWithOpenDatabase = true;
+      unsubscribe();
+    };
+  } });
+  const ready = createReadyTask(harness);
+  enrollTerminalTask(harness, ready);
+  const newer = terminalNotification("native-newer");
+  newer.params.turn.startedAt = "2027-01-01T00:00:00Z";
+  const older = terminalNotification("native-older", "failed");
+  older.params.turn.startedAt = "2025-01-01T00:00:00Z";
+  subscription.emit(newer);
+  subscription.emit(older);
+  subscription.emit(newer);
+  assert.equal(harness.app.database.getTaskContinuation(ready.task.id).recordedTerminalCheckpoint.turnId, "native-older");
+  assert.equal(terminalReceiptRows(harness).length, 2);
+  await harness.app.close();
+  running.find((entry) => entry.app === harness.app).closed = true;
+  assert.equal(unsubscribedWithOpenDatabase, true);
+  assert.equal(subscription.listeners.size, 0);
+  assert.deepEqual(subscription.emit(terminalNotification("after-close")), []);
 });
 
 test("expired executor cannot mutate or deliver after a competing lease takes over", async () => {

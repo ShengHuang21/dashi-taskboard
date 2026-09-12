@@ -3978,8 +3978,12 @@ export function createTaskboardServer(options = {}) {
       pollTimeoutMs: options.remoteHostExecutorPollTimeoutMs,
       requestTimeoutMs: options.remoteHostExecutorRequestTimeoutMs,
     });
+  const localHostExecutorAdapter = options.hostExecutorRpcAdapter ?? aiChat.appServer;
+  const unsubscribeOwnedTerminal = typeof localHostExecutorAdapter.subscribe === "function"
+    ? localHostExecutorAdapter.subscribe((notification) => database.recordOwnedTerminalCheckpoint(notification))
+    : null;
   const hostExecutorAdapter = createHostExecutorAdapterRouter({
-    localAdapter: options.hostExecutorRpcAdapter ?? aiChat.appServer,
+    localAdapter: localHostExecutorAdapter,
     remoteChannels: remoteHostExecutorChannels,
   });
   const hostExecutorDispatcher = createHostExecutorDispatcher({
@@ -7336,6 +7340,7 @@ export function createTaskboardServer(options = {}) {
       return server.address();
     },
     async close() {
+      unsubscribeOwnedTerminal?.();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());
