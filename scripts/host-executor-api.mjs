@@ -125,6 +125,14 @@ export function createHostExecutorApi({
     });
   };
 
+  const inspectEffect = (input) => {
+    const codexHostId = requiredString(input?.codexHostId, "codexHostId");
+    const effectKey = requiredString(input?.effectKey, "effectKey");
+    const pathname = `/api/local/host-executors/${encodeURIComponent(codexHostId)}`
+      + `/effects/${encodeURIComponent(effectKey)}`;
+    return request(pathname, { method: "GET", action: "effect inspection" });
+  };
+
   const executeEffect = (input) => {
     const codexHostId = requiredString(input?.execution?.codexHostId, "codexHostId");
     const effectKey = requiredString(input?.effectKey, "effectKey");
@@ -181,6 +189,7 @@ export function createHostExecutorApi({
   return {
     register: registration,
     inspect: inspection,
+    inspectEffect,
     acquire: (input) => leaseMutation("acquire", input),
     renew: (input) => leaseMutation("renew", input),
     release: (input) => leaseMutation("release", input),

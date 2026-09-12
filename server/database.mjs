@@ -4263,6 +4263,33 @@ export class TaskboardDatabase {
     };
   }
 
+  getHostExecutorEffect(codexHostId, effectKeyInput) {
+    if (!isCanonicalCodexHostId(codexHostId)) {
+      throw new ApiError(400, "INVALID_FIELD", "'codexHostId' is invalid");
+    }
+    const effectKey = hostExecutorIdentifier(effectKeyInput, "effectKey");
+    const { timestamp } = this.#hostExecutorTime();
+    // Inspect retained metadata only; observation must not prune or renew history.
+    const row = this.#prepare(`
+      SELECT effect_key, codex_host_id, request_fingerprint, status, created_at, updated_at
+      FROM host_executor_effects
+      WHERE codex_host_id = ? AND effect_key = ?
+    `).get(codexHostId, effectKey);
+    return {
+      found: Boolean(row),
+      effect: row ? {
+        effectKey: row.effect_key,
+        codexHostId: row.codex_host_id,
+        requestFingerprint: row.request_fingerprint,
+        status: row.status,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      } : null,
+      queriedAt: timestamp,
+      observationOnly: true,
+    };
+  }
+
   reserveHostExecutorEffect(rawInput) {
     const input = this.#hostExecutorEffectRequest(rawInput);
     this.database.exec("BEGIN IMMEDIATE");

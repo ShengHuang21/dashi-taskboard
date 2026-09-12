@@ -4381,6 +4381,26 @@ export function createTaskboardServer(options = {}) {
         ));
       }
 
+      const hostExecutorEffectInspectionMatch = pathname.match(
+        /^\/api\/local\/host-executors\/([^/]+)\/effects\/([^/]+)$/,
+      );
+      if (hostExecutorEffectInspectionMatch) {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertNoQuery(url.searchParams, "Host executor effect inspection routes");
+        await assertEmptyRequestBody(request, "Host executor effect inspection routes");
+        assertHostExecutorProof(
+          request,
+          resolved.instanceSecret,
+          pathname,
+          null,
+          database,
+        );
+        return sendJson(response, 200, database.getHostExecutorEffect(
+          parseHostExecutorRoute(hostExecutorEffectInspectionMatch[1]),
+          decodeRouteSegment(hostExecutorEffectInspectionMatch[2], "Host executor effect key"),
+        ));
+      }
+
       const hostExecutorEffectMatch = pathname.match(
         /^\/api\/local\/host-executors\/([^/]+)\/effects\/([^/]+)\/execute$/,
       );
