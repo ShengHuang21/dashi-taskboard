@@ -112,6 +112,42 @@ This command makes one read-only Capsule GET and returns a compact `progress` ob
 
 Report unrecorded work or uncertain freshness as unknown. Full `issue bootstrap` and its complete current requirements remain mandatory before executing or adopting work; this compact query grants no execution authority and does not publish, adopt, acknowledge, or validate an artifact version. Versioned artifact adoption and safe-boundary clarification delivery are separate workflows, not effects of this command.
 
+## Record an existing continuation agreement
+
+At the current bound Root's natural checkpoint, bootstrap the task and read
+`taskctl continuation assess ISSUE_ID --json`. Then use
+`taskctl continuation record ISSUE_ID --record-file FILE --json` to append the
+existing goal, sources, stop boundary and checkpoint. This is a durable declaration,
+not a new authorization, actual runtime observation or automatic continuation.
+
+The JSON file requires `eventId`, `idempotencyKey`, `expectedRecordId`,
+`expectedResumeToken`, `goal`, `sourceRefs`, `authorizationSource`, `actionIds`,
+`stopBoundary`, `status` and `checkpoint`. Use explicit JSON `null` for the first
+`expectedRecordId`; replacements name the exact previous event ID. The string
+`"none"` is an ordinary ID. `authorizationSource` is null or the existing Capsule
+source `{commentId, commentVersion}`. `status` is `active`, `paused`, `canceled` or
+`endpoint_reached`. Checkpoint fields are `summary`, `nextActionId` (string/null),
+`waitingKind` (`none`, `resource`, `dependency`, `decision`, `authorization`),
+`waitingDetail` (string/null) and `retryAt` (ISO time/null). All nullable fields
+must be present. Text/reference order is preserved; never store secrets or customer data.
+The CLI always attributes the sender to actual `CODEX_THREAD_ID`, not file contents.
+
+Assessment reads the latest committed event and current task/source/authorization.
+Missing structured evidence asks Root to reconcile evidence, not Owner to approve
+ordinary work again. Resource waiting stays a queue; reaching `retryAt` means
+capacity needs observation, not that capacity is available. A recorded endpoint
+does not complete the task. Binding or requirements changes require reconciliation.
+Existing pending-action and effective gate evidence is necessary but never proves
+runtime idle, readiness, review/CI or merge eligibility. Every assessment returns
+`liveExecution: "unknown"` and `eligibleForDispatch: false`.
+
+This protected local-only path does not poll, send/start/steer, claim, acknowledge,
+change status or authorization, merge, or activate a runtime. Writes append only
+`continuation_record` receipts; they do not add comments or invalidate their own
+Capsule revision/token. On uncertain transport retry the exact original request;
+historical replay does not revive older state. On conflict, reread and reconcile
+before making a new explicit record. Records follow existing task/project retention.
+
 ## Publish and adopt a text result without interrupting another task
 
 Use `handoff publish SOURCE --consumer TARGET` from the producer task's current bound Root at its chosen checkpoint, then `handoff read SOURCE --consumer TARGET` from the consumer. These three new commands use the protected local Taskboard HTTP API; they do not add cloud support. Both tasks must currently share a project. The service stores exact UTF-8 text (1–65,536 bytes, including whitespace), its SHA-256, server time, source task version, and the exact task UUID pair. Optional evidence references are producer declarations, not frozen files, images, Git trees, review, or deployment proof. Never publish credentials or sensitive customer data.

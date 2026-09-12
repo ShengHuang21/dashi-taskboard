@@ -804,6 +804,40 @@ function structuralNextActionFor(reasonCode) {
   };
 }
 
+export function evaluateTaskAuthorization({ task, comments, ownerDecisionReceipts = [], standingAuthorities = [], now = new Date() }) {
+  const orderedComments = [...comments].sort((left, right) => (
+    left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+  ));
+  const authorization = authorizationFor(task, orderedComments);
+  const resolution = applyOwnerDecisionReceipts(authorization, ownerDecisionReceipts);
+  const effectiveAuthorization = resolution.authorization;
+  const standingAuthority = standingAuthorityFor(task, effectiveAuthorization, standingAuthorities, now);
+  const pendingActions = effectiveAuthorization.state === "valid"
+    ? effectiveAuthorization.envelope.actions
+      .filter((action) => action.status === "pending")
+      .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
+    : [];
+  const gatesById = new Map((effectiveAuthorization.envelope?.gates ?? []).map((gate) => {
+    const expired = gate.state === "authorized"
+      && gate.expiresAt
+      && new Date(gate.expiresAt) <= now;
+    if (!expired) {
+      return [gate.id, standingAuthority.authorizedGateIds.includes(gate.id)
+        ? { ...gate, state: "authorized", standingAuthority: true }
+        : gate];
+    }
+    return [gate.id, {
+      ...gate,
+      state: gate.renewable ? "approval_required" : "forbidden",
+      expired: true,
+    }];
+  }));
+  return {
+    authorization, effectiveAuthorization, appliedOwnerDecisionReceipts: resolution.applied,
+    standingAuthority, pendingActions, gatesById, evaluatedAt: now.toISOString(),
+  };
+}
+
 function readyWorkFor(
   task,
   claim,
@@ -817,6 +851,8 @@ function readyWorkFor(
   standingAuthority,
   requirementsRevision,
   dependencyClearances,
+  pendingActions,
+  gates,
 ) {
   const reasonCodes = [];
   const workflow = workflowFor(task);
@@ -850,11 +886,6 @@ function readyWorkFor(
   const state = claimState(claim, timestamp);
   if (state === "active") reasonCodes.push("ACTIVE_CLAIM");
   if (state === "expired_unresolved") reasonCodes.push("EXPIRED_UNRESOLVED_CLAIM");
-  const pendingActions = authorization.state === "valid"
-    ? authorization.envelope.actions
-      .filter((action) => action.status === "pending")
-      .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
-    : [];
   const currentFrontier = frontierFor(
     task,
     comments,
@@ -895,21 +926,6 @@ function readyWorkFor(
     return readyWork;
   }
 
-  const gates = new Map(authorization.envelope.gates.map((gate) => {
-    const expired = gate.state === "authorized"
-      && gate.expiresAt
-      && new Date(gate.expiresAt) <= timestamp;
-    if (!expired) {
-      return [gate.id, standingAuthority.authorizedGateIds.includes(gate.id)
-        ? { ...gate, state: "authorized", standingAuthority: true }
-        : gate];
-    }
-    return [gate.id, {
-      ...gate,
-      state: gate.renewable ? "approval_required" : "forbidden",
-      expired: true,
-    }];
-  }));
   readyWork.safeActions = pendingActions
     .filter((action) => gates.get(action.gate).state === "authorized")
     .map((action) => {
@@ -986,6 +1002,8 @@ export function createTaskCapsule({
   domainRoute = null,
   globalCoordinatorFrontier = null,
   dependencyClearances = [],
+  latestContinuationRecord = null,
+  authorizationEvaluation = null,
   now = new Date(),
 }) {
   const orderedComments = [...comments].sort((left, right) => (
@@ -999,10 +1017,11 @@ export function createTaskCapsule({
   });
   const execution = executionFor(task);
   const plannedModelRouting = modelRoutingFor(orderedComments);
-  const authorization = authorizationFor(task, orderedComments);
-  const ownerDecisionResolution = applyOwnerDecisionReceipts(authorization, ownerDecisionReceipts);
-  const effectiveAuthorization = ownerDecisionResolution.authorization;
-  const standingAuthority = standingAuthorityFor(task, effectiveAuthorization, standingAuthorities, now);
+  const evaluation = authorizationEvaluation ?? evaluateTaskAuthorization({
+    task, comments: orderedComments, ownerDecisionReceipts, standingAuthorities, now,
+  });
+  const { authorization, effectiveAuthorization, standingAuthority, pendingActions, gatesById } = evaluation;
+  const ownerDecisionResolution = { applied: evaluation.appliedOwnerDecisionReceipts };
   const handoffs = handoffsFor(coordinationEvents);
   const legacyRun = latestRun ? null : activeRunFor(task, currentClaim, now);
   const activeRun = currentRun ? durableRunFor(currentRun) : legacyRun;
@@ -1020,6 +1039,8 @@ export function createTaskCapsule({
     standingAuthority,
     requirementsRevision,
     dependencyClearances,
+    pendingActions,
+    gatesById,
   );
   const modelRouting = selectedModelRouting(plannedModelRouting, readyWork);
   const workflow = workflowFor(task);
@@ -1034,11 +1055,7 @@ export function createTaskCapsule({
           activeRun,
           projectedLatestRun,
           effectiveAuthorization,
-          effectiveAuthorization.state === "valid"
-            ? effectiveAuthorization.envelope.actions
-              .filter((action) => action.status === "pending")
-              .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id))
-            : [],
+          pendingActions,
         ).observedAt,
   };
   const resumeToken = hash({
@@ -1150,5 +1167,16 @@ export function createTaskCapsule({
     readyWork,
     currentFrontier,
     resumeToken,
+    continuation: {
+      latestRecord: latestContinuationRecord ? {
+        eventId: latestContinuationRecord.eventId,
+        previousRecordId: latestContinuationRecord.previousRecordId,
+        status: latestContinuationRecord.status,
+        createdAt: latestContinuationRecord.createdAt,
+      } : null,
+      assessCommand: `taskctl continuation assess ${task.identifier} --json`,
+      liveExecution: "unknown",
+      eligibleForDispatch: false,
+    },
   };
 }
