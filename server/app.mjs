@@ -1967,17 +1967,22 @@ function parseAgentClaim(body) {
   };
 }
 
-function parseSafeActionAdmissionDeferral(body) {
+function parseSafeActionAdmissionDeferral(body, { allowReason = false } = {}) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "rootThreadId", "expectedResumeToken", "safeActionId", "admissionReceiptId", "admissionAttemptId",
+    ...(allowReason ? ["reason"] : []),
   ]));
+  if (allowReason && body.reason !== undefined && !["model_capacity", "coordinator_busy"].includes(body.reason)) {
+    throw new ApiError(400, "INVALID_FIELD", "'reason' must be model_capacity or coordinator_busy");
+  }
   return {
     rootThreadId: parseThreadId(body.rootThreadId),
     expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 128 }),
     safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
     admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
     admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+    ...(allowReason ? { reason: body.reason ?? "model_capacity" } : {}),
   };
 }
 
@@ -6935,7 +6940,7 @@ export function createTaskboardServer(options = {}) {
         const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
           request, resolved.instanceSecret, pathname, rawDeferral,
         );
-        const deferral = parseSafeActionAdmissionDeferral(rawDeferral);
+        const deferral = parseSafeActionAdmissionDeferral(rawDeferral, { allowReason: true });
         return sendJson(response, 200, database.deferTaskSafeActionAdmission(id, {
           ...deferral,
           hostExecutorExecution,

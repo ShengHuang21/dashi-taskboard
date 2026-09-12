@@ -3180,6 +3180,7 @@ async function mutateBackgroundAdmission(claim, action) {
     admissionReceiptId: claim.admissionReceiptId,
     admissionAttemptId: claim.admissionAttemptId,
     ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
+    ...(action === "defer" && claim.reason !== undefined ? { reason: claim.reason } : {}),
   };
   const response = await fetch(
     `${taskboardBaseUrl}${pathname}`,

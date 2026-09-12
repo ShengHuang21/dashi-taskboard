@@ -11387,8 +11387,12 @@ export class TaskboardDatabase {
 
   deferTaskSafeActionAdmission(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    reason = "model_capacity",
     hostExecutorExecution = undefined,
   }) {
+    if (!["model_capacity", "coordinator_busy"].includes(reason)) {
+      throw new ApiError(400, "INVALID_FIELD", "Admission deferral reason is invalid");
+    }
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -11404,10 +11408,16 @@ export class TaskboardDatabase {
       }
       this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
       if (row.status === "reserved" && row.admission_state === "deferred") {
+        if (row.admission_deferred_reason !== reason) {
+          throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission was deferred for a different reason");
+        }
         this.database.exec("COMMIT");
         return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
       }
-      if (row.status !== "delivering" || !["awaiting_admission", "prepared"].includes(row.admission_state)) {
+      if (row.status !== "delivering"
+        || !["awaiting_admission", "prepared"].includes(row.admission_state)
+        || (reason === "coordinator_busy"
+          && (row.admission_state !== "awaiting_admission" || row.delivery_turn_id !== null))) {
         throw new ApiError(409, "ADMISSION_NOT_AWAITING", "Only the current awaiting admission attempt can be deferred");
       }
       if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
@@ -11419,11 +11429,11 @@ export class TaskboardDatabase {
         UPDATE task_safe_action_receipts
         SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
           lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
-          admission_deferred_reason = 'model_capacity', admission_retry_count = ?,
+          admission_deferred_reason = ?, admission_retry_count = ?,
           admission_retry_after = ?
         WHERE id = ? AND status = 'delivering' AND admission_state IN ('awaiting_admission', 'prepared')
           AND admission_attempt_id = ?
-      `).run(retryCount, retryAfter, row.id, admissionAttemptId);
+      `).run(reason, retryCount, retryAfter, row.id, admissionAttemptId);
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission attempt changed before capacity deferral");
       }
