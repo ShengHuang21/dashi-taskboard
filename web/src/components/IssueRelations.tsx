@@ -3,7 +3,7 @@ import {
   useMemo,
   useRef,
   useState,
-  type CSSProperties,
+  type ReactNode,
 } from "react";
 
 import type {
@@ -11,9 +11,13 @@ import type {
   Task,
   TaskRelationSummary,
 } from "../types";
-import { useTaskboardI18n } from "../i18n";
+import { taskStatusLabel, useTaskboardI18n } from "../i18n";
+import type { createTaskProgressModel } from "../taskProgress";
+import type { TaskCardPresentation } from "../taskConversations";
 import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon } from "./LinearIcon";
+import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import {
   BlockingRelationIcon,
   PlusIcon,
@@ -331,18 +335,39 @@ export function IssueParentLink({
 export function IssueSubIssues({
   task,
   tasks,
+  referenceTasks,
+  progressModel,
+  presentations,
+  expandedTaskIds,
+  onToggleTaskExpansion,
   onOpenTask,
   onAddRelation,
   onRemoveRelation,
-}: RelationActions) {
-  const { text } = useTaskboardI18n();
+}: RelationActions & {
+  referenceTasks: Task[];
+  progressModel: ReturnType<typeof createTaskProgressModel>;
+  presentations: Record<string, TaskCardPresentation>;
+  expandedTaskIds: string[];
+  onToggleTaskExpansion: (taskId: string) => void;
+}) {
+  const { language, text } = useTaskboardI18n();
   const [savingId, setSavingId] = useState<string | null>(null);
-  const subIssues = task.relations.subIssues;
-  const done = subIssues.filter((issue) => issue.status === "done").length;
+  const taskById = new Map(referenceTasks.map((candidate) => [candidate.id, candidate]));
+  const orderedTasks = [...taskById.values()].sort((left, right) => (
+    left.createdAt.localeCompare(right.createdAt) || left.identifier.localeCompare(right.identifier)
+  ));
+  const childrenById = new Map(orderedTasks.map((candidate) => [
+    candidate.id,
+    new Map<string, TaskRelationSummary>(candidate.relations.subIssues.map((child) => [child.id, child])),
+  ]));
+  for (const candidate of orderedTasks) {
+    const parentId = candidate.relations.parent?.id;
+    if (parentId) childrenById.get(parentId)?.set(candidate.id, candidate);
+  }
+  const subIssues = [...(childrenById.get(task.id)?.values() ?? [])];
   const directIds = new Set(subIssues.map((issue) => issue.id));
   const ancestors = new Set<string>([task.id]);
   let parent = task.relations.parent;
-  const taskById = new Map(tasks.map((candidate) => [candidate.id, candidate]));
   while (parent && !ancestors.has(parent.id)) {
     ancestors.add(parent.id);
     parent = taskById.get(parent.id)?.relations.parent ?? null;
@@ -352,7 +377,83 @@ export function IssueSubIssues({
     && !ancestors.has(candidate.id)
     && !directIds.has(candidate.id)
   ));
-  const progress = subIssues.length > 0 ? Math.round((done / subIssues.length) * 100) : 0;
+
+  function renderChildren(parentId: string, path: ReadonlySet<string>): ReactNode {
+    return [...(childrenById.get(parentId)?.values() ?? [])]
+      .filter((relation) => !path.has(relation.id))
+      .map((relation) => {
+        const child = taskById.get(relation.id);
+        const issue = child ?? relation;
+        const childPath = new Set([...path, issue.id]);
+        const hasChildren = [...(childrenById.get(issue.id)?.keys() ?? [])]
+          .some((id) => !childPath.has(id));
+        const expanded = expandedTaskIds.includes(issue.id);
+        return (
+          <li className="issue-tree-node" data-task-id={issue.id} key={issue.id}>
+            <div className="issue-tree-row">
+              {hasChildren ? (
+                <button
+                  className="issue-tree-toggle"
+                  type="button"
+                  aria-expanded={expanded}
+                  aria-label={expanded
+                    ? text(`收起 ${issue.title} 的子议题`, `Collapse sub-issues of ${issue.title}`)
+                    : text(`展开 ${issue.title} 的子议题`, `Expand sub-issues of ${issue.title}`)}
+                  onClick={() => onToggleTaskExpansion(issue.id)}
+                >
+                  <LinearIcon name={expanded ? "chevronDown" : "chevronRight"} />
+                </button>
+              ) : <span className="issue-tree-toggle-space" aria-hidden="true" />}
+              <div className="issue-tree-content">
+                <button
+                  className="issue-tree-target"
+                  type="button"
+                  aria-label={text(`打开 ${issue.title} 详情`, `Open details for ${issue.title}`)}
+                  disabled={!child}
+                  onClick={() => onOpenTask(issue)}
+                >
+                  <StatusIcon status={issue.status} size={14} />
+                  <span className="issue-relation-id">{issue.externalKey ?? issue.identifier}</span>
+                  <span className="issue-tree-title">{issue.title}</span>
+                  <ActorAvatar actor={issue.assignee} className="issue-relation-assignee" />
+                </button>
+                <div className="issue-tree-status">
+                  <span>{taskStatusLabel(language, issue.status)}</span>
+                  <TaskExecutionStatus state={presentations[issue.id]?.execution ?? "uncertain"} />
+                  {child?.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
+                </div>
+                <TaskProgress
+                  progress={progressModel.forTask(issue.id)}
+                  label={text(`${issue.title}的进度`, `Progress for ${issue.title}`)}
+                />
+              </div>
+              {parentId === task.id && child ? (
+                <button
+                  className="issue-tree-remove"
+                  type="button"
+                  aria-label={text(
+                    `移除 ${issue.externalKey ?? issue.identifier}`,
+                    `Remove ${issue.externalKey ?? issue.identifier}`,
+                  )}
+                  disabled={savingId === issue.id}
+                  onClick={() => {
+                    setSavingId(issue.id);
+                    void onRemoveRelation(child, "parent", task.id)
+                      .catch(() => undefined)
+                      .finally(() => setSavingId(null));
+                  }}
+                >
+                  <LinearIcon name="close" />
+                </button>
+              ) : null}
+            </div>
+            {hasChildren && expanded ? (
+              <ul className="issue-tree-children">{renderChildren(issue.id, childPath)}</ul>
+            ) : null}
+          </li>
+        );
+      });
+  }
 
   return (
     <section className="issue-sub-issues" aria-labelledby="sub-issues-heading">
@@ -361,12 +462,7 @@ export function IssueSubIssues({
           <h2 id="sub-issues-heading">{text("子议题", "Sub-issues")}</h2>
           {subIssues.length > 0 && (
             <span className="sub-issue-summary">
-              <span
-                className="sub-issue-progress"
-                style={{ "--sub-issue-progress": `${progress}%` } as CSSProperties}
-                aria-hidden="true"
-              />
-              {done}/{subIssues.length}
+              {text(`${subIssues.length} 个直接子议题`, `${subIssues.length} direct sub-issues`)}
             </span>
           )}
         </div>
@@ -385,27 +481,9 @@ export function IssueSubIssues({
         />
       </header>
       {subIssues.length > 0 && (
-        <div className="issue-sub-issue-list">
-          {subIssues.map((issue) => {
-            const child = taskById.get(issue.id);
-            return (
-              <IssueRelationRow
-                issue={issue}
-                key={issue.id}
-                showAssignee
-                removing={savingId === issue.id}
-                onOpen={() => onOpenTask(issue)}
-                onRemove={() => {
-                  if (!child) return;
-                  setSavingId(issue.id);
-                  void onRemoveRelation(child, "parent", task.id)
-                    .catch(() => undefined)
-                    .finally(() => setSavingId(null));
-                }}
-              />
-            );
-          })}
-        </div>
+        <ul className="issue-sub-issue-list issue-tree">
+          {renderChildren(task.id, new Set([task.id]))}
+        </ul>
       )}
     </section>
   );

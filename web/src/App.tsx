@@ -146,7 +146,7 @@ type Theme = "light" | "dark";
 type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt" | "lanes";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
-  | { projectId: string; view: "list"; scrollTop: number };
+  | { projectId: string; view: "list" | "dashboard"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
 type BoardCardDisplay = { cover: boolean; body: boolean };
 type ActionError = string | readonly [string, string];
@@ -782,6 +782,7 @@ export function App() {
   const [detailTaskIdentifier, setDetailTaskIdentifier] = useState<string | null>(
     () => readIssueIdentifier(window.location.search),
   );
+  const [expandedDetailTaskIds, setExpandedDetailTaskIds] = useState<Record<string, string[]>>({});
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [readmeRevision, setReadmeRevision] = useState(0);
@@ -828,6 +829,8 @@ export function App() {
   const undoInFlightRef = useRef(false);
   const dragRegionRef = useRef<HTMLDivElement>(null);
   const issueListRef = useRef<HTMLDivElement>(null);
+  const ownerGoalsRef = useRef<HTMLElement>(null);
+  const detailScrollTopRef = useRef<Record<string, number>>({});
   const boardColumnScrollRefs = useRef<Partial<Record<TaskStatus, HTMLDivElement | null>>>({});
   const detailSourceProjectIdRef = useRef<string | null>(null);
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
@@ -1502,13 +1505,19 @@ export function App() {
     const currentIssue = readIssueIdentifier(window.location.search);
     if (!currentIssue) detailSourceProjectIdRef.current = selectedProjectId;
     if (isAllProjects) setSelectedProjectId(task.projectId);
-    if (boardView === "list" && issueListRef.current) {
+    if (!currentIssue && boardView === "dashboard" && ownerGoalsRef.current) {
+      pendingDetailSourceScrollRef.current = {
+        projectId: selectedProjectId,
+        view: "dashboard",
+        scrollTop: ownerGoalsRef.current.scrollTop,
+      };
+    } else if (!currentIssue && boardView === "list" && issueListRef.current) {
       pendingDetailSourceScrollRef.current = {
         projectId: selectedProjectId,
         view: "list",
         scrollTop: issueListRef.current.scrollTop,
       };
-    } else if (boardView === "issues" && fullTask) {
+    } else if (!currentIssue && boardView === "issues" && fullTask) {
       const scrollContainer = boardColumnScrollRefs.current[fullTask.status];
       if (scrollContainer) {
         pendingDetailSourceScrollRef.current = {
@@ -1524,17 +1533,29 @@ export function App() {
     setDetailTaskIdentifier(task.identifier);
     const boardUrl = buildIssueUrl(window.location.href, selectedProjectId, null);
     if (!currentIssue) {
-      window.history.replaceState(window.history.state, "", boardUrl);
+      window.history.replaceState({
+        ...window.history.state,
+        taskboardDetail: false,
+        taskboardTaskScopeProjectId: selectedProjectId,
+      }, "", boardUrl);
     }
     const detailUrl = buildIssueUrl(
       currentIssue ? window.location.href : boardUrl.href,
       task.projectId,
       task.identifier,
     );
-    window.history.pushState(window.history.state, "", detailUrl);
+    window.history.pushState({
+      ...window.history.state,
+      taskboardDetail: true,
+      taskboardTaskScopeProjectId: detailSourceProjectIdRef.current ?? task.projectId,
+    }, "", detailUrl);
   }
 
   function closeTaskDetail() {
+    if (window.history.state?.taskboardDetail) {
+      window.history.back();
+      return;
+    }
     const sourceProjectId = detailSourceProjectIdRef.current ?? selectedProjectId;
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
@@ -1554,9 +1575,11 @@ export function App() {
       pendingDetailSourceScrollRef.current = null;
       return;
     }
-    const scrollContainer = pendingScroll.view === "list"
-      ? issueListRef.current
-      : boardColumnScrollRefs.current[pendingScroll.status];
+    const scrollContainer = pendingScroll.view === "issues"
+      ? boardColumnScrollRefs.current[pendingScroll.status]
+      : pendingScroll.view === "dashboard"
+        ? ownerGoalsRef.current
+        : issueListRef.current;
     pendingDetailSourceScrollRef.current = null;
     if (!scrollContainer) return;
     scrollContainer.scrollTop = pendingScroll.scrollTop;
@@ -1567,7 +1590,17 @@ export function App() {
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
-      if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
+      const routeTaskScopeProjectId = window.history.state?.taskboardTaskScopeProjectId;
+      detailSourceProjectIdRef.current = routeIssueIdentifier
+        ? typeof routeTaskScopeProjectId === "string" ? routeTaskScopeProjectId : routeProjectId
+        : null;
+      if (routeIssueIdentifier && boardView === "dashboard" && ownerGoalsRef.current) {
+        pendingDetailSourceScrollRef.current = {
+          projectId: selectedProjectId,
+          view: "dashboard",
+          scrollTop: ownerGoalsRef.current.scrollTop,
+        };
+      } else if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
           view: "list",
@@ -1589,8 +1622,10 @@ export function App() {
           };
         }
       }
-      if (!routeIssueIdentifier) detailSourceProjectIdRef.current = null;
       setDetailTaskIdentifier(routeIssueIdentifier);
+      if (!routeIssueIdentifier && pendingDetailSourceScrollRef.current?.projectId === routeProjectId) {
+        setBoardView(pendingDetailSourceScrollRef.current.view);
+      }
       if (routeProjectId === selectedProjectId) return;
       const routeProject = projects.find((project) => project.id === routeProjectId);
       setBoardView(readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
@@ -1599,7 +1634,7 @@ export function App() {
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, projects, selectedProjectId]);
+  }, [boardView, detailTaskIdentifier, projects, selectedProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -3367,8 +3402,8 @@ export function App() {
                 <button
                   className="detail-back-button"
                   type="button"
-                  aria-label={text("返回议题看板", "Back to issue board")}
-                  title={text("返回议题看板 (Esc)", "Back to issue board (Esc)")}
+                  aria-label={text("返回上一页", "Back to previous page")}
+                  title={text("返回上一页 (Esc)", "Back to previous page (Esc)")}
                   onClick={closeTaskDetail}
                 >
                   <LinearIcon name="chevronLeft" />
@@ -3681,8 +3716,21 @@ export function App() {
             key={detailTask.id}
             task={detailTask}
             tasks={tasks.filter((task) => task.projectId === detailTask.projectId)}
-            referenceTasks={referenceTasks.filter((task) => task.projectId === detailTask.projectId)}
+            referenceTasks={referenceTasks}
             execution={taskPresentations[detailTask.id].execution}
+            presentations={taskPresentations}
+            expandedTaskIds={expandedDetailTaskIds[detailTask.id] ?? []}
+            onToggleTaskExpansion={(taskId) => setExpandedDetailTaskIds((current) => {
+              const expanded = current[detailTask.id] ?? [];
+              return {
+                ...current,
+                [detailTask.id]: expanded.includes(taskId)
+                  ? expanded.filter((id) => id !== taskId)
+                  : [...expanded, taskId],
+              };
+            })}
+            initialScrollTop={detailScrollTopRef.current[detailTask.id] ?? 0}
+            onScrollTopChange={(scrollTop) => { detailScrollTopRef.current[detailTask.id] = scrollTop; }}
             currentUser={currentUser}
             availableLabels={availableLabels}
             developmentScan={developmentScan}
@@ -3756,6 +3804,7 @@ export function App() {
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
           <OwnerGoalsView
             key={selectedProjectId}
+            scrollRef={ownerGoalsRef}
             projectName={isAllProjects ? null : headerProjectName}
             referenceTasks={referenceTasks}
             presentations={taskPresentations}

@@ -24,7 +24,9 @@ const sourceRuntimeFile = path.resolve(
   ".data",
   "launcher-runtime.json",
 );
-const BOOLEAN_OPTIONS = new Set(["json", "clear-binding-thread", "clear-working-log", "help"]);
+const BOOLEAN_OPTIONS = new Set([
+  "json", "clear-binding-thread", "clear-working-log", "help", "no-published-basis", "no-observed-publication",
+]);
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
@@ -96,6 +98,7 @@ const COMMAND_OPTIONS = new Map([
   ["issue list", new Set(["project", "status", "archived", "json"])],
   ["issue get", new Set(["json"])],
   ["issue bootstrap", new Set(["json"])],
+  ["issue progress", new Set(["json"])],
   [
     "issue create",
     new Set([
@@ -182,6 +185,24 @@ const COMMAND_OPTIONS = new Map([
   ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["handoff list", new Set(["json"])],
+  ["continuation record", new Set(["record-file", "json"])],
+  ["continuation assess", new Set(["json"])],
+  ["clarification list", new Set(["json"])],
+  ["clarification enqueue", new Set([
+    "consumer", "event-id", "idempotency-key", "basis-publication", "no-published-basis",
+    "question", "evidence-ref", "thread-id", "json",
+  ])],
+  ["clarification resolve", new Set([
+    "event-id", "idempotency-key", "observed-publication", "no-observed-publication",
+    "outcome", "result", "boundary", "thread-id", "json",
+  ])],
+  ["handoff publish", new Set([
+    "consumer", "event-id", "idempotency-key", "content", "content-file", "evidence-ref", "thread-id", "json",
+  ])],
+  ["handoff read", new Set(["consumer", "version", "json"])],
+  ["handoff adopt", new Set([
+    "consumer", "version", "expected-adoption", "event-id", "idempotency-key", "boundary", "thread-id", "json",
+  ])],
   ["handoff add", new Set([
     "event-id", "idempotency-key", "parent-task", "agent-path", "thread-id", "sequence",
     "timestamp", "summary", "evidence-ref", "blocker", "next-action", "requires-ack",
@@ -213,6 +234,9 @@ const HELP_TEXT = new Map([
   ["", `Usage: taskctl RESOURCE ACTION [options]
 
 Commands:
+  clarification enqueue PRODUCER --consumer CONSUMER (see clarification --help)
+  clarification list ISSUE_ID [--json]
+  clarification resolve CANONICAL_REQUEST_ID (see clarification --help)
   context current [--cwd PATH] [--json]
   project list
   project create --name NAME [--id ID] [--workspace-path PATH]
@@ -261,11 +285,18 @@ Commands:
   activation apply-workflow-profile ISSUE_ID --if-version N
   cloud login --url URL --actor-name NAME
   cloud status|logout
-  issue list|get|bootstrap|create|update|move|archive|restore|relation
+  issue list|get|bootstrap|create|update|move|archive|restore|relation|progress
   dependency-handoff status PROJECT_ID TARGET_ISSUE_ID
   dependency-handoff accept PROJECT_ID TARGET_ISSUE_ID --source SOURCE_ISSUE_ID
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
+  continuation record ISSUE_ID --record-file FILE [--json]
+  continuation assess ISSUE_ID [--json]
   handoff list ISSUE_ID
+  handoff publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
+    (--content TEXT | --content-file PATH)
+  handoff read SOURCE --consumer TARGET [--version PUBLICATION_EVENT_ID]
+  handoff adopt SOURCE --consumer TARGET --version PUBLICATION_EVENT_ID
+    --expected-adoption none|ADOPTION_EVENT_ID --event-id ID --idempotency-key KEY --boundary TEXT
   handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
     --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
   handoff ack EVENT_ID --acknowledgement-id ID --agent-path /root
@@ -284,6 +315,7 @@ Global options:
 
 Examples:
   taskctl issue bootstrap LOCAL-275 --json
+  taskctl issue progress LOCAL-275 --json
   taskctl run get RUN_ID --json
   taskctl comment list LOCAL-275 --json
 
@@ -294,6 +326,7 @@ Actions:
   list [--project PROJECT_ID] [--status STATUS] [--archived true|false|all] [--json]
   get ISSUE_ID [--json]
   bootstrap ISSUE_ID [--json]
+  progress ISSUE_ID [--json]
   create --project PROJECT_ID --title TITLE
     [--description TEXT | --description-file FILE]
     [--status STATUS] [--priority PRIORITY] [--labels a,b]
@@ -340,6 +373,11 @@ Actions:
 
 Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
+
+Progress reads recorded excerpts through one Capsule GET; it never sends a message
+or starts a task. queriedAt is retrieval time, not a work checkpoint. Each record
+retains its own version/time; requirementsRevision is not a Git, QA, or run revision.
+Live execution is unknown. Use the full bootstrap before executing work.
 
 Example:
   taskctl issue bootstrap LOCAL-275 --json`],
@@ -426,10 +464,31 @@ Actions:
 Audit is read-only. Apply accepts only one recorded legacy candidate and is
 optimistic and idempotent. Legacy Root bindings remain a separate coordinator
 repair-binding action.`],
+  ["continuation", `Usage: taskctl continuation ACTION [arguments] [options]
+
+Actions:
+  record ISSUE_ID --record-file FILE [--json]
+  assess ISSUE_ID [--json]
+
+Record appends an existing agreement/checkpoint from a JSON file. Required fields:
+eventId, idempotencyKey, expectedRecordId (null for first record, else exact event ID),
+expectedResumeToken, goal, sourceRefs, authorizationSource (null or commentId/commentVersion),
+actionIds, stopBoundary, status (active/paused/canceled/endpoint_reached), and checkpoint
+(summary, nextActionId, waitingKind, waitingDetail, retryAt). Nullable fields must be explicit.
+The literal string "none" is an ID, not null. senderThreadId always comes from CODEX_THREAD_ID.
+Reads use the protected local service. Assessment never resumes, wakes, claims, or grants
+authority: liveExecution is always unknown and eligibleForDispatch is always false.
+After conflict, reread the Capsule and latest record; never silently rewrite a stale request.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
   list ISSUE_ID [--json]
+  publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
+    (--content TEXT | --content-file PATH) [--evidence-ref REF[,REF]] [--thread-id ID] [--json]
+  read SOURCE --consumer TARGET [--version PUBLICATION_EVENT_ID] [--json]
+  adopt SOURCE --consumer TARGET --version PUBLICATION_EVENT_ID
+    --expected-adoption none|ADOPTION_EVENT_ID --event-id ID --idempotency-key KEY
+    --boundary TEXT [--thread-id ID] [--json]
   add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
     --sequence N [--timestamp ISO] --summary TEXT [--evidence-ref REF[,REF]]
     [--blocker TEXT] --next-action TEXT --requires-ack true|false
@@ -437,8 +496,35 @@ Actions:
     [--thread-id ID] [--json]
   ack EVENT_ID --acknowledgement-id ID --agent-path /root [--thread-id ID] [--json]
 
-Handoff add uses CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
+Publish/read/adopt use the protected local Taskboard service. Publish freezes up to
+64 KiB of UTF-8 text exactly; references remain declarations, not frozen artifacts.
+Read is observer-only. Adopt records the consumer Root's explicit exact version
+and prior adoption; a later publication never changes an earlier adoption.
+Handoff writes use CODEX_THREAD_ID unless --thread-id is explicit. Omit --parent-task
 when the durable task has no parent relation.`],
+  ["clarification", `Usage: taskctl clarification ACTION [arguments] [options]
+
+Actions:
+  enqueue PRODUCER --consumer CONSUMER --event-id ID --idempotency-key KEY
+    (--basis-publication ID | --no-published-basis) --question TEXT
+    [--evidence-ref REF[,REF]] [--thread-id ID] [--json]
+  list ISSUE_ID [--json]
+  resolve CANONICAL_REQUEST_ID --event-id ID --idempotency-key KEY
+    (--observed-publication ID | --no-observed-publication)
+    --outcome answered|needs_reconfirmation --result TEXT --boundary TEXT
+    [--thread-id ID] [--json]
+
+Enqueue is written by the consumer's current bound Root; resolve by the producer's.
+Both tasks must share a project. These commands use protected local Taskboard only.
+Null publication state requires the explicit no-publication flag; the string none is an ID.
+Question text and ordered evidence references are exact. New delivery keys for identical
+requests coalesce durably, including handled requests; conflicting reuse is rejected.
+List and Capsule discovery do not consume, wake, send, start, or steer any task.
+Resolve only at a caller-chosen natural safe point; --boundary is a declaration, not
+proof of idle or execution permission. Observe the latest publication for this exact
+producer-consumer pair. Stale requests require needs_reconfirmation, not answered.
+Handling is immutable and never automatically adopts a result or reopens a request.
+Writes use CODEX_THREAD_ID unless --thread-id is explicit.`],
   ["comment list", `Usage: taskctl comment list ISSUE_ID [--after CURSOR] [--json]
 
 Options:
@@ -531,7 +617,7 @@ export async function main(argv = process.argv.slice(2), overrides = {}) {
       const scope = `${parsed.resource ?? ""} ${parsed.action ?? ""}`.trim();
       const help = HELP_TEXT.get(scope);
       if (!help || parsed.operands.length > 0 || Object.keys(parsed.options).length !== 1) {
-        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl handoff, and taskctl comment list");
+        throw usageError("Help is available for taskctl, taskctl authority, taskctl coordinator, taskctl issue, taskctl run, taskctl continuation, taskctl handoff, taskctl clarification, and taskctl comment list");
       }
       stdout.write(`${help}\n`);
       return 0;
@@ -561,7 +647,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation, run get/checkpoint/finish, handoff list/add/ack, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess, handoff list/add/ack/publish/read/adopt, clarification enqueue/list/resolve, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -577,6 +663,9 @@ async function execute(parsed, overrides) {
     || command.startsWith("domain-coordinator ")
     || command.startsWith("domain-todo ")
     || command.startsWith("dependency-handoff ")
+    || command.startsWith("continuation ")
+    || ["handoff publish", "handoff read", "handoff adopt"].includes(command)
+    || command.startsWith("clarification ")
     || command.startsWith("activation ");
   const api = createApiClient(overrides, {
     baseUrl: usesCompanionControl || env.CODEX_TASKBOARD_COMPANION_URL !== undefined
@@ -815,6 +904,11 @@ async function execute(parsed, overrides) {
     case "issue bootstrap":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
+    case "issue progress": {
+      expectOperandCount(parsed, 1);
+      const { capsule } = await api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
+      return { progress: recordedProgress(capsule) };
+    }
     case "issue create":
       expectOperandCount(parsed, 0);
       return createIssue(api, parsed.options, overrides);
@@ -857,9 +951,51 @@ async function execute(parsed, overrides) {
     case "run finish":
       expectOperandCount(parsed, 1);
       return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "continuation assess":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`);
+    case "continuation record": {
+      expectOperandCount(parsed, 1);
+      const filename = resolveInputPath(requiredOption(parsed.options, "record-file"), overrides);
+      let body;
+      try {
+        const source = await (overrides.readFile ?? readFile)(filename, "utf8");
+        if (Buffer.byteLength(source, "utf8") > 262_144) throw new Error("Record file exceeds 262144 UTF-8 bytes");
+        body = JSON.parse(source);
+      } catch (error) {
+        throw new TaskctlError("Cannot read continuation JSON record", {
+          code: "INVALID_RECORD_FILE", details: error.message,
+        });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw usageError("Record file must be a JSON object");
+      return api.request("POST", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`, {
+        ...body, senderThreadId: resolveThreadId({}, overrides),
+      });
+    }
     case "handoff list":
       expectOperandCount(parsed, 1);
       return api.request("GET", `${taskPath(parsed.operands[0])}/coordination-events`);
+    case "clarification list":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/clarifications`);
+    case "clarification enqueue":
+      expectOperandCount(parsed, 1);
+      return enqueueTaskClarification(api, parsed.operands[0], parsed.options, overrides);
+    case "clarification resolve":
+      expectOperandCount(parsed, 1);
+      return resolveTaskClarification(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff publish":
+      expectOperandCount(parsed, 1);
+      return publishTaskResult(api, parsed.operands[0], parsed.options, overrides);
+    case "handoff read": {
+      expectOperandCount(parsed, 1);
+      const search = new URLSearchParams();
+      if (parsed.options.version !== undefined) search.set("version", requiredOption(parsed.options, "version"));
+      return api.request("GET", `${resultHandoffPath(parsed.operands[0], parsed.options)}${search.size ? `?${search}` : ""}`);
+    }
+    case "handoff adopt":
+      expectOperandCount(parsed, 1);
+      return adoptTaskResult(api, parsed.operands[0], parsed.options, overrides);
     case "handoff add":
       expectOperandCount(parsed, 1);
       return addTaskHandoff(api, parsed.operands[0], parsed.options, overrides);
@@ -939,6 +1075,65 @@ async function execute(parsed, overrides) {
     default:
       throw usageError(`Unsupported command: ${command}`);
   }
+}
+
+function recordedProgress(capsule) {
+  if (!capsule?.task) {
+    throw new TaskctlError("Taskboard service returned a Capsule without a task", {
+      code: "INVALID_RESPONSE",
+      exitCode: 4,
+    });
+  }
+  const task = capsule.task;
+  const comment = [...(capsule.comments ?? [])].sort((left, right) => (
+    right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id)
+  ))[0];
+  const run = Number.isInteger(capsule.latestRun?.version)
+    && typeof capsule.latestRun.status === "string"
+    ? capsule.latestRun
+    : null;
+  const handoff = capsule.handoffs?.latestEvent;
+  return {
+    queriedAt: new Date().toISOString(),
+    task: {
+      id: task.id,
+      identifier: task.identifier,
+      projectId: task.projectId,
+      ...progressText("title", task.title),
+      status: task.status,
+      version: task.version,
+    },
+    requirementsRevision: capsule.requirementsRevision,
+    latestComment: comment ? {
+      id: comment.id,
+      version: comment.version,
+      createdAt: comment.createdAt,
+      updatedAt: comment.updatedAt,
+      ...progressText("body", comment.body),
+    } : null,
+    latestRun: run ? {
+      id: run.id,
+      version: run.version,
+      status: run.status,
+      updatedAt: run.updatedAt,
+      ...progressText("summary", run.summary),
+      ...progressText("nextAction", run.nextAction),
+    } : null,
+    latestHandoff: handoff ? {
+      eventId: handoff.eventId,
+      createdAt: handoff.createdAt,
+      ...progressText("summary", handoff.envelope?.summary),
+      ...progressText("nextAction", handoff.envelope?.nextAction),
+    } : null,
+    liveExecution: "unknown",
+  };
+}
+
+function progressText(field, value) {
+  return {
+    [field]: typeof value === "string" ? value.slice(0, 2_000) : null,
+    [`${field}Truncated`]: typeof value === "string" && value.length > 2_000,
+  };
 }
 
 function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
@@ -1736,6 +1931,83 @@ function parseEvidenceRefs(raw) {
     throw usageError("--evidence-ref must contain at most 32 unique comma-separated references");
   }
   return references;
+}
+
+function explicitPublicationOption(options, idOption, nullOption) {
+  if ((options[idOption] !== undefined) === (options[nullOption] === true)) {
+    throw usageError(`Use exactly one of --${idOption} or --${nullOption}`);
+  }
+  return options[nullOption] === true ? null : requiredOption(options, idOption);
+}
+
+function enqueueTaskClarification(api, producerTaskId, options, overrides) {
+  const consumerTaskId = requiredOption(options, "consumer");
+  return api.request("POST", `/api/local/tasks/${encodeURIComponent(producerTaskId)}/clarifications/${encodeURIComponent(consumerTaskId)}`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    basisPublicationEventId: explicitPublicationOption(options, "basis-publication", "no-published-basis"),
+    question: requiredOption(options, "question"),
+    evidenceRefs: options["evidence-ref"] === undefined ? [] : options["evidence-ref"].split(","),
+  });
+}
+
+function resolveTaskClarification(api, canonicalRequestId, options, overrides) {
+  return api.request("POST", `/api/local/clarifications/${encodeURIComponent(canonicalRequestId)}/resolution`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    observedLatestPublicationEventId: explicitPublicationOption(options, "observed-publication", "no-observed-publication"),
+    outcome: requiredOption(options, "outcome"),
+    result: requiredOption(options, "result"),
+    safeBoundary: requiredOption(options, "boundary"),
+  });
+}
+
+function resultHandoffPath(taskId, options) {
+  return `/api/local/tasks/${encodeURIComponent(taskId)}/result-handoffs/${encodeURIComponent(requiredOption(options, "consumer"))}`;
+}
+
+async function publishTaskResult(api, taskId, options, overrides) {
+  const pathname = resultHandoffPath(taskId, options);
+  if ((options.content === undefined) === (options["content-file"] === undefined)) {
+    throw usageError("Use exactly one of --content or --content-file");
+  }
+  let content = options.content;
+  if (options["content-file"] !== undefined) {
+    const read = overrides.readFile ?? readFile;
+    try {
+      content = await read(resolveInputPath(requiredOption(options, "content-file"), overrides), "utf8");
+    } catch (error) {
+      throw new TaskctlError("Cannot read result content file", {
+        code: "FILE_READ_FAILED", exitCode: 2,
+        details: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (typeof content !== "string" || content.length === 0 || Buffer.byteLength(content, "utf8") > 65_536) {
+    throw usageError("Content must contain 1 to 65536 UTF-8 bytes");
+  }
+  return api.request("POST", pathname, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    content,
+    evidenceRefs: parseEvidenceRefs(options["evidence-ref"]),
+  });
+}
+
+function adoptTaskResult(api, taskId, options, overrides) {
+  const expected = requiredOption(options, "expected-adoption").trim();
+  if (!expected || expected.length > 256) throw usageError("--expected-adoption must be none or an exact adoption event id");
+  return api.request("POST", `${resultHandoffPath(taskId, options)}/adoptions`, {
+    eventId: requiredOption(options, "event-id"),
+    idempotencyKey: requiredOption(options, "idempotency-key"),
+    senderThreadId: resolveThreadId(options, overrides),
+    publicationEventId: requiredOption(options, "version"),
+    expectedAdoptionId: expected === "none" ? null : expected,
+    adoptionBoundary: requiredOption(options, "boundary"),
+  });
 }
 
 async function addTaskHandoff(api, taskId, options, overrides) {

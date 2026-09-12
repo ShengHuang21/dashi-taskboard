@@ -90,6 +90,19 @@ Read the current revision immediately before every configuration write. Scopes m
 
 Use `issue bootstrap` as the first read for a fresh or memoryless window. It performs one direct Task Capsule read and returns the recovery state together, including the issue, relations, comments, attachments, inbox, handoffs, active/latest execution run, authorization state, and `resumeToken`. Use the returned `resumeToken` and execution frontier when claiming or resuming work; `issue bootstrap` itself is read-only.
 
+For a difficulty-selected child model, plan before reservation/delivery by adding one structured comment through the existing command, then bootstrap again:
+
+```bash
+taskctl comment add ISSUE_ID --body-file /absolute/path/task-model-routing-v1.md [--thread-id ROOT_THREAD] [--json]
+taskctl issue bootstrap ISSUE_ID [--json]
+```
+
+The body file contains one `Task Model Routing V1` marker immediately followed by a `json` code fence. Its JSON requires `workflow: "ai-coding-end-to-end"`; `fast`, `balanced`, and `capable` profiles, each with a Host-advertised `model` and `reasoningEffort`; a non-empty `profileSource`; `planningProfile` and `validationProfile` both `capable`; plus one execution `{ safeActionId, difficulty, profile, reason }`. The only mappings are `simple -> fast`, `standard -> balanced`, and `complex -> capable`.
+
+The re-bootstrapped Capsule exposes `modelRouting` with the source comment id/version and `selectedExecution` only when the configured `safeActionId` equals the current Safe Action. A malformed supplied route or mismatch stops routing; it must not degrade to an unpinned model choice. When no routing marker is supplied, existing dispatch behavior remains unchanged.
+
+Use the existing `issue admission-prepare` command with the exact re-bootstrapped token and action. If its response is not rerouted, it includes `spawnConfig`: use its `taskName`, `model`, `reasoningEffort`, and `forkTurns: "none"` exactly for the child spawn. A null `spawnConfig` means the task is unconfigured, so retain the existing no-model-override dispatch behavior while using the returned admission agent identity. On capacity rejection, retain the requested model and effort through the existing defer/retry path; do not reselect a profile or model. After the child makes the exact prepared claim, use the existing comment command to record requested parameters and real spawn/claim tool-call evidence only.
+
 If the Capsule returns `readyWork.ownerDecisionRequest`, do not send the Owner to Taskboard and do not let a Sub-Agent ask them. The authenticated host Injector reserves the exact current request and Root route atomically, delivers the question once, and reads the delivery id back from the exact Root thread after uncertain transport. Once delivery is confirmed, Taskboard keeps that exact Root coordinator route protected for a bounded human-response window until the decision is recorded. After the Owner replies, Root bootstraps again and follows the injected instruction to emit one `TASKBOARD_OWNER_DECISION_V1` marker only when the request remains current. The Injector accepts that marker only after a real Owner input in the exact Root thread and records the immutable receipt through its host-authenticated route. `taskctl` has no Owner-decision mutation command. This is Root-attested Owner provenance, not Agent self-approval.
 
 ## Create issues
@@ -198,6 +211,31 @@ taskctl comment delete COMMENT_ID --if-version N [--thread-id ID] [--json]
 Without `--after`, `comment list` returns the full list. Its response includes `nextCursor`; keep that value and pass it to the next read of the same issue to return only comments created or modified after that cursor. `--body-file` reads the UTF-8 file and passes its contents directly to the existing comment write path.
 
 Each comment JSON object independently records the most recent conversation that created or changed that comment as `threadId`. Comment operations never change the parent issue's `threadId`.
+
+## Versioned text result handoffs
+
+```bash
+taskctl handoff publish SOURCE --consumer TARGET \
+  --event-id PUBLICATION_ID --idempotency-key KEY \
+  (--content TEXT | --content-file PATH) \
+  [--evidence-ref REF[,REF]] [--thread-id PRODUCER_ROOT] [--json]
+taskctl handoff read SOURCE --consumer TARGET [--version PUBLICATION_ID] [--json]
+taskctl handoff adopt SOURCE --consumer TARGET --version PUBLICATION_ID \
+  --expected-adoption none|ADOPTION_ID --event-id ADOPTION_ID --idempotency-key KEY \
+  --boundary TEXT [--thread-id CONSUMER_ROOT] [--json]
+```
+
+Publish/read/adopt resolve the configured protected local service; legacy list/add/ack routing is unchanged. They use `POST`/`GET /api/local/tasks/:source/result-handoffs/:consumer` and `POST .../adoptions`. Both tasks must exist in the same current project. Publish requires the current producer Root, adopt the current consumer Root; writes use `CODEX_THREAD_ID` unless `--thread-id` is explicit. These are the existing caller/thread checks, not a new host-attestation mechanism. Reads do not require a thread identity or create adoption authority.
+
+Publish stores the exact text, including leading/trailing whitespace, with a limit of 65,536 UTF-8 bytes (non-empty). `--content-file` reads only the caller's explicit path as UTF-8; the server receives text, never a path to open. The event includes `contentSha256`, `createdAt`, `sourceTaskVersion`, `previousPublicationId`, and resolved producer/consumer task UUIDs. At most 32 unique evidence references (each up to 2,048 characters) are declarations; the service does not fetch or freeze their files/URLs. Do not include credentials or sensitive customer data.
+
+Read returns `queriedAt`, `latestPublication`, `selectedPublication`, `currentAdoption`, `adoptedPublication`, and `syncStatus`. Without `--version`, selected equals latest; with it, the exact retained publication must belong to this pair. The statuses are `no_publication` (none currently retained), `awaiting_adoption` (published, no adoption), `pending_sync` (latest differs from adopted), or `adopted` (same exact publication). Read creates no receipt/comment/run/claim/status change and never messages, starts, wakes, or steers a task.
+
+Adopt requires an exact publication id and explicit expected current adoption id (`none` only when absent). Its boundary is a non-empty statement up to 2,000 characters, not server proof of an idle thread or completed document update. A replacement appends another adoption; publishing P2 does not rewrite A1 → P1. An explicit adoption may select an older publication and remain `pending_sync` against latest. On CAS conflict, reread and reconcile before choosing again.
+
+Publish/adopt return `{ applied, event }`. An identical event id, key, and normalized input returns the original event with `applied: false`; a conflicting input or event/key collision fails without another record. After uncertain transport, authoritative readback or the exact same request can determine the recorded outcome. Generated time, content hash, and captured source version are not new replay inputs.
+
+Result publications/adoptions are not legacy handoffs, acknowledgements, Capsule execution-frontier entries, or Ready Work. Existing task/project cascading deletion controls retention; even after a task moves, deletion of its original project can delete its receipts. No permanent-retention, crash-recovery, cloud deployment, or frozen-artifact claim follows from these records.
 
 ## Structured handoffs
 

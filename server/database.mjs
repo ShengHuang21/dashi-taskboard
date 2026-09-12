@@ -8,7 +8,8 @@ import {
   JIRA_PROJECT_ID,
   isCanonicalCodexHostId,
 } from "../shared/domain.mjs";
-import { createTaskCapsule } from "./task-capsule.mjs";
+import { createTaskCapsule, evaluateTaskAuthorization } from "./task-capsule.mjs";
+import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord } from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -567,6 +568,17 @@ function deterministicAdmissionAgentName(task, admissionAttemptId) {
   const taskPart = task.identifier.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 32);
   const attemptPart = admissionAttemptId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 16);
   return `${taskPart || "task"}_admission_${attemptPart}`;
+}
+
+function spawnConfigForModelRouting(modelRouting, taskName) {
+  const selected = modelRouting?.selectedExecution;
+  if (!selected) return null;
+  return {
+    taskName,
+    model: selected.model,
+    reasoningEffort: selected.reasoningEffort,
+    forkTurns: "none",
+  };
 }
 
 function normalizeWorkingLog(workingLog, developmentContext) {
@@ -10109,6 +10121,11 @@ export class TaskboardDatabase {
   }
 
   getTaskCapsule(id, { worktreeRepositoryProbe = null } = {}) {
+    const inputs = this.#taskCapsuleInputs(id, worktreeRepositoryProbe);
+    return inputs ? createTaskCapsule(inputs) : null;
+  }
+
+  #taskCapsuleInputs(id, worktreeRepositoryProbe = null) {
     let task = this.getTask(id);
     if (!task) return null;
     if (worktreeRepositoryProbe) {
@@ -10127,12 +10144,13 @@ export class TaskboardDatabase {
       codexHostId: globalLease.holderCodexHostId,
       workspacePath: globalLease.holderWorkspacePath,
     } : null;
-    return createTaskCapsule({
+    return {
       task,
       comments: this.listComments(task.id),
       attachments: this.listAttachments(task.id),
       inboxReceipts: this.listTaskInboxDeliveryReceipts(task.id),
       coordinationEvents: this.listTaskCoordinationEvents(task.id),
+      clarifications: this.getTaskClarificationMetadata(task.id),
       currentClaim: this.getAgentTaskClaim(task.id),
       currentRun: this.getOpenTaskAgentRun(task.id),
       latestRun: this.getLatestTaskAgentRun(task.id),
@@ -10142,7 +10160,92 @@ export class TaskboardDatabase {
       domainRoute: domainAssignment ? this.getAgentTaskDomainRoute(task.id) : null,
       globalCoordinatorFrontier,
       dependencyClearances: this.listCrossDomainDependencyClearances(task.id),
-    });
+      latestContinuationRecord: this.#latestTaskContinuation(task.id),
+    };
+  }
+
+  #latestTaskContinuation(taskId) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+      ORDER BY rowid DESC LIMIT 1
+    `).get(taskId);
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  #taskContinuationContext(taskId) {
+    const inputs = this.#taskCapsuleInputs(taskId);
+    if (!inputs) throw new ApiError(404, "TASK_NOT_FOUND", `Task '${taskId}' does not exist`);
+    const timestamp = new Date();
+    const evaluation = evaluateTaskAuthorization({ ...inputs, now: timestamp });
+    const capsule = createTaskCapsule({ ...inputs, now: timestamp, authorizationEvaluation: evaluation });
+    return { capsule, evaluation, currentClaim: inputs.currentClaim, record: inputs.latestContinuationRecord };
+  }
+
+  getTaskContinuation(taskId) {
+    this.database.exec("BEGIN");
+    try {
+      const result = assessTaskContinuation(this.#taskContinuationContext(taskId));
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendTaskContinuation(taskId, body) {
+    let input;
+    try {
+      input = normalizeContinuationRecord(body);
+    } catch (error) {
+      throw new ApiError(400, "INVALID_FIELD", error.message);
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const task = this.#requireTask(taskId);
+      if (!task.threadBinding || task.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "CONTINUATION_SENDER_MISMATCH", "The sender must be the task's current bound Root");
+      }
+      const request = { ...input, eventType: "continuation_record", taskId: task.id };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const existing = this.#prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+      `).all(input.eventId, task.id, input.idempotencyKey);
+      if (existing.length > 0) {
+        const event = existing[0].envelope_json ? JSON.parse(existing[0].envelope_json) : null;
+        if (existing.length !== 1 || existing[0].task_id !== task.id
+          || event?.eventType !== "continuation_record" || event.senderThreadId !== input.senderThreadId
+          || event.requestSha256 !== requestSha256) {
+          throw new ApiError(409, "CONTINUATION_CONFLICT", "The event or key already belongs to another request");
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, event };
+      }
+      if (task.archivedAt !== null) throw new ApiError(409, "TASK_ARCHIVED", "Cannot record an archived task");
+      const context = this.#taskContinuationContext(task.id);
+      if (context.capsule.resumeToken !== input.expectedResumeToken
+        || (context.record?.eventId ?? null) !== input.expectedRecordId) {
+        throw new ApiError(409, "CONTINUATION_STALE", "Reread the current Capsule and continuation before recording", {
+          currentRecordId: context.record?.eventId ?? null,
+        });
+      }
+      const event = {
+        ...request, projectId: task.projectId, requestSha256, previousRecordId: context.record?.eventId ?? null,
+        basis: continuationBasis(context.capsule, context.evaluation), createdAt: context.evaluation.evaluatedAt,
+      };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (
+          event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+      `).run(event.eventId, task.projectId, task.id, event.idempotencyKey, JSON.stringify(event), event.createdAt);
+      this.database.exec("COMMIT");
+      return { applied: true, event };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   #assertTaskSafeActionHostExecutor(rootRun, ownedCodexHostId) {
@@ -10672,6 +10775,17 @@ export class TaskboardDatabase {
         || capsule.readyWork.safeActions[0]?.id !== safeActionId) {
         throw new ApiError(409, "ADMISSION_FRONTIER_CHANGED", "Task Capsule changed before admission preparation");
       }
+      if (capsule.modelRouting?.state === "invalid") {
+        throw new ApiError(409, "MODEL_ROUTING_INVALID", "Task model routing must be corrected before admission preparation");
+      }
+      if (capsule.modelRouting?.state === "valid"
+        && capsule.modelRouting.selectionState !== "matched") {
+        throw new ApiError(409, "MODEL_ROUTING_SAFE_ACTION_MISMATCH", "Task model routing does not match the current safe action");
+      }
+      const spawnConfig = spawnConfigForModelRouting(
+        capsule.modelRouting,
+        row.admission_agent_name ?? deterministicAdmissionAgentName(task, admissionAttemptId),
+      );
       if (rootRun.domainWriteScope && normalizedWriteScope.some((entry) => !scopeIsContainedBy(
         entry,
         rootRun.domainWriteScope,
@@ -10684,7 +10798,11 @@ export class TaskboardDatabase {
           throw new ApiError(409, "ADMISSION_WRITE_SCOPE_MISMATCH", "Admission was already prepared with another write scope");
         }
         this.database.exec("COMMIT");
-        return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
+        return {
+          applied: false,
+          receipt: this.#taskSafeActionReceipt(row),
+          spawnConfig,
+        };
       }
       if (row.status !== "delivering" || row.admission_state !== "awaiting_admission") {
         throw new ApiError(409, "ADMISSION_NOT_AWAITING", "Only the current awaiting admission attempt can be prepared");
@@ -10758,7 +10876,11 @@ export class TaskboardDatabase {
       }
       const prepared = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(row.id);
       this.database.exec("COMMIT");
-      return { applied: true, receipt: this.#taskSafeActionReceipt(prepared) };
+      return {
+        applied: true,
+        receipt: this.#taskSafeActionReceipt(prepared),
+        spawnConfig,
+      };
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -13021,6 +13143,317 @@ export class TaskboardDatabase {
     }
   }
 
+  #requireResultHandoffPair(producerTaskId, consumerTaskId) {
+    const producer = this.#requireTask(producerTaskId);
+    const consumer = this.#requireTask(consumerTaskId);
+    if (producer.projectId !== consumer.projectId) {
+      throw new ApiError(409, "RESULT_HANDOFF_PROJECT_MISMATCH", "Result handoffs require tasks in the same current project");
+    }
+    return { producer, consumer };
+  }
+
+  #getResultHandoffEvent(producerTaskId, consumerTaskId, eventType, eventId = null) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE task_id = ?
+        AND json_extract(envelope_json, '$.eventType') = ?
+        AND json_extract(envelope_json, '$.producerTaskId') = ?
+        AND json_extract(envelope_json, '$.consumerTaskId') = ?
+        AND (? IS NULL OR event_id = ?)
+      ORDER BY rowid DESC LIMIT 1
+    `).get(
+      eventType === "result_publication" ? producerTaskId : consumerTaskId,
+      eventType, producerTaskId, consumerTaskId, eventId, eventId,
+    );
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  getTaskResultHandoff(producerTaskId, consumerTaskId, publicationEventId = null) {
+    this.database.exec("BEGIN");
+    try {
+      const { producer, consumer } = this.#requireResultHandoffPair(producerTaskId, consumerTaskId);
+      const publication = (id = null) => this.#getResultHandoffEvent(
+        producer.id, consumer.id, "result_publication", id,
+      );
+      const latestPublication = publication();
+      const selectedPublication = publicationEventId === null ? latestPublication : publication(publicationEventId);
+      if (publicationEventId !== null && !selectedPublication) {
+        throw new ApiError(404, "RESULT_PUBLICATION_NOT_FOUND", "The requested publication is not retained for this task pair");
+      }
+      const currentAdoption = this.#getResultHandoffEvent(producer.id, consumer.id, "result_adoption");
+      const adoptedPublication = currentAdoption ? publication(currentAdoption.publicationEventId) : null;
+      const syncStatus = !latestPublication ? "no_publication"
+        : !currentAdoption ? "awaiting_adoption"
+          : currentAdoption.publicationEventId === latestPublication.eventId ? "adopted" : "pending_sync";
+      const result = {
+        queriedAt: now(), latestPublication, selectedPublication, currentAdoption, adoptedPublication, syncStatus,
+      };
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendTaskResultHandoff(producerTaskId, consumerTaskId, eventType, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { producer, consumer } = this.#requireResultHandoffPair(producerTaskId, consumerTaskId);
+      const publishing = eventType === "result_publication";
+      const task = publishing ? producer : consumer;
+      if (!task.threadBinding || task.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "RESULT_HANDOFF_SENDER_MISMATCH", "The sender must be the task's current bound Root");
+      }
+      const request = { ...input, eventType, taskId: task.id, producerTaskId: producer.id, consumerTaskId: consumer.id };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const existing = this.#prepare(`
+        SELECT * FROM agent_event_receipts
+        WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+      `).all(input.eventId, task.id, input.idempotencyKey);
+      if (existing.length > 0) {
+        const event = existing[0].envelope_json ? JSON.parse(existing[0].envelope_json) : null;
+        if (existing.length !== 1 || existing[0].task_id !== task.id
+          || event?.eventType !== eventType || event.requestSha256 !== requestSha256) {
+          throw new ApiError(409, "RESULT_HANDOFF_CONFLICT", "The event or idempotency key is already bound to another request");
+        }
+        this.database.exec("COMMIT");
+        return { applied: false, event };
+      }
+      let captured;
+      if (publishing) {
+        const previous = this.#getResultHandoffEvent(producer.id, consumer.id, "result_publication");
+        captured = {
+          contentSha256: createHash("sha256").update(input.content, "utf8").digest("hex"),
+          sourceTaskVersion: producer.version,
+          previousPublicationId: previous?.eventId ?? null,
+        };
+      } else {
+        const publication = this.#getResultHandoffEvent(
+          producer.id, consumer.id, "result_publication", input.publicationEventId,
+        );
+        if (!publication) {
+          throw new ApiError(404, "RESULT_PUBLICATION_NOT_FOUND", "The requested publication is not retained for this task pair");
+        }
+        const current = this.#getResultHandoffEvent(producer.id, consumer.id, "result_adoption");
+        if ((current?.eventId ?? null) !== input.expectedAdoptionId) {
+          throw new ApiError(409, "RESULT_ADOPTION_CONFLICT", "Read the current adoption before choosing its replacement", {
+            currentAdoptionId: current?.eventId ?? null,
+          });
+        }
+        captured = {};
+      }
+      const event = { ...request, ...captured, requestSha256, createdAt: now() };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (
+          event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+      `).run(event.eventId, task.projectId, task.id, event.idempotencyKey, JSON.stringify(event), event.createdAt);
+      this.database.exec("COMMIT");
+      return { applied: true, event };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #getClarificationRequest(canonicalRequestId) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE json_extract(envelope_json, '$.eventType') = 'clarification_request'
+        AND json_extract(envelope_json, '$.canonicalRequestId') = ?
+    `).get(canonicalRequestId);
+    if (!row) {
+      throw new ApiError(404, "CLARIFICATION_NOT_FOUND", "The canonical clarification request is not retained");
+    }
+    return JSON.parse(row.envelope_json);
+  }
+
+  #getClarificationResolution(canonicalRequestId) {
+    const row = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts
+      WHERE json_extract(envelope_json, '$.eventType') = 'clarification_resolution'
+        AND json_extract(envelope_json, '$.canonicalRequestId') = ?
+    `).get(canonicalRequestId);
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  #clarificationView(request) {
+    const resolution = this.#getClarificationResolution(request.canonicalRequestId);
+    const latestPublicationEventId = this.#getResultHandoffEvent(
+      request.producerTaskId, request.consumerTaskId, "result_publication",
+    )?.eventId ?? null;
+    const relevance = request.basisPublicationEventId === null && latestPublicationEventId === null
+      ? "no_published_basis"
+      : request.basisPublicationEventId === latestPublicationEventId ? "current" : "needs_reconfirmation";
+    return {
+      canonicalRequestId: request.canonicalRequestId,
+      request,
+      resolution,
+      status: resolution ? "handled" : "queued",
+      basisPublicationEventId: request.basisPublicationEventId,
+      latestPublicationEventId,
+      relevance,
+    };
+  }
+
+  #clarificationReplay(taskId, input, requestSha256, eventTypes) {
+    const rows = this.#prepare(`
+      SELECT * FROM agent_event_receipts
+      WHERE event_id = ? OR (task_id = ? AND idempotency_key = ?)
+    `).all(input.eventId, taskId, input.idempotencyKey);
+    if (rows.length === 0) return null;
+    const event = rows[0].envelope_json ? JSON.parse(rows[0].envelope_json) : null;
+    if (rows.length !== 1 || rows[0].task_id !== taskId
+      || !eventTypes.includes(event?.eventType) || event.requestSha256 !== requestSha256) {
+      throw new ApiError(409, "CLARIFICATION_CONFLICT", "The event or idempotency key is already bound to another request");
+    }
+    return event;
+  }
+
+  #insertClarificationReceipt(task, event) {
+    this.#prepare(`
+      INSERT INTO agent_event_receipts (
+        event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?)
+    `).run(event.eventId, task.projectId, task.id, event.idempotencyKey, JSON.stringify(event), event.createdAt);
+  }
+
+  enqueueTaskClarification(producerTaskId, consumerTaskId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const { producer, consumer } = this.#requireResultHandoffPair(producerTaskId, consumerTaskId);
+      if (!consumer.threadBinding || consumer.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "CLARIFICATION_SENDER_MISMATCH", "Enqueue requires the consumer task's current bound Root");
+      }
+      const logical = {
+        producerTaskId: producer.id, consumerTaskId: consumer.id,
+        basisPublicationEventId: input.basisPublicationEventId,
+        question: input.question, evidenceRefs: input.evidenceRefs,
+      };
+      const request = { ...input, ...logical };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(request)).digest("hex");
+      const replay = this.#clarificationReplay(
+        consumer.id, input, requestSha256, ["clarification_request", "clarification_alias"],
+      );
+      if (replay) {
+        const result = this.#clarificationView(this.#getClarificationRequest(replay.canonicalRequestId));
+        this.database.exec("COMMIT");
+        return { applied: false, receipt: replay, ...result };
+      }
+      if (input.basisPublicationEventId !== null && !this.#getResultHandoffEvent(
+        producer.id, consumer.id, "result_publication", input.basisPublicationEventId,
+      )) {
+        throw new ApiError(404, "RESULT_PUBLICATION_NOT_FOUND", "The basis publication is not retained for this task pair");
+      }
+      const logicalSha256 = createHash("sha256").update(JSON.stringify(logical)).digest("hex");
+      const existing = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'clarification_request'
+          AND json_extract(envelope_json, '$.logicalSha256') = ?
+      `).get(consumer.id, logicalSha256);
+      const canonical = existing ? JSON.parse(existing.envelope_json) : null;
+      const receipt = {
+        ...request,
+        eventType: canonical ? "clarification_alias" : "clarification_request",
+        canonicalRequestId: canonical?.canonicalRequestId ?? randomUUID(),
+        logicalSha256, requestSha256, createdAt: now(),
+      };
+      this.#insertClarificationReceipt(consumer, receipt);
+      const result = this.#clarificationView(canonical ?? receipt);
+      this.database.exec("COMMIT");
+      return { applied: true, receipt, ...result };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  resolveTaskClarification(canonicalRequestId, input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const request = this.#getClarificationRequest(canonicalRequestId);
+      const { producer, consumer } = this.#requireResultHandoffPair(request.producerTaskId, request.consumerTaskId);
+      if (!producer.threadBinding || producer.threadBinding.threadId !== input.senderThreadId) {
+        throw new ApiError(409, "CLARIFICATION_SENDER_MISMATCH", "Resolve requires the producer task's current bound Root");
+      }
+      const delivery = {
+        ...input, canonicalRequestId, producerTaskId: producer.id, consumerTaskId: consumer.id,
+      };
+      const requestSha256 = createHash("sha256").update(JSON.stringify(delivery)).digest("hex");
+      const replay = this.#clarificationReplay(producer.id, input, requestSha256, ["clarification_resolution"]);
+      if (replay) {
+        const result = this.#clarificationView(request);
+        this.database.exec("COMMIT");
+        return { applied: false, receipt: replay, ...result };
+      }
+      const current = this.#clarificationView(request);
+      if (current.resolution) {
+        throw new ApiError(409, "CLARIFICATION_ALREADY_HANDLED", "A clarification has one immutable terminal resolution");
+      }
+      if (input.observedLatestPublicationEventId !== current.latestPublicationEventId) {
+        throw new ApiError(409, "CLARIFICATION_PUBLICATION_CONFLICT", "Read the latest publication before resolving", {
+          latestPublicationEventId: current.latestPublicationEventId,
+        });
+      }
+      if (input.outcome === "answered" && current.relevance === "needs_reconfirmation") {
+        throw new ApiError(409, "CLARIFICATION_RECONFIRMATION_REQUIRED", "A stale request must be explicitly handled as needs_reconfirmation");
+      }
+      const receipt = { ...delivery, eventType: "clarification_resolution", requestSha256, createdAt: now() };
+      this.#insertClarificationReceipt(producer, receipt);
+      this.database.exec("COMMIT");
+      return { applied: true, receipt, ...current, resolution: receipt, status: "handled" };
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listTaskClarifications(taskId) {
+    this.database.exec("BEGIN");
+    try {
+      const task = this.#requireTask(taskId);
+      const requests = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE json_extract(envelope_json, '$.eventType') = 'clarification_request'
+          AND (json_extract(envelope_json, '$.producerTaskId') = ?
+            OR json_extract(envelope_json, '$.consumerTaskId') = ?)
+        ORDER BY rowid
+      `).all(task.id, task.id).map((row) => JSON.parse(row.envelope_json));
+      const clarifications = requests.map((request) => ({
+        ...this.#clarificationView(request),
+        incoming: request.producerTaskId === task.id,
+        outgoing: request.consumerTaskId === task.id,
+      }));
+      const result = { taskId: task.id, clarifications, queriedAt: now() };
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getTaskClarificationMetadata(taskId) {
+    // Capsule callers may already hold a claim/safe-action transaction. This is one read only.
+    const counts = this.#prepare(`
+      SELECT
+        COALESCE(SUM(json_extract(request.envelope_json, '$.producerTaskId') = ?), 0) AS incomingPendingCount,
+        COALESCE(SUM(json_extract(request.envelope_json, '$.consumerTaskId') = ?), 0) AS outgoingPendingCount
+      FROM agent_event_receipts AS request
+      WHERE json_extract(request.envelope_json, '$.eventType') = 'clarification_request'
+        AND (json_extract(request.envelope_json, '$.producerTaskId') = ?
+          OR json_extract(request.envelope_json, '$.consumerTaskId') = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_event_receipts AS resolution
+          WHERE json_extract(resolution.envelope_json, '$.eventType') = 'clarification_resolution'
+            AND json_extract(resolution.envelope_json, '$.canonicalRequestId')
+              = json_extract(request.envelope_json, '$.canonicalRequestId')
+        )
+    `).get(taskId, taskId, taskId, taskId);
+    return { ...counts, readInstruction: `taskctl clarification list ${taskId} --json` };
+  }
+
   appendTaskCoordinationEvent(taskId, envelope, actor) {
     this.database.exec("BEGIN IMMEDIATE");
     try {
@@ -13091,6 +13524,7 @@ export class TaskboardDatabase {
       const priorEnvelopes = this.#prepare(`
         SELECT envelope_json FROM agent_event_receipts
         WHERE task_id = ? AND envelope_json IS NOT NULL
+          AND json_extract(envelope_json, '$.eventType') = 'handoff'
         ORDER BY created_at DESC, rowid DESC
       `).all(task.id).map((row) => JSON.parse(row.envelope_json));
       if (completedRun && envelope.causationId !== completedRun.id) {
@@ -13172,6 +13606,7 @@ export class TaskboardDatabase {
     const row = this.#prepare(`
       SELECT * FROM agent_event_receipts
       WHERE event_id = ? AND envelope_json IS NOT NULL
+        AND json_extract(envelope_json, '$.eventType') = 'handoff'
     `).get(eventId);
     if (!row) return null;
     const acknowledgements = this.#prepare(`
@@ -13187,6 +13622,7 @@ export class TaskboardDatabase {
     return this.#prepare(`
       SELECT * FROM agent_event_receipts
       WHERE task_id = ? AND envelope_json IS NOT NULL
+        AND json_extract(envelope_json, '$.eventType') = 'handoff'
       ORDER BY created_at, rowid
     `).all(task.id).map((row) => this.getTaskCoordinationEvent(row.event_id));
   }
@@ -13197,6 +13633,7 @@ export class TaskboardDatabase {
       const row = this.#prepare(`
         SELECT * FROM agent_event_receipts
         WHERE event_id = ? AND envelope_json IS NOT NULL
+          AND json_extract(envelope_json, '$.eventType') = 'handoff'
       `).get(eventId);
       if (!row) {
         throw new ApiError(404, "COORDINATION_EVENT_NOT_FOUND", `Coordination event '${eventId}' does not exist`);

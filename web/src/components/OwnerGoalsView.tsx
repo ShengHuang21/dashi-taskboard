@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, type Ref } from "react";
 import { useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation } from "../taskConversations";
 import { createTaskProgressModel } from "../taskProgress";
@@ -8,6 +8,7 @@ import { TaskProgress } from "./TaskProgress";
 import "./OwnerGoalsView.css";
 
 interface OwnerGoalsViewProps {
+  scrollRef?: Ref<HTMLElement>;
   projectName: string | null;
   referenceTasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
@@ -16,6 +17,7 @@ interface OwnerGoalsViewProps {
 }
 
 export function OwnerGoalsView({
+  scrollRef,
   projectName,
   referenceTasks,
   presentations,
@@ -54,7 +56,7 @@ export function OwnerGoalsView({
   }
 
   return (
-    <section className="owner-goals-view" aria-label={text("我的任务", "My tasks")}>
+    <section ref={scrollRef} className="owner-goals-view" aria-label={text("我的任务", "My tasks")}>
       <div className="owner-goals-content">
         <header className="owner-goals-heading">
           <div>
