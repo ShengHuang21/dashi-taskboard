@@ -522,7 +522,7 @@ function parseHostExecutorExecution(value, codexHostId) {
 
 function parseHostExecutorEffect(value, codexHostId, effectKey) {
   assertPlainObject(value);
-  assertAllowedKeys(value, new Set(["execution", "operations"]));
+  assertAllowedKeys(value, new Set(["execution", "operations", "ordinaryDelivery"]));
   if (!Array.isArray(value.operations)
     || value.operations.length < 1
     || value.operations.length > 4) {
@@ -542,10 +542,23 @@ function parseHostExecutorEffect(value, codexHostId, effectKey) {
     assertPlainObject(operation.params);
     return { method, params: operation.params };
   });
+  let ordinaryDelivery;
+  if (Object.hasOwn(value, "ordinaryDelivery")) {
+    assertPlainObject(value.ordinaryDelivery);
+    assertAllowedKeys(value.ordinaryDelivery, new Set(["receiptId", "admissionAttemptId"]));
+    if (codexHostId !== "local" || operations.length !== 1 || operations[0].method !== "turn/start") {
+      throw new ApiError(400, "INVALID_FIELD", "Ordinary delivery identity requires one local turn/start");
+    }
+    ordinaryDelivery = {
+      receiptId: parseHostExecutorIdentifier(value.ordinaryDelivery.receiptId, "receiptId"),
+      admissionAttemptId: parseHostExecutorIdentifier(value.ordinaryDelivery.admissionAttemptId, "admissionAttemptId"),
+    };
+  }
   return {
     effectKey: parseHostExecutorIdentifier(effectKey, "effectKey"),
     execution: parseHostExecutorExecution(value.execution, codexHostId),
     operations,
+    ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
   };
 }
 
@@ -3985,7 +3998,10 @@ export function createTaskboardServer(options = {}) {
     });
   const localHostExecutorAdapter = options.hostExecutorRpcAdapter ?? aiChat.appServer;
   const unsubscribeOwnedTerminal = typeof localHostExecutorAdapter.subscribe === "function"
-    ? localHostExecutorAdapter.subscribe((notification) => database.recordOwnedTerminalCheckpoint(notification))
+    ? localHostExecutorAdapter.subscribe((notification) => {
+        database.recordOrdinaryDeliveryTerminal(notification);
+        return database.recordOwnedTerminalCheckpoint(notification);
+      })
     : null;
   const hostExecutorAdapter = createHostExecutorAdapterRouter({
     localAdapter: localHostExecutorAdapter,
