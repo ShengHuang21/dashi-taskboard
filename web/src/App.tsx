@@ -24,6 +24,7 @@ import {
   deleteProjectLabel as deleteProjectLabelRequest,
   deleteProject as deleteProjectRequest,
   getAiChatCatalog,
+  getAgentLaneSnapshot,
   getCodexThreadProgress,
   getHostRuntime,
   getJiraConnection,
@@ -56,7 +57,7 @@ import { BoardColumn } from "./components/BoardColumn";
 import type { AiChatOpenThreadRequest } from "./components/AiChat";
 import { AgentLaneBoard } from "./components/AgentLaneBoard";
 import { BoardCardDisplayMenu } from "./components/BoardCardDisplayMenu";
-import { DashboardView } from "./components/DashboardView";
+import { OwnerGoalsView } from "./components/OwnerGoalsView";
 import { ProjectReadmeView } from "./components/ProjectReadmeView";
 import { IssueListView } from "./components/IssueListView";
 import { JiraConnectionDialog } from "./components/JiraConnectionDialog";
@@ -107,6 +108,7 @@ import {
   type TaskCardPresentation,
   type TaskConversationItem,
 } from "./taskConversations";
+import { createTaskProgressModel, type DeliveryProgress } from "./taskProgress";
 import {
   EMPTY_TASK_FILTERS,
   matchesTaskFilters,
@@ -120,6 +122,7 @@ import {
   type ActorIdentity,
   type AiChatModel,
   type AiChatThread,
+  type AgentLaneSnapshot,
   type CodexProjectIdentity,
   type CodexThreadBinding,
   type CoordinationDispatchTarget,
@@ -143,7 +146,7 @@ type Theme = "light" | "dark";
 type BoardView = "readme" | "dashboard" | "issues" | "list" | "gantt" | "lanes";
 type DetailSourceScroll =
   | { projectId: string; view: "issues"; status: TaskStatus; scrollTop: number }
-  | { projectId: string; view: "list"; scrollTop: number };
+  | { projectId: string; view: "list" | "dashboard"; scrollTop: number };
 type GanttZoom = "day" | "week" | "month";
 type BoardCardDisplay = { cover: boolean; body: boolean };
 type ActionError = string | readonly [string, string];
@@ -742,8 +745,10 @@ export function App() {
   const [selectedProjectId, setSelectedProjectId] = useState(initialProjectId);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [archivedTasks, setArchivedTasks] = useState<Task[]>([]);
+  const [executionSnapshot, setExecutionSnapshot] = useState<AgentLaneSnapshot | null>(null);
   const [tasksLoading, setTasksLoading] = useState(false);
   const [hasLoadedTasks, setHasLoadedTasks] = useState(false);
+  const [loadedTasksScopeProjectId, setLoadedTasksScopeProjectId] = useState<string | null>(null);
   const [projectLoadError, setProjectLoadError] = useState<ProjectLoadError | null>(null);
   const [tasksLoadError, setTasksLoadError] = useState<TasksLoadError | null>(null);
   const loadError: LoadError | null = projectLoadError ?? tasksLoadError;
@@ -758,7 +763,6 @@ export function App() {
   const [filters, setFilters] = useState(readTaskFilters);
   const [boardView, setBoardView] = useState<BoardView>(() => readProjectBoardView(initialProjectId));
   const [boardCardDisplay, setBoardCardDisplay] = useState<BoardCardDisplay>(readBoardCardDisplay);
-  const [dashboardSummaryAnimatedProjectId, setDashboardSummaryAnimatedProjectId] = useState<string | null>(null);
   const [ganttZoom, setGanttZoom] = useState<GanttZoom>("week");
   const [ganttHideCompleted, setGanttHideCompleted] = useState(false);
   const [ganttTodayRequest, setGanttTodayRequest] = useState(0);
@@ -779,6 +783,7 @@ export function App() {
   const [detailTaskIdentifier, setDetailTaskIdentifier] = useState<string | null>(
     () => readIssueIdentifier(window.location.search),
   );
+  const [expandedDetailTaskIds, setExpandedDetailTaskIds] = useState<Record<string, string[]>>({});
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [readmeRevision, setReadmeRevision] = useState(0);
@@ -825,6 +830,8 @@ export function App() {
   const undoInFlightRef = useRef(false);
   const dragRegionRef = useRef<HTMLDivElement>(null);
   const issueListRef = useRef<HTMLDivElement>(null);
+  const ownerGoalsRef = useRef<HTMLElement>(null);
+  const detailScrollTopRef = useRef<Record<string, number>>({});
   const boardColumnScrollRefs = useRef<Partial<Record<TaskStatus, HTMLDivElement | null>>>({});
   const detailSourceProjectIdRef = useRef<string | null>(null);
   const pendingDetailSourceScrollRef = useRef<DetailSourceScroll | null>(null);
@@ -858,10 +865,6 @@ export function App() {
   const setAnnouncement = useCallback((message: string) => {
     setUndoNotice(null);
     setAnnouncementValue(message);
-  }, []);
-
-  const markDashboardSummaryAnimationStarted = useCallback((projectId: string) => {
-    setDashboardSummaryAnimatedProjectId(projectId);
   }, []);
 
   const rememberDeviceWorkspacePath = useCallback((projectId: string, workspacePath: string) => {
@@ -1078,6 +1081,20 @@ export function App() {
     };
   }, [automationProjectContext, hostContext, manageTaskboardSkillPath, selectedProject]);
   const referenceTasks = useMemo(() => [...tasks, ...archivedTasks], [archivedTasks, tasks]);
+  const deliveryProgressByTask = useMemo(() => {
+    const tasksByProject = new Map<string, Task[]>();
+    for (const task of referenceTasks) {
+      const projectTasks = tasksByProject.get(task.projectId) ?? [];
+      projectTasks.push(task);
+      tasksByProject.set(task.projectId, projectTasks);
+    }
+    const progress: Record<string, DeliveryProgress> = {};
+    for (const projectTasks of tasksByProject.values()) {
+      const model = createTaskProgressModel(projectTasks);
+      for (const task of projectTasks) progress[task.id] = model.forTask(task.id);
+    }
+    return progress;
+  }, [referenceTasks]);
   const detailTask = detailTaskIdentifier
     ? referenceTasks.find((task) => task.identifier === detailTaskIdentifier) ?? null
     : null;
@@ -1133,16 +1150,14 @@ export function App() {
         codexIdentity: projectCodexIdentities[project.id] ?? null,
       });
     }
-    const recentOrder = new Map(recentProjectIds.map((projectId, index) => [projectId, index]));
     const sortedChoices = choices.sort((left, right) => (
-      (recentOrder.get(left.id) ?? recentProjectIds.length)
-      - (recentOrder.get(right.id) ?? recentProjectIds.length)
+      left.name.localeCompare(right.name) || left.id.localeCompare(right.id)
     ));
     return [
       ...sortedChoices.filter((project) => project.issueCount > 0),
       ...sortedChoices.filter((project) => project.issueCount === 0),
     ];
-  }, [hostContext?.projects, projectCodexIdentities, projects, recentProjectIds, text]);
+  }, [hostContext?.projects, projectCodexIdentities, projects, text]);
   const projectMenuChoices = projectChoices.filter(
     (project) => project.id !== GLOBAL_PROJECT_ID || project.issueCount > 0,
   );
@@ -1491,13 +1506,19 @@ export function App() {
     const currentIssue = readIssueIdentifier(window.location.search);
     if (!currentIssue) detailSourceProjectIdRef.current = selectedProjectId;
     if (isAllProjects) setSelectedProjectId(task.projectId);
-    if (boardView === "list" && issueListRef.current) {
+    if (!currentIssue && boardView === "dashboard" && ownerGoalsRef.current) {
+      pendingDetailSourceScrollRef.current = {
+        projectId: selectedProjectId,
+        view: "dashboard",
+        scrollTop: ownerGoalsRef.current.scrollTop,
+      };
+    } else if (!currentIssue && boardView === "list" && issueListRef.current) {
       pendingDetailSourceScrollRef.current = {
         projectId: selectedProjectId,
         view: "list",
         scrollTop: issueListRef.current.scrollTop,
       };
-    } else if (boardView === "issues" && fullTask) {
+    } else if (!currentIssue && boardView === "issues" && fullTask) {
       const scrollContainer = boardColumnScrollRefs.current[fullTask.status];
       if (scrollContainer) {
         pendingDetailSourceScrollRef.current = {
@@ -1513,23 +1534,35 @@ export function App() {
     setDetailTaskIdentifier(task.identifier);
     const boardUrl = buildIssueUrl(window.location.href, selectedProjectId, null);
     if (!currentIssue) {
-      window.history.replaceState(window.history.state, "", boardUrl);
+      window.history.replaceState({
+        ...window.history.state,
+        taskboardDetail: false,
+        taskboardTaskScopeProjectId: selectedProjectId,
+      }, "", boardUrl);
     }
     const detailUrl = buildIssueUrl(
       currentIssue ? window.location.href : boardUrl.href,
       task.projectId,
       task.identifier,
     );
-    window.history.pushState(window.history.state, "", detailUrl);
+    window.history.pushState({
+      ...window.history.state,
+      taskboardDetail: true,
+      taskboardTaskScopeProjectId: detailSourceProjectIdRef.current ?? task.projectId,
+    }, "", detailUrl);
   }
 
   function closeTaskDetail() {
+    if (window.history.state?.taskboardDetail) {
+      window.history.back();
+      return;
+    }
     const sourceProjectId = detailSourceProjectIdRef.current ?? selectedProjectId;
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
     if (sourceProjectId !== selectedProjectId) {
       setSelectedProjectId(sourceProjectId);
-      setBoardView(sourceProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(sourceProjectId));
+      setBoardView(readProjectBoardView(sourceProjectId));
     }
     const url = buildIssueUrl(window.location.href, sourceProjectId, null);
     window.history.replaceState(window.history.state, "", url);
@@ -1543,9 +1576,11 @@ export function App() {
       pendingDetailSourceScrollRef.current = null;
       return;
     }
-    const scrollContainer = pendingScroll.view === "list"
-      ? issueListRef.current
-      : boardColumnScrollRefs.current[pendingScroll.status];
+    const scrollContainer = pendingScroll.view === "issues"
+      ? boardColumnScrollRefs.current[pendingScroll.status]
+      : pendingScroll.view === "dashboard"
+        ? ownerGoalsRef.current
+        : issueListRef.current;
     pendingDetailSourceScrollRef.current = null;
     if (!scrollContainer) return;
     scrollContainer.scrollTop = pendingScroll.scrollTop;
@@ -1556,7 +1591,17 @@ export function App() {
       const url = new URL(window.location.href);
       const routeProjectId = url.searchParams.get("project") ?? GLOBAL_PROJECT_ID;
       const routeIssueIdentifier = readIssueIdentifier(url.search);
-      if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
+      const routeTaskScopeProjectId = window.history.state?.taskboardTaskScopeProjectId;
+      detailSourceProjectIdRef.current = routeIssueIdentifier
+        ? typeof routeTaskScopeProjectId === "string" ? routeTaskScopeProjectId : routeProjectId
+        : null;
+      if (routeIssueIdentifier && boardView === "dashboard" && ownerGoalsRef.current) {
+        pendingDetailSourceScrollRef.current = {
+          projectId: selectedProjectId,
+          view: "dashboard",
+          scrollTop: ownerGoalsRef.current.scrollTop,
+        };
+      } else if (routeIssueIdentifier && boardView === "list" && issueListRef.current) {
         pendingDetailSourceScrollRef.current = {
           projectId: selectedProjectId,
           view: "list",
@@ -1578,19 +1623,19 @@ export function App() {
           };
         }
       }
-      if (!routeIssueIdentifier) detailSourceProjectIdRef.current = null;
       setDetailTaskIdentifier(routeIssueIdentifier);
+      if (!routeIssueIdentifier && pendingDetailSourceScrollRef.current?.projectId === routeProjectId) {
+        setBoardView(pendingDetailSourceScrollRef.current.view);
+      }
       if (routeProjectId === selectedProjectId) return;
       const routeProject = projects.find((project) => project.id === routeProjectId);
-      setBoardView(routeProjectId === ALL_PROJECTS_ID
-        ? "issues"
-        : readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
+      setBoardView(readProjectBoardView(routeProjectId, routeProject?.agentLanesConfigured));
       setSelectedProjectId(routeProjectId);
     }
 
     window.addEventListener("popstate", syncRouteFromLocation);
     return () => window.removeEventListener("popstate", syncRouteFromLocation);
-  }, [boardView, projects, selectedProjectId]);
+  }, [boardView, detailTaskIdentifier, projects, selectedProjectId]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1609,17 +1654,9 @@ export function App() {
 
   useEffect(() => {
     if (selectedProjectId) {
-      setBoardView(selectedProjectId === ALL_PROJECTS_ID ? "issues" : readProjectBoardView(selectedProjectId));
+      setBoardView(readProjectBoardView(selectedProjectId));
     }
   }, [selectedProjectId]);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setDashboardSummaryAnimatedProjectId(null);
-    } else if (boardView !== "dashboard") {
-      setDashboardSummaryAnimatedProjectId(selectedProjectId);
-    }
-  }, [boardView, selectedProjectId]);
 
   useEffect(() => {
     writeTaskFilters(filters);
@@ -1963,6 +2000,7 @@ export function App() {
       if (requestId !== tasksRequestRef.current) return;
       setTasks(sortTasks(nextTasks));
       setArchivedTasks(sortTasks(nextArchivedTasks));
+      setLoadedTasksScopeProjectId(projectId);
       setProjects((current) => current.map((project) => {
         if (project.id !== projectId || project.source !== "jira") return project;
         const labels = [...new Set(nextTasks.flatMap((task) => task.labels))];
@@ -1988,6 +2026,7 @@ export function App() {
       setTasks([]);
       setArchivedTasks([]);
       setHasLoadedTasks(false);
+      setLoadedTasksScopeProjectId(null);
       return;
     }
     setHasLoadedTasks(false);
@@ -2219,7 +2258,9 @@ export function App() {
             JSON.stringify(current) === JSON.stringify(progress) ? current : progress
           ));
         }
-      } catch {}
+      } catch {
+        if (!disposed) setCodexThreadProgress({});
+      }
     };
     void sync();
     const timer = window.setInterval(sync, 2_000);
@@ -2228,6 +2269,34 @@ export function App() {
       window.clearInterval(timer);
     };
   }, [trackedCodexThreadIdsKey]);
+
+  const executionProjectId = selectedProject?.agentLanesConfigured ? selectedProject.id : null;
+  useEffect(() => {
+    setExecutionSnapshot(null);
+    if (!executionProjectId) return;
+    let disposed = false;
+    let pending = false;
+    const controller = new AbortController();
+    const sync = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const snapshot = await getAgentLaneSnapshot(executionProjectId, controller.signal);
+        if (!disposed) setExecutionSnapshot(snapshot.projectId === executionProjectId ? snapshot : null);
+      } catch {
+        if (!disposed) setExecutionSnapshot(null);
+      } finally {
+        pending = false;
+      }
+    };
+    void sync();
+    const timer = window.setInterval(sync, 15_000);
+    return () => {
+      disposed = true;
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [executionProjectId]);
 
   const tasksByStatus = useMemo(() => {
     return Object.fromEntries(
@@ -2244,13 +2313,17 @@ export function App() {
   const otherTasksColumnCount = mainStatuses.length + 1;
   const otherTasksWidth = `clamp(300px, calc(${100 / otherTasksColumnCount}% - ${(36 + (mainStatuses.length * 24)) / otherTasksColumnCount}px), 400px)`;
 
-  const taskPresentations = useMemo(() => Object.fromEntries(tasks.map((task) => {
+  const taskPresentations = useMemo(() => Object.fromEntries(referenceTasks.map((task) => {
     const unread = (task.status === "in_review" || task.status === "blocked")
       && readActivityKeys[task.id] !== task.activityKey;
     const runningNativeThreadId = hostContext?.threadRunning
       ? hostContext.threadId ?? null
       : null;
     const taskThreadId = normalizeCodexThreadId(task.threadId);
+    const executionSnapshotMatches = executionSnapshot?.projectId === executionProjectId
+      && executionSnapshot.projectId === task.projectId;
+    const executionObservationAvailable = projects.find((project) => project.id === task.projectId)?.agentLanesConfigured === false
+      || executionSnapshotMatches;
     return [task.id, taskCardPresentation(
       task,
       aiThreads,
@@ -2258,15 +2331,22 @@ export function App() {
       runningNativeThreadId,
       hostContext?.threadTodoProgress ?? null,
       taskThreadId ? codexThreadProgress[taskThreadId] ?? null : undefined,
+      executionSnapshotMatches
+        ? executionSnapshot.todos.find((todo) => todo.taskId === task.id) ?? null
+        : null,
+      executionObservationAvailable,
     )];
   })) as Record<string, TaskCardPresentation>, [
     aiThreads,
     codexThreadProgress,
+    executionProjectId,
+    executionSnapshot,
     hostContext?.threadId,
     hostContext?.threadRunning,
     hostContext?.threadTodoProgress,
+    projects,
     readActivityKeys,
-    tasks,
+    referenceTasks,
   ]);
   const hasRunningTask = useMemo(
     () => Object.values(taskPresentations).some((presentation) => presentation.processing.running),
@@ -3098,9 +3178,7 @@ export function App() {
     detailSourceProjectIdRef.current = null;
     setDetailTaskIdentifier(null);
     const project = projects.find((candidate) => candidate.id === projectId);
-    setBoardView(projectId === ALL_PROJECTS_ID
-      ? "issues"
-      : readProjectBoardView(projectId, project?.agentLanesConfigured));
+    setBoardView(readProjectBoardView(projectId, project?.agentLanesConfigured));
     if (projectId !== ALL_PROJECTS_ID) rememberProjectOpen(projectId);
     setSelectedProjectId(projectId);
     setSearch("");
@@ -3333,8 +3411,8 @@ export function App() {
                 <button
                   className="detail-back-button"
                   type="button"
-                  aria-label={text("返回议题看板", "Back to issue board")}
-                  title={text("返回议题看板 (Esc)", "Back to issue board (Esc)")}
+                  aria-label={text("返回上一页", "Back to previous page")}
+                  title={text("返回上一页 (Esc)", "Back to previous page (Esc)")}
                   onClick={closeTaskDetail}
                 >
                   <LinearIcon name="chevronLeft" />
@@ -3490,7 +3568,7 @@ export function App() {
               aria-pressed={boardView === "dashboard"}
               onClick={() => selectBoardView("dashboard")}
             >
-              {text("仪表盘", "Dashboard")}
+              {text("我的任务", "My tasks")}
             </button>
             <button
               className={`view-tab${boardView === "issues" ? " active" : ""}`}
@@ -3498,7 +3576,7 @@ export function App() {
               aria-pressed={boardView === "issues"}
               onClick={() => selectBoardView("issues")}
             >
-              {text("议题看板", "Issue board")}
+              {text("执行看板", "Execution board")}
             </button>
             <button
               className={`view-tab${boardView === "list" ? " active" : ""}`}
@@ -3506,7 +3584,7 @@ export function App() {
               aria-pressed={boardView === "list"}
               onClick={() => selectBoardView("list")}
             >
-              {text("列表视图", "List")}
+              {text("执行列表", "Execution list")}
             </button>
             <button
               className={`view-tab${boardView === "gantt" ? " active" : ""}`}
@@ -3647,7 +3725,21 @@ export function App() {
             key={detailTask.id}
             task={detailTask}
             tasks={tasks.filter((task) => task.projectId === detailTask.projectId)}
-            referenceTasks={referenceTasks.filter((task) => task.projectId === detailTask.projectId)}
+            referenceTasks={referenceTasks}
+            execution={taskPresentations[detailTask.id].execution}
+            presentations={taskPresentations}
+            expandedTaskIds={expandedDetailTaskIds[detailTask.id] ?? []}
+            onToggleTaskExpansion={(taskId) => setExpandedDetailTaskIds((current) => {
+              const expanded = current[detailTask.id] ?? [];
+              return {
+                ...current,
+                [detailTask.id]: expanded.includes(taskId)
+                  ? expanded.filter((id) => id !== taskId)
+                  : [...expanded, taskId],
+              };
+            })}
+            initialScrollTop={detailScrollTopRef.current[detailTask.id] ?? 0}
+            onScrollTopChange={(scrollTop) => { detailScrollTopRef.current[detailTask.id] = scrollTop; }}
             currentUser={currentUser}
             availableLabels={availableLabels}
             developmentScan={developmentScan}
@@ -3674,6 +3766,7 @@ export function App() {
         ) : boardView !== "readme"
           && hasLoadedTasks
           && tasks.length === 0
+          && boardView !== "dashboard"
           && selectedProject
           && aiImportReadyProjectId === selectedProject.id ? (
           <div className="page-empty">
@@ -3718,19 +3811,23 @@ export function App() {
             onError={setActionError}
           />
         ) : boardView === "dashboard" && (selectedProject || isAllProjects) ? (
-          <DashboardView
-            key={selectedProjectId}
-            projectId={selectedProjectId}
-            projectCreatedAt={selectedProject?.createdAt ?? null}
-            isAllProjects={isAllProjects}
-            tasks={tasks}
-            presentations={taskPresentations}
-            currentUser={currentUser}
-            animateSummary={dashboardSummaryAnimatedProjectId !== selectedProjectId}
-            onSummaryAnimationStart={markDashboardSummaryAnimationStarted}
-            onOpenTask={openTaskDetail}
-            onOpenConversation={openTaskConversation}
-          />
+          hasLoadedTasks && loadedTasksScopeProjectId === taskScopeProjectId ? (
+            <OwnerGoalsView
+              key={selectedProjectId}
+              scrollRef={ownerGoalsRef}
+              projectName={isAllProjects ? null : headerProjectName}
+              referenceTasks={referenceTasks}
+              presentations={taskPresentations}
+              onOpenTask={openTaskDetail}
+              onOpenAgentDetails={() => selectBoardView("issues")}
+            />
+          ) : (
+            <div className="page-empty" role="status" aria-busy={tasksLoading}>
+              <p>{tasksLoadError && !tasksLoading
+                ? text("未能读取这个项目的任务，请点击上方重试。", "Could not load this project's tasks. Please retry above.")
+                : text("正在读取任务…", "Loading tasks…")}</p>
+            </div>
+          )
         ) : boardView === "list" ? (
           <IssueListView
             scrollRef={issueListRef}
@@ -3795,6 +3892,7 @@ export function App() {
                         status={status}
                         tasks={tasksByStatus[status]}
                         presentations={taskPresentations}
+                        deliveryProgressByTask={deliveryProgressByTask}
                         now={processingNow}
                         emptyMessage={hasActiveTaskFilters
                           ? text("当前筛选下无匹配议题", "No issues match the current filters")
@@ -3833,6 +3931,7 @@ export function App() {
                     tasksByStatus={tasksByStatus}
                     archivedTasks={filteredArchivedTasks}
                     presentations={taskPresentations}
+                    deliveryProgressByTask={deliveryProgressByTask}
                     now={processingNow}
                     hasActiveFilters={hasActiveTaskFilters}
                     isDropTarget={otherTasksTab !== "archived" && dropTarget === otherTasksTab}

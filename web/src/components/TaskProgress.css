@@ -1,0 +1,93 @@
+.task-progress {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  gap: 7px;
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.task-progress-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.task-progress-text b {
+  color: var(--accent);
+  font-size: 17px;
+  font-weight: 650;
+}
+
+.task-progress-track {
+  display: block;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+}
+
+.task-progress-track > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.task-progress.is-unestimated .task-progress-text b {
+  color: var(--text-secondary);
+}
+
+.task-progress-change {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.task-progress-change time {
+  white-space: nowrap;
+}
+
+.issue-delivery-progress {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 20px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.issue-delivery-progress > span {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.card-delivery-progress {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  margin: 4px 0 8px;
+}
+
+.card-delivery-progress > span:first-child {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+
+.card-delivery-progress .task-progress {
+  gap: 5px;
+}
+
+.card-delivery-progress .task-progress-text b {
+  font-size: 14px;
+}
+
+.card-delivery-progress .task-progress-track {
+  height: 4px;
+}

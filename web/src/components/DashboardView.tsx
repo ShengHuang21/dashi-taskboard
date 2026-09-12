@@ -15,12 +15,16 @@ import type { ActorIdentity, ProjectSummary, Task } from "../types";
 import { ActorAvatar } from "./ActorAvatar";
 import { PriorityIcon } from "./SemanticIcons";
 import { TaskConversationMenu } from "./TaskConversationMenu";
+import { createTaskProgressModel } from "../taskProgress";
+import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
 
 interface DashboardViewProps {
   projectId: string;
   projectCreatedAt: string | null;
   isAllProjects: boolean;
   tasks: Task[];
+  referenceTasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
   currentUser: ActorIdentity;
   animateSummary: boolean;
@@ -48,34 +52,6 @@ const STARTED_STATUSES = new Set<Task["status"]>([
   "in_review",
   "blocked",
 ]);
-
-const ROADMAP_ROOT_STATUS_RANK: Record<Task["status"], number> = {
-  in_progress: 0,
-  blocked: 1,
-  todo: 2,
-  backlog: 3,
-  in_review: 4,
-  done: 5,
-  canceled: 6,
-};
-
-function selectRoadmap(tasks: Task[]) {
-  const taskById = new Map(tasks.map((task) => [task.id, task]));
-  const roots = tasks
-    .filter((task) => task.relations.parent === null && task.relations.subIssues.length > 0)
-    .sort((left, right) => (
-      ROADMAP_ROOT_STATUS_RANK[left.status] - ROADMAP_ROOT_STATUS_RANK[right.status]
-      || right.activityUpdatedAt.localeCompare(left.activityUpdatedAt)
-    ));
-  const root = roots[0] ?? null;
-  const features = root
-    ? root.relations.subIssues
-      .map((relation) => taskById.get(relation.id))
-      .filter((task): task is Task => task !== undefined)
-      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
-    : tasks.filter((task) => task.relations.parent === null);
-  return { root, features };
-}
 
 interface ProgressPoint {
   timestamp: number;
@@ -196,6 +172,7 @@ export function DashboardView({
   projectCreatedAt,
   isAllProjects,
   tasks,
+  referenceTasks,
   presentations,
   currentUser,
   animateSummary,
@@ -269,24 +246,18 @@ export function DashboardView({
     .filter((task) => task.dueDate && dayValue(task.dueDate) <= upcomingEnd)
     .sort((left, right) => (left.dueDate ?? "").localeCompare(right.dueDate ?? ""))
     .slice(0, 5);
-  const completionRate = tasks.length
-    ? Math.round((completedTasks.length / tasks.length) * 100)
-    : 0;
-  const roadmap = selectRoadmap(tasks);
-  const roadmapPlanned = roadmap.features.filter((task) => task.status !== "canceled");
-  const roadmapCompleted = roadmapPlanned.filter((task) => task.status === "done");
-  const roadmapCurrent = roadmapPlanned.filter((task) => task.status === "in_progress");
+  const progressModel = createTaskProgressModel(referenceTasks);
+  const roadmapPlanned = progressModel.roadmap.map((item) => item.task).filter((task) => task.status !== "canceled");
+  const roadmapCurrent = roadmapPlanned.filter((task) => presentations[task.id]?.processing.running);
   const roadmapBlocked = roadmapPlanned.filter((task) => task.status === "blocked");
-  const roadmapRemaining = roadmapPlanned.length - roadmapCompleted.length;
-  const roadmapLatest = roadmapPlanned
-    .filter((task) => task.status === "done" || STARTED_STATUSES.has(task.status))
+  const roadmapRemaining = roadmapPlanned.filter((task) => task.status !== "done").length;
+  const roadmapLatest = [...roadmapPlanned]
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ?? null;
-  const roadmapNext = roadmapPlanned.find((task) => task.status === "todo")
-    ?? roadmapPlanned.find((task) => task.status === "backlog")
-    ?? roadmapPlanned.find((task) => task.status === "in_review")
+  const roadmapNext = roadmapPlanned.find((task) => !task.archivedAt && task.status === "todo")
+    ?? roadmapPlanned.find((task) => !task.archivedAt && task.status === "backlog")
+    ?? roadmapPlanned.find((task) => !task.archivedAt && task.status === "in_review")
     ?? null;
-  const roadmapDueDate = roadmap.root?.dueDate
-    ?? roadmapPlanned
+  const roadmapDueDate = roadmapPlanned
       .map((task) => task.dueDate)
       .filter((value): value is string => value !== null)
       .sort()
@@ -552,12 +523,13 @@ export function DashboardView({
           <header className="dashboard-heading">
             <h1>{text("项目完成度", "Project completion")}</h1>
             <div className="dashboard-hero-value">
-              <strong>{completionRate}%</strong>
+              <strong>{progressModel.project.percent === null ? text("待评估", "Unestimated") : `${progressModel.project.percent}%`}</strong>
               <span>{text(
-                `${completedTasks.length} 个已完成 · ${activeTasks.length} 个尚未结束`,
-                `${completedTasks.length} completed · ${activeTasks.length} remaining`,
+                "按交付项计算，不代表剩余时间",
+                "By deliverables, not time remaining",
               )}</span>
             </div>
+            <TaskProgress progress={progressModel.project} label={text("项目交付完成度", "Project delivery completion")} />
           </header>
 
           <section className="dashboard-codex-summary" aria-label={text("Codex 项目总结", "Codex project summary")}>
@@ -571,49 +543,51 @@ export function DashboardView({
           </section>
         </div>
 
-        {!isAllProjects && roadmap.features.length > 0 ? (
+        {!isAllProjects && progressModel.roadmap.length > 0 ? (
           <section className="dashboard-roadmap" aria-label={text("项目路线图", "Project roadmap")}>
             <header className="dashboard-roadmap-heading">
               <div>
                 <span>{text("项目路线图", "Project roadmap")}</span>
-                <h2>{roadmap.root?.title ?? text("当前项目功能", "Current project features")}</h2>
+                <h2>{text("完整功能与任务", "All features and tasks")}</h2>
               </div>
               <div className="dashboard-roadmap-progress">
-                <strong>{roadmapCompleted.length}/{roadmapPlanned.length}</strong>
                 <span>{text(
-                  `${roadmapCurrent.length} 个进行中 · ${roadmapRemaining} 个未完成`,
-                  `${roadmapCurrent.length} in progress · ${roadmapRemaining} remaining`,
+                  `${roadmapCurrent.length} 个正在运行 · 包含已归档任务`,
+                  `${roadmapCurrent.length} running · includes archived tasks`,
                 )}</span>
+                <TaskProgress progress={progressModel.project} label={text("路线图交付完成度", "Roadmap delivery completion")} />
               </div>
             </header>
 
             <div className="dashboard-roadmap-facts">
               <div>
                 <span>{text("现在", "Now")}</span>
-                <strong>{roadmapCurrent[0]?.title ?? text("当前没有正在开发的功能", "No feature is currently in development")}</strong>
+                <strong>{roadmapCurrent[0]?.title ?? text("当前未检测到运行中的 Agent", "No running agent detected")}</strong>
               </div>
               <div>
-                <span>{text("最近进展", "Latest progress")}</span>
+                <span>{text("最近任务更新", "Latest task update")}</span>
                 <strong>{roadmapLatest
-                  ? `${roadmapLatest.title} · ${taskStatusLabel(language, roadmapLatest.status)}`
+                  ? `${roadmapLatest.identifier} · ${new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(roadmapLatest.updatedAt))}`
                   : text("暂无更新", "No recent update")}</strong>
               </div>
               <div>
-                <span>{text("预计完成", "Estimated completion")}</span>
+                <span>{text("计划截止日", "Planned due date")}</span>
                 <strong>{roadmapDueDate
                   ? shortDate(roadmapDueDate, locale)
-                  : text("尚无法可靠估计", "Not enough evidence to estimate")}</strong>
+                  : text("尚未设置", "Not set")}</strong>
               </div>
               <div>
                 <span>{text("下一步", "Next")}</span>
                 <strong>{roadmapNext?.title ?? (roadmapRemaining > 0
                   ? text("等待当前功能完成", "Finish the current feature")
-                  : text("所有功能均已完成", "All features are complete"))}</strong>
+                  : progressModel.project.percent === 100
+                    ? text("所有交付项均已完成", "All deliverables are complete")
+                    : text("补齐交付计划", "Complete the deliverable plan"))}</strong>
               </div>
             </div>
 
             <div className="dashboard-roadmap-list">
-              {roadmap.features.map((task, index) => {
+              {progressModel.roadmap.map(({ task, depth }) => {
                 const isRecent = new Date(task.createdAt).getTime() >= recentlyAddedAfter;
                 return (
                   <button
@@ -621,11 +595,19 @@ export function DashboardView({
                     className={`dashboard-roadmap-item status-${task.status}`}
                     onClick={() => onOpenTask(task)}
                     key={task.id}
+                    style={{ paddingInlineStart: `${18 + depth * 14}px` }}
                   >
-                    <span className="dashboard-roadmap-index">{text(`功能 ${index + 1}`, `Feature ${index + 1}`)}</span>
-                    <strong>{task.title}</strong>
-                    {isRecent ? <small>{text("新加入", "New")}</small> : null}
-                    <span className="dashboard-roadmap-status">{taskStatusLabel(language, task.status)}</span>
+                    <span className="dashboard-roadmap-item-heading">
+                      <span className="dashboard-roadmap-index">{task.identifier}</span>
+                      <strong title={task.title}>{task.title}</strong>
+                      {task.archivedAt ? <small>{text("已归档", "Archived")}</small>
+                        : isRecent ? <small>{text("新加入", "New")}</small> : null}
+                    </span>
+                    <TaskExecutionStatus state={presentations[task.id].execution} className="dashboard-roadmap-status" />
+                    <TaskProgress
+                      progress={progressModel.forTask(task.id)}
+                      label={text(`${task.identifier} 交付完成度`, `${task.identifier} delivery completion`)}
+                    />
                   </button>
                 );
               })}

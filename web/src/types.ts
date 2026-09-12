@@ -400,6 +400,14 @@ export type TaskConversationRef = TaskConversationRefBase & (
   | { threadId: string; legacyLocal: true }
 );
 
+export type TaskProgressChange = {
+  id: string;
+  createdAt: string;
+} & (
+  | { kind: "created" | "canceled" | "restored" | "reopened" }
+  | { kind: "parent"; beforeParentIdentifier: string | null; afterParentIdentifier: string | null }
+);
+
 export interface Task {
   id: string;
   identifier: string;
@@ -419,6 +427,7 @@ export interface Task {
   previewImage: Attachment | null;
   activityKey: string;
   activityUpdatedAt: string;
+  progressChanges?: TaskProgressChange[];
   creatorType: ActorType;
   creatorId: string;
   creatorName: string;

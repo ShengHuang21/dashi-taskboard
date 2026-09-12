@@ -11,6 +11,7 @@ const labelPickerSource = await readFile(new URL("../web/src/components/LabelPic
 const pendingAttachmentsSource = await readFile(new URL("../web/src/components/PendingAttachments.tsx", import.meta.url), "utf8");
 const labelsSource = await readFile(new URL("../web/src/labels.ts", import.meta.url), "utf8");
 const dashboardSource = await readFile(new URL("../web/src/components/DashboardView.tsx", import.meta.url), "utf8");
+const ownerGoalsSource = await readFile(new URL("../web/src/components/OwnerGoalsView.tsx", import.meta.url), "utf8");
 
 test("the project switcher merges live Codex projects with persisted Taskboard projects", () => {
   assert.match(appSource, /hostContext\?\.projects \?\? \[\]/);
@@ -54,7 +55,9 @@ test("project selection starts from the route or recent projects and updates the
 test("the selected project exposes the current board surfaces", () => {
   assert.match(appSource, /<header className="workspace-header">/);
   assert.match(appSource, /<div className="board-toolbar">/);
-  assert.match(appSource, /<DashboardView/);
+  assert.match(appSource, /boardView === "dashboard"[\s\S]*?<OwnerGoalsView[\s\S]*?referenceTasks=\{referenceTasks\}[\s\S]*?onOpenTask=\{openTaskDetail\}[\s\S]*?onOpenAgentDetails=\{\(\) => selectBoardView\("issues"\)\}/);
+  assert.match(ownerGoalsSource, /\.filter\(\(task\) => task\.labels\.includes\("owner-goal"\)\)/);
+  assert.match(ownerGoalsSource, /<button type="button" onClick=\{\(\) => onOpenTask\(goal\)\}>\{goal\.title\}<\/button>/);
   assert.match(appSource, /<IssueListView/);
   assert.match(appSource, /<GanttView/);
   assert.match(appSource, /<BoardColumn/);
@@ -70,14 +73,15 @@ test("ordinary projects open on the Owner roadmap by default", () => {
 });
 
 test("the Owner roadmap separates current work, next work, and meaningful progress", () => {
+  assert.match(dashboardSource, /const roadmapCurrent = roadmapPlanned\.filter\(\(task\) => presentations\[task\.id\]\?\.processing\.running\)/);
   assert.match(
     dashboardSource,
-    /const roadmapLatest = roadmapPlanned[\s\S]*?STARTED_STATUSES\.has\(task\.status\)[\s\S]*?right\.updatedAt\.localeCompare\(left\.updatedAt\)/,
+    /const roadmapLatest = \[\.\.\.roadmapPlanned\]\s*\.sort\(\(left, right\) => right\.updatedAt\.localeCompare\(left\.updatedAt\)\)\[0\] \?\? null/,
   );
   assert.doesNotMatch(dashboardSource, /const roadmapLatest =[\s\S]*?activityUpdatedAt[\s\S]*?const roadmapNext/);
   assert.match(
     dashboardSource,
-    /const roadmapNext = roadmapPlanned\.find\(\(task\) => task\.status === "todo"\)[\s\S]*?task\.status === "backlog"[\s\S]*?task\.status === "in_review"/,
+    /const roadmapNext = roadmapPlanned\.find\(\(task\) => !task\.archivedAt && task\.status === "todo"\)\s*\?\? roadmapPlanned\.find\(\(task\) => !task\.archivedAt && task\.status === "backlog"\)\s*\?\? roadmapPlanned\.find\(\(task\) => !task\.archivedAt && task\.status === "in_review"\)/,
   );
   assert.doesNotMatch(dashboardSource, /const roadmapNext = roadmapCurrent\[0\]/);
 });
@@ -122,7 +126,7 @@ test("the project header exposes project, automation, and create controls", () =
 
 test("the project header keeps detail navigation separate from the project switcher", () => {
   assert.match(appSource, /const headerProjectName = isAllProjects\s*\? text\("所有项目", "All projects"\)\s*: selectedProject\?\.id === GLOBAL_PROJECT_ID\s*\? text\("临时任务", "Temporary tasks"\)\s*: selectedProject\?\.name \?\? text\("任务面板", "Taskboard"\)/);
-  assert.match(appSource, /detailTask && \([\s\S]*?aria-label=\{text\("返回议题看板", "Back to issue board"\)\}[\s\S]*?<\/button>/);
+  assert.match(appSource, /detailTask && \(\s*<button\s*className="detail-back-button"[\s\S]*?aria-label=\{text\("返回上一页", "Back to previous page"\)\}[\s\S]*?onClick=\{closeTaskDetail\}[\s\S]*?<\/button>/);
   assert.match(appSource, /className="header-project-switcher"[\s\S]*?<span className="project-name">\{headerProjectName\}<\/span>/);
   assert.doesNotMatch(appSource, /className="issue-root-button"/);
   assert.doesNotMatch(appSource, /detailTask\?\.identifier \?\? "议题"/);

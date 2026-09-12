@@ -26,11 +26,15 @@ import { TaskPropertyPicker } from "./TaskPropertyPicker";
 import { TaskConversationMenu } from "./TaskConversationMenu";
 import completeIcon from "../assets/figma-taskboard/card-complete.svg";
 import processingAnimation from "../assets/figma-taskboard/loading-16.svg";
+import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
+import type { DeliveryProgress } from "../taskProgress";
 
 interface TaskCardProps {
   task: Task;
   variant?: "main" | "sidebar";
   presentation: TaskCardPresentation;
+  deliveryProgress: DeliveryProgress;
   now: number;
   isDragging: boolean;
   dragShift: number;
@@ -204,17 +208,12 @@ function ProcessingStatusRow({
   now: number;
   onOpenConversation: (conversation: TaskConversationItem) => void;
 }) {
-  const { text } = useTaskboardI18n();
   const elapsed = elapsedTime(presentation.processing.startedAt, now);
   const running = presentation.processing.running;
   return (
-    <div className={`task-processing-row${running ? " is-running" : " is-paused"}`}>
+    <div className={`task-processing-row${running ? " is-running" : ""}`}>
       {running && <img className="task-processing-glyph" src={processingAnimation} alt="" aria-hidden="true" />}
-      <span className="task-processing-label">
-        {running
-          ? (elapsed ? text(`已处理 ${elapsed}...`, `Processing for ${elapsed}...`) : text("正在处理...", "Processing..."))
-          : text("暂停处理", "Processing paused")}
-      </span>
+      <TaskExecutionStatus state={presentation.execution} className="task-processing-label" elapsed={elapsed} />
       <span className="task-processing-spacer" aria-hidden="true" />
       {presentation.conversations.length > 0 && (
         <TaskConversationMenu
@@ -387,6 +386,7 @@ export function TaskCard({
   task,
   variant = "main",
   presentation,
+  deliveryProgress,
   now,
   isDragging,
   dragShift,
@@ -509,6 +509,14 @@ export function TaskCard({
 
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
 
+      <div className="card-delivery-progress">
+        <span>{text("交付完成度", "Deliverable completion")}</span>
+        <TaskProgress
+          progress={deliveryProgress}
+          label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} deliverable completion`)}
+        />
+      </div>
+
       {body && <p className="task-card-description">{body}</p>}
 
       {image && (
@@ -586,6 +594,11 @@ export function TaskCard({
             onOpenConversation={onOpenConversation}
           />
         </>
+      )}
+      {!processingCard && (
+        <div className="task-processing-row">
+          <TaskExecutionStatus state={presentation.execution} className="task-processing-label" />
+        </div>
       )}
     </article>
   );

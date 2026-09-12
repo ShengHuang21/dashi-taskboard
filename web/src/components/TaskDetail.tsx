@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent,
@@ -97,6 +98,10 @@ import { postEmbeddedHostMessage } from "../embeddedHost.mjs";
 import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
+import { createTaskProgressModel } from "../taskProgress";
+import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
+import type { TaskCardPresentation, TaskExecutionState } from "../taskConversations";
 
 type TaskDetailError = string | readonly [string, string];
 
@@ -104,6 +109,12 @@ interface TaskDetailProps {
   task: Task;
   tasks: Task[];
   referenceTasks: Task[];
+  execution: TaskExecutionState;
+  presentations: Record<string, TaskCardPresentation>;
+  expandedTaskIds: string[];
+  onToggleTaskExpansion: (taskId: string) => void;
+  initialScrollTop: number;
+  onScrollTopChange: (scrollTop: number) => void;
   currentUser: ActorIdentity;
   availableLabels: string[];
   developmentScan: DevelopmentScan;
@@ -365,6 +376,12 @@ export function TaskDetail({
   task,
   tasks,
   referenceTasks,
+  execution,
+  presentations,
+  expandedTaskIds,
+  onToggleTaskExpansion,
+  initialScrollTop,
+  onScrollTopChange,
   currentUser,
   availableLabels,
   developmentScan,
@@ -397,6 +414,7 @@ export function TaskDetail({
   >(null);
   const [savingProperty, setSavingProperty] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [attachmentsLoading, setAttachmentsLoading] = useState(true);
   const [attachmentsError, setAttachmentsError] = useState<TaskDetailError | null>(null);
   const [uploadingAttachments, setUploadingAttachments] = useState(false);
   const [pendingAttachmentDelete, setPendingAttachmentDelete] = useState<Attachment | null>(null);
@@ -423,6 +441,8 @@ export function TaskDetail({
   const [pendingDelete, setPendingDelete] = useState<Comment | null>(null);
   const [deleting, setDeleting] = useState(false);
   const titleRef = useRef<HTMLTextAreaElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pendingScrollTopRef = useRef<number | null>(initialScrollTop);
   const descriptionComposerRef = useRef<InlineMediaComposerHandle>(null);
   const composerRef = useRef<InlineMediaComposerHandle>(null);
   const editingComposerRef = useRef<InlineMediaComposerHandle>(null);
@@ -434,7 +454,22 @@ export function TaskDetail({
   const commentInlineImages = inlineMediaImages(commentSegments);
   const editingDraft = serializeInlineMedia(editingSegments);
   const displayIdentifier = currentTask.externalKey ?? currentTask.identifier;
+  const progressTasks = [
+    ...referenceTasks.filter((item) => item.id !== currentTask.id),
+    currentTask,
+  ];
+  const progressModel = createTaskProgressModel(progressTasks);
+  const deliveryProgress = progressModel.forTask(currentTask.id);
   const editingInlineImages = inlineMediaImages(editingSegments);
+
+  useLayoutEffect(() => {
+    const scrollContainer = scrollRef.current;
+    const scrollTop = pendingScrollTopRef.current;
+    if (!scrollContainer || scrollTop === null || commentsLoading || attachmentsLoading) return;
+    pendingScrollTopRef.current = null;
+    scrollContainer.scrollTop = scrollTop;
+    onScrollTopChange(scrollContainer.scrollTop);
+  }, [attachmentsLoading, commentsLoading, onScrollTopChange]);
 
   useEffect(() => {
     const taskChanged = currentTask.id !== task.id;
@@ -495,10 +530,12 @@ export function TaskDetail({
     void listAttachments(task.id, controller.signal).then(
       (nextAttachments) => {
         setAttachments(nextAttachments.filter((attachment) => !attachment.commentId));
+        setAttachmentsLoading(false);
       },
       (error) => {
         if ((error as Error).name === "AbortError") return;
         setAttachmentsError(messageFor(error));
+        setAttachmentsLoading(false);
       },
     );
     return () => controller.abort();
@@ -1012,7 +1049,21 @@ export function TaskDetail({
       className="issue-detail"
       aria-label={text(`${displayIdentifier} 议题详情`, `${displayIdentifier} issue details`)}
     >
-      <div className="issue-detail-scroll">
+      <div
+        className="issue-detail-scroll"
+        ref={scrollRef}
+        onScroll={(event) => {
+          if (pendingScrollTopRef.current === null) onScrollTopChange(event.currentTarget.scrollTop);
+        }}
+        onWheel={() => { pendingScrollTopRef.current = null; }}
+        onTouchMove={() => { pendingScrollTopRef.current = null; }}
+        onPointerDown={() => { pendingScrollTopRef.current = null; }}
+        onKeyDown={(event) => {
+          if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Tab"].includes(event.key)) {
+            pendingScrollTopRef.current = null;
+          }
+        }}
+      >
         <div className="issue-detail-layout">
           <div className="issue-detail-main">
             <article className="issue-editor" aria-label={text("议题内容", "Issue content")}>
@@ -1034,6 +1085,31 @@ export function TaskDetail({
                 <IssueParentLink
                   task={currentTask}
                   tasks={tasks}
+                  onOpenTask={onOpenTask}
+                  onAddRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
+                    () => onAddRelation(anchor, type, relatedTaskId),
+                  )}
+                  onRemoveRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
+                    () => onRemoveRelation(anchor, type, relatedTaskId),
+                  )}
+                />
+                <section className="issue-delivery-progress" aria-label={text("交付完成度", "Delivery completion")}>
+                  <span>{text("交付完成度 · 按完成项计算，不代表剩余时间", "Delivery completion · item count, not a time estimate")}</span>
+                  <TaskProgress
+                    progress={deliveryProgress}
+                    label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
+                  />
+                  <TaskExecutionStatus state={execution} />
+                  {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
+                </section>
+                <IssueSubIssues
+                  task={currentTask}
+                  tasks={tasks}
+                  referenceTasks={progressTasks}
+                  progressModel={progressModel}
+                  presentations={presentations}
+                  expandedTaskIds={expandedTaskIds}
+                  onToggleTaskExpansion={onToggleTaskExpansion}
                   onOpenTask={onOpenTask}
                   onAddRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
                     () => onAddRelation(anchor, type, relatedTaskId),
@@ -1199,18 +1275,6 @@ export function TaskDetail({
                 </div>
               )}
             </article>
-
-            <IssueSubIssues
-              task={currentTask}
-              tasks={tasks}
-              onOpenTask={onOpenTask}
-              onAddRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
-                () => onAddRelation(anchor, type, relatedTaskId),
-              )}
-              onRemoveRelation={(anchor, type, relatedTaskId) => applyRelationMutation(
-                () => onRemoveRelation(anchor, type, relatedTaskId),
-              )}
-            />
 
             <section className="activity-section" aria-labelledby="activity-heading">
               <header className="activity-heading">

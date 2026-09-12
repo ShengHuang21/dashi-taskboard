@@ -10,6 +10,9 @@ import {
 import { LinearIcon } from "./LinearIcon";
 import { DeleteIcon, PlusIcon, RefreshIcon, StatusIcon } from "./SemanticIcons";
 import { TaskCard } from "./TaskCard";
+import { TaskProgress } from "./TaskProgress";
+import { TaskExecutionStatus } from "./TaskExecutionStatus";
+import type { DeliveryProgress } from "../taskProgress";
 
 function archivedDate(
   value: string | null,
@@ -24,6 +27,8 @@ function archivedDate(
 
 interface ArchivedTaskCardProps {
   task: Task;
+  deliveryProgress: DeliveryProgress;
+  presentation: TaskCardPresentation;
   busy: boolean;
   restoring: boolean;
   onRestore: (task: Task) => void;
@@ -32,6 +37,8 @@ interface ArchivedTaskCardProps {
 
 function ArchivedTaskCard({
   task,
+  deliveryProgress,
+  presentation,
   busy,
   restoring,
   onRestore,
@@ -46,6 +53,16 @@ function ArchivedTaskCard({
         <span className="archived-task-date">{archivedDate(task.archivedAt, locale, text)}</span>
       </div>
       <h3>{task.title}</h3>
+      <div className="card-delivery-progress">
+        <span>{text("交付完成度", "Deliverable completion")}</span>
+        <TaskProgress
+          progress={deliveryProgress}
+          label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} deliverable completion`)}
+        />
+      </div>
+      <div className="task-processing-row">
+        <TaskExecutionStatus state={presentation.execution} className="task-processing-label" />
+      </div>
       <div className="archived-task-footer">
         <span className="archived-task-status">
           <StatusIcon status={task.status} size={14} />
@@ -85,6 +102,7 @@ interface OtherTasksPanelProps {
   tasksByStatus: Record<TaskStatus, Task[]>;
   archivedTasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
+  deliveryProgressByTask: Record<string, DeliveryProgress>;
   now: number;
   hasActiveFilters: boolean;
   isDropTarget: boolean;
@@ -121,6 +139,7 @@ export function OtherTasksPanel({
   tasksByStatus,
   archivedTasks,
   presentations,
+  deliveryProgressByTask,
   now,
   hasActiveFilters,
   isDropTarget,
@@ -272,6 +291,8 @@ export function OtherTasksPanel({
           <ArchivedTaskCard
             key={task.id}
             task={task}
+            deliveryProgress={deliveryProgressByTask[task.id]}
+            presentation={presentations[task.id]}
             busy={restoringTaskId !== null || deletingTaskId !== null}
             restoring={restoringTaskId === task.id}
             onRestore={onRestore}
@@ -285,6 +306,7 @@ export function OtherTasksPanel({
               task={task}
               variant="sidebar"
               presentation={presentations[task.id]}
+              deliveryProgress={deliveryProgressByTask[task.id]}
               now={now}
               isDragging={draggedTaskId === task.id}
               dragShift={dragShift}

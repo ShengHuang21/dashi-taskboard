@@ -4,6 +4,7 @@ import type {
   AiChatTodoProgress,
   CodexThreadBinding,
   ComposerPersistedDocument,
+  CoordinationTodoSnapshot,
   Task,
 } from "./types";
 import type { InlineMediaSegment } from "./components/InlineMediaComposer";
@@ -33,7 +34,48 @@ export interface TaskProcessingPresentation {
 export interface TaskCardPresentation {
   conversations: TaskConversationItem[];
   processing: TaskProcessingPresentation;
+  execution: TaskExecutionState;
   unread: boolean;
+}
+
+export type TaskExecutionState = "completed" | "canceled" | "running" | "review"
+  | "feedback" | "dependency" | "model_capacity" | "uncertain" | "interrupted"
+  | "awaiting_claim" | "blocked" | "not_running" | "not_planned" | "not_started";
+
+function taskExecutionState(
+  task: Task,
+  processing: TaskProcessingPresentation,
+  aiThreads: AiChatThread[],
+  todo: CoordinationTodoSnapshot | null,
+  executionObservationAvailable: boolean,
+): TaskExecutionState {
+  if (task.status === "done") return "completed";
+  if (task.status === "canceled") return "canceled";
+  if (processing.running) return "running";
+  if (task.status === "in_review") return "review";
+  if (task.status === "blocked" && (task.labels.includes("waiting-user") || todo?.state === "waiting_user")) {
+    return "feedback";
+  }
+  if (task.relations.blockedBy.some((dependency) => dependency.status !== "done")) return "dependency";
+  if (todo?.admission?.state === "deferred" && todo.admission.deferredReason === "model_capacity") {
+    return "model_capacity";
+  }
+  if (todo?.admission?.state === "admission_uncertain") return "uncertain";
+
+  // Thread metadata can change after a run; it is not evidence of a newer execution.
+  const runs = aiThreads
+    .filter((thread) => thread.origin.projectId === task.projectId && thread.origin.issueId === task.id)
+    .flatMap((thread) => thread.currentRun ? [thread.currentRun] : []);
+  const runTime = (run: AiChatRun) => Date.parse(run.startedAt ?? run.finishedAt ?? "");
+  const latestRun = runs.every((run) => Number.isFinite(runTime(run)))
+    ? [...runs].sort((left, right) => runTime(right) - runTime(left))[0]
+    : undefined;
+  if (latestRun?.status === "interrupted") return "interrupted";
+  if (todo?.state === "ready" && todo.readyWork.eligible) return "awaiting_claim";
+  if (task.status === "blocked") return "blocked";
+  if (!executionObservationAvailable && (task.status === "todo" || task.status === "in_progress")) return "uncertain";
+  if (task.status === "in_progress") return "not_running";
+  return task.status === "backlog" ? "not_planned" : "not_started";
 }
 
 export function buildPersistedTaskComposerDocument(
@@ -171,6 +213,8 @@ export function taskCardPresentation(
     total: number | null;
     running: boolean;
   } | null | undefined = undefined,
+  coordinationTodo: CoordinationTodoSnapshot | null = null,
+  executionObservationAvailable = true,
 ): TaskCardPresentation {
   const conversations = taskConversations(task, aiThreads);
   const runningAi = conversations
@@ -197,15 +241,18 @@ export function taskCardPresentation(
       : taskNativeSession !== undefined
         ? taskNativeTodoProgress
         : conversations.find((conversation) => conversation.latestTodo)?.latestTodo ?? null;
+  const processing = {
+    running: task.status === "in_progress"
+      && (Boolean(running) || taskNativeSession?.running === true),
+    completed: latestTodo?.completed ?? null,
+    total: latestTodo?.total ?? null,
+    startedAt: runningAi?.currentRun?.startedAt ?? null,
+  };
   return {
     conversations,
     unread,
-    processing: {
-      running: task.status === "in_progress"
-        && (Boolean(running) || taskNativeSession?.running === true),
-      completed: latestTodo?.completed ?? null,
-      total: latestTodo?.total ?? null,
-      startedAt: runningAi?.currentRun?.startedAt ?? null,
-    },
+    processing,
+    execution: taskExecutionState(task, processing, aiThreads,
+      coordinationTodo?.taskId === task.id ? coordinationTodo : null, executionObservationAvailable),
   };
 }
