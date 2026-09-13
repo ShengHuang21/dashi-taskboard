@@ -408,6 +408,21 @@ export type TaskProgressChange = {
   | { kind: "parent"; beforeParentIdentifier: string | null; afterParentIdentifier: string | null }
 );
 
+export interface TaskGoalWindows {
+  state: "declared" | "invalid";
+  sourceCommentId: string;
+  sourceCommentVersion: number;
+  updatedAt: string;
+  sourceRef: string | null;
+  windows: {
+    threadId: string;
+    title: string;
+    role: "coding" | "qa_guide";
+    threadBinding: CodexThreadBinding | null;
+  }[];
+  resourceRefs: { taskId: string; stepId: string; allocationId: string }[];
+}
+
 export interface Task {
   id: string;
   identifier: string;
@@ -423,6 +438,7 @@ export interface Task {
   threadBinding: CodexThreadBinding | null;
   legacyLocalThreadId: string | null;
   conversationRefs: TaskConversationRef[];
+  goalWindows?: TaskGoalWindows | null;
   participants: ActorIdentity[];
   previewImage: Attachment | null;
   activityKey: string;

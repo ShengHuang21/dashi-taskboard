@@ -2,7 +2,8 @@ import { useMemo, type Ref } from "react";
 import { useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation } from "../taskConversations";
 import { createTaskProgressModel } from "../taskProgress";
-import type { Task } from "../types";
+import type { CodexThreadBinding, Task } from "../types";
+import { GoalWindows } from "./GoalWindows";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import { TaskProgress } from "./TaskProgress";
 import "./OwnerGoalsView.css";
@@ -13,6 +14,7 @@ interface OwnerGoalsViewProps {
   referenceTasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
   onOpenTask: (task: Task) => void;
+  onOpenThread: (binding: CodexThreadBinding) => void;
   onOpenAgentDetails: () => void;
 }
 
@@ -22,6 +24,7 @@ export function OwnerGoalsView({
   referenceTasks,
   presentations,
   onOpenTask,
+  onOpenThread,
   onOpenAgentDetails,
 }: OwnerGoalsViewProps) {
   const { text } = useTaskboardI18n();
@@ -87,6 +90,7 @@ export function OwnerGoalsView({
                     <TaskExecutionStatus state={presentations[goal.id]?.execution ?? "uncertain"} />
                   )}
                 </p>
+                <GoalWindows declaration={goal.goalWindows} onOpenThread={onOpenThread} />
               </article>
             ))}
           </div>

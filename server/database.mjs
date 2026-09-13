@@ -883,6 +883,73 @@ function storedThreadBinding(threadBinding, threadId) {
   ];
 }
 
+function goalWindowsFromComments(comments) {
+  const marker = /^\s*```taskboard-goal-windows\b/m;
+  const latest = comments.filter((comment) => marker.test(comment.body ?? ""))
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id))[0];
+  if (!latest) return null;
+  const result = {
+    state: "invalid",
+    sourceCommentId: latest.id,
+    sourceCommentVersion: latest.version,
+    updatedAt: latest.updated_at,
+    sourceRef: null,
+    windows: [],
+    resourceRefs: [],
+  };
+  const blocks = [...latest.body.matchAll(/^\s*```taskboard-goal-windows\s*\r?\n([\s\S]*?)^\s*```\s*$/gm)];
+  // A newer incomplete declaration must not resurrect an older association.
+  if (blocks.length !== 1 || [...latest.body.matchAll(/^\s*```taskboard-goal-windows\b/gm)].length !== 1) return result;
+  let declaration;
+  try {
+    declaration = JSON.parse(blocks[0][1]);
+  } catch {
+    return result;
+  }
+  const text = (value) => typeof value === "string" && value.trim().length > 0;
+  const identity = (value) => text(value) && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+  if (declaration?.version !== 1 || !text(declaration.sourceRef)
+    || !Array.isArray(declaration.windows) || declaration.windows.length === 0
+    || !declaration.windows.every((member) => identity(member?.threadId) && text(member.title)
+      && ["coding", "qa_guide"].includes(member.role))
+    || (declaration.resourceRefs !== undefined && (!Array.isArray(declaration.resourceRefs)
+      || !declaration.resourceRefs.every((ref) => identity(ref?.taskId) && identity(ref.stepId) && identity(ref.allocationId))))) {
+    return result;
+  }
+  const seenWindows = new Set();
+  const windows = declaration.windows.filter((member) => {
+    if (seenWindows.has(member.threadId)) return false;
+    seenWindows.add(member.threadId);
+    return true;
+  }).map((member) => {
+    const binding = member.threadBinding;
+    const complete = binding?.threadId === member.threadId
+      && identity(binding.codexProjectId) && identity(binding.workspacePath)
+      && isCanonicalCodexHostId(binding.codexHostId)
+      && ((binding.codexProjectKind === "local" && binding.codexHostId === "local")
+        || (binding.codexProjectKind === "remote" && binding.codexHostId !== "local"));
+    return {
+      threadId: member.threadId,
+      title: member.title,
+      role: member.role,
+      threadBinding: complete ? {
+        threadId: binding.threadId,
+        codexProjectId: binding.codexProjectId,
+        codexProjectKind: binding.codexProjectKind,
+        codexHostId: binding.codexHostId,
+        workspacePath: binding.workspacePath,
+      } : null,
+    };
+  });
+  const seenAllocations = new Set();
+  const resourceRefs = (declaration.resourceRefs ?? []).filter((ref) => {
+    if (seenAllocations.has(ref.allocationId)) return false;
+    seenAllocations.add(ref.allocationId);
+    return true;
+  }).map(({ taskId, stepId, allocationId }) => ({ taskId, stepId, allocationId }));
+  return { ...result, state: "declared", sourceRef: declaration.sourceRef, windows, resourceRefs };
+}
+
 function attachTaskActivity(task, comments, activities, previewImage = null) {
   const orderedComments = [...comments].sort((left, right) => (
     left.id.localeCompare(right.id)
@@ -955,6 +1022,7 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
   }
 
   task.conversationRefs = conversationRefs;
+  task.goalWindows = goalWindowsFromComments(comments);
   task.participants = participants;
   task.previewImage = previewImage;
   task.progressChanges = orderedActivities.flatMap((activity) => (
@@ -14660,7 +14728,8 @@ export class TaskboardDatabase {
       const rows = this.#prepare(`
         SELECT
           id, task_id,
-          CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
+          CASE WHEN instr(body, 'taskboard-goal-windows') > 0 THEN body
+            WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
           thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           author_type, author_id, author_name,

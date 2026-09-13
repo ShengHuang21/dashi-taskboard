@@ -7,6 +7,69 @@
   background: var(--bg);
 }
 
+.goal-windows {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.goal-windows summary {
+  cursor: pointer;
+  color: var(--text-primary);
+  width: fit-content;
+}
+
+.goal-windows summary:focus-visible,
+.goal-windows button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.goal-windows ul {
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.goal-windows-members li {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin-top: 12px;
+}
+
+.goal-windows-members li > div {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.goal-window-title,
+.goal-window-role,
+.goal-windows-resources small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.goal-window-title {
+  color: var(--text-primary);
+}
+
+.goal-windows-resources {
+  margin-top: 16px;
+  overflow-wrap: anywhere;
+}
+
+.goal-windows-resources p {
+  margin: 0;
+}
+
+.goal-windows-resources li + li {
+  margin-top: 8px;
+}
+
 .owner-goals-content {
   max-width: 1080px;
   margin-inline: auto;

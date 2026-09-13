@@ -100,6 +100,7 @@ import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
+import { GoalWindows } from "./GoalWindows";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { TaskCardPresentation, TaskExecutionState } from "../taskConversations";
 
@@ -1102,6 +1103,7 @@ export function TaskDetail({
                   <TaskExecutionStatus state={execution} />
                   {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </section>
+                <GoalWindows declaration={currentTask.goalWindows} onOpenThread={onOpenThread} />
                 <IssueSubIssues
                   task={currentTask}
                   tasks={tasks}

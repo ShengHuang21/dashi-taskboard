@@ -3820,6 +3820,7 @@ export function App() {
               presentations={taskPresentations}
               onOpenTask={openTaskDetail}
               onOpenAgentDetails={() => selectBoardView("issues")}
+              onOpenThread={openThread}
             />
           ) : (
             <div className="page-empty" role="status" aria-busy={tasksLoading}>
