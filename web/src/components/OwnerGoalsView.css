@@ -70,6 +70,26 @@
   margin-top: 8px;
 }
 
+.goal-resource-record {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.goal-resource-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.goal-resource-record p + p,
+.goal-resource-reference {
+  margin-top: 8px;
+}
+
 .owner-goals-content {
   max-width: 1080px;
   margin-inline: auto;

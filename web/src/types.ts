@@ -408,6 +408,42 @@ export type TaskProgressChange = {
   | { kind: "parent"; beforeParentIdentifier: string | null; afterParentIdentifier: string | null }
 );
 
+export interface ResourceAllocationRecord {
+  id: string;
+  kind: "environment" | "heavy";
+  state: "held" | "available" | "released";
+  ownerThreadId: string;
+  ownerRunId: string;
+  source: string;
+  sourceRef: string;
+  sourceVersion?: number;
+  declaredAt?: string;
+  validUntil?: string;
+  grantedAt?: string;
+  releasedAt: string | null;
+}
+
+export interface ResourceStepRecord {
+  step: {
+    id: string;
+    taskId: string;
+    runId: string;
+    actionId: string;
+    ownerThreadId: string;
+    state: string;
+    createdAt: string;
+    waiter?: { observedAt: string; validUntil: string };
+    grantedAt?: string;
+    consumedAt?: string;
+    resultRecordedAt?: string;
+    result?: { outcome: "exited" | "no_start" | "start_uncertain"; exitCode: number | null; signal: string | null; sourceRef: string };
+  };
+  allocation: ResourceAllocationRecord | null;
+  environment: ResourceAllocationRecord | null;
+  executionOutcome: string;
+  waitingReason: string | null;
+}
+
 export interface TaskGoalWindows {
   state: "declared" | "invalid";
   sourceCommentId: string;

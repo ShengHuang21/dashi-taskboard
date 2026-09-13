@@ -10630,6 +10630,7 @@ export class TaskboardDatabase {
     const step = this.#resourceStep(this.#prepare("SELECT * FROM resource_steps WHERE id = ? AND task_id = ?").get(stepId, task.id));
     if (!step) throw new ApiError(404, "resource_step_not_found", "Resource step not found");
     return { step, allocation: step.allocationId ? this.#getResourceAllocation(step.allocationId) : null,
+      environment: step.demand?.environmentAllocationId ? this.#getResourceAllocation(step.demand.environmentAllocationId) : null,
       executionOutcome: step.state === "start_consumed" ? "start_uncertain" : step.state,
       waitingReason: step.waitingReason ?? null };
   }

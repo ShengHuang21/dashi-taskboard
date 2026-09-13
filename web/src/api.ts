@@ -24,6 +24,7 @@ import type {
   ProjectReadme,
   ProjectReadmeAttachment,
   ProjectSummary,
+  ResourceStepRecord,
   Task,
   TaskChangeActivity,
   TaskboardMetadata,
@@ -136,6 +137,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export async function listProjects(signal?: AbortSignal): Promise<Project[]> {
   const data = await request<{ projects: Project[] }>("/api/projects", { signal });
   return data.projects;
+}
+
+export function getResourceStep(taskId: string, stepId: string, signal?: AbortSignal): Promise<ResourceStepRecord> {
+  return request<ResourceStepRecord>(`/api/local/tasks/${encodeURIComponent(taskId)}/resource-steps/${encodeURIComponent(stepId)}`, { signal });
 }
 
 export async function listAgentLaneProjectIds(signal?: AbortSignal): Promise<string[]> {
