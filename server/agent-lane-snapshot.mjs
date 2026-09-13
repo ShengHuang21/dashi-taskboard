@@ -1262,6 +1262,7 @@ export function createAgentLaneSnapshotProvider({
   listTasks = null,
   getClaim = null,
   getAdmission = null,
+  listResourceSteps = null,
   getTaskCapsule = null,
   recordProgress = null,
   recordCompletion = null,
@@ -1757,6 +1758,8 @@ export function createAgentLaneSnapshotProvider({
           shutdownAttempt,
         },
         todos,
+        // These are existing-run checkpoints, never new Todo/bootstrap candidates.
+        resourceSteps: typeof listResourceSteps === "function" ? await listResourceSteps(projectId) : [],
         attentionQueue: todos
           .filter((todo) => todo.continuation.attention !== "done")
           .sort((left, right) => {
