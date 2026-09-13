@@ -644,6 +644,7 @@ async function taskTodoProjection(
       domainCoordinatorLeaseId: admission.domainCoordinatorLeaseId,
       domainCoordinatorTaskId: admission.domainCoordinatorTaskId,
       domainCoordinatorThreadId: admission.domainCoordinatorThreadId,
+      recordedDeliveryObservation: admission.recordedDeliveryObservation ?? null,
     } : null,
     readyWork,
     modelRouting: readyWork.modelRouting,

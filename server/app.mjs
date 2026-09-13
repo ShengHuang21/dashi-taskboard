@@ -522,7 +522,7 @@ function parseHostExecutorExecution(value, codexHostId) {
 
 function parseHostExecutorEffect(value, codexHostId, effectKey) {
   assertPlainObject(value);
-  assertAllowedKeys(value, new Set(["execution", "operations"]));
+  assertAllowedKeys(value, new Set(["execution", "operations", "ordinaryDelivery"]));
   if (!Array.isArray(value.operations)
     || value.operations.length < 1
     || value.operations.length > 4) {
@@ -542,10 +542,23 @@ function parseHostExecutorEffect(value, codexHostId, effectKey) {
     assertPlainObject(operation.params);
     return { method, params: operation.params };
   });
+  let ordinaryDelivery;
+  if (Object.hasOwn(value, "ordinaryDelivery")) {
+    assertPlainObject(value.ordinaryDelivery);
+    assertAllowedKeys(value.ordinaryDelivery, new Set(["receiptId", "admissionAttemptId"]));
+    if (codexHostId !== "local" || operations.length !== 1 || operations[0].method !== "turn/start") {
+      throw new ApiError(400, "INVALID_FIELD", "Ordinary delivery identity requires one local turn/start");
+    }
+    ordinaryDelivery = {
+      receiptId: parseHostExecutorIdentifier(value.ordinaryDelivery.receiptId, "receiptId"),
+      admissionAttemptId: parseHostExecutorIdentifier(value.ordinaryDelivery.admissionAttemptId, "admissionAttemptId"),
+    };
+  }
   return {
     effectKey: parseHostExecutorIdentifier(effectKey, "effectKey"),
     execution: parseHostExecutorExecution(value.execution, codexHostId),
     operations,
+    ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
   };
 }
 
@@ -1967,17 +1980,22 @@ function parseAgentClaim(body) {
   };
 }
 
-function parseSafeActionAdmissionDeferral(body) {
+function parseSafeActionAdmissionDeferral(body, { allowReason = false } = {}) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "rootThreadId", "expectedResumeToken", "safeActionId", "admissionReceiptId", "admissionAttemptId",
+    ...(allowReason ? ["reason"] : []),
   ]));
+  if (allowReason && body.reason !== undefined && !["model_capacity", "coordinator_busy"].includes(body.reason)) {
+    throw new ApiError(400, "INVALID_FIELD", "'reason' must be model_capacity or coordinator_busy");
+  }
   return {
     rootThreadId: parseThreadId(body.rootThreadId),
     expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 128 }),
     safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
     admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
     admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+    ...(allowReason ? { reason: body.reason ?? "model_capacity" } : {}),
   };
 }
 
@@ -3978,8 +3996,15 @@ export function createTaskboardServer(options = {}) {
       pollTimeoutMs: options.remoteHostExecutorPollTimeoutMs,
       requestTimeoutMs: options.remoteHostExecutorRequestTimeoutMs,
     });
+  const localHostExecutorAdapter = options.hostExecutorRpcAdapter ?? aiChat.appServer;
+  const unsubscribeOwnedTerminal = typeof localHostExecutorAdapter.subscribe === "function"
+    ? localHostExecutorAdapter.subscribe((notification) => {
+        database.recordOrdinaryDeliveryTerminal(notification);
+        return database.recordOwnedTerminalCheckpoint(notification);
+      })
+    : null;
   const hostExecutorAdapter = createHostExecutorAdapterRouter({
-    localAdapter: options.hostExecutorRpcAdapter ?? aiChat.appServer,
+    localAdapter: localHostExecutorAdapter,
     remoteChannels: remoteHostExecutorChannels,
   });
   const hostExecutorDispatcher = createHostExecutorDispatcher({
@@ -6931,7 +6956,7 @@ export function createTaskboardServer(options = {}) {
         const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
           request, resolved.instanceSecret, pathname, rawDeferral,
         );
-        const deferral = parseSafeActionAdmissionDeferral(rawDeferral);
+        const deferral = parseSafeActionAdmissionDeferral(rawDeferral, { allowReason: true });
         return sendJson(response, 200, database.deferTaskSafeActionAdmission(id, {
           ...deferral,
           hostExecutorExecution,
@@ -7336,6 +7361,7 @@ export function createTaskboardServer(options = {}) {
       return server.address();
     },
     async close() {
+      unsubscribeOwnedTerminal?.();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());

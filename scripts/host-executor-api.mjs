@@ -136,6 +136,7 @@ export function createHostExecutorApi({
       body: {
         execution: input.execution,
         operations: input.operations,
+        ...(input.ordinaryDelivery === undefined ? {} : { ordinaryDelivery: input.ordinaryDelivery }),
       },
     });
   };

@@ -9,7 +9,7 @@ import {
   isCanonicalCodexHostId,
 } from "../shared/domain.mjs";
 import { createTaskCapsule, evaluateTaskAuthorization } from "./task-capsule.mjs";
-import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord } from "./task-continuation.mjs";
+import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord, normalizeOwnedTerminalNotification } from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -1480,6 +1480,8 @@ function activationWorkflowProfileCandidate(row) {
 }
 
 export class TaskboardDatabase {
+  #ordinaryDeliveryBuffers = new Map();
+
   constructor(filename, {
     admissionTtlMs = TASK_SAFE_ACTION_ADMISSION_TTL_MS,
     hostExecutorClock = Date.now,
@@ -1808,6 +1810,26 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS host_executor_effects_executor
         ON host_executor_effects(executor_instance_id, effect_key);
+
+      CREATE TABLE IF NOT EXISTS ordinary_delivery_observations (
+        receipt_id TEXT NOT NULL,
+        admission_attempt_id TEXT NOT NULL,
+        context_json TEXT NOT NULL,
+        effect_key TEXT,
+        request_fingerprint TEXT,
+        dispatch_token TEXT,
+        native_turn_id TEXT,
+        result_recorded_at TEXT,
+        terminal_status TEXT,
+        terminal_observed_at TEXT,
+        PRIMARY KEY (receipt_id, admission_attempt_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS ordinary_delivery_observations_effect
+        ON ordinary_delivery_observations(effect_key, dispatch_token);
+
+      CREATE INDEX IF NOT EXISTS ordinary_delivery_observations_turn
+        ON ordinary_delivery_observations(native_turn_id);
 
       CREATE TABLE IF NOT EXISTS host_executor_proof_nonces (
         nonce TEXT PRIMARY KEY,
@@ -3019,6 +3041,7 @@ export class TaskboardDatabase {
   }
 
   close() {
+    this.#ordinaryDeliveryBuffers.clear();
     this.statementCache.clear();
     this.database.close();
   }
@@ -4251,16 +4274,189 @@ export class TaskboardDatabase {
       return { method, params };
     });
     const operationsJson = JSON.stringify(operations);
+    let ordinaryDelivery;
+    if (Object.hasOwn(rawInput, "ordinaryDelivery")) {
+      const tag = rawInput.ordinaryDelivery;
+      if (!tag || typeof tag !== "object" || Array.isArray(tag)
+        || Object.keys(tag).some((key) => !["receiptId", "admissionAttemptId"].includes(key))
+        || execution.codexHostId !== "local" || operations.length !== 1 || operations[0].method !== "turn/start") {
+        throw new ApiError(400, "INVALID_FIELD", "Ordinary delivery identity requires one local turn/start");
+      }
+      ordinaryDelivery = {
+        receiptId: hostExecutorIdentifier(tag.receiptId, "receiptId"),
+        admissionAttemptId: hostExecutorIdentifier(tag.admissionAttemptId, "admissionAttemptId"),
+      };
+    }
     return {
       effectKey,
       execution,
       operations,
       operationsJson,
+      ordinaryDelivery,
       requestFingerprint: createHash("sha256").update(JSON.stringify({
         codexHostId: execution.codexHostId,
         operations,
+        ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
       })).digest("hex"),
     };
+  }
+
+  #ordinaryDeliveryContext(row, task) {
+    return {
+      taskId: task.id,
+      projectId: task.projectId,
+      receiptId: row.id,
+      admissionAttemptId: row.admission_attempt_id,
+      safeActionId: row.safe_action_id,
+      resumeTokenHash: createHash("sha256").update(row.resume_token).digest("hex"),
+      rootHostId: row.root_host_id,
+      rootThreadId: row.root_thread_id,
+      rootWorkspacePath: row.root_workspace_path,
+      worktreePath: row.worktree_path,
+      worktreeBranch: row.worktree_branch,
+      globalCoordinatorLeaseId: row.global_coordinator_lease_id,
+      globalCoordinatorTaskId: row.global_coordinator_task_id,
+      globalCoordinatorThreadId: row.global_coordinator_thread_id,
+      coordinationDomainId: row.coordination_domain_id,
+      domainCoordinatorLeaseId: row.domain_coordinator_lease_id,
+      domainCoordinatorTaskId: row.domain_coordinator_task_id,
+      domainCoordinatorThreadId: row.domain_coordinator_thread_id,
+    };
+  }
+
+  // Only optional observation writes belong here; identity validation must stay outside this savepoint.
+  #writeOrdinaryDeliveryObservation(write) {
+    let opened = false;
+    try {
+      this.database.exec("SAVEPOINT ordinary_delivery_observation");
+      opened = true;
+      const result = write();
+      this.database.exec("RELEASE ordinary_delivery_observation");
+      return result;
+    } catch {
+      if (opened) {
+        this.database.exec("ROLLBACK TO ordinary_delivery_observation; RELEASE ordinary_delivery_observation");
+      }
+      return null;
+    }
+  }
+
+  #validateOrdinaryDelivery(input) {
+    if (!input.ordinaryDelivery) return null;
+    const { receiptId, admissionAttemptId } = input.ordinaryDelivery;
+    const row = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(receiptId);
+    if (!row || row.admission_attempt_id !== admissionAttemptId || row.status !== "delivering"
+      || row.admission_state !== "awaiting_admission" || row.delivery_turn_id !== null
+      || row.root_host_id !== "local" || input.operations[0].params.threadId !== row.root_thread_id) {
+      throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The exact ordinary delivering attempt and target are required");
+    }
+    const task = this.#requireTask(row.task_id);
+    const rootRun = this.#rootAgentRunBinding(task, row.root_thread_id);
+    this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+    if (rootRun.rootHostId !== row.root_host_id || rootRun.rootWorkspacePath !== row.root_workspace_path
+      || rootRun.worktreePath !== row.worktree_path || rootRun.worktreeBranch !== row.worktree_branch
+      || this.getTaskCapsule(task.id).resumeToken !== row.resume_token) {
+      throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The current ordinary delivery context changed");
+    }
+    // Absence is not permission to recreate history; validation above still applies.
+    const observation = this.#prepare(`
+      SELECT * FROM ordinary_delivery_observations WHERE receipt_id = ? AND admission_attempt_id = ?
+    `).get(receiptId, admissionAttemptId);
+    if (!observation) return null;
+    const { confirmedAt, ...frozenContext } = JSON.parse(observation.context_json);
+    if (JSON.stringify(frozenContext) !== JSON.stringify(this.#ordinaryDeliveryContext(row, task))
+      || (observation.effect_key !== null && (observation.effect_key !== input.effectKey
+        || observation.request_fingerprint !== input.requestFingerprint))) {
+      throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The attempt already has another frozen context or effect");
+    }
+    return observation;
+  }
+
+  #bindOrdinaryDelivery(input, observation, dispatchToken) {
+    if (!observation) return null;
+    return this.#writeOrdinaryDeliveryObservation(() => {
+      const result = this.#prepare(`
+        UPDATE ordinary_delivery_observations SET effect_key = ?, request_fingerprint = ?, dispatch_token = ?
+        WHERE receipt_id = ? AND admission_attempt_id = ? AND dispatch_token IS NULL AND native_turn_id IS NULL
+      `).run(input.effectKey, input.requestFingerprint, dispatchToken,
+        observation.receipt_id, observation.admission_attempt_id);
+      if (result.changes !== 1) return null;
+      return { threadId: JSON.parse(observation.context_json).rootThreadId, candidates: new Map(), overflow: false };
+    });
+  }
+
+  recordOrdinaryDeliveryTerminal(notification) {
+    const terminal = normalizeOwnedTerminalNotification(notification);
+    if (!terminal) return;
+    for (const buffer of this.#ordinaryDeliveryBuffers.values()) {
+      if (buffer.threadId !== terminal.threadId || buffer.overflow || buffer.candidates.has(terminal.turnId)) continue;
+      if (buffer.candidates.size === 32) {
+        buffer.candidates.clear();
+        buffer.overflow = true;
+      } else {
+        buffer.candidates.set(terminal.turnId, terminal);
+      }
+    }
+    this.#writeOrdinaryDeliveryObservation(() => {
+      this.#prepare(`
+        UPDATE ordinary_delivery_observations SET terminal_status = ?, terminal_observed_at = ?
+        WHERE native_turn_id = ? AND terminal_status IS NULL
+          AND json_extract(context_json, '$.rootHostId') = 'local'
+          AND json_extract(context_json, '$.rootThreadId') = ?
+      `).run(terminal.turnStatus, now(), terminal.turnId, terminal.threadId);
+    });
+  }
+
+  #completeOrdinaryDelivery(effectKey, dispatchToken, results, timestamp) {
+    this.#writeOrdinaryDeliveryObservation(() => {
+      if (!Array.isArray(results) || results.length !== 1) return;
+      const turnId = hostExecutorIdentifier(results[0]?.turn?.id, "turnId");
+      const updated = this.#prepare(`
+        UPDATE ordinary_delivery_observations SET native_turn_id = ?, result_recorded_at = ?
+        WHERE effect_key = ? AND dispatch_token = ? AND native_turn_id IS NULL
+      `).run(turnId, timestamp, effectKey, dispatchToken);
+      if (updated.changes !== 1) return;
+      const early = this.#ordinaryDeliveryBuffers.get(dispatchToken)?.candidates.get(turnId);
+      if (early) {
+        this.#prepare(`
+          UPDATE ordinary_delivery_observations SET terminal_status = ?, terminal_observed_at = ?
+          WHERE effect_key = ? AND dispatch_token = ? AND terminal_status IS NULL
+        `).run(early.turnStatus, timestamp, effectKey, dispatchToken);
+      }
+    });
+  }
+
+  #recordedDeliveryObservation(row) {
+    try {
+      const observation = this.#prepare(`
+        SELECT * FROM ordinary_delivery_observations WHERE receipt_id = ? AND admission_attempt_id = ?
+      `).get(row.id, row.admission_attempt_id);
+      if (!observation) return null;
+      const { resumeTokenHash, confirmedAt, ...context } = JSON.parse(observation.context_json);
+      let currentAdmissionContextMatches = false;
+      try {
+        const task = this.#requireTask(row.task_id);
+        const current = this.#ordinaryDeliveryContext(row, task);
+        const rootRun = this.#rootAgentRunBinding(task, row.root_thread_id);
+        this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+        currentAdmissionContextMatches = JSON.stringify({ ...current, confirmedAt }) === observation.context_json
+          && rootRun.rootHostId === row.root_host_id && rootRun.rootWorkspacePath === row.root_workspace_path
+          && rootRun.worktreePath === row.worktree_path && rootRun.worktreeBranch === row.worktree_branch
+          && this.getTaskCapsule(task.id).resumeToken === row.resume_token;
+      } catch { /* Historical observation is still readable when its current binding is unavailable. */ }
+      return {
+        ...context, confirmedAt,
+        ...(observation.native_turn_id === null ? {} : {
+          nativeResult: { turnId: observation.native_turn_id, recordedAt: observation.result_recorded_at },
+        }),
+        ...(observation.terminal_status === null ? {} : {
+          terminal: { turnId: observation.native_turn_id, turnStatus: observation.terminal_status, observedAt: observation.terminal_observed_at },
+        }),
+        currentAdmissionContextMatches, observationOnly: true, liveExecution: "unknown", eligibleForDispatch: false,
+      };
+    } catch {
+      return null;
+    }
   }
 
   reserveHostExecutorEffect(rawInput) {
@@ -4314,6 +4510,7 @@ export class TaskboardDatabase {
             "The Codex RPC effect was already dispatched and requires observation",
           );
         }
+        this.#validateOrdinaryDelivery(input);
         if (existing.executor_instance_id !== execution.executorInstanceId
           || existing.registration_fingerprint !== execution.registrationFingerprint
           || existing.lease_id !== execution.leaseId) {
@@ -4337,6 +4534,7 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return { applied: false, replayed: false, effect: hostExecutorEffectFromRow(rebound) };
       }
+      this.#validateOrdinaryDelivery(input);
       this.#prepare(`
         INSERT INTO host_executor_effects (
           effect_key, codex_host_id, executor_instance_id, registration_fingerprint,
@@ -4421,6 +4619,7 @@ export class TaskboardDatabase {
         );
       }
       const dispatchToken = randomUUID();
+      const ordinaryObservation = this.#validateOrdinaryDelivery(input);
       this.#prepare(`
         UPDATE host_executor_effects
         SET status = 'dispatched', dispatch_token = ?, updated_at = ?
@@ -4429,7 +4628,9 @@ export class TaskboardDatabase {
       const dispatched = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(input.effectKey);
+      const ordinaryBuffer = this.#bindOrdinaryDelivery(input, ordinaryObservation, dispatchToken);
       this.database.exec("COMMIT");
+      if (ordinaryBuffer) this.#ordinaryDeliveryBuffers.set(dispatchToken, ordinaryBuffer);
       return {
         dispatch: true,
         replayed: false,
@@ -4472,6 +4673,15 @@ export class TaskboardDatabase {
           SET status = 'completed', result_json = ?, updated_at = ?
           WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
         `).run(resultJson, timestamp, effectKey, dispatchToken);
+        this.database.exec("SAVEPOINT continuation_effect_origin");
+        try {
+          this.#recordContinuationEffectOrigins(row, result, timestamp);
+          this.database.exec("RELEASE continuation_effect_origin");
+        } catch {
+          // Observation failure must not turn an already-successful native RPC into an uncertain effect.
+          this.database.exec("ROLLBACK TO continuation_effect_origin; RELEASE continuation_effect_origin");
+        }
+        this.#completeOrdinaryDelivery(effectKey, dispatchToken, result, timestamp);
       } else if (row.result_json !== resultJson) {
         throw new ApiError(
           409,
@@ -4487,6 +4697,46 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#ordinaryDeliveryBuffers.delete(dispatchToken);
+    }
+  }
+
+  #recordContinuationEffectOrigins(effect, results, recordedAt) {
+    if (effect.codex_host_id !== "local" || effect.adapter_id !== LOCAL_HOST_EXECUTOR_ADAPTER_ID) return;
+    const operations = JSON.parse(effect.operations_json);
+    if (!Array.isArray(operations) || operations.length !== 1 || operations[0]?.method !== "turn/start"
+      || !Array.isArray(results) || results.length !== 1) return;
+    const threadId = hostExecutorIdentifier(operations[0].params?.threadId, "threadId");
+    const turnId = hostExecutorIdentifier(results[0]?.turn?.id, "turnId");
+    const source = "taskboard-local-host-effect-completion";
+    const enrolled = this.#prepare(`
+      SELECT tasks.id FROM tasks
+      WHERE thread_id = ? AND thread_codex_host_id = 'local'
+        AND EXISTS (
+          SELECT 1 FROM agent_event_receipts
+          WHERE task_id = tasks.id AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+        )
+    `).all(threadId);
+    for (const { id } of enrolled) {
+      const context = this.#taskContinuationContext(id);
+      const binding = context.capsule.execution.threadBinding;
+      if (!binding || binding.codexHostId !== "local" || binding.threadId !== threadId) continue;
+      const projectId = context.capsule.task.projectId;
+      const eventId = `continuation-effect-origin:v1:${createHash("sha256").update(JSON.stringify([
+        source, id, projectId, "local", effect.effect_key, effect.request_fingerprint,
+        effect.dispatch_token, 0, threadId, turnId,
+      ])).digest("hex")}`;
+      if (this.#prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) continue;
+      const event = {
+        eventId, eventType: "continuation_effect_origin", taskId: id, projectId, source, codexHostId: "local",
+        threadId, turnId, effectKey: effect.effect_key, requestFingerprint: effect.request_fingerprint,
+        operationIndex: 0, continuationRecordId: context.record.eventId, bindingAtObservation: binding, recordedAt,
+      };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+        VALUES (?, ?, ?, NULL, ?, ?)
+      `).run(eventId, projectId, id, JSON.stringify(event), recordedAt);
     }
   }
 
@@ -4524,6 +4774,8 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#ordinaryDeliveryBuffers.delete(dispatchToken);
     }
   }
 
@@ -4554,6 +4806,12 @@ export class TaskboardDatabase {
         SET status = 'reserved', dispatch_token = NULL, updated_at = ?
         WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
       `).run(timestamp, effectKey, dispatchToken);
+      this.#writeOrdinaryDeliveryObservation(() => {
+        this.#prepare(`
+          UPDATE ordinary_delivery_observations SET effect_key = NULL, request_fingerprint = NULL, dispatch_token = NULL
+          WHERE effect_key = ? AND dispatch_token = ? AND native_turn_id IS NULL
+        `).run(effectKey, dispatchToken);
+      });
       const reserved = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
@@ -4562,6 +4820,8 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#ordinaryDeliveryBuffers.delete(dispatchToken);
     }
   }
 
@@ -10158,9 +10418,78 @@ export class TaskboardDatabase {
   getTaskContinuation(taskId) {
     this.database.exec("BEGIN");
     try {
-      const result = assessTaskContinuation(this.#taskContinuationContext(taskId));
+      const context = this.#taskContinuationContext(taskId);
+      const row = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_owned_terminal'
+        ORDER BY rowid DESC LIMIT 1
+      `).get(context.capsule.task.id);
+      const terminalCheckpoint = row ? JSON.parse(row.envelope_json) : null;
+      const terminalEffectOrigins = terminalCheckpoint ? this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_effect_origin'
+          AND json_extract(envelope_json, '$.codexHostId') = 'local'
+          AND json_extract(envelope_json, '$.threadId') = ?
+          AND json_extract(envelope_json, '$.turnId') = ?
+        ORDER BY rowid
+      `).all(context.capsule.task.id, terminalCheckpoint.threadId, terminalCheckpoint.turnId)
+        .map((origin) => JSON.parse(origin.envelope_json)) : [];
+      const result = assessTaskContinuation({
+        ...context, terminalCheckpoint, terminalEffectOrigins,
+      });
       this.database.exec("COMMIT");
       return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordOwnedTerminalCheckpoint(notification) {
+    const terminal = normalizeOwnedTerminalNotification(notification);
+    if (!terminal) return [];
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const enrolled = this.#prepare(`
+        SELECT tasks.id FROM tasks
+        WHERE thread_id = ? AND thread_codex_host_id = 'local'
+          AND EXISTS (
+            SELECT 1 FROM agent_event_receipts
+            WHERE task_id = tasks.id AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+          )
+      `).all(terminal.threadId);
+      const observedAt = now();
+      const source = "taskboard-server-owned-app-server";
+      const receipts = [];
+      for (const { id } of enrolled) {
+        const context = this.#taskContinuationContext(id);
+        const binding = context.capsule.execution.threadBinding;
+        if (!binding || binding.codexHostId !== "local" || binding.threadId !== terminal.threadId) continue;
+        const eventId = `continuation-owned-terminal:${createHash("sha256")
+          .update(JSON.stringify([source, id, "local", terminal.threadId, terminal.turnId])).digest("hex")}`;
+        const existing = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE event_id = ?").get(eventId);
+        if (existing) {
+          const event = JSON.parse(existing.envelope_json);
+          receipts.push({ applied: false, conflict: event.turnStatus !== terminal.turnStatus, event });
+          continue;
+        }
+        // The native notification proves thread/turn/status only. Binding and agreement are DB context at receipt time.
+        const event = {
+          eventId, eventType: "continuation_owned_terminal", taskId: id, projectId: context.capsule.task.projectId,
+          source, codexHostId: "local", ...terminal,
+          continuationRecordId: context.record.eventId,
+          bindingAtObservation: binding,
+          requirementsRevision: context.capsule.requirementsRevision,
+          observedAt,
+        };
+        this.#prepare(`
+          INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+          VALUES (?, ?, ?, NULL, ?, ?)
+        `).run(eventId, event.projectId, id, JSON.stringify(event), observedAt);
+        receipts.push({ applied: true, conflict: false, event });
+      }
+      this.database.exec("COMMIT");
+      return receipts;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -10518,7 +10847,7 @@ export class TaskboardDatabase {
       }
       if (!this.#taskSafeActionCoordinatorEpochMatches(row, rootRun)) return null;
     }
-    return this.#taskSafeActionReceipt(row);
+    return { ...this.#taskSafeActionReceipt(row), recordedDeliveryObservation: this.#recordedDeliveryObservation(row) };
   }
 
   confirmTaskSafeActionDelivery(id, {
@@ -10561,6 +10890,23 @@ export class TaskboardDatabase {
         row.id,
       );
       const delivering = this.#prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(row.id);
+      if (rootRun.rootHostId === "local") {
+        const context = this.#ordinaryDeliveryContext(delivering, task);
+        const existing = this.#writeOrdinaryDeliveryObservation(() => this.#prepare(`
+          SELECT context_json FROM ordinary_delivery_observations WHERE receipt_id = ? AND admission_attempt_id = ?
+        `).get(row.id, row.admission_attempt_id));
+        if (existing) {
+          const { confirmedAt, ...frozenContext } = JSON.parse(existing.context_json);
+          if (JSON.stringify(frozenContext) !== JSON.stringify(context)) {
+            throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The attempt already has another frozen confirmation context");
+          }
+        } else {
+          this.#writeOrdinaryDeliveryObservation(() => this.#prepare(`
+            INSERT INTO ordinary_delivery_observations (receipt_id, admission_attempt_id, context_json)
+            VALUES (?, ?, ?)
+          `).run(row.id, row.admission_attempt_id, JSON.stringify({ ...context, confirmedAt: now() })));
+        }
+      }
       this.database.exec("COMMIT");
       return { confirmed: true, receipt: this.#taskSafeActionReceipt(delivering) };
     } catch (error) {
@@ -11272,8 +11618,12 @@ export class TaskboardDatabase {
 
   deferTaskSafeActionAdmission(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    reason = "model_capacity",
     hostExecutorExecution = undefined,
   }) {
+    if (!["model_capacity", "coordinator_busy"].includes(reason)) {
+      throw new ApiError(400, "INVALID_FIELD", "Admission deferral reason is invalid");
+    }
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -11289,10 +11639,16 @@ export class TaskboardDatabase {
       }
       this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
       if (row.status === "reserved" && row.admission_state === "deferred") {
+        if (row.admission_deferred_reason !== reason) {
+          throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission was deferred for a different reason");
+        }
         this.database.exec("COMMIT");
         return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
       }
-      if (row.status !== "delivering" || !["awaiting_admission", "prepared"].includes(row.admission_state)) {
+      if (row.status !== "delivering"
+        || !["awaiting_admission", "prepared"].includes(row.admission_state)
+        || (reason === "coordinator_busy"
+          && (row.admission_state !== "awaiting_admission" || row.delivery_turn_id !== null))) {
         throw new ApiError(409, "ADMISSION_NOT_AWAITING", "Only the current awaiting admission attempt can be deferred");
       }
       if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
@@ -11304,11 +11660,11 @@ export class TaskboardDatabase {
         UPDATE task_safe_action_receipts
         SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
           lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
-          admission_deferred_reason = 'model_capacity', admission_retry_count = ?,
+          admission_deferred_reason = ?, admission_retry_count = ?,
           admission_retry_after = ?
         WHERE id = ? AND status = 'delivering' AND admission_state IN ('awaiting_admission', 'prepared')
           AND admission_attempt_id = ?
-      `).run(retryCount, retryAfter, row.id, admissionAttemptId);
+      `).run(reason, retryCount, retryAfter, row.id, admissionAttemptId);
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission attempt changed before capacity deferral");
       }

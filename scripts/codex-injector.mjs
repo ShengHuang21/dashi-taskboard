@@ -1255,6 +1255,7 @@ async function requestCodexAppServerViaCdp(
   method,
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
+  ordinaryDelivery = undefined,
 ) {
   const residentExecution = residentHostExecutorContext.getStore();
   if (residentExecution && residentHostExecutorMutatingRpcMethods.has(method)) {
@@ -1284,6 +1285,7 @@ async function requestCodexAppServerViaCdp(
         leaseId: residentExecution.leaseId,
       },
       operations: [{ method, params }],
+      ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
     });
     if (!Array.isArray(result?.results) || result.results.length !== 1) {
       throw new Error("Taskboard host executor dispatcher returned an invalid result");
@@ -3180,6 +3182,7 @@ async function mutateBackgroundAdmission(claim, action) {
     admissionReceiptId: claim.admissionReceiptId,
     admissionAttemptId: claim.admissionAttemptId,
     ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
+    ...(action === "defer" && claim.reason !== undefined ? { reason: claim.reason } : {}),
   };
   const response = await fetch(
     `${taskboardBaseUrl}${pathname}`,
@@ -3355,6 +3358,12 @@ function runBackgroundContinuationDispatch(cdp, projectId, hostResourceAdmission
         method,
         params,
         10_000,
+        request.codexHostId === "local" && method === "turn/start"
+          ? {
+              receiptId: request.deliveryReceipt.id,
+              admissionAttemptId: request.deliveryReceipt.admissionAttemptId,
+            }
+          : undefined,
       ),
       validateGitExecutionTarget,
       revalidateBackgroundContinuationHostAccess,
