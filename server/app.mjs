@@ -6491,7 +6491,34 @@ export function createTaskboardServer(options = {}) {
         const taskId = decodeRouteSegment(continuationRoute[1], "Task id");
         assertNoQuery(url.searchParams, "Task continuation");
         if (request.method === "GET") {
-          return sendJson(response, 200, database.getTaskContinuation(taskId));
+          const assessment = database.getTaskContinuation(taskId);
+          const binding = assessment.basis.current.binding;
+          const completeLocalBinding = binding?.codexHostId === "local"
+            && binding.codexProjectKind === "local"
+            && [binding.threadId, binding.codexProjectId].every((value) => typeof value === "string" && value.trim())
+            && typeof binding.workspacePath === "string" && path.isAbsolute(binding.workspacePath)
+            && !binding.workspacePath.includes("\0");
+          const rootTurn = completeLocalBinding && typeof localHostExecutorAdapter.getRootTurnObservation === "function"
+            ? localHostExecutorAdapter.getRootTurnObservation(binding.threadId)
+            : {
+                source: "selected_local_adapter",
+                scope: "last_observed_root_turn_only",
+                status: "unknown",
+                reason: completeLocalBinding ? "adapter_unsupported" : "binding_unsupported",
+                lastEvent: null,
+                observedAt: null,
+                queriedAt: new Date().toISOString(),
+                ageMs: null,
+              };
+          return sendJson(response, 200, {
+            ...assessment,
+            passiveActivity: {
+              rootTurn,
+              children: "not_observed",
+              tools: "not_observed",
+              backgroundSessions: "not_observed",
+            },
+          });
         }
         if (request.method === "POST") {
           if (request.headers["x-taskboard-client"] !== "taskctl") {
