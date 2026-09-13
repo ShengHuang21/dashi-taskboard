@@ -4417,6 +4417,64 @@ const confirmedIdentity = {
   repository: null,
 };
 
+test("recorded hold D2: both recovery predicates and the confirmed arm skip held candidates while selecting a peer", async (t) => {
+  const oldRoot = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const newRoot = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  for (const sample of ["replacement-prepared", "same-prepared", "same-confirmed"]) {
+    const replacement = sample === "replacement-prepared";
+    const held = {
+      id: "CAP-HOLD", taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+      dispatchTarget: { rootThreadId: replacement ? newRoot : oldRoot, codexHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard", worktreePath: confirmedIdentity.worktreePath },
+      ...(replacement ? { domainAssignment: { status: "active", domainId: "frontend",
+        leaseId: "replacement-lease", coordinatorTaskId: "frontend-coordinator" } } : {}),
+      admission: {
+        receiptId: "held-receipt", attemptId: "held-attempt",
+        state: sample === "same-confirmed" ? "recovery_confirmed" : "prepared",
+        deadlineAt: "2026-08-31T00:01:00.000Z", rootThreadId: oldRoot, rootHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard", resumeToken: "d".repeat(64), safeActionId: "safe-action",
+        agentPath: "/root/task_admission_1234", agentName: "task_admission_1234", writeScope: ["server"],
+        recoveredAgentThreadId: sample === "same-confirmed" ? "confirmed-child" : null,
+        ...(replacement ? { coordinationDomainId: "frontend", domainCoordinatorLeaseId: "old-lease",
+          domainCoordinatorTaskId: "frontend-coordinator", domainCoordinatorThreadId: oldRoot } : {}),
+      },
+      readyWork: { eligible: false, reasonCodes: ["CONTINUATION_PAUSED"] },
+    };
+    const before = structuredClone(held);
+    const peer = {
+      id: "CAP-PEER", taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615f", run: null,
+      dispatchTarget: { rootThreadId: newRoot, codexHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard", worktreePath: confirmedIdentity.worktreePath },
+      readyWork: { eligible: true, safeActions: [{ id: "safe-action", text: "Continue peer" }],
+        reasonCodes: [], resumeToken: "b".repeat(64) },
+    };
+    const calls = [];
+    const forbidden = (name) => async (request) => { calls.push([name, request.taskId]); assert.fail(`held ${sample} reached ${name}`); };
+    const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor, policy: { enabled: true, projectId: "taskboard-core" },
+      now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: [held, peer] }),
+      markAdmissionUncertain: forbidden("uncertain"), claimAdmissionProbe: forbidden("probe"),
+      reconcileAdmission: forbidden("reconcile"), claimReplacementAdmissionProbe: forbidden("replacement-probe"),
+      reconcileReplacementAdmission: forbidden("replacement-reconcile"), deliverAdmissionRecovery: forbidden("recovery-instruction"),
+      claimReceipt: async (request) => {
+        calls.push(["claim", request.taskId]);
+        return { available: true, completed: false, receipt: { id: "peer-receipt", reservationLeaseId: "peer-lease" } };
+      },
+      confirmDelivery: async (request) => { calls.push(["confirm", request.taskId]); return confirmedIdentity; },
+      deliver: async (request) => { calls.push(["deliver", request.taskId]); return { delivery: "started", turnId: "peer-turn" }; },
+      completeDelivery: async (request) => { calls.push(["complete", request.taskId]); return { completed: true }; },
+    });
+    assert.deepEqual(held, before, "receipt, attempt and recovery state must stay intact");
+    assert.equal(result.delivered, true);
+    assert.equal(result.todoId, peer.id);
+    assert.deepEqual(calls, ["claim", "confirm", "deliver", "complete"].map((name) => [name, peer.taskId]));
+    t.diagnostic(JSON.stringify({ case: "D2", sample, receiptId: held.admission.receiptId,
+      attemptId: held.admission.attemptId, state: held.admission.state, heldTaskCalls: 0,
+      selectedPeerTaskId: peer.taskId, admissionUnchanged: true }));
+  }
+});
+
 test("background continuation delivers one eligible first safe action without a mounted view", async () => {
   const deliveries = [];
   const receipts = new Set();

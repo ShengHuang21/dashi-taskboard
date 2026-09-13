@@ -27,6 +27,9 @@ const domainCoordinatorShutdownIdleObservations = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
 const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
+const CONTINUATION_HOLD_REASONS = new Set([
+  "CONTINUATION_PAUSED", "CONTINUATION_CANCELED", "CONTINUATION_ENDPOINT_REACHED",
+]);
 const OWNER_DECISION_MARKER = "TASKBOARD_OWNER_DECISION_V1";
 const OWNER_INTENT_ADOPTION_MARKER = "Taskboard Owner Intent adoption id:";
 const OWNER_INTENT_ROUTE_MARKER = "TASKBOARD_OWNER_INTENT_ROUTE_V1";
@@ -4535,6 +4538,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   let hostExecutorUnavailable = false;
   const replacementRecoveryObservedAt = now();
   const replacementRecoveryTodo = snapshot.todos.find((candidate) => {
+    if (candidate?.readyWork?.reasonCodes?.some((reason) => CONTINUATION_HOLD_REASONS.has(reason))) return false;
     const admission = candidate?.admission;
     const target = candidate?.dispatchTarget;
     const assignment = candidate?.domainAssignment;
@@ -4654,6 +4658,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     };
   }
   const recoveryTodo = snapshot.todos.find((candidate) => {
+    if (candidate?.readyWork?.reasonCodes?.some((reason) => CONTINUATION_HOLD_REASONS.has(reason))) return false;
     const admission = candidate?.admission;
     const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")

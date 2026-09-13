@@ -13,6 +13,7 @@ import {
 import { createHostExecutorLeaseLifecycle } from "../scripts/host-executor-lifecycle.mjs";
 import { createTaskboardServer } from "../server/index.mjs";
 import { CodexAppServerError } from "../server/codex-app-server.mjs";
+import { runTaskboardContinuationMonitorOnce } from "../scripts/codex-injector-runtime.mjs";
 
 const running = [];
 
@@ -115,7 +116,7 @@ async function launchHarness({ currentTime, afterReserve, requestReady, subscrib
 
 function createReadyTask(harness, overrides = {}) {
   const actor = { type: "agent", id: "codex-agent", name: "Codex Agent", avatarUrl: null };
-  const binding = {
+  const binding = overrides.threadBinding ?? {
     threadId: "root-thread",
     codexProjectId: "local-project",
     codexProjectKind: "local",
@@ -327,6 +328,152 @@ function enrollTerminalTask(harness, ready, suffix = "first") {
     checkpoint: { summary: "Enrolled", nextActionId: null, waitingKind: "none", waitingDetail: null, retryAt: null },
   }).event;
 }
+
+function recordedHoldInput(harness, ready, status, suffix) {
+  const db = harness.app.database;
+  return {
+    eventId: `recorded-hold-${ready.task.id}-${suffix}`, idempotencyKey: `recorded-hold-${suffix}`,
+    senderThreadId: db.getTask(ready.task.id).threadId,
+    expectedRecordId: db.getTaskContinuation(ready.task.id).record?.eventId ?? null,
+    expectedResumeToken: db.getTaskCapsule(ready.task.id).resumeToken,
+    goal: "Honor the recorded stop boundary", sourceRefs: ["test:recorded-hold"],
+    authorizationSource: null, actionIds: [], stopBoundary: "No new automatic admission while held", status,
+    checkpoint: { summary: suffix, nextActionId: null, waitingKind: "none", waitingDetail: null, retryAt: null },
+  };
+}
+
+test("recorded hold D1: persisted holds inhibit ordinary and capacity selection without starving a ready peer", async (t) => {
+  let heldFixture;
+  for (const [status, reason] of [
+    ["paused", "CONTINUATION_PAUSED"], ["canceled", "CONTINUATION_CANCELED"],
+    ["endpoint_reached", "CONTINUATION_ENDPOINT_REACHED"],
+  ]) {
+    const harness = await launchHarness();
+    const binding = {
+      threadId: "01a004bd-a749-7b53-81e2-af2d477f93ae", codexProjectId: "local-project",
+      codexProjectKind: "local", codexHostId: "local", workspacePath: harness.worktreePath,
+    };
+    const ready = createReadyTask(harness, { threadBinding: binding });
+    const db = harness.app.database;
+    db.upsertAgentLaneProject("local", {
+      rootTaskId: "root", tasks: [{ id: "root", label: "Root", owner: "Codex", source: "codex",
+        taskType: "root_task", ...binding }], adapters: [],
+    });
+    const before = db.getTaskCapsule(ready.task.id);
+    assert.equal(before.readyWork.eligible, true);
+    const recorded = db.appendTaskContinuation(ready.task.id, recordedHoldInput(harness, ready, status, status));
+    const held = db.getTaskCapsule(ready.task.id);
+    assert.equal(held.readyWork.eligible, false);
+    assert.deepEqual(held.readyWork.reasonCodes, [reason]);
+    assert.deepEqual(held.authorization, before.authorization);
+    assert.equal(held.readyWork.approvalRequest, null);
+    assert.equal(held.readyWork.ownerDecisionRequest, null);
+    const snapshot = await (await fetch(`${harness.baseUrl}/api/local/projects/local/agent-lanes`)).json();
+    const todo = snapshot.todos.find((candidate) => candidate.taskId === ready.task.id);
+    assert.deepEqual(todo.readyWork.reasonCodes, [reason]);
+    assert.equal(todo.readyWork.eligible, false);
+    const calls = [];
+    const unexpected = (name) => async (request) => { calls.push([name, request.taskId]); assert.fail(`${name} selected held task`); };
+    await runTaskboardContinuationMonitorOnce({
+      hostExecutor: { ownedCodexHostId: "local" },
+      policy: { enabled: true, projectId: "local", maxActiveAgents: 2, capacityObservationMaxAgeMs: 60_000 },
+      readSnapshot: async () => snapshot,
+      claimReceipt: unexpected("claim"), confirmDelivery: unexpected("confirm"), deliver: unexpected("deliver"),
+      completeDelivery: unexpected("complete"), requestCapacityObservation: unexpected("capacity-probe"),
+    });
+    assert.deepEqual(calls, []);
+    t.diagnostic(JSON.stringify({ case: "D1", taskId: ready.task.id, recordId: recorded.event.eventId,
+      status, reason, eligible: held.readyWork.eligible, heldTaskCalls: calls.length }));
+    heldFixture = { harness, ready, binding, todo };
+  }
+  const { harness, ready: held, binding, todo: heldTodo } = heldFixture;
+  const peer = createReadyTask(harness, { threadBinding: binding });
+  const mixed = await (await fetch(`${harness.baseUrl}/api/local/projects/local/agent-lanes`)).json();
+  const peerTodo = mixed.todos.find((candidate) => candidate.taskId === peer.task.id);
+  assert.equal(peerTodo.readyWork.eligible, true);
+  const calls = [];
+  const result = await runTaskboardContinuationMonitorOnce({
+    hostExecutor: { ownedCodexHostId: "local" }, policy: { enabled: true, projectId: "local" },
+    readSnapshot: async () => ({ ...mixed, todos: [heldTodo, peerTodo] }),
+    claimReceipt: async (request) => {
+      calls.push(["claim", request.taskId]);
+      return { available: true, completed: false, receipt: { id: "peer-receipt", reservationLeaseId: "peer-lease" } };
+    },
+    confirmDelivery: async (request) => {
+      calls.push(["confirm", request.taskId]);
+      return { worktreePath: harness.worktreePath, branch: "codex/host-fence" };
+    },
+    deliver: async (request) => { calls.push(["deliver", request.taskId]); return { delivery: "started", turnId: "peer-turn" }; },
+    completeDelivery: async (request) => { calls.push(["complete", request.taskId]); return { completed: true }; },
+    requestCapacityObservation: async (request) => { calls.push(["capacity-probe", request.taskId]); },
+  });
+  assert.equal(result.delivered, true);
+  assert.equal(result.todoId, peerTodo.id);
+  assert.equal(calls.some(([, taskId]) => taskId === held.task.id), false);
+  assert.deepEqual(calls, ["claim", "confirm", "deliver", "complete"].map((name) => [name, peer.task.id]));
+  t.diagnostic(JSON.stringify({ case: "D1-mixed", heldTaskId: held.task.id, selectedPeerTaskId: peer.task.id, heldTaskCalls: 0, peerCalls: calls.length }));
+});
+
+test("recorded hold D3: a pause committed after reservation rejects the tagged start at its final token fence", async (t) => {
+  let attempt;
+  let recorded;
+  const harness = await launchHarness({ afterReserve() {
+    recorded = harness.app.database.appendTaskContinuation(attempt.ready.task.id,
+      recordedHoldInput(harness, attempt.ready, "paused", "after-reserve"));
+  } });
+  attempt = await confirmRoutedAttempt(harness);
+  await assert.rejects(harness.api.executeEffect(attempt.effect), (error) => (
+    error.status === 409 && error.code === "ORDINARY_DELIVERY_IDENTITY_MISMATCH"
+  ));
+  const row = harness.app.database.database.prepare("SELECT * FROM host_executor_effects WHERE effect_key = ?").get(attempt.effect.effectKey);
+  assert.equal(row.status, "reserved");
+  assert.equal(row.dispatch_token, null);
+  assert.equal(row.result_json, null);
+  assert.equal(harness.calls.filter((call) => call.method === "turn/start").length, 0);
+  assert.equal(routedRows(harness)[0].effect_key, null);
+  t.diagnostic(JSON.stringify({ case: "D3", taskId: attempt.ready.task.id, recordId: recorded.event.eventId,
+    receiptId: attempt.receipt.id, attemptId: attempt.receipt.admissionAttemptId,
+    effectStatus: row.status, errorCode: "ORDINARY_DELIVERY_IDENTITY_MISMATCH", submittedStarts: 0 }));
+});
+
+test("recorded hold D4: real append replay and reopen preserve latest non-ABA tokens and reject a stale append", async (t) => {
+  let harness = await launchHarness();
+  const ready = createReadyTask(harness);
+  let db = harness.app.database;
+  const activeA = recordedHoldInput(harness, ready, "active", "active-a");
+  db.appendTaskContinuation(ready.task.id, activeA);
+  const tokenA = db.getTaskCapsule(ready.task.id).resumeToken;
+  const holdH = recordedHoldInput(harness, ready, "paused", "hold-h");
+  const storedH = db.appendTaskContinuation(ready.task.id, holdH);
+  const tokenH = db.getTaskCapsule(ready.task.id).resumeToken;
+  assert.notEqual(tokenH, tokenA);
+  assert.deepEqual(db.appendTaskContinuation(ready.task.id, holdH), { applied: false, event: storedH.event });
+  assert.equal(db.getTaskCapsule(ready.task.id).resumeToken, tokenH);
+  const activeB = recordedHoldInput(harness, ready, "active", "active-b");
+  const storedB = db.appendTaskContinuation(ready.task.id, activeB);
+  const tokenB = db.getTaskCapsule(ready.task.id).resumeToken;
+  assert.notEqual(tokenB, tokenH);
+  assert.notEqual(tokenB, tokenA);
+  assert.deepEqual(db.appendTaskContinuation(ready.task.id, holdH), { applied: false, event: storedH.event });
+  assert.equal(db.getTaskContinuation(ready.task.id).record.eventId, storedB.event.eventId);
+  assert.equal(db.getTaskCapsule(ready.task.id).resumeToken, tokenB);
+  await harness.app.close();
+  running.find((entry) => entry.app === harness.app).closed = true;
+  harness = await launchHarness({ reopenDirectory: harness.directory });
+  db = harness.app.database;
+  assert.deepEqual(db.getTaskContinuation(ready.task.id).record, storedB.event);
+  assert.equal(db.getTaskCapsule(ready.task.id).resumeToken, tokenB);
+  const stale = { ...recordedHoldInput(harness, ready, "paused", "stale"), expectedResumeToken: tokenH };
+  assert.equal(stale.expectedRecordId, storedB.event.eventId);
+  assert.throws(() => db.appendTaskContinuation(ready.task.id, stale), (error) => error.code === "CONTINUATION_STALE");
+  assert.equal(db.getTaskContinuation(ready.task.id).record.eventId, storedB.event.eventId);
+  assert.equal(db.getTaskCapsule(ready.task.id).resumeToken, tokenB);
+  const count = db.database.prepare("SELECT COUNT(*) AS count FROM agent_event_receipts WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_record'").get(ready.task.id).count;
+  assert.equal(count, 3);
+  t.diagnostic(JSON.stringify({ case: "D4", taskId: ready.task.id, activeA: activeA.eventId, holdH: holdH.eventId,
+    latest: storedB.event.eventId, distinctTokens: new Set([tokenA, tokenH, tokenB]).size,
+    persistedRecords: count, replayStable: true, reopenStable: true, staleAppend: "CONTINUATION_STALE" }));
+});
 
 function terminalNotification(turnId, status = "completed", threadId = "root-thread") {
   return { method: "turn/completed", params: { threadId, turn: { id: turnId, status } } };
