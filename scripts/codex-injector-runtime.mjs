@@ -4413,6 +4413,22 @@ async function reserveHostResourceAdmissionBudget({ budget, projectId, target, h
   };
 }
 
+export async function runTaskboardResourceAdmissionTick({ projects, readSnapshot, readHostResourceObservation, admit, policy, maxActiveAgents }) {
+  const snapshots = [];
+  for (const project of projects) {
+    if (project.continuationEnabled) snapshots.push(await readSnapshot(project.projectId));
+  }
+  if (!snapshots.some((snapshot) => snapshot.resourceSteps?.some((step) => step.state === "queued"))) {
+    return { granted: false, reason: "resource_step_no_queued_work" };
+  }
+  const slotObservations = snapshots.flatMap((snapshot) => (snapshot.windowSubagentTrees ?? [])
+    .filter((tree) => tree.observed === true && tree.capacityObservation?.source === "list_agents")
+    .map((tree) => ({ threadId: tree.rootThreadId, observedAt: tree.capacityObservation.observedAt,
+      active: tree.summary.active + 1, maxActive: maxActiveAgents })));
+  // Only natural recorded list_agents evidence; this path never requests a probe or wakes an Agent.
+  return admit({ observation: await readHostResourceObservation(), slotObservations, policy });
+}
+
 function continuationCapacity(snapshot, target, policy, observedAtMs) {
   if (policy.maxActiveAgents === undefined) return { available: true, headroomAgents: null };
   if (!Number.isSafeInteger(policy.maxActiveAgents)

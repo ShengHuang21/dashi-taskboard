@@ -4024,6 +4024,7 @@ export function createTaskboardServer(options = {}) {
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
     getAdmission: (taskId) => database.getTaskSafeActionAdmission(taskId),
+    listResourceSteps: (projectId) => database.listResourceSteps(projectId),
     getTaskCapsule: (taskId) => verifiedTaskCapsule(taskId),
     getTaskDomainAssignment: (taskId) => database.getAgentTaskDomainAssignment(taskId),
     getTask: (identifier) => database.getTask(identifier),
@@ -6484,6 +6485,47 @@ export function createTaskboardServer(options = {}) {
           return sendJson(response, result.applied ? 201 : 200, result);
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const resourceStepsRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/resource-steps(?:\/([^/]+)(?:\/(wait|consume-start|result))?)?$/);
+      if (resourceStepsRoute) {
+        assertNoQuery(url.searchParams, "Resource step");
+        const taskId = decodeRouteSegment(resourceStepsRoute[1], "Task id");
+        const stepId = resourceStepsRoute[2] ? decodeRouteSegment(resourceStepsRoute[2], "Step id") : null;
+        const action = resourceStepsRoute[3];
+        if (request.method === "GET" && stepId && !action) return sendJson(response, 200, database.getResourceStep(taskId, stepId));
+        if (request.method !== "POST" || (stepId && !action)) return methodNotAllowed(response, stepId && !action ? ["GET"] : ["POST"]);
+        if (request.headers["x-taskboard-client"] !== "taskctl") throw new ApiError(403, "TASKCTL_REQUIRED", "Resource steps require protected taskctl");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        const result = !stepId ? database.registerResourceStep(taskId, body)
+          : action === "wait" ? database.waitResourceStep(taskId, stepId, body)
+            : action === "consume-start" ? database.consumeResourceStep(taskId, stepId, body)
+              : database.recordResourceStepResult(taskId, stepId, body);
+        return sendJson(response, 200, result);
+      }
+      const resourceCheckpointRoute = pathname.match(/^\/api\/local\/resource-allocations\/([^/]+)\/checkpoint$/);
+      if (resourceCheckpointRoute) {
+        assertNoQuery(url.searchParams, "Resource allocation checkpoint");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if (request.headers["x-taskboard-client"] !== "taskctl") throw new ApiError(403, "TASKCTL_REQUIRED", "Resource checkpoints require protected taskctl");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        return sendJson(response, 200, database.checkpointResourceAllocation(
+          decodeRouteSegment(resourceCheckpointRoute[1], "Allocation id"), body,
+        ));
+      }
+      const resourceAdmissionRoute = pathname.match(/^\/api\/local\/hosts\/([^/]+)\/resource-admission$/);
+      if (resourceAdmissionRoute) {
+        assertNoQuery(url.searchParams, "Resource admission");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertInjectorProof(request, resolved.instanceSecret);
+        const body = await readJson(request);
+        assertPlainObject(body);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(request, resolved.instanceSecret, pathname, body);
+        return sendJson(response, 200, database.admitResourceSteps(
+          decodeRouteSegment(resourceAdmissionRoute[1], "Host id"), { ...body, hostExecutorExecution },
+        ));
       }
 
       const continuationRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/continuation$/);
