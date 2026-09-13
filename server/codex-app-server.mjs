@@ -6,6 +6,7 @@ import { executableCommand } from "../shared/executable-command.mjs";
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const MAX_STDOUT_BUFFER = 4 * 1024 * 1024;
 const STDERR_LIMIT = 16 * 1024;
+const MAX_ROOT_TURN_OBSERVATIONS = 256;
 
 export class CodexAppServerError extends Error {
   constructor(message, details, { definitiveRejection = false } = {}) {
@@ -27,13 +28,37 @@ export class CodexAppServer {
     this.nextRequestId = 1;
     this.pending = new Map();
     this.listeners = new Set();
-    this.stdoutBuffer = "";
     this.stderr = "";
+    this.observationGeneration = 0;
+    this.observationConnection = null;
   }
 
   subscribe(listener) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  getRootTurnObservation(threadId) {
+    const queriedTime = Date.now();
+    const connection = this.observationConnection;
+    const connected = connection && connection.child === this.child
+      && connection.child.exitCode === null && connection.child.signalCode === null;
+    const observation = connected ? connection.observations.get(threadId) : null;
+    return {
+      source: "local_codex_app_server_notifications",
+      scope: "last_observed_root_turn_only",
+      status: observation ? "observed" : "unknown",
+      reason: observation ? null : connected ? "not_observed" : "disconnected",
+      lastEvent: observation ? {
+        threadId: observation.threadId,
+        turnId: observation.turnId,
+        eventType: observation.eventType,
+        connectionGeneration: connection.generation,
+      } : null,
+      observedAt: observation?.observedAt ?? null,
+      queriedAt: new Date(queriedTime).toISOString(),
+      ageMs: observation ? Math.max(0, queriedTime - Date.parse(observation.observedAt)) : null,
+    };
   }
 
   async listSkills(workspacePath, { forceReload = false } = {}) {
@@ -84,6 +109,7 @@ export class CodexAppServer {
 
   async close() {
     this.closing = true;
+    this.observationConnection = null;
     const child = this.child;
     this.child = null;
     this.starting = null;
@@ -114,17 +140,23 @@ export class CodexAppServer {
         stdio: ["pipe", "pipe", "pipe"],
       });
       this.child = child;
-      this.stdoutBuffer = "";
+      const connection = {
+        child,
+        generation: ++this.observationGeneration,
+        stdoutBuffer: "",
+        observations: new Map(),
+      };
+      this.observationConnection = connection;
       this.stderr = "";
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => this.#handleStdout(chunk));
+      child.stdout.on("data", (chunk) => this.#handleStdout(chunk, connection));
       child.stderr.on("data", (chunk) => {
         this.stderr = `${this.stderr}${chunk}`.slice(-STDERR_LIMIT);
       });
-      child.stdin.on("error", (error) => this.#handleExit(error));
+      child.stdin.on("error", (error) => this.#handleExit(error, connection));
       child.once("error", (error) => {
-        this.#handleExit(error);
+        this.#handleExit(error, connection);
         reject(error);
       });
       child.once("exit", (code, signal) => {
@@ -133,8 +165,9 @@ export class CodexAppServer {
           `Codex app-server exited (${signal || code})${suffix}`,
           { code, signal },
         );
-        this.#handleExit(error);
+        this.#handleExit(error, connection);
       });
+      child.once("close", () => this.#invalidateObservation(connection));
       child.once("spawn", () => {
         this.#sendRequest("initialize", {
           clientInfo: {
@@ -184,29 +217,29 @@ export class CodexAppServer {
     this.child?.stdin.write(`${JSON.stringify({ method })}\n`);
   }
 
-  #handleStdout(chunk) {
-    this.stdoutBuffer += chunk;
-    if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
-      this.child?.kill("SIGTERM");
-      this.#handleExit(new CodexAppServerError("Codex app-server output exceeded its limit"));
+  #handleStdout(chunk, connection) {
+    connection.stdoutBuffer += chunk;
+    if (connection.stdoutBuffer.length > MAX_STDOUT_BUFFER) {
+      connection.child.kill("SIGTERM");
+      this.#handleExit(new CodexAppServerError("Codex app-server output exceeded its limit"), connection);
       return;
     }
-    let newlineIndex = this.stdoutBuffer.indexOf("\n");
+    let newlineIndex = connection.stdoutBuffer.indexOf("\n");
     while (newlineIndex >= 0) {
-      const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
-      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+      const line = connection.stdoutBuffer.slice(0, newlineIndex).trim();
+      connection.stdoutBuffer = connection.stdoutBuffer.slice(newlineIndex + 1);
       if (line) {
         try {
-          this.#handleMessage(JSON.parse(line));
+          this.#handleMessage(JSON.parse(line), connection);
         } catch (error) {
           console.error("Codex app-server returned invalid JSON", error);
         }
       }
-      newlineIndex = this.stdoutBuffer.indexOf("\n");
+      newlineIndex = connection.stdoutBuffer.indexOf("\n");
     }
   }
 
-  #handleMessage(message) {
+  #handleMessage(message, connection) {
     if (message && Object.hasOwn(message, "id") && !message.method) {
       const pending = this.pending.get(message.id);
       if (!pending) return;
@@ -231,6 +264,7 @@ export class CodexAppServer {
       })}\n`);
       return;
     }
+    this.#observeRootTurn(message, connection);
     for (const listener of this.listeners) {
       try {
         listener(message);
@@ -240,7 +274,33 @@ export class CodexAppServer {
     }
   }
 
-  #handleExit(error) {
+  #observeRootTurn(message, connection) {
+    if (connection !== this.observationConnection || connection.child !== this.child
+      || connection.child.exitCode !== null || connection.child.signalCode !== null
+      || !["turn/started", "turn/completed"].includes(message.method)) return;
+    const { threadId, turn } = message.params ?? {};
+    const identifier = (value) => typeof value === "string" && value.length > 0 && value.length <= 256
+      && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+    if (!identifier(threadId) || !identifier(turn?.id)) return;
+    if (message.method === "turn/completed" && !["completed", "interrupted", "failed"].includes(turn.status)) return;
+    connection.observations.delete(threadId);
+    connection.observations.set(threadId, {
+      threadId,
+      turnId: turn.id,
+      eventType: message.method,
+      observedAt: new Date().toISOString(),
+    });
+    if (connection.observations.size > MAX_ROOT_TURN_OBSERVATIONS) {
+      connection.observations.delete(connection.observations.keys().next().value);
+    }
+  }
+
+  #invalidateObservation(connection) {
+    if (this.observationConnection === connection) this.observationConnection = null;
+  }
+
+  #handleExit(error, connection) {
+    this.#invalidateObservation(connection);
     if (this.child && this.child.exitCode !== null) this.child = null;
     this.#rejectPending(error);
   }
