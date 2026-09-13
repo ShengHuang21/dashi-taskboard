@@ -39,7 +39,7 @@ export interface TaskCardPresentation {
 }
 
 export type TaskExecutionState = "completed" | "canceled" | "running" | "review"
-  | "feedback" | "dependency" | "model_capacity" | "uncertain" | "interrupted"
+  | "feedback" | "dependency" | "model_capacity" | "coordinator_busy" | "uncertain" | "interrupted"
   | "awaiting_claim" | "blocked" | "not_running" | "not_planned" | "not_started";
 
 function taskExecutionState(
@@ -59,6 +59,9 @@ function taskExecutionState(
   if (task.relations.blockedBy.some((dependency) => dependency.status !== "done")) return "dependency";
   if (todo?.admission?.state === "deferred" && todo.admission.deferredReason === "model_capacity") {
     return "model_capacity";
+  }
+  if (todo?.admission?.state === "deferred" && todo.admission.deferredReason === "coordinator_busy") {
+    return "coordinator_busy";
   }
   if (todo?.admission?.state === "admission_uncertain") return "uncertain";
 

@@ -719,7 +719,7 @@ export interface CoordinationTodoSnapshot {
     deadlineAt: string | null;
     uncertainAt: string | null;
     recoveredAgentThreadId: string | null;
-    deferredReason: "model_capacity" | "domain_reroute" | "admission_absent" | null;
+    deferredReason: "model_capacity" | "coordinator_busy" | "domain_reroute" | "admission_absent" | null;
     retryCount: number;
     retryAfter: string | null;
     rootHostId: string;

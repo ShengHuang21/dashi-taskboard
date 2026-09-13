@@ -161,6 +161,31 @@ test("admission recovery replays its exact marker and rejects Root workspace dri
   );
 });
 
+test("CAP-71 recovery busy read stops probe and final claim instructions but preserves observed markers", async () => {
+  for (const mode of ["probe", "claim"]) {
+    const request = {
+      mode, rootThreadId: coordinatorThreadId, rootWorkspacePath: "/tmp/taskboard/project",
+      admissionReceiptId: "busy-recovery", admissionAttemptId: "busy-attempt", admissionProbeId: "busy-probe",
+      admission: { agentPath: "/root/existing", recoveredAgentThreadId: "existing-thread", writeScope: ["server"] },
+    };
+    const marker = `Taskboard admission recovery ${mode} id: busy-recovery:busy-attempt${mode === "probe" ? ":busy-probe" : ""}`;
+    for (const observed of [false, true]) {
+      const calls = [];
+      const result = await deliverTaskboardAdmissionRecovery(request, async (method) => {
+        calls.push(method);
+        assert.equal(method, "thread/read", "busy coordinator must not receive any native mutation");
+        return { thread: { id: coordinatorThreadId, cwd: request.rootWorkspacePath, turns: [{
+          id: "existing-turn", status: "inProgress", input: observed ? marker : "unrelated current work",
+        }] } };
+      });
+      assert.deepEqual(result, observed
+        ? { delivery: "observed", turnId: "existing-turn" }
+        : { delivery: "deferred", reason: "coordinator-busy" });
+      assert.deepEqual(calls, ["thread/read"]);
+    }
+  }
+});
+
 test("admission recovery retries the same probe after a terminal transport failure", async () => {
   const request = {
     mode: "probe",
@@ -4392,6 +4417,64 @@ const confirmedIdentity = {
   repository: null,
 };
 
+test("recorded hold D2: both recovery predicates and the confirmed arm skip held candidates while selecting a peer", async (t) => {
+  const oldRoot = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const newRoot = "01a004bd-a749-7b53-81e2-af2d477f93af";
+  for (const sample of ["replacement-prepared", "same-prepared", "same-confirmed"]) {
+    const replacement = sample === "replacement-prepared";
+    const held = {
+      id: "CAP-HOLD", taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e",
+      dispatchTarget: { rootThreadId: replacement ? newRoot : oldRoot, codexHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard", worktreePath: confirmedIdentity.worktreePath },
+      ...(replacement ? { domainAssignment: { status: "active", domainId: "frontend",
+        leaseId: "replacement-lease", coordinatorTaskId: "frontend-coordinator" } } : {}),
+      admission: {
+        receiptId: "held-receipt", attemptId: "held-attempt",
+        state: sample === "same-confirmed" ? "recovery_confirmed" : "prepared",
+        deadlineAt: "2026-08-31T00:01:00.000Z", rootThreadId: oldRoot, rootHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard", resumeToken: "d".repeat(64), safeActionId: "safe-action",
+        agentPath: "/root/task_admission_1234", agentName: "task_admission_1234", writeScope: ["server"],
+        recoveredAgentThreadId: sample === "same-confirmed" ? "confirmed-child" : null,
+        ...(replacement ? { coordinationDomainId: "frontend", domainCoordinatorLeaseId: "old-lease",
+          domainCoordinatorTaskId: "frontend-coordinator", domainCoordinatorThreadId: oldRoot } : {}),
+      },
+      readyWork: { eligible: false, reasonCodes: ["CONTINUATION_PAUSED"] },
+    };
+    const before = structuredClone(held);
+    const peer = {
+      id: "CAP-PEER", taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615f", run: null,
+      dispatchTarget: { rootThreadId: newRoot, codexHostId: "local",
+        rootWorkspacePath: "/tmp/taskboard", worktreePath: confirmedIdentity.worktreePath },
+      readyWork: { eligible: true, safeActions: [{ id: "safe-action", text: "Continue peer" }],
+        reasonCodes: [], resumeToken: "b".repeat(64) },
+    };
+    const calls = [];
+    const forbidden = (name) => async (request) => { calls.push([name, request.taskId]); assert.fail(`held ${sample} reached ${name}`); };
+    const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor, policy: { enabled: true, projectId: "taskboard-core" },
+      now: () => Date.parse("2026-08-31T00:02:00.000Z"),
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: [held, peer] }),
+      markAdmissionUncertain: forbidden("uncertain"), claimAdmissionProbe: forbidden("probe"),
+      reconcileAdmission: forbidden("reconcile"), claimReplacementAdmissionProbe: forbidden("replacement-probe"),
+      reconcileReplacementAdmission: forbidden("replacement-reconcile"), deliverAdmissionRecovery: forbidden("recovery-instruction"),
+      claimReceipt: async (request) => {
+        calls.push(["claim", request.taskId]);
+        return { available: true, completed: false, receipt: { id: "peer-receipt", reservationLeaseId: "peer-lease" } };
+      },
+      confirmDelivery: async (request) => { calls.push(["confirm", request.taskId]); return confirmedIdentity; },
+      deliver: async (request) => { calls.push(["deliver", request.taskId]); return { delivery: "started", turnId: "peer-turn" }; },
+      completeDelivery: async (request) => { calls.push(["complete", request.taskId]); return { completed: true }; },
+    });
+    assert.deepEqual(held, before, "receipt, attempt and recovery state must stay intact");
+    assert.equal(result.delivered, true);
+    assert.equal(result.todoId, peer.id);
+    assert.deepEqual(calls, ["claim", "confirm", "deliver", "complete"].map((name) => [name, peer.taskId]));
+    t.diagnostic(JSON.stringify({ case: "D2", sample, receiptId: held.admission.receiptId,
+      attemptId: held.admission.attemptId, state: held.admission.state, heldTaskCalls: 0,
+      selectedPeerTaskId: peer.taskId, admissionUnchanged: true }));
+  }
+});
+
 test("background continuation delivers one eligible first safe action without a mounted view", async () => {
   const deliveries = [];
   const receipts = new Set();
@@ -5143,11 +5226,82 @@ test("background continuation recovers an uncertain deterministic child without 
   });
 });
 
+test("CAP-71 busy recovery preserves prior probe bookkeeping without reconciliation or child instruction", async () => {
+  for (const state of ["prepared", "recovery_confirmed"]) {
+    const calls = [];
+    const admission = {
+      state, receiptId: "busy-recovery-receipt", attemptId: "busy-recovery-attempt",
+      rootThreadId: coordinatorThreadId, resumeToken: "b".repeat(64), safeActionId: "safe-action",
+      deadlineAt: "2026-08-31T00:00:00Z", agentPath: "/root/existing", recoveredAgentThreadId: "existing-thread",
+    };
+    const result = await runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor, policy: { enabled: true, projectId: "taskboard-core" },
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: [{
+        id: "CAP-71-BUSY-RECOVERY", taskId: "8e0aa41d-8ffd-4dfa-9efe-9a80c976615e", admission,
+        dispatchTarget: { rootThreadId: coordinatorThreadId, codexHostId: "local", rootWorkspacePath: "/tmp/taskboard", worktreePath: "/tmp/taskboard/project" },
+      }] }),
+      claimReceipt: async () => assert.fail("must not claim"),
+      confirmDelivery: async () => assert.fail("must not confirm"),
+      deliver: async () => assert.fail("must not deliver ordinary work"),
+      completeDelivery: async () => assert.fail("must not complete"),
+      deferAdmission: async () => assert.fail("uncertainty is not a known-unstarted deferral"),
+      markAdmissionUncertain: async () => {
+        calls.push("uncertain");
+        return { receipt: { admissionState: "admission_uncertain" } };
+      },
+      claimAdmissionProbe: async () => {
+        calls.push("probe-record");
+        return { receipt: { admissionProbeId: "busy-probe", admissionProbeRequestedAt: "2026-09-12T20:00:00Z" } };
+      },
+      reconcileAdmission: async () => assert.fail("busy probe must not reconcile"),
+      deliverAdmissionRecovery: async (request) => {
+        calls.push(request.mode);
+        return deliverTaskboardAdmissionRecovery(request, async (method) => {
+          assert.equal(method, "thread/read");
+          return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [{ status: "inProgress" }] } };
+        });
+      },
+    });
+    assert.equal(result.reason, "admission-coordinator-busy");
+    assert.equal(result.delivered, false);
+    assert.deepEqual(calls, state === "prepared" ? ["uncertain", "probe-record", "probe"] : ["claim"]);
+  }
+});
+
+test("CAP-71 busy deferral cannot report success from missing or mismatched persistence", async () => {
+  const todo = {
+    id: "CAP-71-BUSY-FAILURE", taskId: "378b3aed-d664-4417-be3c-903e1227e2bf", run: null,
+    dispatchTarget: { rootThreadId: coordinatorThreadId, codexHostId: "local", rootWorkspacePath: confirmedIdentity.worktreePath, worktreePath: confirmedIdentity.worktreePath },
+    readyWork: { eligible: true, safeActions: [{ id: "safe-first" }], resumeToken: "b".repeat(64) },
+  };
+  for (const receipt of [null, { admissionState: "deferred", admissionDeferredReason: "model_capacity" }]) {
+    await assert.rejects(runTaskboardContinuationMonitorOnce({
+      hostExecutor: localHostExecutor, policy: { enabled: true, projectId: "taskboard-core" },
+      readSnapshot: async () => ({ projectId: "taskboard-core", todos: [todo] }),
+      claimReceipt: async () => ({ available: true, receipt: { id: "busy-receipt", admissionAttemptId: "busy-attempt" } }),
+      confirmDelivery: async () => confirmedIdentity,
+      deliver: async () => ({ delivery: "deferred", reason: "coordinator-busy" }),
+      deferAdmission: async (request) => {
+        assert.equal(request.reason, "coordinator_busy");
+        assert.equal(request.admissionReceiptId, "busy-receipt");
+        assert.equal(request.admissionAttemptId, "busy-attempt");
+        return { receipt };
+      },
+      completeDelivery: async () => assert.fail("busy delivery cannot complete"),
+    }), /did not durably defer the busy coordinator/);
+  }
+  const source = await readFile(new URL("../scripts/codex-injector.mjs", import.meta.url), "utf8");
+  const mutation = source.slice(source.indexOf("async function mutateBackgroundAdmission("), source.indexOf("function assertResolvedTargetInsideWorktree("));
+  assert.match(mutation, /action === "defer" && claim\.reason !== undefined \? \{ reason: claim\.reason \}/);
+  assert.ok(mutation.indexOf("reason: claim.reason") < mutation.indexOf("residentHostExecutorFenceHeaders(pathname, body)"));
+});
+
 test("background continuation never reconciles an unconfirmed admission probe delivery", async () => {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   for (const [deliveryReason, expectedReason] of [
     ["terminal-retry-backoff", "admission-terminal-retry-backoff"],
     ["delivery-status-unconfirmed", "admission-delivery-status-unconfirmed"],
+    ["coordinator-busy", "admission-coordinator-busy"],
   ]) {
     let reconciled = false;
     const result = await runTaskboardContinuationMonitorOnce({
@@ -5513,6 +5667,7 @@ test("replacement recovery never reconciles an unconfirmed admission probe deliv
   for (const [deliveryReason, expectedReason] of [
     ["terminal-retry-backoff", "replacement-admission-terminal-retry-backoff"],
     ["delivery-status-unconfirmed", "replacement-admission-delivery-status-unconfirmed"],
+    ["coordinator-busy", "replacement-admission-coordinator-busy"],
   ]) {
     let reconciled = false;
     const result = await runTaskboardContinuationMonitorOnce({
@@ -8092,7 +8247,7 @@ test("the authenticated network proxy signs host-runtime publications", async ()
   );
 });
 
-test("Agent Todo coordination steers an active Root turn", async () => {
+test("Agent Todo coordination defers a busy Root and evicts only the busy delivery cache", async () => {
   const calls = [];
   const request = {
     rootThreadId: "01a004bd-a749-7b53-81e2-af2d477f93ae",
@@ -8116,25 +8271,42 @@ test("Agent Todo coordination steers an active Root turn", async () => {
     return {};
   });
 
-  assert.deepEqual(result, { delivery: "steered", turnId: "turn-active" });
-  assert.equal(calls[1][0], "turn/steer");
-  assert.equal(calls[1][1].expectedTurnId, "turn-active");
-  assert.equal(calls[1][1].approvalPolicy, undefined);
-  assert.equal(calls[1][1].sandboxPolicy, undefined);
-  assert.match(calls[1][1].input[0].text, /taskctl issue bootstrap TASKBOARD-17 --json/);
-  assert.match(calls[1][1].input[0].text, /Taskboard coordination delivery id: coordination-receipt/);
-  assert.match(calls[1][1].input[0].text, /readyWork\.eligible/);
-  assert.match(calls[1][1].input[0].text, /safeActions\[0\]\.id/);
-  assert.match(calls[1][1].input[0].text, /Never execute any readyWork\.deferredActions/);
-  assert.match(calls[1][1].input[0].text, /Todo: TASKBOARD-17/);
-  assert.match(calls[1][1].input[0].text, /call collaboration\.spawn_agent exactly once with its taskName as task_name/);
-  assert.match(calls[1][1].input[0].text, /--admission-receipt-id and --admission-attempt-id/);
-  assert.match(calls[1][1].input[0].text, /Admission attempt id: admission-attempt/);
-  assert.match(calls[1][1].input[0].text, /issue admission-prepare/);
-  assert.match(calls[1][1].input[0].text, /rerouted=true/);
-  assert.match(calls[1][1].input[0].text, /exact admissionAgentName/);
-  assert.match(calls[1][1].input[0].text, /Exact Root thread id: 01a004bd-a749-7b53-81e2-af2d477f93ae/);
-  assert.match(calls[1][1].input[0].text, /--root-thread-id/);
+  assert.deepEqual(result, { delivery: "deferred", reason: "coordinator-busy" });
+  assert.deepEqual(calls.map(([method]) => method), ["thread/read"]);
+  calls.length = 0;
+  const idle = await deliverCoordination(request, async (method, params) => {
+    calls.push([method, params]);
+    if (method === "thread/read") return {
+      thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [] },
+    };
+    return method === "turn/start" ? { turn: { id: "turn-after-busy" } } : {};
+  });
+  assert.deepEqual(idle, { delivery: "started", turnId: "turn-after-busy" });
+  assert.deepEqual(calls.map(([method]) => method), ["thread/read", "thread/resume", "turn/start"]);
+  assert.deepEqual(await deliverCoordination(request, async () => assert.fail("success remains cached")), idle);
+  const instruction = calls[2][1].input[0].text;
+  for (const pattern of [
+    /taskctl issue bootstrap TASKBOARD-17 --json/,
+    /Taskboard coordination delivery id: coordination-receipt/,
+    /readyWork\.eligible/, /safeActions\[0\]\.id/, /Never execute any readyWork\.deferredActions/,
+    /Todo: TASKBOARD-17/, /call collaboration\.spawn_agent exactly once with its taskName as task_name/,
+    /--admission-receipt-id and --admission-attempt-id/, /Admission attempt id: admission-attempt/,
+    /issue admission-prepare/, /rerouted=true/, /exact admissionAgentName/,
+    /Exact Root thread id: 01a004bd-a749-7b53-81e2-af2d477f93ae/, /--root-thread-id/,
+  ]) assert.match(instruction, pattern);
+  for (const observed of [false, true]) {
+    const observation = { ...request, todoId: `CAP-71-OBS-${observed}`, observeOnly: true };
+    const result = await deliverCoordination(observation, async (method) => {
+      assert.equal(method, "thread/read");
+      return { thread: { id: request.rootThreadId, cwd: request.rootWorkspacePath, turns: [{
+        id: "busy-marker", status: "inProgress",
+        items: observed ? [{ text: instruction }] : [],
+      }] } };
+    });
+    assert.deepEqual(result, observed
+      ? { delivery: "observed", turnId: "busy-marker" }
+      : { delivery: "not-observed", turnId: null });
+  }
 });
 
 test("Agent Todo coordination starts an idle Root turn", async () => {

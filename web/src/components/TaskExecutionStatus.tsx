@@ -9,6 +9,7 @@ const labels: Record<TaskExecutionState, readonly [string, string]> = {
   feedback: ["等待反馈", "Awaiting feedback"],
   dependency: ["等待前置任务", "Waiting for dependencies"],
   model_capacity: ["排队 · 等待模型容量", "Queued · waiting for model capacity"],
+  coordinator_busy: ["排队 · 等待协调器空闲", "Queued · waiting for coordinator availability"],
   uncertain: ["执行状态待确认", "Execution state unconfirmed"],
   interrupted: ["已中断 · 待继续", "Interrupted · awaiting continuation"],
   awaiting_claim: ["待领取", "Awaiting claim"],

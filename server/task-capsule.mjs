@@ -853,8 +853,15 @@ function readyWorkFor(
   dependencyClearances,
   pendingActions,
   gates,
+  latestContinuationRecord,
 ) {
   const reasonCodes = [];
+  const continuationHoldReason = {
+    paused: "CONTINUATION_PAUSED",
+    canceled: "CONTINUATION_CANCELED",
+    endpoint_reached: "CONTINUATION_ENDPOINT_REACHED",
+  }[latestContinuationRecord?.status];
+  if (continuationHoldReason) reasonCodes.push(continuationHoldReason);
   const workflow = workflowFor(task);
   if (task.labels.includes("project-inbox")) {
     reasonCodes.push("PROJECT_INBOX_NON_DISPATCHABLE");
@@ -1041,6 +1048,7 @@ export function createTaskCapsule({
     dependencyClearances,
     pendingActions,
     gatesById,
+    latestContinuationRecord,
   );
   const modelRouting = selectedModelRouting(plannedModelRouting, readyWork);
   const workflow = workflowFor(task);
@@ -1100,6 +1108,12 @@ export function createTaskCapsule({
     ...(domainAssignment ? { domainAssignment, domainRoute } : {}),
     ...(!domainAssignment ? { globalCoordinatorFrontier } : {}),
     dependencyClearances,
+    ...(latestContinuationRecord ? {
+      latestContinuationRecord: {
+        eventId: latestContinuationRecord.eventId,
+        status: latestContinuationRecord.status,
+      },
+    } : {}),
   });
   if (readyWork.approvalRequest) {
     readyWork.approvalRequest.expectedResumeToken = resumeToken;
