@@ -1811,6 +1811,25 @@ export class TaskboardDatabase {
       CREATE INDEX IF NOT EXISTS host_executor_effects_executor
         ON host_executor_effects(executor_instance_id, effect_key);
 
+      CREATE TABLE IF NOT EXISTS resource_steps (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+        action_id TEXT NOT NULL, authorization_comment_id TEXT NOT NULL,
+        authorization_comment_version INTEGER NOT NULL, host_id TEXT NOT NULL,
+        state TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL,
+        data_json TEXT NOT NULL,
+        UNIQUE(task_id, action_id, authorization_comment_id, authorization_comment_version)
+      );
+      CREATE TABLE IF NOT EXISTS resource_allocations (
+        id TEXT PRIMARY KEY, host_id TEXT NOT NULL, resource_group_key TEXT NOT NULL,
+        kind TEXT NOT NULL, state TEXT NOT NULL, released_at TEXT,
+        version INTEGER NOT NULL, data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resource_start_interlocks (
+        effect_key TEXT NOT NULL, dispatch_token TEXT NOT NULL, host_id TEXT NOT NULL,
+        state TEXT NOT NULL, settled_at TEXT,
+        PRIMARY KEY(effect_key, dispatch_token)
+      );
+
       CREATE TABLE IF NOT EXISTS ordinary_delivery_observations (
         receipt_id TEXT NOT NULL,
         admission_attempt_id TEXT NOT NULL,
@@ -4620,6 +4639,11 @@ export class TaskboardDatabase {
       }
       const dispatchToken = randomUUID();
       const ordinaryObservation = this.#validateOrdinaryDelivery(input);
+      if (input.operations.some((operation) => ["turn/start", "turn/steer"].includes(operation.method))) {
+        if (this.#resourceHostHeld(execution.codexHostId)) this.#resourceError("waiting_resource_allocation_release");
+        this.#prepare("INSERT INTO resource_start_interlocks VALUES (?, ?, ?, 'in_flight', NULL)")
+          .run(input.effectKey, dispatchToken, execution.codexHostId);
+      }
       this.#prepare(`
         UPDATE host_executor_effects
         SET status = 'dispatched', dispatch_token = ?, updated_at = ?
@@ -4682,6 +4706,12 @@ export class TaskboardDatabase {
           this.database.exec("ROLLBACK TO continuation_effect_origin; RELEASE continuation_effect_origin");
         }
         this.#completeOrdinaryDelivery(effectKey, dispatchToken, result, timestamp);
+        const operations = JSON.parse(row.operations_json);
+        const accepted = operations.every((operation, index) => !["turn/start", "turn/steer"].includes(operation.method)
+          || (typeof (result?.[index]?.turn?.id ?? result?.[index]?.turnId) === "string"
+            && (result[index].turn?.id ?? result[index].turnId).length > 0));
+        this.#prepare("UPDATE resource_start_interlocks SET state = ?, settled_at = ? WHERE effect_key = ? AND dispatch_token = ?")
+          .run(accepted ? "settled" : "unknown_start", accepted ? timestamp : null, effectKey, dispatchToken);
       } else if (row.result_json !== resultJson) {
         throw new ApiError(
           409,
@@ -4766,6 +4796,8 @@ export class TaskboardDatabase {
         UPDATE host_executor_effects SET status = 'uncertain', updated_at = ?
         WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
       `).run(timestamp, effectKey, dispatchToken);
+      this.#prepare("UPDATE resource_start_interlocks SET state = 'unknown_start' WHERE effect_key = ? AND dispatch_token = ? AND state = 'in_flight'")
+        .run(effectKey, dispatchToken);
       const uncertain = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
@@ -4806,6 +4838,8 @@ export class TaskboardDatabase {
         SET status = 'reserved', dispatch_token = NULL, updated_at = ?
         WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
       `).run(timestamp, effectKey, dispatchToken);
+      this.#prepare("UPDATE resource_start_interlocks SET state = 'settled', settled_at = ? WHERE effect_key = ? AND dispatch_token = ?")
+        .run(timestamp, effectKey, dispatchToken);
       this.#writeOrdinaryDeliveryObservation(() => {
         this.#prepare(`
           UPDATE ordinary_delivery_observations SET effect_key = NULL, request_fingerprint = NULL, dispatch_token = NULL
@@ -10415,6 +10449,398 @@ export class TaskboardDatabase {
     return { capsule, evaluation, currentClaim: inputs.currentClaim, record: inputs.latestContinuationRecord };
   }
 
+  #resourceTransaction(operation) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #resourceError(reason) {
+    throw new ApiError(409, reason, reason);
+  }
+
+  #resourceOwner(taskId, input, requireActive = true) {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireTaskAgentRun(input.runId ?? input.ownerRunId);
+    if (run.taskId !== task.id || run.agentThreadId !== input.ownerThreadId) {
+      this.#resourceError("resource_step_run_binding_required");
+    }
+    if (requireActive) {
+      const root = this.#rootAgentRunBinding(task, run.rootThreadId);
+      this.#assertTaskAgentRunBinding(run, task, root);
+      const claim = this.getAgentTaskClaim(task.id);
+      if (!["active", "blocked"].includes(run.status) || root.rootHostId !== "local"
+        || claim?.status !== "active" || claim.agentThreadId !== run.agentThreadId
+        || !Number.isFinite(Date.parse(claim.leaseExpiresAt)) || Date.parse(claim.leaseExpiresAt) <= Date.now()
+        || input.hostId !== root.rootHostId || input.worktreePath !== run.worktree.path
+        || input.worktreeBranch !== run.worktree.branch) {
+        this.#resourceError("resource_step_run_binding_required");
+      }
+    }
+    return { task, run };
+  }
+
+  #resourceAuthorized(step) {
+    const { task, run } = this.#resourceOwner(step.taskId, step);
+    const { capsule, evaluation, record } = this.#taskContinuationContext(task.id);
+    if (task.archivedAt || ["done", "canceled"].includes(task.status)
+      || (record && record.status !== "active")
+      || capsule.relations.blockedBy.some((dependency) => dependency.status !== "done")
+      || capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED")) {
+      this.#resourceError("resource_step_current_scope_blocked");
+    }
+    if (evaluation.effectiveAuthorization.state !== "valid"
+      || evaluation.effectiveAuthorization.source?.commentId !== step.authorizationSource.commentId
+      || evaluation.effectiveAuthorization.source?.commentVersion !== step.authorizationSource.commentVersion) {
+      this.#resourceError("resource_step_authorization_required");
+    }
+    const action = evaluation.pendingActions.find((candidate) => candidate.id === step.actionId);
+    const gate = action ? evaluation.gatesById.get(action.gate) : null;
+    if (!action || !gate || gate.state !== "authorized" || gate.expired
+      || gate.kind !== "test"
+      || action.target !== `resource-command:sha256:${step.commandDigest}`) {
+      this.#resourceError("resource_step_action_scope_required");
+    }
+    return { task, run };
+  }
+
+  #resourceStep(row) {
+    return row ? { ...JSON.parse(row.data_json), id: row.id, state: row.state, version: row.version, createdAt: row.created_at } : null;
+  }
+
+  #resourceAllocation(row) {
+    return row ? { ...JSON.parse(row.data_json), id: row.id, kind: row.kind, state: row.state,
+      version: row.version, releasedAt: row.released_at } : null;
+  }
+
+  #getResourceAllocation(id) {
+    return this.#resourceAllocation(this.#prepare("SELECT * FROM resource_allocations WHERE id = ?").get(id));
+  }
+
+  #saveResourceStep(step, state = step.state) {
+    const result = this.#prepare(`UPDATE resource_steps SET state = ?, version = version + 1, data_json = ?
+      WHERE id = ? AND version = ?`).run(state, JSON.stringify(step), step.id, step.version);
+    if (result.changes !== 1) this.#resourceError("resource_step_version_conflict");
+    return this.#resourceStep(this.#prepare("SELECT * FROM resource_steps WHERE id = ?").get(step.id));
+  }
+
+  getResourceStep(taskId, stepId) {
+    const task = this.#requireTask(taskId);
+    const step = this.#resourceStep(this.#prepare("SELECT * FROM resource_steps WHERE id = ? AND task_id = ?").get(stepId, task.id));
+    if (!step) throw new ApiError(404, "resource_step_not_found", "Resource step not found");
+    return { step, allocation: step.allocationId ? this.#getResourceAllocation(step.allocationId) : null,
+      executionOutcome: step.state === "start_consumed" ? "start_uncertain" : step.state,
+      waitingReason: step.waitingReason ?? null };
+  }
+
+  listResourceSteps(projectId) {
+    return this.#prepare(`SELECT resource_steps.* FROM resource_steps JOIN tasks ON tasks.id = resource_steps.task_id
+      WHERE tasks.project_id = ? AND resource_steps.state IN ('queued','reserved') ORDER BY resource_steps.created_at, resource_steps.id`)
+      .all(projectId).map((row) => this.#resourceStep(row));
+  }
+
+  registerResourceStep(taskId, input) {
+    return this.#resourceTransaction(() => {
+      const { task, run } = this.#resourceOwner(taskId, input);
+      const id = (value, field) => hostExecutorIdentifier(value, field);
+      if (!/^[a-f0-9]{64}$/.test(input.commandDigest ?? "")) this.#resourceError("resource_step_action_scope_required");
+      const demand = {
+        cpuUnits: input.demand?.cpuUnits, hostPeakMemoryBytes: input.demand?.hostPeakMemoryBytes,
+        environmentCpuUnits: input.demand?.environmentCpuUnits,
+        environmentPeakMemoryBytes: input.demand?.environmentPeakMemoryBytes,
+        environmentAllocationId: id(input.demand?.environmentAllocationId, "environmentAllocationId"),
+      };
+      if (![demand.cpuUnits, demand.environmentCpuUnits].every((value) => Number.isFinite(value) && value > 0 && value <= 4096)
+        || ![demand.hostPeakMemoryBytes, demand.environmentPeakMemoryBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
+        this.#resourceError("resource_step_demand_required");
+      }
+      const authorizationSource = {
+        commentId: id(input.authorizationSource?.commentId, "authorizationCommentId"),
+        commentVersion: input.authorizationSource?.commentVersion,
+      };
+      if (!Number.isSafeInteger(authorizationSource.commentVersion) || authorizationSource.commentVersion < 1) {
+        this.#resourceError("resource_step_authorization_required");
+      }
+      const immutable = {
+        taskId: task.id, projectId: task.projectId, runId: run.id, ownerThreadId: run.agentThreadId,
+        rootThreadId: run.rootThreadId, hostId: input.hostId, worktreePath: run.worktree.path,
+        worktreeBranch: run.worktree.branch, actionId: id(input.actionId, "actionId"), authorizationSource,
+        commandDigest: input.commandDigest, demand,
+        demandDigest: createHash("sha256").update(JSON.stringify(demand)).digest("hex"),
+      };
+      const existing = this.#resourceStep(this.#prepare(`SELECT * FROM resource_steps WHERE task_id = ? AND action_id = ?
+        AND authorization_comment_id = ? AND authorization_comment_version = ?`)
+        .get(task.id, immutable.actionId, authorizationSource.commentId, authorizationSource.commentVersion));
+      if (existing) {
+        if (JSON.stringify(existing.request) !== JSON.stringify(immutable)) this.#resourceError("resource_step_request_conflict");
+        return this.getResourceStep(task.id, existing.id);
+      }
+      const older = this.#prepare("SELECT * FROM resource_steps WHERE task_id = ? AND action_id = ?").all(task.id, immutable.actionId);
+      if (older.length) this.#resourceError("resource_step_reconciliation_required");
+      this.#resourceAuthorized(immutable);
+      const stepId = randomUUID();
+      this.#prepare(`INSERT INTO resource_steps VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?)`)
+        .run(stepId, task.id, immutable.actionId, authorizationSource.commentId, authorizationSource.commentVersion,
+          immutable.hostId, now(), JSON.stringify({ ...immutable, request: immutable, waitingReason: "waiting_checkpoint" }));
+      return this.getResourceStep(task.id, stepId);
+    });
+  }
+
+  waitResourceStep(taskId, stepId, input) {
+    return this.#resourceTransaction(() => {
+      const { step } = this.getResourceStep(taskId, stepId);
+      this.#resourceOwner(taskId, { ...step, ownerThreadId: input.ownerThreadId });
+      if (step.version !== input.stepVersion) this.#resourceError("resource_step_version_conflict");
+      if (!["queued", "reserved"].includes(step.state)) return this.getResourceStep(taskId, stepId);
+      this.#resourceAuthorized(step);
+      const waitAttemptId = hostExecutorIdentifier(input.waitAttemptId, "waitAttemptId");
+      const timestamp = Date.now();
+      if (step.waiter && step.waiter.waitAttemptId !== waitAttemptId
+        && (Date.parse(step.waiter.validUntil) > timestamp || step.state === "reserved")) {
+        this.#resourceError("resource_step_waiter_conflict");
+      }
+      const checkpoint = hostExecutorIdentifier(input.checkpoint, "checkpoint");
+      step.waiter = { waitAttemptId, checkpoint, observedAt: new Date(timestamp).toISOString(), validUntil: new Date(timestamp + 60_000).toISOString() };
+      this.#saveResourceStep(step);
+      return this.getResourceStep(taskId, stepId);
+    });
+  }
+
+  consumeResourceStep(taskId, stepId, input) {
+    return this.#resourceTransaction(() => {
+      const { step, allocation } = this.getResourceStep(taskId, stepId);
+      this.#resourceOwner(taskId, { ...step, ownerThreadId: input.ownerThreadId });
+      if (["start_consumed", "start_uncertain", "result_recorded"].includes(step.state)) {
+        return { ...this.getResourceStep(taskId, stepId), execute: false };
+      }
+      this.#resourceAuthorized(step);
+      this.#requireActiveHostExecutorFence(step.grantExecution);
+      const environment = this.#getResourceAllocation(step.demand.environmentAllocationId);
+      if (step.state !== "reserved" || step.version !== input.stepVersion || step.grantId !== input.grantId
+        || allocation?.id !== input.allocationId || allocation.version !== input.allocationVersion || allocation.releasedAt
+        || step.waiter?.waitAttemptId !== input.waitAttemptId || Date.parse(step.waiter.validUntil) <= Date.now()
+        || Date.parse(step.grantedAt) + 60_000 <= Date.now()
+        || !environment || environment.version !== step.environmentVersion || environment.state !== "available"
+        || Date.parse(environment.validUntil) <= Date.now()) this.#resourceError("resource_step_grant_stale");
+      step.consumeId = randomUUID();
+      step.consumedAt = now();
+      this.#saveResourceStep(step, "start_consumed");
+      return { ...this.getResourceStep(taskId, stepId), execute: true, consumeId: step.consumeId };
+    });
+  }
+
+  recordResourceStepResult(taskId, stepId, input) {
+    return this.#resourceTransaction(() => {
+      const { step } = this.getResourceStep(taskId, stepId);
+      this.#resourceOwner(taskId, { ...step, ownerThreadId: input.ownerThreadId }, false);
+      if (step.consumeId !== input.consumeId || !["start_consumed", "start_uncertain", "result_recorded"].includes(step.state)) {
+        this.#resourceError("resource_step_result_conflict");
+      }
+      const result = { outcome: input.outcome, exitCode: input.exitCode ?? null,
+        signal: input.signal == null ? null : hostExecutorIdentifier(input.signal, "signal"), sourceRef: hostExecutorIdentifier(input.sourceRef, "sourceRef") };
+      if (!["exited", "no_start", "start_uncertain"].includes(result.outcome)
+        || (result.exitCode !== null && !Number.isInteger(result.exitCode))) this.#resourceError("resource_step_result_required");
+      if (step.result) {
+        if (JSON.stringify(step.result) !== JSON.stringify(result)) this.#resourceError("resource_step_result_conflict");
+        return this.getResourceStep(taskId, stepId);
+      }
+      if (step.version !== input.stepVersion) this.#resourceError("resource_step_version_conflict");
+      step.result = result;
+      step.resultRecordedAt = now();
+      this.#saveResourceStep(step, result.outcome === "start_uncertain" ? "start_uncertain" : "result_recorded");
+      return this.getResourceStep(taskId, stepId);
+    });
+  }
+
+  checkpointResourceAllocation(allocationId, input) {
+    return this.#resourceTransaction(() => {
+      const existing = this.#getResourceAllocation(allocationId);
+      const { task, run } = this.#resourceOwner(input.taskId, input, !existing || input.state !== "released");
+      if (existing && (existing.ownerRunId !== run.id || existing.ownerThreadId !== input.ownerThreadId)) {
+        this.#resourceError("resource_allocation_owner_conflict");
+      }
+      if (input.source !== "owner_declaration" || !["held", "available", "released"].includes(input.state)
+        || input.version !== (existing?.version ?? 0)) this.#resourceError("environment_observation_required");
+      const timestamp = Date.now();
+      if (!Number.isFinite(Date.parse(input.declaredAt)) || Date.parse(input.declaredAt) > timestamp
+        || timestamp - Date.parse(input.declaredAt) > 60_000
+        || !Number.isFinite(Date.parse(input.validUntil)) || Date.parse(input.validUntil) <= timestamp) {
+        this.#resourceError("environment_observation_required");
+      }
+      if (existing?.releasedAt && existing.kind === "heavy") this.#resourceError("resource_allocation_already_released");
+      if (existing?.state === "held" && input.state === "available") this.#resourceError("resource_allocation_release_required");
+      if (existing?.kind === "heavy" && input.state !== "released") this.#resourceError("resource_allocation_release_required");
+      const resourceGroupKey = hostExecutorIdentifier(input.resourceGroupKey, "resourceGroupKey");
+      const environmentKey = hostExecutorIdentifier(input.environmentKey, "environmentKey");
+      if (existing && (existing.hostId !== input.hostId || existing.resourceGroupKey !== resourceGroupKey
+        || existing.environmentKey !== environmentKey)) this.#resourceError("resource_allocation_identity_conflict");
+      if (!existing && this.#prepare(`SELECT 1 FROM resource_allocations WHERE host_id = ? AND resource_group_key = ?
+        AND kind = 'environment' AND released_at IS NULL`).get(input.hostId, resourceGroupKey)) {
+        this.#resourceError("resource_allocation_identity_conflict");
+      }
+      if (!Number.isFinite(input.capacityCpuUnits) || input.capacityCpuUnits <= 0
+        || !Number.isSafeInteger(input.capacityMemoryBytes) || input.capacityMemoryBytes <= 0
+        || !Array.isArray(input.exclusiveKeys) || input.exclusiveKeys.length > 32) this.#resourceError("environment_observation_required");
+      const exclusiveKeys = [...new Set(input.exclusiveKeys.map((key) => hostExecutorIdentifier(key, "exclusiveKey")))].sort();
+      if (existing && JSON.stringify(existing.exclusiveKeys) !== JSON.stringify(exclusiveKeys)) this.#resourceError("resource_allocation_identity_conflict");
+      const declaration = {
+        ...existing, taskId: task.id, ownerRunId: run.id, ownerThreadId: input.ownerThreadId,
+        hostId: input.hostId, environmentKey, resourceGroupKey, exclusiveKeys,
+        source: "owner_declaration", sourceRef: hostExecutorIdentifier(input.sourceRef, "sourceRef"),
+        sourceVersion: input.sourceVersion, declaredAt: input.declaredAt, validUntil: input.validUntil,
+        lastReleasedAt: input.state === "released" ? now() : existing?.lastReleasedAt ?? null,
+        capacityCpuUnits: input.capacityCpuUnits, capacityMemoryBytes: input.capacityMemoryBytes,
+      };
+      if (!Number.isSafeInteger(input.sourceVersion) || input.sourceVersion < 1) this.#resourceError("environment_observation_required");
+      const releasedAt = input.state === "released" ? now() : null;
+      if (existing) {
+        this.#prepare(`UPDATE resource_allocations SET state = ?, released_at = ?, version = version + 1, data_json = ? WHERE id = ?`)
+          .run(input.state, releasedAt, JSON.stringify(declaration), allocationId);
+      } else {
+        this.#prepare("INSERT INTO resource_allocations VALUES (?, ?, ?, 'environment', ?, ?, 1, ?)")
+          .run(hostExecutorIdentifier(allocationId, "allocationId"), input.hostId, resourceGroupKey, input.state, releasedAt, JSON.stringify(declaration));
+      }
+      return { allocation: this.#getResourceAllocation(allocationId) };
+    });
+  }
+
+  #resourceHostHeld(hostId) {
+    return Boolean(this.#prepare(`SELECT 1 FROM resource_allocations WHERE host_id = ? AND released_at IS NULL
+      AND (kind = 'heavy' OR state = 'held') LIMIT 1`).get(hostId));
+  }
+
+  admitResourceSteps(hostId, input) {
+    return this.#resourceTransaction(() => {
+      const { execution, observedAtMs } = this.#requireActiveHostExecutorFence(input.hostExecutorExecution);
+      if (execution.codexHostId !== hostId || hostId !== "local") this.#resourceError("resource_host_fence_required");
+      const waiting = (reason) => {
+        for (const row of this.#prepare("SELECT * FROM resource_steps WHERE host_id = ? AND state = 'queued'").all(hostId)) {
+          const step = this.#resourceStep(row);
+          if (step.waitingReason !== reason) this.#saveResourceStep({ ...step, waitingReason: reason });
+        }
+        return { granted: false, reason };
+      };
+      if (this.#resourceHostHeld(hostId)) return waiting("waiting_resource_allocation_release");
+      if (this.#prepare(`SELECT 1 FROM resource_start_interlocks WHERE host_id = ?
+        AND state IN ('in_flight','unknown_start') LIMIT 1`).get(hostId)) return waiting("waiting_ordinary_start_observation");
+      const settlement = this.#prepare(`SELECT MAX(value) AS value FROM (
+        SELECT settled_at AS value FROM resource_start_interlocks WHERE host_id = ?
+        UNION ALL SELECT json_extract(data_json, '$.lastReleasedAt') AS value FROM resource_allocations WHERE host_id = ?
+      )`).get(hostId, hostId).value;
+      const observation = input.observation;
+      const cpu = observation?.cpu;
+      const memory = observation?.memory;
+      const observationAt = Date.parse(observation?.observedAt ?? "");
+      const policy = input.policy;
+      if (observation?.schemaVersion !== 1 || observation?.source !== "resident-injector" || observation.hostId !== hostId
+        || !Number.isFinite(observationAt) || observationAt > observedAtMs || observedAtMs - observationAt > 60_000
+        || !Number.isFinite(cpu?.busyRatio) || cpu.busyRatio < 0 || cpu.busyRatio > 1
+        || !Number.isInteger(cpu.capacity) || cpu.capacity < 1 || !Number.isInteger(cpu.sampleWindowMs)
+        || cpu.sampleWindowMs < 1 || cpu.sampleWindowMs > 60_000
+        || !Number.isSafeInteger(memory?.totalBytes) || memory.totalBytes <= 0
+        || !Number.isSafeInteger(memory.availableBytes) || memory.availableBytes < 0 || memory.availableBytes > memory.totalBytes
+        || !Number.isFinite(policy?.targetCpuRatio) || policy.targetCpuRatio <= 0 || policy.targetCpuRatio >= 1
+        || !Number.isFinite(policy.memoryReserveRatio) || policy.memoryReserveRatio <= 0 || policy.memoryReserveRatio >= 1
+        || !Number.isSafeInteger(policy.minimumMemoryReserveBytes) || policy.minimumMemoryReserveBytes < 0) {
+        return waiting("resource_host_observation_required");
+      }
+      if (settlement && observationAt - cpu.sampleWindowMs <= Date.parse(settlement)) {
+        return waiting("resource_post_start_observation_required");
+      }
+      const cpuHeadroom = Math.max(0, cpu.capacity * (policy.targetCpuRatio - cpu.busyRatio));
+      const memoryHeadroom = Math.max(0, memory.availableBytes - Math.max(policy.minimumMemoryReserveBytes, memory.totalBytes * policy.memoryReserveRatio));
+      const candidates = [];
+      const priorities = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
+      const rows = this.#prepare("SELECT * FROM resource_steps WHERE host_id = ? AND state = 'queued' ORDER BY created_at, id").all(hostId);
+      let reason = "resource_step_no_ready_waiter";
+      for (const row of rows) {
+        const step = this.#resourceStep(row);
+        try {
+          const { task } = this.#resourceAuthorized(step);
+          if (!step.waiter || Date.parse(step.waiter.validUntil) <= observedAtMs) continue;
+          const environment = this.#getResourceAllocation(step.demand.environmentAllocationId);
+          if (!environment || environment.kind !== "environment" || environment.hostId !== hostId || environment.state !== "available"
+            || Date.parse(environment.validUntil) <= observedAtMs || Date.parse(environment.declaredAt) > observedAtMs) {
+            reason = "environment_observation_required"; continue;
+          }
+          const slot = input.slotObservations?.find((entry) => entry.threadId === step.rootThreadId);
+          const slotAt = Date.parse(slot?.observedAt ?? "");
+          if (!Number.isFinite(slotAt) || slotAt > observedAtMs || observedAtMs - slotAt > 60_000
+            || (settlement && slotAt <= Date.parse(settlement)) || !Number.isInteger(slot.active)
+            || !Number.isInteger(slot.maxActive) || slot.active < 0 || slot.active > slot.maxActive || slot.maxActive < 1) {
+            reason = "resource_slot_observation_required"; continue;
+          }
+          if (step.demand.cpuUnits > cpuHeadroom || step.demand.hostPeakMemoryBytes > memoryHeadroom
+            || step.demand.environmentCpuUnits > environment.capacityCpuUnits
+            || step.demand.environmentPeakMemoryBytes > environment.capacityMemoryBytes) {
+            reason = "waiting_host_resources"; continue;
+          }
+          candidates.push({ kind: "heavy", step, environment, task, createdAt: step.createdAt });
+        } catch (error) { reason = error.code ?? "resource_step_authorization_required"; }
+      }
+      // Rank against the server's complete current ordinary queue, not a caller-selected winner.
+      if (Number.isFinite(policy.cpuPerAgent) && policy.cpuPerAgent > 0
+        && Number.isSafeInteger(policy.memoryPerAgentBytes) && policy.memoryPerAgentBytes > 0
+        && cpuHeadroom >= policy.cpuPerAgent && memoryHeadroom >= policy.memoryPerAgentBytes) {
+        for (const row of this.#prepare("SELECT id FROM tasks WHERE status = 'todo' AND archived_at IS NULL").all()) {
+          const task = this.#requireTask(row.id);
+          const inputs = this.#taskCapsuleInputs(row.id);
+          const capsule = createTaskCapsule(inputs);
+          const admission = this.getTaskSafeActionAdmission(row.id);
+          if (admission && (admission.admissionState !== "deferred" || Date.parse(admission.admissionRetryAfter) > observedAtMs)) continue;
+          if (capsule?.task?.labels?.includes("agent-todo") && capsule.readyWork.eligible
+            && capsule.execution?.threadBinding) {
+            let root;
+            try {
+              const threadId = inputs.domainRoute?.holder?.threadId ?? inputs.globalCoordinatorFrontier?.threadId
+                ?? capsule.execution.threadBinding.threadId;
+              root = this.#rootAgentRunBinding(task, threadId);
+            } catch { continue; }
+            if (root.rootHostId !== hostId) continue;
+            const slot = input.slotObservations?.find((entry) => entry.threadId === root.rootThreadId);
+            const slotAt = Date.parse(slot?.observedAt ?? "");
+            if (Number.isFinite(slotAt) && slotAt <= observedAtMs && observedAtMs - slotAt <= 60_000
+              && Number.isInteger(slot.active) && Number.isInteger(slot.maxActive) && slot.active < slot.maxActive) {
+              candidates.push({ kind: "ordinary", task, createdAt: task.createdAt });
+            }
+          }
+        }
+      }
+      candidates.sort((left, right) => (priorities[left.task.priority] ?? 4) - (priorities[right.task.priority] ?? 4)
+        || left.createdAt.localeCompare(right.createdAt) || left.task.id.localeCompare(right.task.id));
+      const selected = candidates[0];
+      if (!selected) return waiting(reason);
+      if (selected.kind === "ordinary") return { ...waiting("ordinary_candidate_precedes"), taskId: selected.task.id };
+      const { step, environment } = selected;
+      const allocationId = randomUUID();
+      const timestamp = new Date(observedAtMs).toISOString();
+      const allocation = {
+        taskId: step.taskId, stepId: step.id, ownerRunId: step.runId, ownerThreadId: step.ownerThreadId,
+        hostId, environmentKey: environment.environmentKey, resourceGroupKey: environment.resourceGroupKey,
+        exclusiveKeys: environment.exclusiveKeys, environmentAllocationId: environment.id,
+        environmentVersion: environment.version, capacityCpuUnits: environment.capacityCpuUnits,
+        capacityMemoryBytes: environment.capacityMemoryBytes, demand: step.demand,
+        source: "resident_resource_admission", sourceRef: execution.leaseId, grantedAt: timestamp,
+      };
+      this.#prepare("INSERT INTO resource_allocations VALUES (?, ?, ?, 'heavy', 'held', NULL, 1, ?)")
+        .run(allocationId, hostId, environment.resourceGroupKey, JSON.stringify(allocation));
+      step.allocationId = allocationId;
+      step.environmentVersion = environment.version;
+      step.grantId = randomUUID();
+      step.grantExecution = execution;
+      step.grantedAt = timestamp;
+      step.waitingReason = null;
+      this.#saveResourceStep(step, "reserved");
+      return { granted: true, ...this.getResourceStep(step.taskId, step.id) };
+    });
+  }
+
   getTaskContinuation(taskId) {
     this.database.exec("BEGIN");
     try {
@@ -10594,6 +11020,7 @@ export class TaskboardDatabase {
       if (capsule.readyWork.safeActions[0].id !== safeActionId) {
         throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap claim must match the first authorized safe action");
       }
+      if (this.#resourceHostHeld(rootRun.rootHostId)) this.#resourceError("waiting_resource_allocation_release");
 
       const durableDelivery = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
