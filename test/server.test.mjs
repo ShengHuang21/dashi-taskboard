@@ -1585,7 +1585,10 @@ test("CAP-71 busy deferral persists exact no-start state and retries only when d
   const replay = await post("admission-defer", { ...binding, reason: "coordinator_busy" });
   assert.equal(replay.response.status, 200);
   assert.equal(replay.body.applied, false);
-  assert.deepEqual(replay.body.receipt, deferred);
+  const deferredReceipt = { ...deferred };
+  delete deferredReceipt.recordedDeliveryObservation;
+  assert.deepEqual(replay.body.receipt, deferredReceipt);
+  assert.deepEqual(database.getTaskSafeActionAdmission(task.id), deferred);
   for (const body of [{ ...binding }, { ...binding, reason: "model_capacity" }, {
     ...binding, reason: "coordinator_busy", admissionAttemptId: "old-attempt",
   }, { ...binding, reason: "coordinator_busy", rootThreadId: "wrong-root" }]) {
