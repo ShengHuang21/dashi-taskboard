@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { ApiError, getResourceStep } from "../api";
 import { useTaskboardI18n } from "../i18n";
+import { shortWindowTitle } from "../taskWindowDisplayName";
 import type { CodexThreadBinding, ResourceAllocationRecord, ResourceStepRecord, TaskGoalWindows } from "../types";
 import "./OwnerGoalsView.css";
 
@@ -20,7 +21,10 @@ function DeclaredGoalWindows({ declaration, onOpenThread }: GoalWindowsProps & {
     <details className="goal-windows" onToggle={(event) => {
       if (event.target === event.currentTarget) setOpened(event.currentTarget.open);
     }}>
-      <summary>{text("协作窗口", "Collaborating windows")}</summary>
+      <summary title={declaration.windows.map(({ title }) => title).join("\n")}>
+        {text("协作窗口", "Collaborating windows")}
+        {declaration.state === "declared" ? ` · ${declaration.windows.map(({ title }) => shortWindowTitle(title)).join(" / ")}` : ""}
+      </summary>
       {declaration.state !== "declared" ? (
         <p>{text("待关联 · 最新窗口记录需核实", "Association pending · latest window record needs verification")}</p>
       ) : (
@@ -29,7 +33,7 @@ function DeclaredGoalWindows({ declaration, onOpenThread }: GoalWindowsProps & {
             {declaration.windows.map((member) => (
               <li key={member.threadId}>
                 <div>
-                  <span className="goal-window-title">{member.title}</span>
+                  <span className="goal-window-title" title={member.title}>{shortWindowTitle(member.title)}</span>
                   <span className="goal-window-role">{member.role === "coding"
                     ? text("代码处理", "Coding") : text("图文说明", "Illustrated guide")}</span>
                 </div>
