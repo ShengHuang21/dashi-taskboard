@@ -522,7 +522,7 @@ function parseHostExecutorExecution(value, codexHostId) {
 
 function parseHostExecutorEffect(value, codexHostId, effectKey) {
   assertPlainObject(value);
-  assertAllowedKeys(value, new Set(["execution", "operations"]));
+  assertAllowedKeys(value, new Set(["execution", "operations", "ordinaryDelivery"]));
   if (!Array.isArray(value.operations)
     || value.operations.length < 1
     || value.operations.length > 4) {
@@ -542,10 +542,23 @@ function parseHostExecutorEffect(value, codexHostId, effectKey) {
     assertPlainObject(operation.params);
     return { method, params: operation.params };
   });
+  let ordinaryDelivery;
+  if (Object.hasOwn(value, "ordinaryDelivery")) {
+    assertPlainObject(value.ordinaryDelivery);
+    assertAllowedKeys(value.ordinaryDelivery, new Set(["receiptId", "admissionAttemptId"]));
+    if (codexHostId !== "local" || operations.length !== 1 || operations[0].method !== "turn/start") {
+      throw new ApiError(400, "INVALID_FIELD", "Ordinary delivery identity requires one local turn/start");
+    }
+    ordinaryDelivery = {
+      receiptId: parseHostExecutorIdentifier(value.ordinaryDelivery.receiptId, "receiptId"),
+      admissionAttemptId: parseHostExecutorIdentifier(value.ordinaryDelivery.admissionAttemptId, "admissionAttemptId"),
+    };
+  }
   return {
     effectKey: parseHostExecutorIdentifier(effectKey, "effectKey"),
     execution: parseHostExecutorExecution(value.execution, codexHostId),
     operations,
+    ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
   };
 }
 
@@ -1967,17 +1980,22 @@ function parseAgentClaim(body) {
   };
 }
 
-function parseSafeActionAdmissionDeferral(body) {
+function parseSafeActionAdmissionDeferral(body, { allowReason = false } = {}) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set([
     "rootThreadId", "expectedResumeToken", "safeActionId", "admissionReceiptId", "admissionAttemptId",
+    ...(allowReason ? ["reason"] : []),
   ]));
+  if (allowReason && body.reason !== undefined && !["model_capacity", "coordinator_busy"].includes(body.reason)) {
+    throw new ApiError(400, "INVALID_FIELD", "'reason' must be model_capacity or coordinator_busy");
+  }
   return {
     rootThreadId: parseThreadId(body.rootThreadId),
     expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 128 }),
     safeActionId: stringField(body.safeActionId, "safeActionId", { required: true, maxLength: 128 }),
     admissionReceiptId: stringField(body.admissionReceiptId, "admissionReceiptId", { required: true, maxLength: 128 }),
     admissionAttemptId: stringField(body.admissionAttemptId, "admissionAttemptId", { required: true, maxLength: 128 }),
+    ...(allowReason ? { reason: body.reason ?? "model_capacity" } : {}),
   };
 }
 
@@ -3978,8 +3996,15 @@ export function createTaskboardServer(options = {}) {
       pollTimeoutMs: options.remoteHostExecutorPollTimeoutMs,
       requestTimeoutMs: options.remoteHostExecutorRequestTimeoutMs,
     });
+  const localHostExecutorAdapter = options.hostExecutorRpcAdapter ?? aiChat.appServer;
+  const unsubscribeOwnedTerminal = typeof localHostExecutorAdapter.subscribe === "function"
+    ? localHostExecutorAdapter.subscribe((notification) => {
+        database.recordOrdinaryDeliveryTerminal(notification);
+        return database.recordOwnedTerminalCheckpoint(notification);
+      })
+    : null;
   const hostExecutorAdapter = createHostExecutorAdapterRouter({
-    localAdapter: options.hostExecutorRpcAdapter ?? aiChat.appServer,
+    localAdapter: localHostExecutorAdapter,
     remoteChannels: remoteHostExecutorChannels,
   });
   const hostExecutorDispatcher = createHostExecutorDispatcher({
@@ -3999,6 +4024,7 @@ export function createTaskboardServer(options = {}) {
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
     getAdmission: (taskId) => database.getTaskSafeActionAdmission(taskId),
+    listResourceSteps: (projectId) => database.listResourceSteps(projectId),
     getTaskCapsule: (taskId) => verifiedTaskCapsule(taskId),
     getTaskDomainAssignment: (taskId) => database.getAgentTaskDomainAssignment(taskId),
     getTask: (identifier) => database.getTask(identifier),
@@ -6481,12 +6507,98 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const resourceStepsRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/resource-steps(?:\/([^/]+)(?:\/(wait|consume-start|result))?)?$/);
+      if (resourceStepsRoute) {
+        assertNoQuery(url.searchParams, "Resource step");
+        const taskId = decodeRouteSegment(resourceStepsRoute[1], "Task id");
+        const stepId = resourceStepsRoute[2] ? decodeRouteSegment(resourceStepsRoute[2], "Step id") : null;
+        const action = resourceStepsRoute[3];
+        if (request.method === "GET" && stepId && !action) return sendJson(response, 200, database.getResourceStep(taskId, stepId));
+        if (request.method !== "POST" || (stepId && !action)) return methodNotAllowed(response, stepId && !action ? ["GET"] : ["POST"]);
+        if (request.headers["x-taskboard-client"] !== "taskctl") throw new ApiError(403, "TASKCTL_REQUIRED", "Resource steps require protected taskctl");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        const result = !stepId ? database.registerResourceStep(taskId, body)
+          : action === "wait" ? database.waitResourceStep(taskId, stepId, body)
+            : action === "consume-start" ? database.consumeResourceStep(taskId, stepId, body)
+              : database.recordResourceStepResult(taskId, stepId, body);
+        return sendJson(response, 200, result);
+      }
+      const resourceCheckpointRoute = pathname.match(/^\/api\/local\/resource-allocations\/([^/]+)\/checkpoint$/);
+      if (resourceCheckpointRoute) {
+        assertNoQuery(url.searchParams, "Resource allocation checkpoint");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        if (request.headers["x-taskboard-client"] !== "taskctl") throw new ApiError(403, "TASKCTL_REQUIRED", "Resource checkpoints require protected taskctl");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        return sendJson(response, 200, database.checkpointResourceAllocation(
+          decodeRouteSegment(resourceCheckpointRoute[1], "Allocation id"), body,
+        ));
+      }
+      const resourceAdmissionRoute = pathname.match(/^\/api\/local\/hosts\/([^/]+)\/resource-admission$/);
+      if (resourceAdmissionRoute) {
+        assertNoQuery(url.searchParams, "Resource admission");
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertInjectorProof(request, resolved.instanceSecret);
+        const body = await readJson(request);
+        assertPlainObject(body);
+        const hostExecutorExecution = residentHostExecutorExecutionFromRequest(request, resolved.instanceSecret, pathname, body);
+        return sendJson(response, 200, database.admitResourceSteps(
+          decodeRouteSegment(resourceAdmissionRoute[1], "Host id"), { ...body, hostExecutorExecution },
+        ));
+      }
+
+      const continuationCheckpointRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/continuation\/checkpoints$/);
+      if (continuationCheckpointRoute) {
+        const taskId = decodeRouteSegment(continuationCheckpointRoute[1], "Task id");
+        if (request.headers["x-taskboard-client"] !== "taskctl") {
+          throw new ApiError(403, "TASKCTL_REQUIRED", "Continuation checkpoints require protected taskctl");
+        }
+        if (request.method === "GET") {
+          assertAllowedQuery(url.searchParams, new Set(["occurrenceId"]), "GET continuation checkpoint");
+          return sendJson(response, 200, database.getTaskContinuationCheckpoint(taskId, url.searchParams.get("occurrenceId")));
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST continuation checkpoint");
+          const result = database.appendTaskContinuationCheckpoint(taskId, await readJson(request));
+          return sendJson(response, result.applied ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
       const continuationRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/continuation$/);
       if (continuationRoute) {
         const taskId = decodeRouteSegment(continuationRoute[1], "Task id");
         assertNoQuery(url.searchParams, "Task continuation");
         if (request.method === "GET") {
-          return sendJson(response, 200, database.getTaskContinuation(taskId));
+          const assessment = database.getTaskContinuation(taskId);
+          const binding = assessment.basis.current.binding;
+          const completeLocalBinding = binding?.codexHostId === "local"
+            && binding.codexProjectKind === "local"
+            && [binding.threadId, binding.codexProjectId].every((value) => typeof value === "string" && value.trim())
+            && typeof binding.workspacePath === "string" && path.isAbsolute(binding.workspacePath)
+            && !binding.workspacePath.includes("\0");
+          const rootTurn = completeLocalBinding && typeof localHostExecutorAdapter.getRootTurnObservation === "function"
+            ? localHostExecutorAdapter.getRootTurnObservation(binding.threadId)
+            : {
+                source: "selected_local_adapter",
+                scope: "last_observed_root_turn_only",
+                status: "unknown",
+                reason: completeLocalBinding ? "adapter_unsupported" : "binding_unsupported",
+                lastEvent: null,
+                observedAt: null,
+                queriedAt: new Date().toISOString(),
+                ageMs: null,
+              };
+          return sendJson(response, 200, {
+            ...assessment,
+            passiveActivity: {
+              rootTurn,
+              children: "not_observed",
+              tools: "not_observed",
+              backgroundSessions: "not_observed",
+            },
+          });
         }
         if (request.method === "POST") {
           if (request.headers["x-taskboard-client"] !== "taskctl") {
@@ -6951,7 +7063,7 @@ export function createTaskboardServer(options = {}) {
         const hostExecutorExecution = residentHostExecutorExecutionFromRequest(
           request, resolved.instanceSecret, pathname, rawDeferral,
         );
-        const deferral = parseSafeActionAdmissionDeferral(rawDeferral);
+        const deferral = parseSafeActionAdmissionDeferral(rawDeferral, { allowReason: true });
         return sendJson(response, 200, database.deferTaskSafeActionAdmission(id, {
           ...deferral,
           hostExecutorExecution,
@@ -7356,6 +7468,7 @@ export function createTaskboardServer(options = {}) {
       return server.address();
     },
     async close() {
+      unsubscribeOwnedTerminal?.();
       const serverClosed = listening
         ? new Promise((resolve, reject) => {
             server.close((error) => error ? reject(error) : resolve());

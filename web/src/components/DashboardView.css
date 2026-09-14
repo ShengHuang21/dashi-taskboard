@@ -65,6 +65,7 @@
 
 .dashboard-view .dashboard-hero-value {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   min-width: 0;
   gap: 16px;
@@ -211,8 +212,10 @@
 
 .dashboard-view .dashboard-roadmap-progress {
   display: flex;
-  align-items: baseline;
+  flex-direction: column;
+  align-items: stretch;
   flex: 0 0 auto;
+  min-width: 220px;
   gap: 10px;
 }
 
@@ -265,7 +268,7 @@
 
 .dashboard-view .dashboard-roadmap-item {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   min-width: 0;
   gap: 10px;
@@ -275,6 +278,21 @@
   color: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+.dashboard-view .dashboard-roadmap-item-heading {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.dashboard-view .dashboard-roadmap-item-heading strong {
+  flex: 1;
+}
+
+.dashboard-view .dashboard-roadmap-item .task-progress-text {
+  color: var(--text-secondary);
 }
 
 .dashboard-view .dashboard-roadmap-item:hover {
@@ -1314,11 +1332,12 @@
   }
 
   .dashboard-view .dashboard-roadmap-item {
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .dashboard-view .dashboard-roadmap-item small {
-    display: none;
+  .dashboard-view .dashboard-roadmap-progress {
+    width: 100%;
+    min-width: 0;
   }
 
   .dashboard-view .dashboard-metrics {

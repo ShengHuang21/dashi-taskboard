@@ -69,6 +69,7 @@ import {
   runCrossDomainHandoffMonitorOnce,
   runTaskboardProjectMonitorSequence,
   runTaskboardContinuationFastLane,
+  runTaskboardResourceAdmissionTick,
   runTaskboardContinuationMonitorOnce,
   selectLaunchCoordinatorRoute,
 } from "./codex-injector-runtime.mjs";
@@ -1255,6 +1256,7 @@ async function requestCodexAppServerViaCdp(
   method,
   params,
   timeoutMs = taskConversationAppServerTimeoutMs,
+  ordinaryDelivery = undefined,
 ) {
   const residentExecution = residentHostExecutorContext.getStore();
   if (residentExecution && residentHostExecutorMutatingRpcMethods.has(method)) {
@@ -1284,6 +1286,7 @@ async function requestCodexAppServerViaCdp(
         leaseId: residentExecution.leaseId,
       },
       operations: [{ method, params }],
+      ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
     });
     if (!Array.isArray(result?.results) || result.results.length !== 1) {
       throw new Error("Taskboard host executor dispatcher returned an invalid result");
@@ -3180,6 +3183,7 @@ async function mutateBackgroundAdmission(claim, action) {
     admissionReceiptId: claim.admissionReceiptId,
     admissionAttemptId: claim.admissionAttemptId,
     ...(claim.admissionProbeId ? { admissionProbeId: claim.admissionProbeId } : {}),
+    ...(action === "defer" && claim.reason !== undefined ? { reason: claim.reason } : {}),
   };
   const response = await fetch(
     `${taskboardBaseUrl}${pathname}`,
@@ -3355,6 +3359,12 @@ function runBackgroundContinuationDispatch(cdp, projectId, hostResourceAdmission
         method,
         params,
         10_000,
+        request.codexHostId === "local" && method === "turn/start"
+          ? {
+              receiptId: request.deliveryReceipt.id,
+              admissionAttemptId: request.deliveryReceipt.admissionAttemptId,
+            }
+          : undefined,
       ),
       validateGitExecutionTarget,
       revalidateBackgroundContinuationHostAccess,
@@ -3368,6 +3378,23 @@ async function runBackgroundContinuationFastLane(cdp) {
     listLifecycleProjects: listResidentCoordinatorMonitorProjects,
     readContinuationPolicyEntries: readTaskboardClientStorageEntries,
     continuationPolicyPrefix: backgroundContinuationPolicyPrefix,
+  });
+  await runTaskboardResourceAdmissionTick({
+    projects, readSnapshot: readTaskboardAgentLaneSnapshot, readHostResourceObservation,
+    policy: hostResourceAdmissionPolicy, maxActiveAgents: configuredMaxActiveAgents,
+    admit: async (body) => {
+      const pathname = `/api/local/hosts/${encodeURIComponent(hostResourceAdmissionPolicy.localHostId)}/resource-admission`;
+      const response = await fetch(`${taskboardBaseUrl}${pathname}`, {
+        method: "POST", headers: residentInjectorProofHeaders(pathname, body), body: JSON.stringify(body),
+        cache: "no-store", signal: AbortSignal.timeout(5_000),
+      });
+      if (!response.ok) throw new Error(`Resource admission returned HTTP ${response.status}`);
+      return response.json();
+    },
+  }).catch((error) => {
+    // Failure to observe new resource work must not stop the existing ordinary queue.
+    // Its final server fence still rejects every unresolved heavy allocation.
+    console.error(`Taskboard resource admission deferred: ${error.message}`);
   });
   return runTaskboardContinuationFastLane({
     projects,

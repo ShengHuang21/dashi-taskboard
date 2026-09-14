@@ -1430,6 +1430,211 @@ test("the default host is loopback-only", () => {
   assert.equal(resolveHost("0.0.0.0"), "0.0.0.0");
 });
 
+test("CAP-71 busy deferral persists exact no-start state and retries only when due with ordinary capacity", async (t) => {
+  const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
+  const instanceSecret = "c".repeat(64);
+  let task;
+  const baseUrl = await startServer(async (directory) => {
+    const database = new TaskboardDatabase(path.join(directory, "taskboard.sqlite"));
+    database.upsertAgentLaneProject("local", {
+      rootTaskId: "root",
+      tasks: [{ id: "root", label: "Fixture Root", owner: "Codex", source: "codex", threadId: rootThreadId, taskType: "root_task" }],
+      adapters: [],
+    });
+    task = createRepositoryRefreshTask(database, {
+      title: "busy-coordinator", worktreePath: "/tmp/cap71-busy-fixture", branch: "codex/busy-fixture",
+    });
+    const binding = { ...task.threadBinding, threadId: rootThreadId };
+    task = database.updateTask(task.id, task.version, { labels: ["agent-todo"], workflowProfile: "vibe" }, rootThreadId, binding, task.assignee);
+    database.createComment(task.id, {
+      body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+        gates: [{ id: "local", kind: "test", state: "authorized", scope: "synthetic local test", approver: "Owner", approvalRequest: "fixture", evidence: "fixture", receipt: "fixture" }],
+        actions: [{ id: "continue", order: 10, text: "Continue exact task", gate: "local", target: "candidate", status: "pending" }],
+      })}\n\`\`\``,
+      threadId: rootThreadId, threadBinding: binding,
+      actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+    });
+    database.close();
+    return { instanceSecret };
+  });
+  const database = runningApps.at(-1).app.database;
+  const rawReceipt = () => database.database.prepare("SELECT * FROM task_safe_action_receipts WHERE task_id = ?").get(task.id);
+  let observedNow = Date.now();
+  t.mock.method(Date, "now", () => observedNow);
+  let busy = true;
+  let capacityFresh = true;
+  let cpuBusyRatio = 0.25;
+  let staleRoute = false;
+  let claims = 0;
+  let completions = 0;
+  const nativeCalls = [];
+  const reservations = [];
+  const budget = new Map();
+  const admissionBody = (claim) => ({
+    rootThreadId: claim.rootThreadId, expectedResumeToken: claim.expectedResumeToken,
+    safeActionId: claim.safeActionId, admissionReceiptId: claim.admissionReceiptId,
+    admissionAttemptId: claim.admissionAttemptId,
+  });
+  const post = async (action, body) => request(baseUrl, `/api/tasks/${task.id}/${action}`, { method: "POST", body });
+  const options = {
+    hostExecutor: { ownedCodexHostId: "local" },
+    policy: {
+      enabled: true, projectId: "local", maxActiveAgents: 4, capacityObservationMaxAgeMs: 60_000,
+      hostResourceAdmission: {
+        enabled: true, localHostId: "local", observationMaxAgeMs: 60_000,
+        targetCpuRatio: 0.8, criticalCpuRatio: 1, memoryReserveRatio: 0.2, criticalMemoryRatio: 0.1,
+        minimumMemoryReserveBytes: 2 * 1024 ** 3, memoryPerAgentBytes: 1024 ** 3, cpuPerAgent: 1,
+      },
+    },
+    now: () => observedNow,
+    hostResourceAdmissionBudget: budget,
+    readHostResourceObservation: async () => ({
+      schemaVersion: 1, source: "resident-injector", hostId: "local", platform: "linux",
+      observedAt: new Date(observedNow).toISOString(),
+      cpu: { capacity: 8, busyRatio: cpuBusyRatio, sampleWindowMs: 1000 },
+      memory: { totalBytes: 16 * 1024 ** 3, availableBytes: 8 * 1024 ** 3, availableRatio: 0.5, source: "linux-meminfo" },
+    }),
+    readSnapshot: async () => {
+      const snapshot = (await request(baseUrl, "/api/local/projects/local/agent-lanes")).body;
+      snapshot.windowSubagentTrees = [{
+        rootThreadId, observed: true, summary: { active: 0 },
+        capacityObservation: { source: "list_agents", observedAt: new Date(observedNow - (capacityFresh ? 0 : 60_001)).toISOString() },
+      }];
+      if (staleRoute) snapshot.todos.find((todo) => todo.taskId === task.id).admission.rootWorkspacePath = "/tmp/stale-root";
+      return snapshot;
+    },
+    claimReceipt: async (claim) => {
+      claims += 1;
+      const result = await post("bootstrap-claim", {
+        rootThreadId, ownedCodexHostId: "local", expectedResumeToken: claim.expectedResumeToken,
+        safeActionId: claim.safeActionId, reservationLeaseId: `busy-lease-${claims}`,
+      });
+      assert.equal(result.response.status, 200, JSON.stringify(result.body));
+      reservations.push(result.body.receipt);
+      if (claims === 1) {
+        const receipt = result.body.receipt;
+        const before = rawReceipt();
+        const rejected = await post("admission-defer", {
+          rootThreadId, expectedResumeToken: receipt.resumeToken, safeActionId: receipt.safeActionId,
+          admissionReceiptId: receipt.id, admissionAttemptId: receipt.admissionAttemptId, reason: "coordinator_busy",
+        });
+        assert.equal(rejected.response.status, 409, "reserved is not delivering awaiting admission");
+        assert.deepEqual(rawReceipt(), before);
+      }
+      return result.body;
+    },
+    confirmDelivery: async (claim) => {
+      const result = await post("bootstrap-delivery", {
+        rootThreadId, expectedResumeToken: claim.expectedResumeToken, safeActionId: claim.safeActionId,
+        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+      });
+      assert.equal(result.response.status, 200, JSON.stringify(result.body));
+      return result.body.executionIdentity;
+    },
+    deliver: async (delivery) => {
+      assert.equal(delivery.modelRouting, null, "unconfigured model selection is preserved");
+      return deliverTaskboardCoordination(delivery, async (method, params) => {
+        nativeCalls.push(method);
+        if (method === "thread/read") return { thread: {
+          id: rootThreadId, cwd: delivery.rootWorkspacePath,
+          turns: busy ? [{ id: "owner-working", status: "inProgress" }] : [],
+        } };
+        if (method === "thread/resume") return {};
+        assert.equal(method, "turn/start");
+        assert.equal(params.model, undefined);
+        return { turn: { id: "idle-turn" } };
+      }, async () => {});
+    },
+    deferAdmission: async (claim) => {
+      assert.equal(budget.get("local").used, 0, "release local resource reservation before persistence");
+      const result = await post("admission-defer", { ...admissionBody(claim), reason: claim.reason });
+      assert.equal(result.response.status, 200, JSON.stringify(result.body));
+      return result.body;
+    },
+    completeDelivery: async (claim, delivery) => {
+      completions += 1;
+      const result = await post("bootstrap-complete", {
+        rootThreadId, expectedResumeToken: claim.expectedResumeToken, safeActionId: claim.safeActionId,
+        reservationLeaseId: claim.deliveryReceipt.reservationLeaseId,
+        recoveryLeaseId: claim.recoveryLeaseId, deliveryTurnId: delivery.turnId,
+      });
+      assert.equal(result.response.status, 200, JSON.stringify(result.body));
+      return result.body;
+    },
+  };
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).reason, "coordinator-busy-deferred");
+  assert.deepEqual(nativeCalls, ["thread/read"]);
+  assert.equal(completions, 0);
+  const deferred = database.getTaskSafeActionAdmission(task.id);
+  assert.equal(deferred.status, "reserved");
+  assert.equal(deferred.admissionState, "deferred");
+  assert.equal(deferred.admissionDeferredReason, "coordinator_busy");
+  assert.equal(deferred.deliveryTurnId, null);
+  assert.equal(deferred.reservationLeaseId, null);
+  assert.equal(rawReceipt().recovery_lease_id, null);
+  assert.equal(deferred.admissionRetryCount, 1);
+  assert.equal(Date.parse(deferred.admissionRetryAfter), observedNow + 15_000);
+  assert.equal(database.getTask(task.id).status, "todo");
+  assert.equal(database.getOpenTaskAgentRun(task.id), null);
+  const binding = {
+    rootThreadId, expectedResumeToken: deferred.resumeToken, safeActionId: deferred.safeActionId,
+    admissionReceiptId: deferred.id, admissionAttemptId: deferred.admissionAttemptId,
+  };
+  const beforeRejects = rawReceipt();
+  const beforeTask = database.getTask(task.id);
+  const replay = await post("admission-defer", { ...binding, reason: "coordinator_busy" });
+  assert.equal(replay.response.status, 200);
+  assert.equal(replay.body.applied, false);
+  const deferredReceipt = { ...deferred };
+  delete deferredReceipt.recordedDeliveryObservation;
+  assert.deepEqual(replay.body.receipt, deferredReceipt);
+  assert.deepEqual(database.getTaskSafeActionAdmission(task.id), deferred);
+  for (const body of [{ ...binding }, { ...binding, reason: "model_capacity" }, {
+    ...binding, reason: "coordinator_busy", admissionAttemptId: "old-attempt",
+  }, { ...binding, reason: "coordinator_busy", rootThreadId: "wrong-root" }]) {
+    assert.equal((await post("admission-defer", body)).response.status, 409);
+  }
+  for (const reason of [null, "", "other", " coordinator_busy"]) {
+    assert.equal((await post("admission-defer", { ...binding, reason })).response.status, 400);
+  }
+  for (const action of ["admission-uncertain", "admission-probe"]) {
+    const result = await request(baseUrl, `/api/tasks/${task.id}/${action}`, {
+      method: "POST", headers: signedInjectorHeaders(runningApps.at(-1).app.options.instanceSecret, "7".repeat(32)),
+      body: { ...binding, reason: "coordinator_busy" },
+    });
+    assert.equal(result.response.status, 400);
+  }
+  assert.deepEqual(rawReceipt(), beforeRejects);
+  assert.deepEqual(database.getTask(task.id), beforeTask);
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).reason, "coordinator-busy-backoff");
+  assert.equal(claims, 1);
+  observedNow = Date.parse(deferred.admissionRetryAfter);
+  capacityFresh = false;
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).reason, "capacity-observation-stale");
+  capacityFresh = true;
+  cpuBusyRatio = 1;
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).reason, "waiting-host-resources");
+  cpuBusyRatio = 0.25;
+  staleRoute = true;
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).reason, "stale-coordinator-busy-retry");
+  staleRoute = false;
+  assert.equal(claims, 1);
+  busy = false;
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).delivered, true);
+  assert.equal(reservations[1].id, deferred.id);
+  assert.notEqual(reservations[1].admissionAttemptId, deferred.admissionAttemptId);
+  assert.equal(completions, 1);
+  assert.deepEqual(nativeCalls, ["thread/read", "thread/read", "thread/resume", "turn/start"]);
+  assert.equal((await runTaskboardContinuationMonitorOnce(options)).reason, "awaiting-admission");
+  assert.equal(claims, 2);
+  const deliveredReceipt = database.getTaskSafeActionAdmission(task.id);
+  const deliveredState = rawReceipt();
+  assert.equal((await post("admission-defer", {
+    ...binding, admissionAttemptId: deliveredReceipt.admissionAttemptId, reason: "coordinator_busy",
+  })).response.status, 409, "a recorded delivery turn is not known-unstarted");
+  assert.deepEqual(rawReceipt(), deliveredState);
+});
+
 test("Agent Lane admission is fenced from Root delivery through the exact durable child claim", async () => {
   const rootThreadId = "01a004bd-a749-7b53-81e2-af2d477f93ae";
   const instanceSecret = "6".repeat(64);
@@ -1510,6 +1715,21 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
   const deliveries = [];
   let deliveryAttempts = 0;
   let firstReceipt;
+  const rejectBusyDeferral = async (receipt) => {
+    const database = runningApps.at(-1).app.database;
+    const readReceipt = () => database.database.prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(receipt.id);
+    const beforeReceipt = readReceipt();
+    const beforeTask = database.getTask(task.id);
+    const rejected = await request(baseUrl, `/api/tasks/${task.identifier}/admission-defer`, {
+      method: "POST", body: {
+        rootThreadId, expectedResumeToken: receipt.resumeToken, safeActionId: receipt.safeActionId,
+        admissionReceiptId: receipt.id, admissionAttemptId: receipt.admissionAttemptId, reason: "coordinator_busy",
+      },
+    });
+    assert.equal(rejected.response.status, 409, beforeReceipt.admission_state);
+    assert.deepEqual(readReceipt(), beforeReceipt);
+    assert.deepEqual(database.getTask(task.id), beforeTask);
+  };
   const options = {
     hostExecutor: { ownedCodexHostId: "local" },
     policy: { enabled: true, projectId: "local" },
@@ -1617,6 +1837,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
     },
   });
   assert.equal(firstPrepared.response.status, 200, JSON.stringify(firstPrepared.body));
+  await rejectBusyDeferral(firstPrepared.body.receipt);
   await new Promise((resolve) => setTimeout(resolve, 20));
   const firstUncertain = await request(baseUrl, `/api/tasks/${task.identifier}/admission-uncertain`, {
     method: "POST",
@@ -1630,6 +1851,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
     },
   });
   assert.equal(firstUncertain.response.status, 200, JSON.stringify(firstUncertain.body));
+  await rejectBusyDeferral(firstUncertain.body.receipt);
   const firstProbe = await request(baseUrl, `/api/tasks/${task.identifier}/admission-probe`, {
     method: "POST",
     headers: signedInjectorHeaders(instanceSecret, "2".repeat(32)),
@@ -1713,6 +1935,9 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
   assert.equal(afterDriftedClaim.body.task.status, "todo");
   assert.equal(afterDriftedClaim.body.task.version, task.version);
 
+  const absenceReceiptBeforeDeferral = runningApps.at(-1).app.database.database.prepare(
+    "SELECT * FROM task_safe_action_receipts WHERE id = ?",
+  ).get(firstReceipt.id);
   const deferred = await request(baseUrl, `/api/tasks/${task.identifier}/admission-defer`, {
     method: "POST",
     body: {
@@ -1723,8 +1948,8 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
       admissionAttemptId: firstReceipt.admissionAttemptId,
     },
   });
-  assert.equal(deferred.response.status, 200);
-  assert.equal(deferred.body.applied, false);
+  assert.equal(deferred.response.status, 409);
+  assert.equal(deferred.body.error.code, "ADMISSION_ATTEMPT_MISMATCH");
   const deferredReplay = await request(baseUrl, `/api/tasks/${task.identifier}/admission-defer`, {
     method: "POST",
     body: {
@@ -1735,8 +1960,12 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
       admissionAttemptId: firstReceipt.admissionAttemptId,
     },
   });
-  assert.equal(deferredReplay.response.status, 200);
-  assert.equal(deferredReplay.body.applied, false);
+  assert.equal(deferredReplay.response.status, 409);
+  assert.equal(deferredReplay.body.error.code, "ADMISSION_ATTEMPT_MISMATCH");
+  assert.deepEqual(runningApps.at(-1).app.database.database.prepare(
+    "SELECT * FROM task_safe_action_receipts WHERE id = ?",
+  ).get(firstReceipt.id), absenceReceiptBeforeDeferral);
+  assert.deepEqual((await request(baseUrl, `/api/tasks/${task.identifier}`)).body.task, afterDriftedClaim.body.task);
 
   const nextReservation = await request(baseUrl, `/api/tasks/${task.identifier}/bootstrap-claim`, {
     method: "POST",
@@ -1914,6 +2143,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
   assert.equal(reconciled.body.outcome, "present", JSON.stringify(reconciled.body));
   assert.equal(reconciled.body.receipt.admissionState, "recovery_confirmed");
   assert.equal(reconciled.body.receipt.admissionRecoveredAgentThreadId, "admitted-child-thread");
+  await rejectBusyDeferral(reconciled.body.receipt);
 
   const admitted = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
     method: "POST",
@@ -1923,6 +2153,7 @@ test("Agent Lane admission is fenced from Root delivery through the exact durabl
   assert.equal(admitted.body.task.status, "in_progress");
   assert.equal(admitted.body.claim.agentThreadId, "admitted-child-thread");
   assert.equal(admitted.body.run.status, "active");
+  await rejectBusyDeferral(nextReceipt);
   const widenedReplay = await request(baseUrl, `/api/tasks/${task.identifier}/claim`, {
     method: "POST",
     body: {
@@ -2300,6 +2531,8 @@ test("Root records one immutable Owner decision receipt from the project-level r
     restoreDatabase.upsertAgentLaneProject("local", exactRouteConfig);
     restoreDatabase.close();
   }
+  // The route-rejection fixtures can outlast the host observation's freshness window.
+  assert.equal((await publishRootRuntime("ac".repeat(16))).response.status, 200);
   const delivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     headers: injectorHeaders("c".repeat(32)),

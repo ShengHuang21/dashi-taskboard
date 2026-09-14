@@ -27,6 +27,9 @@ const domainCoordinatorShutdownIdleObservations = new Map();
 const THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const COORDINATION_ID_PATTERN = /^[a-z0-9._-]{1,128}$/i;
 const RESUME_TOKEN_PATTERN = /^[a-f0-9]{64}$/;
+const CONTINUATION_HOLD_REASONS = new Set([
+  "CONTINUATION_PAUSED", "CONTINUATION_CANCELED", "CONTINUATION_ENDPOINT_REACHED",
+]);
 const OWNER_DECISION_MARKER = "TASKBOARD_OWNER_DECISION_V1";
 const OWNER_INTENT_ADOPTION_MARKER = "Taskboard Owner Intent adoption id:";
 const OWNER_INTENT_ROUTE_MARKER = "TASKBOARD_OWNER_INTENT_ROUTE_V1";
@@ -3184,9 +3187,12 @@ export async function deliverTaskboardCoordination(
   );
   const entry = { promise: delivery, expiresAt: observedAt + COORDINATION_DEDUPLICATION_MS };
   coordinationDeliveries.set(deliveryKey, entry);
-  delivery.catch(() => {
+  const forgetDelivery = () => {
     if (coordinationDeliveries.get(deliveryKey) === entry) coordinationDeliveries.delete(deliveryKey);
-  });
+  };
+  delivery.then((result) => {
+    if (result?.delivery === "deferred" && result.reason === "coordinator-busy") forgetDelivery();
+  }, forgetDelivery);
   return delivery;
 }
 
@@ -4407,6 +4413,22 @@ async function reserveHostResourceAdmissionBudget({ budget, projectId, target, h
   };
 }
 
+export async function runTaskboardResourceAdmissionTick({ projects, readSnapshot, readHostResourceObservation, admit, policy, maxActiveAgents }) {
+  const snapshots = [];
+  for (const project of projects) {
+    if (project.continuationEnabled) snapshots.push(await readSnapshot(project.projectId));
+  }
+  if (!snapshots.some((snapshot) => snapshot.resourceSteps?.some((step) => step.state === "queued"))) {
+    return { granted: false, reason: "resource_step_no_queued_work" };
+  }
+  const slotObservations = snapshots.flatMap((snapshot) => (snapshot.windowSubagentTrees ?? [])
+    .filter((tree) => tree.observed === true && tree.capacityObservation?.source === "list_agents")
+    .map((tree) => ({ threadId: tree.rootThreadId, observedAt: tree.capacityObservation.observedAt,
+      active: tree.summary.active + 1, maxActive: maxActiveAgents })));
+  // Only natural recorded list_agents evidence; this path never requests a probe or wakes an Agent.
+  return admit({ observation: await readHostResourceObservation(), slotObservations, policy });
+}
+
 function continuationCapacity(snapshot, target, policy, observedAtMs) {
   if (policy.maxActiveAgents === undefined) return { available: true, headroomAgents: null };
   if (!Number.isSafeInteger(policy.maxActiveAgents)
@@ -4452,9 +4474,10 @@ function continuationCapacity(snapshot, target, policy, observedAtMs) {
     : { available: false, reason: "waiting-capacity", headroomAgents };
 }
 
-function durableModelCapacityRetry(snapshot, candidate, target, readyWork, safeAction, observedAtMs) {
+function durableAdmissionRetry(snapshot, candidate, target, readyWork, safeAction, observedAtMs) {
   const admission = candidate?.admission;
-  if (admission?.state !== "deferred" || admission?.deferredReason !== "model_capacity") {
+  if (admission?.state !== "deferred"
+    || !["model_capacity", "coordinator_busy"].includes(admission?.deferredReason)) {
     return null;
   }
   const retryAfter = Date.parse(admission.retryAfter ?? "");
@@ -4489,8 +4512,11 @@ function durableModelCapacityRetry(snapshot, candidate, target, readyWork, safeA
         && admission.globalCoordinatorLeaseId == null
         && admission.globalCoordinatorTaskId == null
         && admission.globalCoordinatorThreadId == null;
-  if (!exactRootRoute || !exactCoordinatorEpoch) return { staleRoute: true, due: false };
-  return { staleRoute: false, due: retryAfter <= observedAtMs };
+  return {
+    reason: admission.deferredReason,
+    staleRoute: !exactRootRoute || !exactCoordinatorEpoch,
+    due: exactRootRoute && exactCoordinatorEpoch && retryAfter <= observedAtMs,
+  };
 }
 
 async function runTaskboardContinuationMonitorOnceUnlocked({
@@ -4528,6 +4554,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
   let hostExecutorUnavailable = false;
   const replacementRecoveryObservedAt = now();
   const replacementRecoveryTodo = snapshot.todos.find((candidate) => {
+    if (candidate?.readyWork?.reasonCodes?.some((reason) => CONTINUATION_HOLD_REASONS.has(reason))) return false;
     const admission = candidate?.admission;
     const target = candidate?.dispatchTarget;
     const assignment = candidate?.domainAssignment;
@@ -4626,6 +4653,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       codexHostId: probe.observationTarget.codexHostId,
       rootWorkspacePath: probe.observationTarget.rootWorkspacePath,
     });
+    if (probeDelivery?.delivery === "deferred" && probeDelivery.reason === "coordinator-busy") {
+      return { delivered: false, todoId: replacementRecoveryTodo.id, reason: "replacement-admission-coordinator-busy" };
+    }
     if (!["started", "steered", "observed"].includes(probeDelivery?.delivery)) {
       const reason = probeDelivery?.reason === "terminal-retry-backoff"
         ? "replacement-admission-terminal-retry-backoff"
@@ -4644,6 +4674,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     };
   }
   const recoveryTodo = snapshot.todos.find((candidate) => {
+    if (candidate?.readyWork?.reasonCodes?.some((reason) => CONTINUATION_HOLD_REASONS.has(reason))) return false;
     const admission = candidate?.admission;
     const eligible = COORDINATION_ID_PATTERN.test(candidate?.id ?? "")
       && COORDINATION_ID_PATTERN.test(candidate?.taskId ?? "")
@@ -4711,6 +4742,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       recovery.admissionProbeId = probe.receipt.admissionProbeId;
       recovery.admissionProbeRequestedAt = probe.receipt.admissionProbeRequestedAt;
       const probeDelivery = await deliverAdmissionRecovery({ ...recovery, mode: "probe" });
+      if (probeDelivery?.delivery === "deferred" && probeDelivery.reason === "coordinator-busy") {
+        return { delivered: false, todoId: recoveryTodo.id, reason: "admission-coordinator-busy" };
+      }
       if (!["started", "steered", "observed"].includes(probeDelivery?.delivery)) {
         const reason = probeDelivery?.reason === "terminal-retry-backoff"
           ? "admission-terminal-retry-backoff"
@@ -4738,6 +4772,9 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       recovery.expectedResumeToken = reconciled.receipt.resumeToken;
     }
     const delivery = await deliverAdmissionRecovery({ ...recovery, mode: "claim" });
+    if (delivery?.delivery === "deferred" && delivery.reason === "coordinator-busy") {
+      return { delivered: false, todoId: recoveryTodo.id, reason: "admission-coordinator-busy" };
+    }
     return {
       delivered: delivery?.delivery === "started" || delivery?.delivery === "steered",
       todoId: recoveryTodo.id,
@@ -4790,7 +4827,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       hostExecutorUnavailable = true;
       return false;
     }
-    const modelRetry = durableModelCapacityRetry(
+    const admissionRetry = durableAdmissionRetry(
       snapshot,
       candidate,
       target,
@@ -4798,12 +4835,14 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
       safeAction,
       capacityObservedAt,
     );
-    if (modelRetry?.staleRoute) {
-      capacityReason ??= "stale-model-capacity-retry";
+    if (admissionRetry?.staleRoute) {
+      capacityReason ??= admissionRetry.reason === "model_capacity"
+        ? "stale-model-capacity-retry" : "stale-coordinator-busy-retry";
       return false;
     }
-    if (modelRetry && !modelRetry.due) {
-      capacityReason ??= "model-capacity-backoff";
+    if (admissionRetry && !admissionRetry.due) {
+      capacityReason ??= admissionRetry.reason === "model_capacity"
+        ? "model-capacity-backoff" : "coordinator-busy-backoff";
       return false;
     }
     const hostResourceCapacity = evaluateHostResourceAdmission({
@@ -4814,7 +4853,7 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     });
     const capacity = continuationCapacity(snapshot, target, policy, capacityObservedAt);
     if (!capacity.available) {
-      if (modelRetry?.due
+      if (admissionRetry?.due && admissionRetry.reason === "model_capacity"
         && ["capacity-unobserved", "capacity-observation-stale"].includes(capacity.reason)) {
         if (!hostResourceCapacity.available) {
           capacityReason ??= hostResourceCapacity.reason;
@@ -5015,6 +5054,29 @@ async function runTaskboardContinuationMonitorOnceUnlocked({
     if (definitelyDidNotStart) releaseHostResourceReservation();
     return { delivered: false, reason: "manual-recovery-required" };
   }
+  if (delivery?.delivery === "deferred" && delivery.reason === "coordinator-busy") {
+    releaseHostResourceReservation();
+    const deferred = typeof deferAdmission === "function"
+      ? await deferAdmission({
+          ...authorization,
+          admissionReceiptId: reservation.receipt.id,
+          admissionAttemptId: reservation.receipt.admissionAttemptId,
+          reason: "coordinator_busy",
+        })
+      : null;
+    const receipt = deferred?.receipt;
+    if (receipt?.id !== reservation.receipt.id
+      || receipt.taskId !== todo.taskId
+      || receipt.admissionAttemptId !== reservation.receipt.admissionAttemptId
+      || receipt.rootThreadId !== dispatch.rootThreadId
+      || receipt.status !== "reserved"
+      || receipt.admissionState !== "deferred"
+      || receipt.admissionDeferredReason !== "coordinator_busy"
+      || receipt.deliveryTurnId !== null) {
+      throw new Error("Taskboard did not durably defer the busy coordinator admission attempt");
+    }
+    return { delivered: false, todoId: todo.id, actionId: safeAction.id, reason: "coordinator-busy-deferred" };
+  }
   let completion;
   try {
     completion = await completeDelivery(authorization, delivery);
@@ -5142,21 +5204,15 @@ async function deliverTaskboardCoordinationOnce(
     ))));
   if (observed?.id) return { delivery: "observed", turnId: observed.id };
   if (request.observeOnly === true) return { delivery: "not-observed", turnId: null };
+  if (turns.some((turn) => turn?.status === "inProgress")) {
+    return { delivery: "deferred", reason: "coordinator-busy" };
+  }
   await validateTaskModelRoutingCatalog(rpc, request.modelRouting);
   await validateExecutionTarget(targetRoot, request.executionIdentity);
   const durableInstruction = `${coordinationDeliveryMarker(
     deliveryId,
     request.deliveryReceipt?.admissionAttemptId,
   )}\n${instruction}`;
-  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
-  if (activeTurn?.id) {
-    await rpc("turn/steer", {
-      threadId: request.rootThreadId,
-      expectedTurnId: activeTurn.id,
-      input: [{ type: "text", text: durableInstruction }],
-    });
-    return { delivery: "steered", turnId: activeTurn.id };
-  }
   await rpc("thread/resume", { threadId: request.rootThreadId });
   const hostAccess = typeof confirmHostAccess === "function"
     ? await confirmHostAccess(request)
@@ -5206,6 +5262,9 @@ export async function deliverTaskboardAdmissionRecovery(
     (turn) => turn?.status === "completed" || turn?.status === "inProgress",
   );
   if (observed?.id) return { delivery: "observed", turnId: observed.id };
+  if (turns.some((turn) => turn?.status === "inProgress")) {
+    return { delivery: "deferred", reason: "coordinator-busy" };
+  }
   const terminalTurns = matchingTurns.filter(
     (turn) => ["failed", "interrupted", "canceled"].includes(turn?.status),
   );
@@ -5235,15 +5294,6 @@ export async function deliverTaskboardAdmissionRecovery(
         `Admission attempt id: ${request.admissionAttemptId}`,
         "Do not spawn another agent. Send one follow-up to that exact existing child instructing it to bootstrap the Todo and claim with its exact path/thread, the exact prepared write scope, this Root thread, and both exact admission ids. If any identity differs, stop without mutation.",
       ].join("\n");
-  const activeTurn = [...turns].reverse().find((turn) => turn?.status === "inProgress");
-  if (activeTurn?.id) {
-    await rpc("turn/steer", {
-      threadId: request.rootThreadId,
-      expectedTurnId: activeTurn.id,
-      input: [{ type: "text", text: instruction }],
-    });
-    return { delivery: "steered", turnId: activeTurn.id };
-  }
   await rpc("thread/resume", { threadId: request.rootThreadId });
   const started = await rpc("turn/start", {
     threadId: request.rootThreadId,

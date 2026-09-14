@@ -273,6 +273,53 @@ function capsule(comments, overrides = {}, inputs = {}) {
   });
 }
 
+test("recorded hold D5: unenrolled token omission and active records preserve existing authority and dependency gates", (t) => {
+  const comments = [envelopeComment(envelope({
+    gates: [
+      gate("local", "edit", "authorized", { evidence: "Owner resumed local work", receipt: "turn:resume" }),
+      gate("push", "push", "approval_required", { approver: "Owner", approvalRequest: "Approve exact push" }),
+    ],
+    actions: [action("verify-demo", 10, "local", "Run local acceptance"), action("push-head", 20, "push", "Push later")],
+  }))];
+  const omitted = capsule(comments);
+  const explicitNull = capsule(comments, {}, { latestContinuationRecord: null });
+  assert.equal(omitted.resumeToken, explicitNull.resumeToken);
+  assert.deepEqual(omitted.readyWork, explicitNull.readyWork);
+  const latestContinuationRecord = { eventId: "active-record", status: "active", previousRecordId: "old-hold",
+    createdAt: "2026-08-26T00:30:00.000Z" };
+  const active = capsule(comments, {}, { latestContinuationRecord });
+  assert.equal(active.readyWork.eligible, true);
+  assert.deepEqual(active.readyWork.safeActions, omitted.readyWork.safeActions);
+  assert.deepEqual(active.readyWork.deferredActions, omitted.readyWork.deferredActions);
+  assert.deepEqual(active.authorization, omitted.authorization);
+  assert.equal(active.readyWork.reasonCodes.some((reason) => reason.startsWith("CONTINUATION_")), false);
+  assert.equal(active.continuation.liveExecution, "unknown");
+  assert.equal(active.continuation.eligibleForDispatch, false);
+  const gated = capsule([envelopeComment(envelope({
+    gates: [gate("push", "push", "approval_required", { approver: "Owner", approvalRequest: "Approve exact push" })],
+    actions: [action("push-head", 10, "push", "Push later")],
+  }))], {}, { latestContinuationRecord });
+  assert.equal(gated.readyWork.eligible, false);
+  assert.deepEqual(gated.readyWork.safeActions, []);
+  assert.ok(gated.readyWork.reasonCodes.includes("AUTHORIZATION_REQUIRED"));
+  assert.equal(gated.readyWork.approvalRequest.actionId, "push-head");
+  const blocked = capsule(comments, {
+    relations: { parent: null, subIssues: [], blocks: [], related: [], blockedBy: [{
+      id: "dependency", identifier: "CAP-DEP", title: "Prerequisite", status: "in_progress", version: 1,
+      externalKey: null, projectId: "capstone-dev", priority: "medium", labels: [],
+      assignee: { type: "agent", id: "codex", name: "Codex", avatarUrl: null }, archivedAt: null,
+    }] },
+  }, { latestContinuationRecord });
+  assert.equal(blocked.readyWork.eligible, false);
+  assert.ok(blocked.readyWork.reasonCodes.includes("BLOCKED_BY_INCOMPLETE"));
+  assert.deepEqual(blocked.authorization, omitted.authorization);
+  t.diagnostic(JSON.stringify({ case: "D5", unenrolledTokenEqual: omitted.resumeToken === explicitNull.resumeToken,
+    activeSafeActions: active.readyWork.safeActions.map((item) => item.id),
+    activeDeferredActions: active.readyWork.deferredActions.map((item) => item.id),
+    gatedReasons: gated.readyWork.reasonCodes, blockedReasons: blocked.readyWork.reasonCodes,
+    liveExecution: active.continuation.liveExecution, eligibleForDispatch: active.continuation.eligibleForDispatch }));
+});
+
 function checkpoint(nextAction, overrides = {}) {
   return {
     id: "checkpoint-1",

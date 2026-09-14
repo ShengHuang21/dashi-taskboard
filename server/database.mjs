@@ -9,7 +9,10 @@ import {
   isCanonicalCodexHostId,
 } from "../shared/domain.mjs";
 import { createTaskCapsule, evaluateTaskAuthorization } from "./task-capsule.mjs";
-import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord } from "./task-continuation.mjs";
+import {
+  assessTaskContinuation, continuationBasis, continuationCheckpointOccurrenceId,
+  normalizeContinuationCheckpoint, normalizeContinuationRecord, normalizeOwnedTerminalNotification,
+} from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -883,6 +886,73 @@ function storedThreadBinding(threadBinding, threadId) {
   ];
 }
 
+function goalWindowsFromComments(comments) {
+  const marker = /^\s*```taskboard-goal-windows\b/m;
+  const latest = comments.filter((comment) => marker.test(comment.body ?? ""))
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id))[0];
+  if (!latest) return null;
+  const result = {
+    state: "invalid",
+    sourceCommentId: latest.id,
+    sourceCommentVersion: latest.version,
+    updatedAt: latest.updated_at,
+    sourceRef: null,
+    windows: [],
+    resourceRefs: [],
+  };
+  const blocks = [...latest.body.matchAll(/^\s*```taskboard-goal-windows\s*\r?\n([\s\S]*?)^\s*```\s*$/gm)];
+  // A newer incomplete declaration must not resurrect an older association.
+  if (blocks.length !== 1 || [...latest.body.matchAll(/^\s*```taskboard-goal-windows\b/gm)].length !== 1) return result;
+  let declaration;
+  try {
+    declaration = JSON.parse(blocks[0][1]);
+  } catch {
+    return result;
+  }
+  const text = (value) => typeof value === "string" && value.trim().length > 0;
+  const identity = (value) => text(value) && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+  if (declaration?.version !== 1 || !text(declaration.sourceRef)
+    || !Array.isArray(declaration.windows) || declaration.windows.length === 0
+    || !declaration.windows.every((member) => identity(member?.threadId) && text(member.title)
+      && ["coding", "qa_guide"].includes(member.role))
+    || (declaration.resourceRefs !== undefined && (!Array.isArray(declaration.resourceRefs)
+      || !declaration.resourceRefs.every((ref) => identity(ref?.taskId) && identity(ref.stepId) && identity(ref.allocationId))))) {
+    return result;
+  }
+  const seenWindows = new Set();
+  const windows = declaration.windows.filter((member) => {
+    if (seenWindows.has(member.threadId)) return false;
+    seenWindows.add(member.threadId);
+    return true;
+  }).map((member) => {
+    const binding = member.threadBinding;
+    const complete = binding?.threadId === member.threadId
+      && identity(binding.codexProjectId) && identity(binding.workspacePath)
+      && isCanonicalCodexHostId(binding.codexHostId)
+      && ((binding.codexProjectKind === "local" && binding.codexHostId === "local")
+        || (binding.codexProjectKind === "remote" && binding.codexHostId !== "local"));
+    return {
+      threadId: member.threadId,
+      title: member.title,
+      role: member.role,
+      threadBinding: complete ? {
+        threadId: binding.threadId,
+        codexProjectId: binding.codexProjectId,
+        codexProjectKind: binding.codexProjectKind,
+        codexHostId: binding.codexHostId,
+        workspacePath: binding.workspacePath,
+      } : null,
+    };
+  });
+  const seenAllocations = new Set();
+  const resourceRefs = (declaration.resourceRefs ?? []).filter((ref) => {
+    if (seenAllocations.has(ref.allocationId)) return false;
+    seenAllocations.add(ref.allocationId);
+    return true;
+  }).map(({ taskId, stepId, allocationId }) => ({ taskId, stepId, allocationId }));
+  return { ...result, state: "declared", sourceRef: declaration.sourceRef, windows, resourceRefs };
+}
+
 function attachTaskActivity(task, comments, activities, previewImage = null) {
   const orderedComments = [...comments].sort((left, right) => (
     left.id.localeCompare(right.id)
@@ -955,8 +1025,36 @@ function attachTaskActivity(task, comments, activities, previewImage = null) {
   }
 
   task.conversationRefs = conversationRefs;
+  task.goalWindows = goalWindowsFromComments(comments);
   task.participants = participants;
   task.previewImage = previewImage;
+  task.progressChanges = orderedActivities.flatMap((activity) => (
+    JSON.parse(activity.changes).flatMap((change, index) => {
+      const record = { id: `${activity.id}:${index}`, createdAt: activity.created_at };
+      if (change.field === "status") {
+        if (change.after === "canceled" && change.before !== "canceled") {
+          return [{ ...record, kind: "canceled" }];
+        }
+        if (change.before === "canceled" && change.after !== "canceled") {
+          return [{ ...record, kind: "restored" }];
+        }
+        if (change.before === "done"
+          && ["backlog", "todo", "in_progress", "in_review", "blocked"].includes(change.after)) {
+          return [{ ...record, kind: "reopened" }];
+        }
+      }
+      if (change.field === "relation"
+        && (change.before?.type === "parent" || change.after?.type === "parent")) {
+        return [{
+          ...record,
+          kind: "parent",
+          beforeParentIdentifier: change.before?.type === "parent" ? change.before.identifier : null,
+          afterParentIdentifier: change.after?.type === "parent" ? change.after.identifier : null,
+        }];
+      }
+      return [];
+    })
+  ));
   task.activityKey = JSON.stringify({
     version: 1,
     task: [task.id, task.version, task.updatedAt],
@@ -1480,6 +1578,8 @@ function activationWorkflowProfileCandidate(row) {
 }
 
 export class TaskboardDatabase {
+  #ordinaryDeliveryBuffers = new Map();
+
   constructor(filename, {
     admissionTtlMs = TASK_SAFE_ACTION_ADMISSION_TTL_MS,
     hostExecutorClock = Date.now,
@@ -1808,6 +1908,45 @@ export class TaskboardDatabase {
 
       CREATE INDEX IF NOT EXISTS host_executor_effects_executor
         ON host_executor_effects(executor_instance_id, effect_key);
+
+      CREATE TABLE IF NOT EXISTS resource_steps (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+        action_id TEXT NOT NULL, authorization_comment_id TEXT NOT NULL,
+        authorization_comment_version INTEGER NOT NULL, host_id TEXT NOT NULL,
+        state TEXT NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL,
+        data_json TEXT NOT NULL,
+        UNIQUE(task_id, action_id, authorization_comment_id, authorization_comment_version)
+      );
+      CREATE TABLE IF NOT EXISTS resource_allocations (
+        id TEXT PRIMARY KEY, host_id TEXT NOT NULL, resource_group_key TEXT NOT NULL,
+        kind TEXT NOT NULL, state TEXT NOT NULL, released_at TEXT,
+        version INTEGER NOT NULL, data_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS resource_start_interlocks (
+        effect_key TEXT NOT NULL, dispatch_token TEXT NOT NULL, host_id TEXT NOT NULL,
+        state TEXT NOT NULL, settled_at TEXT,
+        PRIMARY KEY(effect_key, dispatch_token)
+      );
+
+      CREATE TABLE IF NOT EXISTS ordinary_delivery_observations (
+        receipt_id TEXT NOT NULL,
+        admission_attempt_id TEXT NOT NULL,
+        context_json TEXT NOT NULL,
+        effect_key TEXT,
+        request_fingerprint TEXT,
+        dispatch_token TEXT,
+        native_turn_id TEXT,
+        result_recorded_at TEXT,
+        terminal_status TEXT,
+        terminal_observed_at TEXT,
+        PRIMARY KEY (receipt_id, admission_attempt_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS ordinary_delivery_observations_effect
+        ON ordinary_delivery_observations(effect_key, dispatch_token);
+
+      CREATE INDEX IF NOT EXISTS ordinary_delivery_observations_turn
+        ON ordinary_delivery_observations(native_turn_id);
 
       CREATE TABLE IF NOT EXISTS host_executor_proof_nonces (
         nonce TEXT PRIMARY KEY,
@@ -3019,6 +3158,7 @@ export class TaskboardDatabase {
   }
 
   close() {
+    this.#ordinaryDeliveryBuffers.clear();
     this.statementCache.clear();
     this.database.close();
   }
@@ -4251,14 +4391,29 @@ export class TaskboardDatabase {
       return { method, params };
     });
     const operationsJson = JSON.stringify(operations);
+    let ordinaryDelivery;
+    if (Object.hasOwn(rawInput, "ordinaryDelivery")) {
+      const tag = rawInput.ordinaryDelivery;
+      if (!tag || typeof tag !== "object" || Array.isArray(tag)
+        || Object.keys(tag).some((key) => !["receiptId", "admissionAttemptId"].includes(key))
+        || execution.codexHostId !== "local" || operations.length !== 1 || operations[0].method !== "turn/start") {
+        throw new ApiError(400, "INVALID_FIELD", "Ordinary delivery identity requires one local turn/start");
+      }
+      ordinaryDelivery = {
+        receiptId: hostExecutorIdentifier(tag.receiptId, "receiptId"),
+        admissionAttemptId: hostExecutorIdentifier(tag.admissionAttemptId, "admissionAttemptId"),
+      };
+    }
     return {
       effectKey,
       execution,
       operations,
       operationsJson,
+      ordinaryDelivery,
       requestFingerprint: createHash("sha256").update(JSON.stringify({
         codexHostId: execution.codexHostId,
         operations,
+        ...(ordinaryDelivery === undefined ? {} : { ordinaryDelivery }),
       })).digest("hex"),
     };
   }
@@ -4288,6 +4443,164 @@ export class TaskboardDatabase {
       queriedAt: timestamp,
       observationOnly: true,
     };
+  }
+
+  #ordinaryDeliveryContext(row, task) {
+    return {
+      taskId: task.id,
+      projectId: task.projectId,
+      receiptId: row.id,
+      admissionAttemptId: row.admission_attempt_id,
+      safeActionId: row.safe_action_id,
+      resumeTokenHash: createHash("sha256").update(row.resume_token).digest("hex"),
+      rootHostId: row.root_host_id,
+      rootThreadId: row.root_thread_id,
+      rootWorkspacePath: row.root_workspace_path,
+      worktreePath: row.worktree_path,
+      worktreeBranch: row.worktree_branch,
+      globalCoordinatorLeaseId: row.global_coordinator_lease_id,
+      globalCoordinatorTaskId: row.global_coordinator_task_id,
+      globalCoordinatorThreadId: row.global_coordinator_thread_id,
+      coordinationDomainId: row.coordination_domain_id,
+      domainCoordinatorLeaseId: row.domain_coordinator_lease_id,
+      domainCoordinatorTaskId: row.domain_coordinator_task_id,
+      domainCoordinatorThreadId: row.domain_coordinator_thread_id,
+    };
+  }
+
+  // Only optional observation writes belong here; identity validation must stay outside this savepoint.
+  #writeOrdinaryDeliveryObservation(write) {
+    let opened = false;
+    try {
+      this.database.exec("SAVEPOINT ordinary_delivery_observation");
+      opened = true;
+      const result = write();
+      this.database.exec("RELEASE ordinary_delivery_observation");
+      return result;
+    } catch {
+      if (opened) {
+        this.database.exec("ROLLBACK TO ordinary_delivery_observation; RELEASE ordinary_delivery_observation");
+      }
+      return null;
+    }
+  }
+
+  #validateOrdinaryDelivery(input) {
+    if (!input.ordinaryDelivery) return null;
+    const { receiptId, admissionAttemptId } = input.ordinaryDelivery;
+    const row = this.#prepare("SELECT * FROM task_safe_action_receipts WHERE id = ?").get(receiptId);
+    if (!row || row.admission_attempt_id !== admissionAttemptId || row.status !== "delivering"
+      || row.admission_state !== "awaiting_admission" || row.delivery_turn_id !== null
+      || row.root_host_id !== "local" || input.operations[0].params.threadId !== row.root_thread_id) {
+      throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The exact ordinary delivering attempt and target are required");
+    }
+    const task = this.#requireTask(row.task_id);
+    const rootRun = this.#rootAgentRunBinding(task, row.root_thread_id);
+    this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+    if (rootRun.rootHostId !== row.root_host_id || rootRun.rootWorkspacePath !== row.root_workspace_path
+      || rootRun.worktreePath !== row.worktree_path || rootRun.worktreeBranch !== row.worktree_branch
+      || this.getTaskCapsule(task.id).resumeToken !== row.resume_token) {
+      throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The current ordinary delivery context changed");
+    }
+    // Absence is not permission to recreate history; validation above still applies.
+    const observation = this.#prepare(`
+      SELECT * FROM ordinary_delivery_observations WHERE receipt_id = ? AND admission_attempt_id = ?
+    `).get(receiptId, admissionAttemptId);
+    if (!observation) return null;
+    const { confirmedAt, ...frozenContext } = JSON.parse(observation.context_json);
+    if (JSON.stringify(frozenContext) !== JSON.stringify(this.#ordinaryDeliveryContext(row, task))
+      || (observation.effect_key !== null && (observation.effect_key !== input.effectKey
+        || observation.request_fingerprint !== input.requestFingerprint))) {
+      throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The attempt already has another frozen context or effect");
+    }
+    return observation;
+  }
+
+  #bindOrdinaryDelivery(input, observation, dispatchToken) {
+    if (!observation) return null;
+    return this.#writeOrdinaryDeliveryObservation(() => {
+      const result = this.#prepare(`
+        UPDATE ordinary_delivery_observations SET effect_key = ?, request_fingerprint = ?, dispatch_token = ?
+        WHERE receipt_id = ? AND admission_attempt_id = ? AND dispatch_token IS NULL AND native_turn_id IS NULL
+      `).run(input.effectKey, input.requestFingerprint, dispatchToken,
+        observation.receipt_id, observation.admission_attempt_id);
+      if (result.changes !== 1) return null;
+      return { threadId: JSON.parse(observation.context_json).rootThreadId, candidates: new Map(), overflow: false };
+    });
+  }
+
+  recordOrdinaryDeliveryTerminal(notification) {
+    const terminal = normalizeOwnedTerminalNotification(notification);
+    if (!terminal) return;
+    for (const buffer of this.#ordinaryDeliveryBuffers.values()) {
+      if (buffer.threadId !== terminal.threadId || buffer.overflow || buffer.candidates.has(terminal.turnId)) continue;
+      if (buffer.candidates.size === 32) {
+        buffer.candidates.clear();
+        buffer.overflow = true;
+      } else {
+        buffer.candidates.set(terminal.turnId, terminal);
+      }
+    }
+    this.#writeOrdinaryDeliveryObservation(() => {
+      this.#prepare(`
+        UPDATE ordinary_delivery_observations SET terminal_status = ?, terminal_observed_at = ?
+        WHERE native_turn_id = ? AND terminal_status IS NULL
+          AND json_extract(context_json, '$.rootHostId') = 'local'
+          AND json_extract(context_json, '$.rootThreadId') = ?
+      `).run(terminal.turnStatus, now(), terminal.turnId, terminal.threadId);
+    });
+  }
+
+  #completeOrdinaryDelivery(effectKey, dispatchToken, results, timestamp) {
+    this.#writeOrdinaryDeliveryObservation(() => {
+      if (!Array.isArray(results) || results.length !== 1) return;
+      const turnId = hostExecutorIdentifier(results[0]?.turn?.id, "turnId");
+      const updated = this.#prepare(`
+        UPDATE ordinary_delivery_observations SET native_turn_id = ?, result_recorded_at = ?
+        WHERE effect_key = ? AND dispatch_token = ? AND native_turn_id IS NULL
+      `).run(turnId, timestamp, effectKey, dispatchToken);
+      if (updated.changes !== 1) return;
+      const early = this.#ordinaryDeliveryBuffers.get(dispatchToken)?.candidates.get(turnId);
+      if (early) {
+        this.#prepare(`
+          UPDATE ordinary_delivery_observations SET terminal_status = ?, terminal_observed_at = ?
+          WHERE effect_key = ? AND dispatch_token = ? AND terminal_status IS NULL
+        `).run(early.turnStatus, timestamp, effectKey, dispatchToken);
+      }
+    });
+  }
+
+  #recordedDeliveryObservation(row) {
+    try {
+      const observation = this.#prepare(`
+        SELECT * FROM ordinary_delivery_observations WHERE receipt_id = ? AND admission_attempt_id = ?
+      `).get(row.id, row.admission_attempt_id);
+      if (!observation) return null;
+      const { resumeTokenHash, confirmedAt, ...context } = JSON.parse(observation.context_json);
+      let currentAdmissionContextMatches = false;
+      try {
+        const task = this.#requireTask(row.task_id);
+        const current = this.#ordinaryDeliveryContext(row, task);
+        const rootRun = this.#rootAgentRunBinding(task, row.root_thread_id);
+        this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
+        currentAdmissionContextMatches = JSON.stringify({ ...current, confirmedAt }) === observation.context_json
+          && rootRun.rootHostId === row.root_host_id && rootRun.rootWorkspacePath === row.root_workspace_path
+          && rootRun.worktreePath === row.worktree_path && rootRun.worktreeBranch === row.worktree_branch
+          && this.getTaskCapsule(task.id).resumeToken === row.resume_token;
+      } catch { /* Historical observation is still readable when its current binding is unavailable. */ }
+      return {
+        ...context, confirmedAt,
+        ...(observation.native_turn_id === null ? {} : {
+          nativeResult: { turnId: observation.native_turn_id, recordedAt: observation.result_recorded_at },
+        }),
+        ...(observation.terminal_status === null ? {} : {
+          terminal: { turnId: observation.native_turn_id, turnStatus: observation.terminal_status, observedAt: observation.terminal_observed_at },
+        }),
+        currentAdmissionContextMatches, observationOnly: true, liveExecution: "unknown", eligibleForDispatch: false,
+      };
+    } catch {
+      return null;
+    }
   }
 
   reserveHostExecutorEffect(rawInput) {
@@ -4341,6 +4654,7 @@ export class TaskboardDatabase {
             "The Codex RPC effect was already dispatched and requires observation",
           );
         }
+        this.#validateOrdinaryDelivery(input);
         if (existing.executor_instance_id !== execution.executorInstanceId
           || existing.registration_fingerprint !== execution.registrationFingerprint
           || existing.lease_id !== execution.leaseId) {
@@ -4364,6 +4678,7 @@ export class TaskboardDatabase {
         this.database.exec("COMMIT");
         return { applied: false, replayed: false, effect: hostExecutorEffectFromRow(rebound) };
       }
+      this.#validateOrdinaryDelivery(input);
       this.#prepare(`
         INSERT INTO host_executor_effects (
           effect_key, codex_host_id, executor_instance_id, registration_fingerprint,
@@ -4448,6 +4763,12 @@ export class TaskboardDatabase {
         );
       }
       const dispatchToken = randomUUID();
+      const ordinaryObservation = this.#validateOrdinaryDelivery(input);
+      if (input.operations.some((operation) => ["turn/start", "turn/steer"].includes(operation.method))) {
+        if (this.#resourceHostHeld(execution.codexHostId)) this.#resourceError("waiting_resource_allocation_release");
+        this.#prepare("INSERT INTO resource_start_interlocks VALUES (?, ?, ?, 'in_flight', NULL)")
+          .run(input.effectKey, dispatchToken, execution.codexHostId);
+      }
       this.#prepare(`
         UPDATE host_executor_effects
         SET status = 'dispatched', dispatch_token = ?, updated_at = ?
@@ -4456,7 +4777,9 @@ export class TaskboardDatabase {
       const dispatched = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(input.effectKey);
+      const ordinaryBuffer = this.#bindOrdinaryDelivery(input, ordinaryObservation, dispatchToken);
       this.database.exec("COMMIT");
+      if (ordinaryBuffer) this.#ordinaryDeliveryBuffers.set(dispatchToken, ordinaryBuffer);
       return {
         dispatch: true,
         replayed: false,
@@ -4499,6 +4822,21 @@ export class TaskboardDatabase {
           SET status = 'completed', result_json = ?, updated_at = ?
           WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
         `).run(resultJson, timestamp, effectKey, dispatchToken);
+        this.database.exec("SAVEPOINT continuation_effect_origin");
+        try {
+          this.#recordContinuationEffectOrigins(row, result, timestamp);
+          this.database.exec("RELEASE continuation_effect_origin");
+        } catch {
+          // Observation failure must not turn an already-successful native RPC into an uncertain effect.
+          this.database.exec("ROLLBACK TO continuation_effect_origin; RELEASE continuation_effect_origin");
+        }
+        this.#completeOrdinaryDelivery(effectKey, dispatchToken, result, timestamp);
+        const operations = JSON.parse(row.operations_json);
+        const accepted = operations.every((operation, index) => !["turn/start", "turn/steer"].includes(operation.method)
+          || (typeof (result?.[index]?.turn?.id ?? result?.[index]?.turnId) === "string"
+            && (result[index].turn?.id ?? result[index].turnId).length > 0));
+        this.#prepare("UPDATE resource_start_interlocks SET state = ?, settled_at = ? WHERE effect_key = ? AND dispatch_token = ?")
+          .run(accepted ? "settled" : "unknown_start", accepted ? timestamp : null, effectKey, dispatchToken);
       } else if (row.result_json !== resultJson) {
         throw new ApiError(
           409,
@@ -4514,6 +4852,46 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#ordinaryDeliveryBuffers.delete(dispatchToken);
+    }
+  }
+
+  #recordContinuationEffectOrigins(effect, results, recordedAt) {
+    if (effect.codex_host_id !== "local" || effect.adapter_id !== LOCAL_HOST_EXECUTOR_ADAPTER_ID) return;
+    const operations = JSON.parse(effect.operations_json);
+    if (!Array.isArray(operations) || operations.length !== 1 || operations[0]?.method !== "turn/start"
+      || !Array.isArray(results) || results.length !== 1) return;
+    const threadId = hostExecutorIdentifier(operations[0].params?.threadId, "threadId");
+    const turnId = hostExecutorIdentifier(results[0]?.turn?.id, "turnId");
+    const source = "taskboard-local-host-effect-completion";
+    const enrolled = this.#prepare(`
+      SELECT tasks.id FROM tasks
+      WHERE thread_id = ? AND thread_codex_host_id = 'local'
+        AND EXISTS (
+          SELECT 1 FROM agent_event_receipts
+          WHERE task_id = tasks.id AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+        )
+    `).all(threadId);
+    for (const { id } of enrolled) {
+      const context = this.#taskContinuationContext(id);
+      const binding = context.capsule.execution.threadBinding;
+      if (!binding || binding.codexHostId !== "local" || binding.threadId !== threadId) continue;
+      const projectId = context.capsule.task.projectId;
+      const eventId = `continuation-effect-origin:v1:${createHash("sha256").update(JSON.stringify([
+        source, id, projectId, "local", effect.effect_key, effect.request_fingerprint,
+        effect.dispatch_token, 0, threadId, turnId,
+      ])).digest("hex")}`;
+      if (this.#prepare("SELECT 1 FROM agent_event_receipts WHERE event_id = ?").get(eventId)) continue;
+      const event = {
+        eventId, eventType: "continuation_effect_origin", taskId: id, projectId, source, codexHostId: "local",
+        threadId, turnId, effectKey: effect.effect_key, requestFingerprint: effect.request_fingerprint,
+        operationIndex: 0, continuationRecordId: context.record.eventId, bindingAtObservation: binding, recordedAt,
+      };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+        VALUES (?, ?, ?, NULL, ?, ?)
+      `).run(eventId, projectId, id, JSON.stringify(event), recordedAt);
     }
   }
 
@@ -4543,6 +4921,8 @@ export class TaskboardDatabase {
         UPDATE host_executor_effects SET status = 'uncertain', updated_at = ?
         WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
       `).run(timestamp, effectKey, dispatchToken);
+      this.#prepare("UPDATE resource_start_interlocks SET state = 'unknown_start' WHERE effect_key = ? AND dispatch_token = ? AND state = 'in_flight'")
+        .run(effectKey, dispatchToken);
       const uncertain = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
@@ -4551,6 +4931,8 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#ordinaryDeliveryBuffers.delete(dispatchToken);
     }
   }
 
@@ -4581,6 +4963,14 @@ export class TaskboardDatabase {
         SET status = 'reserved', dispatch_token = NULL, updated_at = ?
         WHERE effect_key = ? AND dispatch_token = ? AND status = 'dispatched'
       `).run(timestamp, effectKey, dispatchToken);
+      this.#prepare("UPDATE resource_start_interlocks SET state = 'settled', settled_at = ? WHERE effect_key = ? AND dispatch_token = ?")
+        .run(timestamp, effectKey, dispatchToken);
+      this.#writeOrdinaryDeliveryObservation(() => {
+        this.#prepare(`
+          UPDATE ordinary_delivery_observations SET effect_key = NULL, request_fingerprint = NULL, dispatch_token = NULL
+          WHERE effect_key = ? AND dispatch_token = ? AND native_turn_id IS NULL
+        `).run(effectKey, dispatchToken);
+      });
       const reserved = this.#prepare(`
         SELECT * FROM host_executor_effects WHERE effect_key = ?
       `).get(effectKey);
@@ -4589,6 +4979,8 @@ export class TaskboardDatabase {
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#ordinaryDeliveryBuffers.delete(dispatchToken);
     }
   }
 
@@ -10161,6 +10553,7 @@ export class TaskboardDatabase {
       globalCoordinatorFrontier,
       dependencyClearances: this.listCrossDomainDependencyClearances(task.id),
       latestContinuationRecord: this.#latestTaskContinuation(task.id),
+      resourceSteps: this.#recordedResourceSteps(task.id),
     };
   }
 
@@ -10182,10 +10575,641 @@ export class TaskboardDatabase {
     return { capsule, evaluation, currentClaim: inputs.currentClaim, record: inputs.latestContinuationRecord };
   }
 
+  #resourceTransaction(operation) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const result = operation();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #resourceError(reason) {
+    throw new ApiError(409, reason, reason);
+  }
+
+  #resourceOwner(taskId, input, requireActive = true) {
+    const task = this.#requireTask(taskId);
+    const run = this.#requireTaskAgentRun(input.runId ?? input.ownerRunId);
+    if (run.taskId !== task.id || run.agentThreadId !== input.ownerThreadId) {
+      this.#resourceError("resource_step_run_binding_required");
+    }
+    if (requireActive) {
+      const root = this.#rootAgentRunBinding(task, run.rootThreadId);
+      this.#assertTaskAgentRunBinding(run, task, root);
+      const claim = this.getAgentTaskClaim(task.id);
+      if (!["active", "blocked"].includes(run.status) || root.rootHostId !== "local"
+        || claim?.status !== "active" || claim.agentThreadId !== run.agentThreadId
+        || !Number.isFinite(Date.parse(claim.leaseExpiresAt)) || Date.parse(claim.leaseExpiresAt) <= Date.now()
+        || input.hostId !== root.rootHostId || input.worktreePath !== run.worktree.path
+        || input.worktreeBranch !== run.worktree.branch) {
+        this.#resourceError("resource_step_run_binding_required");
+      }
+    }
+    return { task, run };
+  }
+
+  #resourceAuthorized(step) {
+    const { task, run } = this.#resourceOwner(step.taskId, step);
+    const { capsule, evaluation, record } = this.#taskContinuationContext(task.id);
+    if (task.archivedAt || ["done", "canceled"].includes(task.status)
+      || (record && record.status !== "active")
+      || capsule.relations.blockedBy.some((dependency) => dependency.status !== "done")
+      || capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED")) {
+      this.#resourceError("resource_step_current_scope_blocked");
+    }
+    if (evaluation.effectiveAuthorization.state !== "valid"
+      || evaluation.effectiveAuthorization.source?.commentId !== step.authorizationSource.commentId
+      || evaluation.effectiveAuthorization.source?.commentVersion !== step.authorizationSource.commentVersion) {
+      this.#resourceError("resource_step_authorization_required");
+    }
+    const action = evaluation.pendingActions.find((candidate) => candidate.id === step.actionId);
+    const gate = action ? evaluation.gatesById.get(action.gate) : null;
+    if (!action || !gate || gate.state !== "authorized" || gate.expired
+      || gate.kind !== "test"
+      || action.target !== `resource-command:sha256:${step.commandDigest}`) {
+      this.#resourceError("resource_step_action_scope_required");
+    }
+    return { task, run };
+  }
+
+  #resourceStep(row) {
+    return row ? { ...JSON.parse(row.data_json), id: row.id, state: row.state, version: row.version, createdAt: row.created_at } : null;
+  }
+
+  #resourceAllocation(row) {
+    return row ? { ...JSON.parse(row.data_json), id: row.id, kind: row.kind, state: row.state,
+      version: row.version, releasedAt: row.released_at } : null;
+  }
+
+  #getResourceAllocation(id) {
+    return this.#resourceAllocation(this.#prepare("SELECT * FROM resource_allocations WHERE id = ?").get(id));
+  }
+
+  #saveResourceStep(step, state = step.state) {
+    const result = this.#prepare(`UPDATE resource_steps SET state = ?, version = version + 1, data_json = ?
+      WHERE id = ? AND version = ?`).run(state, JSON.stringify(step), step.id, step.version);
+    if (result.changes !== 1) this.#resourceError("resource_step_version_conflict");
+    return this.#resourceStep(this.#prepare("SELECT * FROM resource_steps WHERE id = ?").get(step.id));
+  }
+
+  getResourceStep(taskId, stepId) {
+    const task = this.#requireTask(taskId);
+    const step = this.#resourceStep(this.#prepare("SELECT * FROM resource_steps WHERE id = ? AND task_id = ?").get(stepId, task.id));
+    if (!step) throw new ApiError(404, "resource_step_not_found", "Resource step not found");
+    return { step, allocation: step.allocationId ? this.#getResourceAllocation(step.allocationId) : null,
+      environment: step.demand?.environmentAllocationId ? this.#getResourceAllocation(step.demand.environmentAllocationId) : null,
+      executionOutcome: step.state === "start_consumed" ? "start_uncertain" : step.state,
+      waitingReason: step.waitingReason ?? null };
+  }
+
+  #recordedResourceSteps(taskId) {
+    return this.#prepare("SELECT id FROM resource_steps WHERE task_id = ? ORDER BY created_at, id")
+      .all(taskId).map(({ id }) => {
+        const { step, allocation, executionOutcome, waitingReason } = this.getResourceStep(taskId, id);
+        return {
+          stepId: step.id,
+          taskId: step.taskId,
+          runId: step.runId,
+          actionId: step.actionId,
+          ownerThreadId: step.ownerThreadId,
+          state: step.state,
+          version: step.version,
+          createdAt: step.createdAt,
+          authorizationSource: {
+            commentId: step.authorizationSource.commentId,
+            commentVersion: step.authorizationSource.commentVersion,
+          },
+          environmentAllocationId: step.demand.environmentAllocationId,
+          allocationId: step.allocationId ?? null,
+          executionOutcome,
+          waitingReason,
+          grantedAt: step.grantedAt ?? null,
+          consumedAt: step.consumedAt ?? null,
+          resultRecordedAt: step.resultRecordedAt ?? null,
+          result: step.result ? {
+            outcome: step.result.outcome,
+            exitCode: step.result.exitCode,
+            signal: step.result.signal,
+            sourceRef: step.result.sourceRef,
+          } : null,
+          allocation: allocation ? {
+            id: allocation.id,
+            kind: allocation.kind,
+            state: allocation.state,
+            version: allocation.version,
+            ownerRunId: allocation.ownerRunId,
+            ownerThreadId: allocation.ownerThreadId,
+            releasedAt: allocation.releasedAt,
+          } : null,
+          getCommand: `taskctl resource-step get ${taskId} ${step.id} --json`,
+        };
+      });
+  }
+
+  listResourceSteps(projectId) {
+    return this.#prepare(`SELECT resource_steps.* FROM resource_steps JOIN tasks ON tasks.id = resource_steps.task_id
+      WHERE tasks.project_id = ? AND resource_steps.state IN ('queued','reserved') ORDER BY resource_steps.created_at, resource_steps.id`)
+      .all(projectId).map((row) => this.#resourceStep(row));
+  }
+
+  registerResourceStep(taskId, input) {
+    return this.#resourceTransaction(() => {
+      const { task, run } = this.#resourceOwner(taskId, input);
+      const id = (value, field) => hostExecutorIdentifier(value, field);
+      if (!/^[a-f0-9]{64}$/.test(input.commandDigest ?? "")) this.#resourceError("resource_step_action_scope_required");
+      const demand = {
+        cpuUnits: input.demand?.cpuUnits, hostPeakMemoryBytes: input.demand?.hostPeakMemoryBytes,
+        environmentCpuUnits: input.demand?.environmentCpuUnits,
+        environmentPeakMemoryBytes: input.demand?.environmentPeakMemoryBytes,
+        environmentAllocationId: id(input.demand?.environmentAllocationId, "environmentAllocationId"),
+      };
+      if (![demand.cpuUnits, demand.environmentCpuUnits].every((value) => Number.isFinite(value) && value > 0 && value <= 4096)
+        || ![demand.hostPeakMemoryBytes, demand.environmentPeakMemoryBytes].every((value) => Number.isSafeInteger(value) && value > 0)) {
+        this.#resourceError("resource_step_demand_required");
+      }
+      const authorizationSource = {
+        commentId: id(input.authorizationSource?.commentId, "authorizationCommentId"),
+        commentVersion: input.authorizationSource?.commentVersion,
+      };
+      if (!Number.isSafeInteger(authorizationSource.commentVersion) || authorizationSource.commentVersion < 1) {
+        this.#resourceError("resource_step_authorization_required");
+      }
+      const immutable = {
+        taskId: task.id, projectId: task.projectId, runId: run.id, ownerThreadId: run.agentThreadId,
+        rootThreadId: run.rootThreadId, hostId: input.hostId, worktreePath: run.worktree.path,
+        worktreeBranch: run.worktree.branch, actionId: id(input.actionId, "actionId"), authorizationSource,
+        commandDigest: input.commandDigest, demand,
+        demandDigest: createHash("sha256").update(JSON.stringify(demand)).digest("hex"),
+      };
+      const existing = this.#resourceStep(this.#prepare(`SELECT * FROM resource_steps WHERE task_id = ? AND action_id = ?
+        AND authorization_comment_id = ? AND authorization_comment_version = ?`)
+        .get(task.id, immutable.actionId, authorizationSource.commentId, authorizationSource.commentVersion));
+      if (existing) {
+        if (JSON.stringify(existing.request) !== JSON.stringify(immutable)) this.#resourceError("resource_step_request_conflict");
+        return this.getResourceStep(task.id, existing.id);
+      }
+      const older = this.#prepare("SELECT * FROM resource_steps WHERE task_id = ? AND action_id = ?").all(task.id, immutable.actionId);
+      if (older.length) this.#resourceError("resource_step_reconciliation_required");
+      this.#resourceAuthorized(immutable);
+      const stepId = randomUUID();
+      this.#prepare(`INSERT INTO resource_steps VALUES (?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?)`)
+        .run(stepId, task.id, immutable.actionId, authorizationSource.commentId, authorizationSource.commentVersion,
+          immutable.hostId, now(), JSON.stringify({ ...immutable, request: immutable, waitingReason: "waiting_checkpoint" }));
+      return this.getResourceStep(task.id, stepId);
+    });
+  }
+
+  waitResourceStep(taskId, stepId, input) {
+    return this.#resourceTransaction(() => {
+      const { step } = this.getResourceStep(taskId, stepId);
+      this.#resourceOwner(taskId, { ...step, ownerThreadId: input.ownerThreadId });
+      if (step.version !== input.stepVersion) this.#resourceError("resource_step_version_conflict");
+      if (!["queued", "reserved"].includes(step.state)) return this.getResourceStep(taskId, stepId);
+      this.#resourceAuthorized(step);
+      const waitAttemptId = hostExecutorIdentifier(input.waitAttemptId, "waitAttemptId");
+      const timestamp = Date.now();
+      if (step.waiter && step.waiter.waitAttemptId !== waitAttemptId
+        && (Date.parse(step.waiter.validUntil) > timestamp || step.state === "reserved")) {
+        this.#resourceError("resource_step_waiter_conflict");
+      }
+      const checkpoint = hostExecutorIdentifier(input.checkpoint, "checkpoint");
+      step.waiter = { waitAttemptId, checkpoint, observedAt: new Date(timestamp).toISOString(), validUntil: new Date(timestamp + 60_000).toISOString() };
+      this.#saveResourceStep(step);
+      return this.getResourceStep(taskId, stepId);
+    });
+  }
+
+  consumeResourceStep(taskId, stepId, input) {
+    return this.#resourceTransaction(() => {
+      const { step, allocation } = this.getResourceStep(taskId, stepId);
+      this.#resourceOwner(taskId, { ...step, ownerThreadId: input.ownerThreadId });
+      if (["start_consumed", "start_uncertain", "result_recorded"].includes(step.state)) {
+        return { ...this.getResourceStep(taskId, stepId), execute: false };
+      }
+      this.#resourceAuthorized(step);
+      this.#requireActiveHostExecutorFence(step.grantExecution);
+      const environment = this.#getResourceAllocation(step.demand.environmentAllocationId);
+      if (step.state !== "reserved" || step.version !== input.stepVersion || step.grantId !== input.grantId
+        || allocation?.id !== input.allocationId || allocation.version !== input.allocationVersion || allocation.releasedAt
+        || step.waiter?.waitAttemptId !== input.waitAttemptId || Date.parse(step.waiter.validUntil) <= Date.now()
+        || Date.parse(step.grantedAt) + 60_000 <= Date.now()
+        || !environment || environment.version !== step.environmentVersion || environment.state !== "available"
+        || Date.parse(environment.validUntil) <= Date.now()) this.#resourceError("resource_step_grant_stale");
+      step.consumeId = randomUUID();
+      step.consumedAt = now();
+      this.#saveResourceStep(step, "start_consumed");
+      return { ...this.getResourceStep(taskId, stepId), execute: true, consumeId: step.consumeId };
+    });
+  }
+
+  recordResourceStepResult(taskId, stepId, input) {
+    return this.#resourceTransaction(() => {
+      const { step } = this.getResourceStep(taskId, stepId);
+      this.#resourceOwner(taskId, { ...step, ownerThreadId: input.ownerThreadId }, false);
+      if (step.consumeId !== input.consumeId || !["start_consumed", "start_uncertain", "result_recorded"].includes(step.state)) {
+        this.#resourceError("resource_step_result_conflict");
+      }
+      const result = { outcome: input.outcome, exitCode: input.exitCode ?? null,
+        signal: input.signal == null ? null : hostExecutorIdentifier(input.signal, "signal"), sourceRef: hostExecutorIdentifier(input.sourceRef, "sourceRef") };
+      if (!["exited", "no_start", "start_uncertain"].includes(result.outcome)
+        || (result.exitCode !== null && !Number.isInteger(result.exitCode))) this.#resourceError("resource_step_result_required");
+      if (step.result) {
+        if (JSON.stringify(step.result) !== JSON.stringify(result)) this.#resourceError("resource_step_result_conflict");
+        return this.getResourceStep(taskId, stepId);
+      }
+      if (step.version !== input.stepVersion) this.#resourceError("resource_step_version_conflict");
+      step.result = result;
+      step.resultRecordedAt = now();
+      this.#saveResourceStep(step, result.outcome === "start_uncertain" ? "start_uncertain" : "result_recorded");
+      return this.getResourceStep(taskId, stepId);
+    });
+  }
+
+  checkpointResourceAllocation(allocationId, input) {
+    return this.#resourceTransaction(() => {
+      const existing = this.#getResourceAllocation(allocationId);
+      const { task, run } = this.#resourceOwner(input.taskId, input, !existing || input.state !== "released");
+      if (existing && (existing.ownerRunId !== run.id || existing.ownerThreadId !== input.ownerThreadId)) {
+        this.#resourceError("resource_allocation_owner_conflict");
+      }
+      if (input.source !== "owner_declaration" || !["held", "available", "released"].includes(input.state)
+        || input.version !== (existing?.version ?? 0)) this.#resourceError("environment_observation_required");
+      const timestamp = Date.now();
+      if (!Number.isFinite(Date.parse(input.declaredAt)) || Date.parse(input.declaredAt) > timestamp
+        || timestamp - Date.parse(input.declaredAt) > 60_000
+        || !Number.isFinite(Date.parse(input.validUntil)) || Date.parse(input.validUntil) <= timestamp) {
+        this.#resourceError("environment_observation_required");
+      }
+      if (existing?.releasedAt && existing.kind === "heavy") this.#resourceError("resource_allocation_already_released");
+      if (existing?.state === "held" && input.state === "available") this.#resourceError("resource_allocation_release_required");
+      if (existing?.kind === "heavy" && input.state !== "released") this.#resourceError("resource_allocation_release_required");
+      const resourceGroupKey = hostExecutorIdentifier(input.resourceGroupKey, "resourceGroupKey");
+      const environmentKey = hostExecutorIdentifier(input.environmentKey, "environmentKey");
+      if (existing && (existing.hostId !== input.hostId || existing.resourceGroupKey !== resourceGroupKey
+        || existing.environmentKey !== environmentKey)) this.#resourceError("resource_allocation_identity_conflict");
+      if (!existing && this.#prepare(`SELECT 1 FROM resource_allocations WHERE host_id = ? AND resource_group_key = ?
+        AND kind = 'environment' AND released_at IS NULL`).get(input.hostId, resourceGroupKey)) {
+        this.#resourceError("resource_allocation_identity_conflict");
+      }
+      if (!Number.isFinite(input.capacityCpuUnits) || input.capacityCpuUnits <= 0
+        || !Number.isSafeInteger(input.capacityMemoryBytes) || input.capacityMemoryBytes <= 0
+        || !Array.isArray(input.exclusiveKeys) || input.exclusiveKeys.length > 32) this.#resourceError("environment_observation_required");
+      const exclusiveKeys = [...new Set(input.exclusiveKeys.map((key) => hostExecutorIdentifier(key, "exclusiveKey")))].sort();
+      if (existing && JSON.stringify(existing.exclusiveKeys) !== JSON.stringify(exclusiveKeys)) this.#resourceError("resource_allocation_identity_conflict");
+      const declaration = {
+        ...existing, taskId: task.id, ownerRunId: run.id, ownerThreadId: input.ownerThreadId,
+        hostId: input.hostId, environmentKey, resourceGroupKey, exclusiveKeys,
+        source: "owner_declaration", sourceRef: hostExecutorIdentifier(input.sourceRef, "sourceRef"),
+        sourceVersion: input.sourceVersion, declaredAt: input.declaredAt, validUntil: input.validUntil,
+        lastReleasedAt: input.state === "released" ? now() : existing?.lastReleasedAt ?? null,
+        capacityCpuUnits: input.capacityCpuUnits, capacityMemoryBytes: input.capacityMemoryBytes,
+      };
+      if (!Number.isSafeInteger(input.sourceVersion) || input.sourceVersion < 1) this.#resourceError("environment_observation_required");
+      const releasedAt = input.state === "released" ? now() : null;
+      if (existing) {
+        this.#prepare(`UPDATE resource_allocations SET state = ?, released_at = ?, version = version + 1, data_json = ? WHERE id = ?`)
+          .run(input.state, releasedAt, JSON.stringify(declaration), allocationId);
+      } else {
+        this.#prepare("INSERT INTO resource_allocations VALUES (?, ?, ?, 'environment', ?, ?, 1, ?)")
+          .run(hostExecutorIdentifier(allocationId, "allocationId"), input.hostId, resourceGroupKey, input.state, releasedAt, JSON.stringify(declaration));
+      }
+      return { allocation: this.#getResourceAllocation(allocationId) };
+    });
+  }
+
+  #resourceHostHeld(hostId) {
+    return Boolean(this.#prepare(`SELECT 1 FROM resource_allocations WHERE host_id = ? AND released_at IS NULL
+      AND (kind = 'heavy' OR state = 'held') LIMIT 1`).get(hostId));
+  }
+
+  admitResourceSteps(hostId, input) {
+    return this.#resourceTransaction(() => {
+      const { execution, observedAtMs } = this.#requireActiveHostExecutorFence(input.hostExecutorExecution);
+      if (execution.codexHostId !== hostId || hostId !== "local") this.#resourceError("resource_host_fence_required");
+      const waiting = (reason) => {
+        for (const row of this.#prepare("SELECT * FROM resource_steps WHERE host_id = ? AND state = 'queued'").all(hostId)) {
+          const step = this.#resourceStep(row);
+          if (step.waitingReason !== reason) this.#saveResourceStep({ ...step, waitingReason: reason });
+        }
+        return { granted: false, reason };
+      };
+      if (this.#resourceHostHeld(hostId)) return waiting("waiting_resource_allocation_release");
+      if (this.#prepare(`SELECT 1 FROM resource_start_interlocks WHERE host_id = ?
+        AND state IN ('in_flight','unknown_start') LIMIT 1`).get(hostId)) return waiting("waiting_ordinary_start_observation");
+      const settlement = this.#prepare(`SELECT MAX(value) AS value FROM (
+        SELECT settled_at AS value FROM resource_start_interlocks WHERE host_id = ?
+        UNION ALL SELECT json_extract(data_json, '$.lastReleasedAt') AS value FROM resource_allocations WHERE host_id = ?
+      )`).get(hostId, hostId).value;
+      const observation = input.observation;
+      const cpu = observation?.cpu;
+      const memory = observation?.memory;
+      const observationAt = Date.parse(observation?.observedAt ?? "");
+      const policy = input.policy;
+      if (observation?.schemaVersion !== 1 || observation?.source !== "resident-injector" || observation.hostId !== hostId
+        || !Number.isFinite(observationAt) || observationAt > observedAtMs || observedAtMs - observationAt > 60_000
+        || !Number.isFinite(cpu?.busyRatio) || cpu.busyRatio < 0 || cpu.busyRatio > 1
+        || !Number.isInteger(cpu.capacity) || cpu.capacity < 1 || !Number.isInteger(cpu.sampleWindowMs)
+        || cpu.sampleWindowMs < 1 || cpu.sampleWindowMs > 60_000
+        || !Number.isSafeInteger(memory?.totalBytes) || memory.totalBytes <= 0
+        || !Number.isSafeInteger(memory.availableBytes) || memory.availableBytes < 0 || memory.availableBytes > memory.totalBytes
+        || !Number.isFinite(policy?.targetCpuRatio) || policy.targetCpuRatio <= 0 || policy.targetCpuRatio >= 1
+        || !Number.isFinite(policy.memoryReserveRatio) || policy.memoryReserveRatio <= 0 || policy.memoryReserveRatio >= 1
+        || !Number.isSafeInteger(policy.minimumMemoryReserveBytes) || policy.minimumMemoryReserveBytes < 0) {
+        return waiting("resource_host_observation_required");
+      }
+      if (settlement && observationAt - cpu.sampleWindowMs <= Date.parse(settlement)) {
+        return waiting("resource_post_start_observation_required");
+      }
+      const cpuHeadroom = Math.max(0, cpu.capacity * (policy.targetCpuRatio - cpu.busyRatio));
+      const memoryHeadroom = Math.max(0, memory.availableBytes - Math.max(policy.minimumMemoryReserveBytes, memory.totalBytes * policy.memoryReserveRatio));
+      const candidates = [];
+      const priorities = { urgent: 0, high: 1, medium: 2, low: 3, none: 4 };
+      const rows = this.#prepare("SELECT * FROM resource_steps WHERE host_id = ? AND state = 'queued' ORDER BY created_at, id").all(hostId);
+      let reason = "resource_step_no_ready_waiter";
+      for (const row of rows) {
+        const step = this.#resourceStep(row);
+        try {
+          const { task } = this.#resourceAuthorized(step);
+          if (!step.waiter || Date.parse(step.waiter.validUntil) <= observedAtMs) continue;
+          const environment = this.#getResourceAllocation(step.demand.environmentAllocationId);
+          if (!environment || environment.kind !== "environment" || environment.hostId !== hostId || environment.state !== "available"
+            || Date.parse(environment.validUntil) <= observedAtMs || Date.parse(environment.declaredAt) > observedAtMs) {
+            reason = "environment_observation_required"; continue;
+          }
+          const slot = input.slotObservations?.find((entry) => entry.threadId === step.rootThreadId);
+          const slotAt = Date.parse(slot?.observedAt ?? "");
+          if (!Number.isFinite(slotAt) || slotAt > observedAtMs || observedAtMs - slotAt > 60_000
+            || (settlement && slotAt <= Date.parse(settlement)) || !Number.isInteger(slot.active)
+            || !Number.isInteger(slot.maxActive) || slot.active < 0 || slot.active > slot.maxActive || slot.maxActive < 1) {
+            reason = "resource_slot_observation_required"; continue;
+          }
+          if (step.demand.cpuUnits > cpuHeadroom || step.demand.hostPeakMemoryBytes > memoryHeadroom
+            || step.demand.environmentCpuUnits > environment.capacityCpuUnits
+            || step.demand.environmentPeakMemoryBytes > environment.capacityMemoryBytes) {
+            reason = "waiting_host_resources"; continue;
+          }
+          candidates.push({ kind: "heavy", step, environment, task, createdAt: step.createdAt });
+        } catch (error) { reason = error.code ?? "resource_step_authorization_required"; }
+      }
+      // Rank against the server's complete current ordinary queue, not a caller-selected winner.
+      if (Number.isFinite(policy.cpuPerAgent) && policy.cpuPerAgent > 0
+        && Number.isSafeInteger(policy.memoryPerAgentBytes) && policy.memoryPerAgentBytes > 0
+        && cpuHeadroom >= policy.cpuPerAgent && memoryHeadroom >= policy.memoryPerAgentBytes) {
+        for (const row of this.#prepare("SELECT id FROM tasks WHERE status = 'todo' AND archived_at IS NULL").all()) {
+          const task = this.#requireTask(row.id);
+          const inputs = this.#taskCapsuleInputs(row.id);
+          const capsule = createTaskCapsule(inputs);
+          const admission = this.getTaskSafeActionAdmission(row.id);
+          if (admission && (admission.admissionState !== "deferred" || Date.parse(admission.admissionRetryAfter) > observedAtMs)) continue;
+          if (capsule?.task?.labels?.includes("agent-todo") && capsule.readyWork.eligible
+            && capsule.execution?.threadBinding) {
+            let root;
+            try {
+              const threadId = inputs.domainRoute?.holder?.threadId ?? inputs.globalCoordinatorFrontier?.threadId
+                ?? capsule.execution.threadBinding.threadId;
+              root = this.#rootAgentRunBinding(task, threadId);
+            } catch { continue; }
+            if (root.rootHostId !== hostId) continue;
+            const slot = input.slotObservations?.find((entry) => entry.threadId === root.rootThreadId);
+            const slotAt = Date.parse(slot?.observedAt ?? "");
+            if (Number.isFinite(slotAt) && slotAt <= observedAtMs && observedAtMs - slotAt <= 60_000
+              && Number.isInteger(slot.active) && Number.isInteger(slot.maxActive) && slot.active < slot.maxActive) {
+              candidates.push({ kind: "ordinary", task, createdAt: task.createdAt });
+            }
+          }
+        }
+      }
+      candidates.sort((left, right) => (priorities[left.task.priority] ?? 4) - (priorities[right.task.priority] ?? 4)
+        || left.createdAt.localeCompare(right.createdAt) || left.task.id.localeCompare(right.task.id));
+      const selected = candidates[0];
+      if (!selected) return waiting(reason);
+      if (selected.kind === "ordinary") return { ...waiting("ordinary_candidate_precedes"), taskId: selected.task.id };
+      const { step, environment } = selected;
+      const allocationId = randomUUID();
+      const timestamp = new Date(observedAtMs).toISOString();
+      const allocation = {
+        taskId: step.taskId, stepId: step.id, ownerRunId: step.runId, ownerThreadId: step.ownerThreadId,
+        hostId, environmentKey: environment.environmentKey, resourceGroupKey: environment.resourceGroupKey,
+        exclusiveKeys: environment.exclusiveKeys, environmentAllocationId: environment.id,
+        environmentVersion: environment.version, capacityCpuUnits: environment.capacityCpuUnits,
+        capacityMemoryBytes: environment.capacityMemoryBytes, demand: step.demand,
+        source: "resident_resource_admission", sourceRef: execution.leaseId, grantedAt: timestamp,
+      };
+      this.#prepare("INSERT INTO resource_allocations VALUES (?, ?, ?, 'heavy', 'held', NULL, 1, ?)")
+        .run(allocationId, hostId, environment.resourceGroupKey, JSON.stringify(allocation));
+      step.allocationId = allocationId;
+      step.environmentVersion = environment.version;
+      step.grantId = randomUUID();
+      step.grantExecution = execution;
+      step.grantedAt = timestamp;
+      step.waitingReason = null;
+      this.#saveResourceStep(step, "reserved");
+      return { granted: true, ...this.getResourceStep(step.taskId, step.id) };
+    });
+  }
+
   getTaskContinuation(taskId) {
     this.database.exec("BEGIN");
     try {
-      const result = assessTaskContinuation(this.#taskContinuationContext(taskId));
+      const context = this.#taskContinuationContext(taskId);
+      const row = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_owned_terminal'
+        ORDER BY rowid DESC LIMIT 1
+      `).get(context.capsule.task.id);
+      const terminalCheckpoint = row ? JSON.parse(row.envelope_json) : null;
+      const terminalEffectOrigins = terminalCheckpoint ? this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_effect_origin'
+          AND json_extract(envelope_json, '$.codexHostId') = 'local'
+          AND json_extract(envelope_json, '$.threadId') = ?
+          AND json_extract(envelope_json, '$.turnId') = ?
+        ORDER BY rowid
+      `).all(context.capsule.task.id, terminalCheckpoint.threadId, terminalCheckpoint.turnId)
+        .map((origin) => JSON.parse(origin.envelope_json)) : [];
+      const result = assessTaskContinuation({
+        ...context, terminalCheckpoint, terminalEffectOrigins,
+      });
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  recordOwnedTerminalCheckpoint(notification) {
+    const terminal = normalizeOwnedTerminalNotification(notification);
+    if (!terminal) return [];
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const enrolled = this.#prepare(`
+        SELECT tasks.id FROM tasks
+        WHERE thread_id = ? AND thread_codex_host_id = 'local'
+          AND EXISTS (
+            SELECT 1 FROM agent_event_receipts
+            WHERE task_id = tasks.id AND json_extract(envelope_json, '$.eventType') = 'continuation_record'
+          )
+      `).all(terminal.threadId);
+      const observedAt = now();
+      const source = "taskboard-server-owned-app-server";
+      const receipts = [];
+      for (const { id } of enrolled) {
+        const context = this.#taskContinuationContext(id);
+        const binding = context.capsule.execution.threadBinding;
+        if (!binding || binding.codexHostId !== "local" || binding.threadId !== terminal.threadId) continue;
+        const eventId = `continuation-owned-terminal:${createHash("sha256")
+          .update(JSON.stringify([source, id, "local", terminal.threadId, terminal.turnId])).digest("hex")}`;
+        const existing = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE event_id = ?").get(eventId);
+        if (existing) {
+          const event = JSON.parse(existing.envelope_json);
+          receipts.push({ applied: false, conflict: event.turnStatus !== terminal.turnStatus, event });
+          continue;
+        }
+        // The native notification proves thread/turn/status only. Binding and agreement are DB context at receipt time.
+        const event = {
+          eventId, eventType: "continuation_owned_terminal", taskId: id, projectId: context.capsule.task.projectId,
+          source, codexHostId: "local", ...terminal,
+          continuationRecordId: context.record.eventId,
+          bindingAtObservation: binding,
+          requirementsRevision: context.capsule.requirementsRevision,
+          observedAt,
+        };
+        this.#prepare(`
+          INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+          VALUES (?, ?, ?, NULL, ?, ?)
+        `).run(eventId, event.projectId, id, JSON.stringify(event), observedAt);
+        receipts.push({ applied: true, conflict: false, event });
+      }
+      this.database.exec("COMMIT");
+      return receipts;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #continuationCheckpointResult(context, checkpoint) {
+    const taskId = context.capsule.task.id;
+    const latestCommand = `taskctl continuation checkpoint get ${taskId} --json`;
+    return {
+      status: checkpoint ? "recorded" : "not_recorded",
+      checkpoint,
+      agreementCurrent: checkpoint ? checkpoint.agreementId === context.record?.eventId : null,
+      bindingCurrent: checkpoint
+        ? JSON.stringify(checkpoint.bindingAtRecord) === JSON.stringify(context.capsule.execution.threadBinding) : null,
+      dispatchEligible: false,
+      executionBridge: "not_implemented",
+      runtimeQuiescence: "not_proven",
+      runClaimHandoff: "not_performed",
+      queries: {
+        latest: latestCommand,
+        occurrence: checkpoint ? `${latestCommand} --occurrence-id ${checkpoint.occurrenceId}` : null,
+      },
+    };
+  }
+
+  getTaskContinuationCheckpoint(taskId, occurrenceId = null) {
+    if (occurrenceId !== null && (typeof occurrenceId !== "string" || !/^[a-f0-9]{64}$/.test(occurrenceId))) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid continuation checkpoint occurrenceId");
+    }
+    this.database.exec("BEGIN");
+    try {
+      const context = this.#taskContinuationContext(taskId);
+      const row = occurrenceId === null ? this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_cooperative_checkpoint'
+        ORDER BY rowid DESC LIMIT 1
+      `).get(context.capsule.task.id) : this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND event_id = ?
+          AND json_extract(envelope_json, '$.eventType') = 'continuation_cooperative_checkpoint'
+      `).get(context.capsule.task.id, `continuation-cooperative-checkpoint:v1:${occurrenceId}`);
+      const result = this.#continuationCheckpointResult(context, row ? JSON.parse(row.envelope_json) : null);
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendTaskContinuationCheckpoint(taskId, body) {
+    let input;
+    try {
+      input = normalizeContinuationCheckpoint(body);
+    } catch (error) {
+      throw new ApiError(400, "INVALID_FIELD", error.message);
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const context = this.#taskContinuationContext(taskId);
+      const { capsule, record, evaluation } = context;
+      const binding = capsule.execution.threadBinding;
+      const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+      if (!binding || binding.codexHostId !== "local" || binding.codexProjectKind !== "local"
+        || !binding.codexProjectId || !path.isAbsolute(binding.workspacePath ?? "")
+        || binding.threadId !== input.senderThreadId || binding.threadId !== input.sourceThreadId
+        || record?.senderThreadId !== input.senderThreadId) {
+        throw new ApiError(409, "CONTINUATION_SENDER_MISMATCH", "Only the agreement's original bound Root may record a checkpoint");
+      }
+      if (record.eventId !== input.agreementId || capsule.resumeToken !== input.expectedResumeToken
+        || record.basis.projectId !== capsule.task.projectId || !same(record.basis.binding, binding)
+        || record.basis.requirementsRevision !== capsule.requirementsRevision) {
+        throw new ApiError(409, "CONTINUATION_STALE", "Reread the current Capsule and original agreement before recording");
+      }
+      if (capsule.task.archivedAt !== null || ["done", "canceled"].includes(capsule.task.status)
+        || record.status !== "active" || capsule.relations.blockedBy.some((dependency) => dependency.status !== "done")
+        || capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED")) {
+        throw new ApiError(409, "CONTINUATION_STOPPED", "The current task or agreement does not allow this checkpoint");
+      }
+      const action = evaluation.pendingActions.find((candidate) => candidate.id === input.nextActionId);
+      const gate = action ? evaluation.gatesById.get(action.gate) : null;
+      if (record.checkpoint.nextActionId !== input.nextActionId || !record.actionIds.includes(input.nextActionId)
+        || record.authorizationSource === null || evaluation.effectiveAuthorization.state !== "valid"
+        || !same(record.authorizationSource, evaluation.effectiveAuthorization.source)
+        || !action || gate?.state !== "authorized" || gate.expired) {
+        throw new ApiError(409, "CONTINUATION_NOT_AUTHORIZED", "The exact next action requires current agreement authorization");
+      }
+      const origins = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_effect_origin'
+          AND json_extract(envelope_json, '$.codexHostId') = 'local'
+          AND json_extract(envelope_json, '$.threadId') = ? AND json_extract(envelope_json, '$.turnId') = ?
+      `).all(capsule.task.id, input.sourceThreadId, input.sourceTurnId).map((row) => JSON.parse(row.envelope_json));
+      if (origins.length !== 1 || origins[0].projectId !== capsule.task.projectId
+        || origins[0].continuationRecordId !== record.eventId || !same(origins[0].bindingAtObservation, binding)) {
+        throw new ApiError(409, "CONTINUATION_ORIGIN_REQUIRED", "The source turn requires one matching original agreement effect origin");
+      }
+      const occurrenceId = continuationCheckpointOccurrenceId(capsule.task.id, input);
+      const receiptId = `continuation-cooperative-checkpoint:v1:${occurrenceId}`;
+      const existing = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE event_id = ?").get(receiptId);
+      let checkpoint = existing ? JSON.parse(existing.envelope_json) : null;
+      if (existing) {
+        if (checkpoint?.eventType !== "continuation_cooperative_checkpoint" || checkpoint.taskId !== capsule.task.id
+          || checkpoint.recordedBy !== input.senderThreadId || !same(checkpoint.bindingAtRecord, binding)
+          || !same(checkpoint.handoffDeclaration, input.handoffDeclaration)) {
+          throw new ApiError(409, "CONTINUATION_CHECKPOINT_CONFLICT", "This occurrence already has a different checkpoint declaration");
+        }
+      } else {
+        checkpoint = {
+          receiptId, eventType: "continuation_cooperative_checkpoint", occurrenceId,
+          taskId: capsule.task.id, projectId: capsule.task.projectId,
+          agreementId: input.agreementId, sourceThreadId: input.sourceThreadId,
+          sourceTurnId: input.sourceTurnId, nextActionId: input.nextActionId,
+          handoffDeclaration: input.handoffDeclaration,
+          recordedAt: evaluation.evaluatedAt, recordedBy: input.senderThreadId, bindingAtRecord: binding,
+        };
+        this.#prepare(`
+          INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+          VALUES (?, ?, ?, NULL, ?, ?)
+        `).run(receiptId, capsule.task.projectId, capsule.task.id, JSON.stringify(checkpoint), checkpoint.recordedAt);
+      }
+      const result = { applied: !existing, ...this.#continuationCheckpointResult(context, checkpoint) };
       this.database.exec("COMMIT");
       return result;
     } catch (error) {
@@ -10292,6 +11316,7 @@ export class TaskboardDatabase {
       if (capsule.readyWork.safeActions[0].id !== safeActionId) {
         throw new ApiError(409, "SAFE_ACTION_MISMATCH", "Bootstrap claim must match the first authorized safe action");
       }
+      if (this.#resourceHostHeld(rootRun.rootHostId)) this.#resourceError("waiting_resource_allocation_release");
 
       const durableDelivery = this.#prepare(`
         SELECT * FROM task_safe_action_receipts
@@ -10545,7 +11570,7 @@ export class TaskboardDatabase {
       }
       if (!this.#taskSafeActionCoordinatorEpochMatches(row, rootRun)) return null;
     }
-    return this.#taskSafeActionReceipt(row);
+    return { ...this.#taskSafeActionReceipt(row), recordedDeliveryObservation: this.#recordedDeliveryObservation(row) };
   }
 
   confirmTaskSafeActionDelivery(id, {
@@ -10588,6 +11613,23 @@ export class TaskboardDatabase {
         row.id,
       );
       const delivering = this.#prepare(`SELECT * FROM task_safe_action_receipts WHERE id = ?`).get(row.id);
+      if (rootRun.rootHostId === "local") {
+        const context = this.#ordinaryDeliveryContext(delivering, task);
+        const existing = this.#writeOrdinaryDeliveryObservation(() => this.#prepare(`
+          SELECT context_json FROM ordinary_delivery_observations WHERE receipt_id = ? AND admission_attempt_id = ?
+        `).get(row.id, row.admission_attempt_id));
+        if (existing) {
+          const { confirmedAt, ...frozenContext } = JSON.parse(existing.context_json);
+          if (JSON.stringify(frozenContext) !== JSON.stringify(context)) {
+            throw new ApiError(409, "ORDINARY_DELIVERY_IDENTITY_MISMATCH", "The attempt already has another frozen confirmation context");
+          }
+        } else {
+          this.#writeOrdinaryDeliveryObservation(() => this.#prepare(`
+            INSERT INTO ordinary_delivery_observations (receipt_id, admission_attempt_id, context_json)
+            VALUES (?, ?, ?)
+          `).run(row.id, row.admission_attempt_id, JSON.stringify({ ...context, confirmedAt: now() })));
+        }
+      }
       this.database.exec("COMMIT");
       return { confirmed: true, receipt: this.#taskSafeActionReceipt(delivering) };
     } catch (error) {
@@ -11299,8 +12341,12 @@ export class TaskboardDatabase {
 
   deferTaskSafeActionAdmission(id, {
     rootThreadId, expectedResumeToken, safeActionId, admissionReceiptId, admissionAttemptId,
+    reason = "model_capacity",
     hostExecutorExecution = undefined,
   }) {
+    if (!["model_capacity", "coordinator_busy"].includes(reason)) {
+      throw new ApiError(400, "INVALID_FIELD", "Admission deferral reason is invalid");
+    }
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -11316,10 +12362,16 @@ export class TaskboardDatabase {
       }
       this.#assertTaskSafeActionCoordinatorEpoch(row, rootRun);
       if (row.status === "reserved" && row.admission_state === "deferred") {
+        if (row.admission_deferred_reason !== reason) {
+          throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission was deferred for a different reason");
+        }
         this.database.exec("COMMIT");
         return { applied: false, receipt: this.#taskSafeActionReceipt(row) };
       }
-      if (row.status !== "delivering" || !["awaiting_admission", "prepared"].includes(row.admission_state)) {
+      if (row.status !== "delivering"
+        || !["awaiting_admission", "prepared"].includes(row.admission_state)
+        || (reason === "coordinator_busy"
+          && (row.admission_state !== "awaiting_admission" || row.delivery_turn_id !== null))) {
         throw new ApiError(409, "ADMISSION_NOT_AWAITING", "Only the current awaiting admission attempt can be deferred");
       }
       if (this.getOpenTaskAgentRun(task.id) || this.getAgentTaskClaim(task.id)?.status === "active") {
@@ -11331,11 +12383,11 @@ export class TaskboardDatabase {
         UPDATE task_safe_action_receipts
         SET status = 'reserved', admission_state = 'deferred', reservation_lease_id = NULL,
           lease_expires_at = NULL, recovery_lease_id = NULL, recovery_lease_expires_at = NULL,
-          admission_deferred_reason = 'model_capacity', admission_retry_count = ?,
+          admission_deferred_reason = ?, admission_retry_count = ?,
           admission_retry_after = ?
         WHERE id = ? AND status = 'delivering' AND admission_state IN ('awaiting_admission', 'prepared')
           AND admission_attempt_id = ?
-      `).run(retryCount, retryAfter, row.id, admissionAttemptId);
+      `).run(reason, retryCount, retryAfter, row.id, admissionAttemptId);
       if (updated.changes !== 1) {
         throw new ApiError(409, "ADMISSION_ATTEMPT_MISMATCH", "Admission attempt changed before capacity deferral");
       }
@@ -13877,7 +14929,8 @@ export class TaskboardDatabase {
       const rows = this.#prepare(`
         SELECT
           id, task_id,
-          CASE WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
+          CASE WHEN instr(body, 'taskboard-goal-windows') > 0 THEN body
+            WHEN thread_id IS NULL THEN NULL ELSE substr(body, 1, 512) END AS body,
           thread_id, thread_codex_project_id, thread_codex_project_kind,
           thread_codex_host_id, thread_workspace_path,
           author_type, author_id, author_name,
@@ -13899,7 +14952,7 @@ export class TaskboardDatabase {
       const placeholders = chunk.map(() => "?").join(", ");
       const rows = this.#prepare(`
         SELECT
-          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, created_at
+          id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at
         FROM task_activities
         WHERE task_id IN (${placeholders})
         ORDER BY task_id, created_at, id

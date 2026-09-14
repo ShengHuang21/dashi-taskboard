@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { realpathSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +32,12 @@ const BOOLEAN_OPTIONS = new Set([
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
+  ["resource-step prepare", new Set(["request-file", "json"])],
+  ["resource-step run", new Set(["run-id", "action-id", "request-file", "wait-timeout", "json"])],
+  ["resource-step get", new Set(["json"])],
+  ["resource-step wait", new Set(["wait-timeout", "json"])],
+  ["resource-step checkpoint", new Set(["request-file", "json"])],
+  ["resource-step result", new Set(["request-file", "json"])],
   ["project list", new Set(["json"])],
   ["project create", new Set(["id", "name", "workspace-path", "json"])],
   ["project map", new Set(["workspace-path", "json"])],
@@ -187,6 +195,7 @@ const COMMAND_OPTIONS = new Map([
   ["handoff list", new Set(["json"])],
   ["continuation record", new Set(["record-file", "json"])],
   ["continuation assess", new Set(["json"])],
+  ["continuation checkpoint", new Set(["from-json", "occurrence-id", "json"])],
   ["clarification list", new Set(["json"])],
   ["clarification enqueue", new Set([
     "consumer", "event-id", "idempotency-key", "basis-publication", "no-published-basis",
@@ -231,6 +240,29 @@ const COMMAND_OPTIONS = new Map([
 ]);
 
 const HELP_TEXT = new Map([
+  ["resource-step", `Usage: taskctl resource-step prepare|run|get|wait|result|checkpoint
+
+prepare --request-file FILE -- ABSOLUTE_EXECUTABLE ARG... prints the canonical
+command and required action target locally. It does not create authorization.
+run ISSUE_ID --run-id RUN --action-id ACTION --request-file FILE --wait-timeout 1..1800 -- ABSOLUTE_EXECUTABLE ARG...
+requires the original run's CODEX_THREAD_ID and exact approved test action target.
+The request file contains hostId, worktreePath, worktreeBranch,
+authorizationSource {commentId,commentVersion}, and demand {cpuUnits,
+hostPeakMemoryBytes,environmentCpuUnits,environmentPeakMemoryBytes,environmentAllocationId}.
+Only the first consume-start permit may launch the shell:false command. A lost
+permit response never retries. Do not put credentials in argv or persist output.
+
+get ISSUE_ID STEP_ID and wait ISSUE_ID STEP_ID --wait-timeout 1..1800 only observe.
+result ISSUE_ID STEP_ID --request-file FILE reports consumeId, stepVersion,
+outcome (exited/no_start/start_uncertain), exitCode, signal, sourceRef.
+checkpoint ALLOCATION_ID --request-file FILE declares or explicitly returns an
+allocation using its exact owner run/thread and current version. Fields: taskId,
+runId, hostId, worktreePath, worktreeBranch, version, source=owner_declaration,
+sourceRef, sourceVersion, declaredAt, validUntil, environmentKey, resourceGroupKey,
+exclusiveKeys, capacityCpuUnits, capacityMemoryBytes, state=held|available|released.
+Use the stable allocation id across windows. A held environment must first be
+released before a new available declaration. A command result is NOT a release.
+No command, environment or Agent is killed by resource-step.`],
   ["", `Usage: taskctl RESOURCE ACTION [options]
 
 Commands:
@@ -291,6 +323,8 @@ Commands:
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
   continuation record ISSUE_ID --record-file FILE [--json]
   continuation assess ISSUE_ID [--json]
+  continuation checkpoint record ISSUE_ID --from-json FILE [--json]
+  continuation checkpoint get ISSUE_ID [--occurrence-id ID] [--json]
   handoff list ISSUE_ID
   handoff publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
     (--content TEXT | --content-file PATH)
@@ -300,6 +334,12 @@ Commands:
   handoff add ISSUE_ID --event-id ID --idempotency-key KEY --agent-path /root/NAME
     --sequence N --summary TEXT --next-action TEXT --requires-ack true|false
   handoff ack EVENT_ID --acknowledgement-id ID --agent-path /root
+  resource-step prepare --request-file FILE -- ABSOLUTE_EXECUTABLE ARG...
+  resource-step run ISSUE_ID --run-id RUN --action-id ACTION --request-file FILE --wait-timeout SECONDS -- ABSOLUTE_EXECUTABLE ARG...
+  resource-step get ISSUE_ID STEP_ID
+  resource-step wait ISSUE_ID STEP_ID --wait-timeout SECONDS
+  resource-step result ISSUE_ID STEP_ID --request-file FILE
+  resource-step checkpoint ALLOCATION_ID --request-file FILE
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -469,6 +509,8 @@ repair-binding action.`],
 Actions:
   record ISSUE_ID --record-file FILE [--json]
   assess ISSUE_ID [--json]
+  checkpoint record ISSUE_ID --from-json FILE [--json]
+  checkpoint get ISSUE_ID [--occurrence-id ID] [--json]
 
 Record appends an existing agreement/checkpoint from a JSON file. Required fields:
 eventId, idempotencyKey, expectedRecordId (null for first record, else exact event ID),
@@ -478,7 +520,18 @@ actionIds, stopBoundary, status (active/paused/canceled/endpoint_reached), and c
 The literal string "none" is an ID, not null. senderThreadId always comes from CODEX_THREAD_ID.
 Reads use the protected local service. Assessment never resumes, wakes, claims, or grants
 authority: liveExecution is always unknown and eligibleForDispatch is always false.
-After conflict, reread the Capsule and latest record; never silently rewrite a stale request.`],
+After conflict, reread the Capsule and latest record; never silently rewrite a stale request.
+
+Checkpoint record saves a cooperative owner declaration without replacing the agreement.
+The JSON file requires agreementId, sourceThreadId, sourceTurnId, nextActionId,
+expectedResumeToken, and handoffDeclaration (children/tools/backgroundSessions/resources,
+each "none" or "returned"). Sender attribution comes only from CODEX_THREAD_ID.
+The source turn needs one recorded effect origin for the same agreement and binding;
+neither a terminal event nor an online adapter is required to save this declaration.
+Checkpoint get recovers the latest record or one exact occurrence for this task.
+Neither command resumes, wakes, claims, or releases resources. A declaration is not
+runtime quiescence or an execution permit: dispatchEligible is false and the execution
+bridge is not implemented. Repeating an unchanged current request returns the same receipt.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
@@ -555,11 +608,13 @@ export function parseArgs(argv) {
 
   const positionals = [];
   const options = {};
+  let commandArgv;
 
   for (let index = 0; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === "--") {
-      positionals.push(...argv.slice(index + 1));
+      if (positionals[0] === "resource-step") commandArgv = argv.slice(index + 1);
+      else positionals.push(...argv.slice(index + 1));
       break;
     }
 
@@ -604,6 +659,7 @@ export function parseArgs(argv) {
     action: positionals[1],
     operands: positionals.slice(2),
     options,
+    ...(commandArgv ? { commandArgv } : {}),
   };
 }
 
@@ -647,12 +703,17 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess, handoff list/add/ack/publish/read/adopt, clarification enqueue/list/resolve, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess/checkpoint, handoff list/add/ack/publish/read/adopt, clarification enqueue/list/resolve, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
 
   const processEnv = overrides.env ?? process.env;
+  if (command === "resource-step prepare") {
+    expectOperandCount(parsed, 0);
+    const request = await readResourceRequest(parsed, overrides);
+    return prepareResourceCommand(parsed.commandArgv, request.worktreePath);
+  }
   const env = parsed.options["runtime-file"] === undefined
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
@@ -664,6 +725,7 @@ async function execute(parsed, overrides) {
     || command.startsWith("domain-todo ")
     || command.startsWith("dependency-handoff ")
     || command.startsWith("continuation ")
+    || command.startsWith("resource-step ")
     || ["handoff publish", "handoff read", "handoff adopt"].includes(command)
     || command.startsWith("clarification ")
     || command.startsWith("activation ");
@@ -673,6 +735,12 @@ async function execute(parsed, overrides) {
       : await resolveTaskboardBaseUrl(env, overrides),
   });
   switch (command) {
+    case "resource-step run":
+    case "resource-step get":
+    case "resource-step wait":
+    case "resource-step checkpoint":
+    case "resource-step result":
+      return executeResourceStep(api, parsed, overrides, processEnv);
     case "project list":
       expectOperandCount(parsed, 0);
       return api.request("GET", "/api/projects");
@@ -954,6 +1022,31 @@ async function execute(parsed, overrides) {
     case "continuation assess":
       expectOperandCount(parsed, 1);
       return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`);
+    case "continuation checkpoint": {
+      expectOperandCount(parsed, 2);
+      const [action, taskId] = parsed.operands;
+      const pathname = `/api/local/tasks/${encodeURIComponent(taskId)}/continuation/checkpoints`;
+      if (action === "get") {
+        if (parsed.options["from-json"] !== undefined) throw usageError("checkpoint get does not accept --from-json");
+        const occurrenceId = parsed.options["occurrence-id"];
+        return api.request("GET", occurrenceId === undefined ? pathname : `${pathname}?occurrenceId=${encodeURIComponent(occurrenceId)}`);
+      }
+      if (action !== "record") throw usageError("Expected continuation checkpoint record or get");
+      if (parsed.options["occurrence-id"] !== undefined) throw usageError("checkpoint record does not accept --occurrence-id");
+      const filename = resolveInputPath(requiredOption(parsed.options, "from-json"), overrides);
+      let body;
+      try {
+        const source = await (overrides.readFile ?? readFile)(filename, "utf8");
+        if (Buffer.byteLength(source, "utf8") > 262_144) throw new Error("Record file exceeds 262144 UTF-8 bytes");
+        body = JSON.parse(source);
+      } catch (error) {
+        throw new TaskctlError("Cannot read continuation checkpoint JSON", {
+          code: "INVALID_RECORD_FILE", details: error.message,
+        });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw usageError("Checkpoint file must be a JSON object");
+      return api.request("POST", pathname, { ...body, senderThreadId: resolveThreadId({}, overrides) });
+    }
     case "continuation record": {
       expectOperandCount(parsed, 1);
       const filename = resolveInputPath(requiredOption(parsed.options, "record-file"), overrides);
@@ -1136,6 +1229,115 @@ function progressText(field, value) {
   };
 }
 
+async function readResourceRequest(parsed, overrides) {
+  const filename = resolveInputPath(requiredOption(parsed.options, "request-file"), overrides);
+  const request = JSON.parse(await (overrides.readFile ?? readFile)(filename, "utf8"));
+  if (!request || typeof request !== "object" || Array.isArray(request)) throw usageError("Expected a resource request object");
+  return request;
+}
+
+function prepareResourceCommand(argv, worktreePath) {
+  if (!Array.isArray(argv) || !argv.length || argv.some((item) => typeof item !== "string" || item.includes("\0"))
+    || !path.isAbsolute(argv[0]) || typeof worktreePath !== "string" || !path.isAbsolute(worktreePath)) {
+    throw usageError("Use an absolute executable after -- and an exact absolute worktreePath in the request file");
+  }
+  const command = { executable: realpathSync(argv[0]), args: argv.slice(1), cwd: realpathSync(worktreePath) };
+  if (command.cwd !== worktreePath) throw usageError("worktreePath must name the canonical permitted worktree, not an alias");
+  const commandDigest = createHash("sha256").update(JSON.stringify(command)).digest("hex");
+  return { command, commandDigest, requiredActionTarget: `resource-command:sha256:${commandDigest}` };
+}
+
+async function executeResourceStep(api, parsed, overrides, env) {
+  const request = (method, pathname, body) => api.request(method, pathname, body, { timeoutMs: 10_000 });
+  const ownerThreadId = env.CODEX_THREAD_ID;
+  const taskPath = (id) => `/api/local/tasks/${encodeURIComponent(id)}/resource-steps`;
+  if (parsed.action === "get") {
+    expectOperandCount(parsed, 2);
+    return request("GET", `${taskPath(parsed.operands[0])}/${encodeURIComponent(parsed.operands[1])}`);
+  }
+  if (!ownerThreadId) throw usageError("Resource writes require the owning CODEX_THREAD_ID");
+  if (parsed.action === "checkpoint") {
+    expectOperandCount(parsed, 1);
+    const body = await readResourceRequest(parsed, overrides);
+    return request("POST", `/api/local/resource-allocations/${encodeURIComponent(parsed.operands[0])}/checkpoint`, { ...body, ownerThreadId });
+  }
+  if (parsed.action === "result") {
+    expectOperandCount(parsed, 2);
+    return request("POST", `${taskPath(parsed.operands[0])}/${encodeURIComponent(parsed.operands[1])}/result`, {
+      ...await readResourceRequest(parsed, overrides), ownerThreadId,
+    });
+  }
+  expectOperandCount(parsed, parsed.action === "run" ? 1 : 2);
+  const timeout = Number(requiredOption(parsed.options, "wait-timeout"));
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 1800) throw usageError("wait-timeout must be 1..1800 seconds");
+  const deadline = Date.now() + timeout * 1000;
+  let prepared;
+  let current;
+  if (parsed.action === "run") {
+    const body = await readResourceRequest(parsed, overrides);
+    prepared = prepareResourceCommand(parsed.commandArgv, body.worktreePath);
+    current = await request("POST", taskPath(parsed.operands[0]), {
+      ...body, ownerThreadId, commandDigest: prepared.commandDigest,
+      runId: requiredOption(parsed.options, "run-id"), actionId: requiredOption(parsed.options, "action-id"),
+    });
+  } else {
+    current = await request("GET", `${taskPath(parsed.operands[0])}/${encodeURIComponent(parsed.operands[1])}`);
+  }
+  const pathname = `${taskPath(parsed.operands[0])}/${encodeURIComponent(current.step.id)}`;
+  // An observing wait never registers a waiter or acquires execution permission.
+  const waitAttemptId = randomUUID();
+  while (Date.now() < deadline) {
+    if (!["queued", "reserved"].includes(current.step.state)) return { ...current, executed: false };
+    if (parsed.action === "run") {
+      if (current.step.state === "queued") {
+        try {
+          current = await request("POST", `${pathname}/wait`, {
+            ownerThreadId, stepVersion: current.step.version, waitAttemptId,
+            checkpoint: `taskctl-resource-step:${waitAttemptId}`,
+          });
+        } catch (error) {
+          if (error.code !== "resource_step_version_conflict") throw error;
+          current = await request("GET", pathname);
+          continue;
+        }
+      }
+      if (current.step.state === "reserved") {
+        // Never retry consume-start, including after a lost response. GET is not execution authority.
+        let consumed;
+        try {
+          consumed = await request("POST", `${pathname}/consume-start`, {
+            ownerThreadId, stepVersion: current.step.version, waitAttemptId,
+            grantId: current.step.grantId, allocationId: current.allocation.id,
+            allocationVersion: current.allocation.version,
+          });
+        } catch (error) {
+          throw new TaskctlError("Start permission outcome is uncertain; no command was launched by this attempt. Reconcile the existing step.", {
+            code: "RESOURCE_START_UNCERTAIN", details: { stepId: current.step.id, cause: error.code },
+          });
+        }
+        if (consumed.execute !== true) return { ...consumed, executed: false };
+        const result = await new Promise((resolve) => {
+          let started = false;
+          const child = spawn(prepared.command.executable, prepared.command.args, {
+            cwd: prepared.command.cwd, shell: false, stdio: ["ignore", "inherit", "inherit"],
+          });
+          child.once("spawn", () => { started = true; });
+          child.once("error", () => resolve({ outcome: started ? "start_uncertain" : "no_start", exitCode: null, signal: null }));
+          child.once("exit", (exitCode, signal) => resolve({ outcome: "exited", exitCode, signal }));
+        });
+        const recorded = await request("POST", `${pathname}/result`, {
+          ownerThreadId, consumeId: consumed.consumeId, stepVersion: consumed.step.version,
+          ...result, sourceRef: `taskctl-resource-step:${waitAttemptId}`,
+        });
+        return { ...recorded, executed: result.outcome !== "no_start", allocationReleaseRequired: true };
+      }
+    }
+    await api.waitForRetry(Math.min(2000, Math.max(0, deadline - Date.now())));
+    current = await request("GET", pathname);
+  }
+  return { ...current, executed: false, waiting: true, reason: "resource_wait_timeout" };
+}
+
 function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
   const fetchImplementation = overrides.fetch ?? globalThis.fetch;
   if (typeof fetchImplementation !== "function") {
@@ -1152,7 +1354,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
     waitForRetry: overrides.waitForRetry ?? ((milliseconds) => (
       new Promise((resolve) => setTimeout(resolve, milliseconds))
     )),
-    async request(method, pathname, body) {
+    async request(method, pathname, body, { timeoutMs } = {}) {
       let response;
       try {
         response = await fetchImplementation(resolveApiUrl(baseUrl, pathname), {
@@ -1163,6 +1365,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
             ...(body === undefined ? {} : { "content-type": "application/json" }),
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+          ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
         });
       } catch (error) {
         throw new TaskctlError(`Cannot reach taskboard service at ${baseUrl}`, {

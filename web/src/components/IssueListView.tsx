@@ -61,6 +61,10 @@ export function IssueListView({
 
   return (
     <div className="issue-list-view" ref={scrollRef}>
+      <p className="issue-list-description">{text(
+        "执行明细（含 Agent 拆分的子任务）。只看你提出的任务和进度，请切换到「我的任务」。",
+        "Execution details include Agent subtasks. Switch to My tasks to see only your requests and their progress.",
+      )}</p>
       <div className="issue-list-groups">
         {TASK_STATUSES.map((status) => {
           const statusTasks = tasks.filter((task) => task.status === status);
@@ -91,8 +95,8 @@ export function IssueListView({
                         }}
                       >
                         <span className="issue-list-title-cell">
-                          <small>{displayIdentifier}</small>
                           <strong>{task.title}</strong>
+                          <small>{text(`编号 ${displayIdentifier}`, `ID ${displayIdentifier}`)}</small>
                           {presentations[task.id]?.unread && <span className="task-unread-dot" aria-label={text("有未读更新", "Unread updates")} />}
                         </span>
                         <span className="issue-list-metadata" aria-label={text("议题属性", "Issue properties")}>

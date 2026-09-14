@@ -3011,6 +3011,101 @@ kbd {
   padding: 0 14px 28px;
 }
 
+.issue-editor-content > .issue-sub-issues {
+  padding-inline: 0;
+}
+
+.issue-tree,
+.issue-tree-children {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.issue-tree-children {
+  margin-left: 18px;
+  border-left: 1px solid var(--border);
+}
+
+.issue-tree-node + .issue-tree-node,
+.issue-tree-children {
+  border-top: 1px solid var(--border);
+}
+
+.issue-tree-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 28px;
+  align-items: start;
+  gap: 6px;
+  padding: 12px 8px;
+}
+
+.issue-tree-toggle,
+.issue-tree-remove,
+.issue-tree-toggle-space {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.issue-tree-toggle:hover,
+.issue-tree-remove:hover,
+.issue-tree-target:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.issue-tree-toggle:focus-visible,
+.issue-tree-remove:focus-visible,
+.issue-tree-target:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.issue-tree-content {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+}
+
+.issue-tree-target {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 28px;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.issue-tree-target > svg {
+  flex: 0 0 auto;
+}
+
+.issue-tree-title {
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.issue-tree-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
 .issue-sub-issues > header {
   display: flex;
   align-items: center;
@@ -10938,6 +11033,13 @@ kbd {
 /* Linear-style list */
 .issue-list-view {
   padding: 12px 10px 24px;
+}
+
+.issue-list-description {
+  margin: 4px 8px 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .issue-list-groups {

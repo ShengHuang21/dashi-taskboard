@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 // Continuation records describe an agreement. They never grant or dispatch work.
 export function normalizeContinuationRecord(input) {
   const invalid = (field) => { throw new TypeError(`Invalid continuation field '${field}'`); };
@@ -60,6 +62,44 @@ export function normalizeContinuationRecord(input) {
   };
 }
 
+export function normalizeContinuationCheckpoint(input) {
+  const invalid = (field) => { throw new TypeError(`Invalid continuation checkpoint field '${field}'`); };
+  const object = (value, keys, field) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).some((key) => !keys.includes(key))
+      || keys.some((key) => !Object.hasOwn(value, key))) invalid(field);
+  };
+  const identifier = (value, field) => {
+    if (typeof value !== "string" || !value || value.length > 256
+      || value.trim() !== value || /[\u0000-\u001f\u007f]/.test(value)) invalid(field);
+    return value;
+  };
+  object(input, ["agreementId", "sourceThreadId", "sourceTurnId", "nextActionId",
+    "expectedResumeToken", "handoffDeclaration", "senderThreadId"], "checkpoint");
+  const fields = ["children", "tools", "backgroundSessions", "resources"];
+  object(input.handoffDeclaration, fields, "handoffDeclaration");
+  const handoffDeclaration = { source: "owner_declaration" };
+  for (const field of fields) {
+    if (!["none", "returned"].includes(input.handoffDeclaration[field])) invalid(`handoffDeclaration.${field}`);
+    handoffDeclaration[field] = input.handoffDeclaration[field];
+  }
+  return {
+    agreementId: identifier(input.agreementId, "agreementId"),
+    sourceThreadId: identifier(input.sourceThreadId, "sourceThreadId"),
+    sourceTurnId: identifier(input.sourceTurnId, "sourceTurnId"),
+    nextActionId: identifier(input.nextActionId, "nextActionId"),
+    expectedResumeToken: identifier(input.expectedResumeToken, "expectedResumeToken"),
+    senderThreadId: identifier(input.senderThreadId, "senderThreadId"),
+    handoffDeclaration,
+  };
+}
+
+export function continuationCheckpointOccurrenceId(taskId, checkpoint) {
+  return createHash("sha256").update(JSON.stringify([
+    taskId, checkpoint.agreementId, checkpoint.sourceThreadId, checkpoint.sourceTurnId, checkpoint.nextActionId,
+  ])).digest("hex");
+}
+
 export function continuationBasis(capsule, evaluation) {
   return {
     taskId: capsule.task.id,
@@ -79,8 +119,34 @@ export function continuationBasis(capsule, evaluation) {
   };
 }
 
-export function assessTaskContinuation({ record, capsule, evaluation, currentClaim }) {
+export function normalizeOwnedTerminalNotification(notification) {
+  if (notification?.method !== "turn/completed" || Object.hasOwn(notification, "id")) return null;
+  const { threadId, turn } = notification.params ?? {};
+  const identifier = (value) => typeof value === "string" && value.length > 0 && value.length <= 256
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/.test(value);
+  if (!identifier(threadId) || !identifier(turn?.id)
+    || !["completed", "interrupted", "failed"].includes(turn?.status)) return null;
+  return { threadId, turnId: turn.id, turnStatus: turn.status };
+}
+
+export function assessTaskContinuation({ record, capsule, evaluation, currentClaim, terminalCheckpoint = null, terminalEffectOrigins = [] }) {
   const current = continuationBasis(capsule, evaluation);
+  const recordedTerminalCheckpoint = record && terminalCheckpoint
+    && terminalCheckpoint.continuationRecordId === record.eventId
+    && terminalCheckpoint.projectId === current.projectId
+    && JSON.stringify(terminalCheckpoint.bindingAtObservation) === JSON.stringify(current.binding)
+    ? terminalCheckpoint : null;
+  const recordedTerminalEffectOrigin = { status: "unavailable", origin: null };
+  if (recordedTerminalCheckpoint && terminalEffectOrigins.length > 1) {
+    recordedTerminalEffectOrigin.status = "ambiguous";
+  } else if (recordedTerminalCheckpoint && terminalEffectOrigins.length === 1) {
+    const origin = terminalEffectOrigins[0];
+    if (origin.projectId === current.projectId && origin.continuationRecordId === record.eventId
+      && JSON.stringify(origin.bindingAtObservation) === JSON.stringify(current.binding)) {
+      recordedTerminalEffectOrigin.status = "matched";
+      recordedTerminalEffectOrigin.origin = origin;
+    }
+  }
   const result = (assessment, reason, nextCoordinationAction) => ({
     record, assessment, reasonCodes: [reason], agreementEventId: record?.eventId ?? null,
     basis: { current, recorded: record?.basis ?? null },
@@ -91,6 +157,8 @@ export function assessTaskContinuation({ record, capsule, evaluation, currentCla
     stopBoundary: record?.stopBoundary ?? null,
     nextCoordinationAction, queriedAt: evaluation.evaluatedAt,
     liveExecution: "unknown", eligibleForDispatch: false,
+    recordedTerminalCheckpoint,
+    recordedTerminalEffectOrigin,
   });
   if (!record) return result("not_enrolled", "continuation_not_recorded", "record_existing_agreement");
   if (capsule.task.archivedAt !== null || ["canceled", "done"].includes(capsule.task.status)) {
