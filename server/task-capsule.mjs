@@ -1010,6 +1010,7 @@ export function createTaskCapsule({
   globalCoordinatorFrontier = null,
   dependencyClearances = [],
   latestContinuationRecord = null,
+  resourceSteps = [],
   authorizationEvaluation = null,
   now = new Date(),
 }) {
@@ -1181,6 +1182,11 @@ export function createTaskCapsule({
     readyWork,
     currentFrontier,
     resumeToken,
+    resourceSteps: {
+      source: "recorded",
+      helpCommand: "taskctl resource-step --help",
+      steps: resourceSteps,
+    },
     continuation: {
       latestRecord: latestContinuationRecord ? {
         eventId: latestContinuationRecord.eventId,

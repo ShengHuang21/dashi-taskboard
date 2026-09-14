@@ -10428,6 +10428,7 @@ export class TaskboardDatabase {
       globalCoordinatorFrontier,
       dependencyClearances: this.listCrossDomainDependencyClearances(task.id),
       latestContinuationRecord: this.#latestTaskContinuation(task.id),
+      resourceSteps: this.#recordedResourceSteps(task.id),
     };
   }
 
@@ -10537,6 +10538,50 @@ export class TaskboardDatabase {
     return { step, allocation: step.allocationId ? this.#getResourceAllocation(step.allocationId) : null,
       executionOutcome: step.state === "start_consumed" ? "start_uncertain" : step.state,
       waitingReason: step.waitingReason ?? null };
+  }
+
+  #recordedResourceSteps(taskId) {
+    return this.#prepare("SELECT id FROM resource_steps WHERE task_id = ? ORDER BY created_at, id")
+      .all(taskId).map(({ id }) => {
+        const { step, allocation, executionOutcome, waitingReason } = this.getResourceStep(taskId, id);
+        return {
+          stepId: step.id,
+          taskId: step.taskId,
+          runId: step.runId,
+          actionId: step.actionId,
+          ownerThreadId: step.ownerThreadId,
+          state: step.state,
+          version: step.version,
+          createdAt: step.createdAt,
+          authorizationSource: {
+            commentId: step.authorizationSource.commentId,
+            commentVersion: step.authorizationSource.commentVersion,
+          },
+          environmentAllocationId: step.demand.environmentAllocationId,
+          allocationId: step.allocationId ?? null,
+          executionOutcome,
+          waitingReason,
+          grantedAt: step.grantedAt ?? null,
+          consumedAt: step.consumedAt ?? null,
+          resultRecordedAt: step.resultRecordedAt ?? null,
+          result: step.result ? {
+            outcome: step.result.outcome,
+            exitCode: step.result.exitCode,
+            signal: step.result.signal,
+            sourceRef: step.result.sourceRef,
+          } : null,
+          allocation: allocation ? {
+            id: allocation.id,
+            kind: allocation.kind,
+            state: allocation.state,
+            version: allocation.version,
+            ownerRunId: allocation.ownerRunId,
+            ownerThreadId: allocation.ownerThreadId,
+            releasedAt: allocation.releasedAt,
+          } : null,
+          getCommand: `taskctl resource-step get ${taskId} ${step.id} --json`,
+        };
+      });
   }
 
   listResourceSteps(projectId) {
