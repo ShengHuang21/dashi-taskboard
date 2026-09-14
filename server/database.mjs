@@ -9,7 +9,10 @@ import {
   isCanonicalCodexHostId,
 } from "../shared/domain.mjs";
 import { createTaskCapsule, evaluateTaskAuthorization } from "./task-capsule.mjs";
-import { assessTaskContinuation, continuationBasis, normalizeContinuationRecord, normalizeOwnedTerminalNotification } from "./task-continuation.mjs";
+import {
+  assessTaskContinuation, continuationBasis, continuationCheckpointOccurrenceId,
+  normalizeContinuationCheckpoint, normalizeContinuationRecord, normalizeOwnedTerminalNotification,
+} from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
@@ -11057,6 +11060,131 @@ export class TaskboardDatabase {
       }
       this.database.exec("COMMIT");
       return receipts;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #continuationCheckpointResult(context, checkpoint) {
+    const taskId = context.capsule.task.id;
+    const latestCommand = `taskctl continuation checkpoint get ${taskId} --json`;
+    return {
+      status: checkpoint ? "recorded" : "not_recorded",
+      checkpoint,
+      agreementCurrent: checkpoint ? checkpoint.agreementId === context.record?.eventId : null,
+      bindingCurrent: checkpoint
+        ? JSON.stringify(checkpoint.bindingAtRecord) === JSON.stringify(context.capsule.execution.threadBinding) : null,
+      dispatchEligible: false,
+      executionBridge: "not_implemented",
+      runtimeQuiescence: "not_proven",
+      runClaimHandoff: "not_performed",
+      queries: {
+        latest: latestCommand,
+        occurrence: checkpoint ? `${latestCommand} --occurrence-id ${checkpoint.occurrenceId}` : null,
+      },
+    };
+  }
+
+  getTaskContinuationCheckpoint(taskId, occurrenceId = null) {
+    if (occurrenceId !== null && (typeof occurrenceId !== "string" || !/^[a-f0-9]{64}$/.test(occurrenceId))) {
+      throw new ApiError(400, "INVALID_FIELD", "Invalid continuation checkpoint occurrenceId");
+    }
+    this.database.exec("BEGIN");
+    try {
+      const context = this.#taskContinuationContext(taskId);
+      const row = occurrenceId === null ? this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_cooperative_checkpoint'
+        ORDER BY rowid DESC LIMIT 1
+      `).get(context.capsule.task.id) : this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND event_id = ?
+          AND json_extract(envelope_json, '$.eventType') = 'continuation_cooperative_checkpoint'
+      `).get(context.capsule.task.id, `continuation-cooperative-checkpoint:v1:${occurrenceId}`);
+      const result = this.#continuationCheckpointResult(context, row ? JSON.parse(row.envelope_json) : null);
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  appendTaskContinuationCheckpoint(taskId, body) {
+    let input;
+    try {
+      input = normalizeContinuationCheckpoint(body);
+    } catch (error) {
+      throw new ApiError(400, "INVALID_FIELD", error.message);
+    }
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const context = this.#taskContinuationContext(taskId);
+      const { capsule, record, evaluation } = context;
+      const binding = capsule.execution.threadBinding;
+      const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+      if (!binding || binding.codexHostId !== "local" || binding.codexProjectKind !== "local"
+        || !binding.codexProjectId || !path.isAbsolute(binding.workspacePath ?? "")
+        || binding.threadId !== input.senderThreadId || binding.threadId !== input.sourceThreadId
+        || record?.senderThreadId !== input.senderThreadId) {
+        throw new ApiError(409, "CONTINUATION_SENDER_MISMATCH", "Only the agreement's original bound Root may record a checkpoint");
+      }
+      if (record.eventId !== input.agreementId || capsule.resumeToken !== input.expectedResumeToken
+        || record.basis.projectId !== capsule.task.projectId || !same(record.basis.binding, binding)
+        || record.basis.requirementsRevision !== capsule.requirementsRevision) {
+        throw new ApiError(409, "CONTINUATION_STALE", "Reread the current Capsule and original agreement before recording");
+      }
+      if (capsule.task.archivedAt !== null || ["done", "canceled"].includes(capsule.task.status)
+        || record.status !== "active" || capsule.relations.blockedBy.some((dependency) => dependency.status !== "done")
+        || capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED")) {
+        throw new ApiError(409, "CONTINUATION_STOPPED", "The current task or agreement does not allow this checkpoint");
+      }
+      const action = evaluation.pendingActions.find((candidate) => candidate.id === input.nextActionId);
+      const gate = action ? evaluation.gatesById.get(action.gate) : null;
+      if (record.checkpoint.nextActionId !== input.nextActionId || !record.actionIds.includes(input.nextActionId)
+        || record.authorizationSource === null || evaluation.effectiveAuthorization.state !== "valid"
+        || !same(record.authorizationSource, evaluation.effectiveAuthorization.source)
+        || !action || gate?.state !== "authorized" || gate.expired) {
+        throw new ApiError(409, "CONTINUATION_NOT_AUTHORIZED", "The exact next action requires current agreement authorization");
+      }
+      const origins = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts
+        WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = 'continuation_effect_origin'
+          AND json_extract(envelope_json, '$.codexHostId') = 'local'
+          AND json_extract(envelope_json, '$.threadId') = ? AND json_extract(envelope_json, '$.turnId') = ?
+      `).all(capsule.task.id, input.sourceThreadId, input.sourceTurnId).map((row) => JSON.parse(row.envelope_json));
+      if (origins.length !== 1 || origins[0].projectId !== capsule.task.projectId
+        || origins[0].continuationRecordId !== record.eventId || !same(origins[0].bindingAtObservation, binding)) {
+        throw new ApiError(409, "CONTINUATION_ORIGIN_REQUIRED", "The source turn requires one matching original agreement effect origin");
+      }
+      const occurrenceId = continuationCheckpointOccurrenceId(capsule.task.id, input);
+      const receiptId = `continuation-cooperative-checkpoint:v1:${occurrenceId}`;
+      const existing = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE event_id = ?").get(receiptId);
+      let checkpoint = existing ? JSON.parse(existing.envelope_json) : null;
+      if (existing) {
+        if (checkpoint?.eventType !== "continuation_cooperative_checkpoint" || checkpoint.taskId !== capsule.task.id
+          || checkpoint.recordedBy !== input.senderThreadId || !same(checkpoint.bindingAtRecord, binding)
+          || !same(checkpoint.handoffDeclaration, input.handoffDeclaration)) {
+          throw new ApiError(409, "CONTINUATION_CHECKPOINT_CONFLICT", "This occurrence already has a different checkpoint declaration");
+        }
+      } else {
+        checkpoint = {
+          receiptId, eventType: "continuation_cooperative_checkpoint", occurrenceId,
+          taskId: capsule.task.id, projectId: capsule.task.projectId,
+          agreementId: input.agreementId, sourceThreadId: input.sourceThreadId,
+          sourceTurnId: input.sourceTurnId, nextActionId: input.nextActionId,
+          handoffDeclaration: input.handoffDeclaration,
+          recordedAt: evaluation.evaluatedAt, recordedBy: input.senderThreadId, bindingAtRecord: binding,
+        };
+        this.#prepare(`
+          INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+          VALUES (?, ?, ?, NULL, ?, ?)
+        `).run(receiptId, capsule.task.projectId, capsule.task.id, JSON.stringify(checkpoint), checkpoint.recordedAt);
+      }
+      const result = { applied: !existing, ...this.#continuationCheckpointResult(context, checkpoint) };
+      this.database.exec("COMMIT");
+      return result;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
