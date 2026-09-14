@@ -195,6 +195,7 @@ const COMMAND_OPTIONS = new Map([
   ["handoff list", new Set(["json"])],
   ["continuation record", new Set(["record-file", "json"])],
   ["continuation assess", new Set(["json"])],
+  ["continuation checkpoint", new Set(["from-json", "occurrence-id", "json"])],
   ["clarification list", new Set(["json"])],
   ["clarification enqueue", new Set([
     "consumer", "event-id", "idempotency-key", "basis-publication", "no-published-basis",
@@ -322,6 +323,8 @@ Commands:
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
   continuation record ISSUE_ID --record-file FILE [--json]
   continuation assess ISSUE_ID [--json]
+  continuation checkpoint record ISSUE_ID --from-json FILE [--json]
+  continuation checkpoint get ISSUE_ID [--occurrence-id ID] [--json]
   handoff list ISSUE_ID
   handoff publish SOURCE --consumer TARGET --event-id ID --idempotency-key KEY
     (--content TEXT | --content-file PATH)
@@ -506,6 +509,8 @@ repair-binding action.`],
 Actions:
   record ISSUE_ID --record-file FILE [--json]
   assess ISSUE_ID [--json]
+  checkpoint record ISSUE_ID --from-json FILE [--json]
+  checkpoint get ISSUE_ID [--occurrence-id ID] [--json]
 
 Record appends an existing agreement/checkpoint from a JSON file. Required fields:
 eventId, idempotencyKey, expectedRecordId (null for first record, else exact event ID),
@@ -515,7 +520,18 @@ actionIds, stopBoundary, status (active/paused/canceled/endpoint_reached), and c
 The literal string "none" is an ID, not null. senderThreadId always comes from CODEX_THREAD_ID.
 Reads use the protected local service. Assessment never resumes, wakes, claims, or grants
 authority: liveExecution is always unknown and eligibleForDispatch is always false.
-After conflict, reread the Capsule and latest record; never silently rewrite a stale request.`],
+After conflict, reread the Capsule and latest record; never silently rewrite a stale request.
+
+Checkpoint record saves a cooperative owner declaration without replacing the agreement.
+The JSON file requires agreementId, sourceThreadId, sourceTurnId, nextActionId,
+expectedResumeToken, and handoffDeclaration (children/tools/backgroundSessions/resources,
+each "none" or "returned"). Sender attribution comes only from CODEX_THREAD_ID.
+The source turn needs one recorded effect origin for the same agreement and binding;
+neither a terminal event nor an online adapter is required to save this declaration.
+Checkpoint get recovers the latest record or one exact occurrence for this task.
+Neither command resumes, wakes, claims, or releases resources. A declaration is not
+runtime quiescence or an execution permit: dispatchEligible is false and the execution
+bridge is not implemented. Repeating an unchanged current request returns the same receipt.`],
   ["handoff", `Usage: taskctl handoff ACTION [arguments] [options]
 
 Actions:
@@ -687,7 +703,7 @@ async function execute(parsed, overrides) {
   const allowedOptions = COMMAND_OPTIONS.get(command);
   if (!allowedOptions) {
     throw usageError(
-      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess, handoff list/add/ack/publish/read/adopt, clarification enqueue/list/resolve, comment list/add/update/delete, attachment list/download/upload, context current",
+      "Expected one of: project list/create/map/readme, authority list/grant/revoke, coordinator status/windows/register-window/acquire/renew/release/repair-binding/receipts, domain-coordinator status/domains/configure/remove/acquire/renew/release/receipts, domain-todo status/assign/clear, activation audit/apply-workflow-profile, cloud login/status/logout, issue list/get/bootstrap/create/update/move/claim/archive/restore/relation/progress, run get/checkpoint/finish, continuation record/assess/checkpoint, handoff list/add/ack/publish/read/adopt, clarification enqueue/list/resolve, comment list/add/update/delete, attachment list/download/upload, context current",
     );
   }
   validateOptions(parsed.options, allowedOptions);
@@ -1006,6 +1022,31 @@ async function execute(parsed, overrides) {
     case "continuation assess":
       expectOperandCount(parsed, 1);
       return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`);
+    case "continuation checkpoint": {
+      expectOperandCount(parsed, 2);
+      const [action, taskId] = parsed.operands;
+      const pathname = `/api/local/tasks/${encodeURIComponent(taskId)}/continuation/checkpoints`;
+      if (action === "get") {
+        if (parsed.options["from-json"] !== undefined) throw usageError("checkpoint get does not accept --from-json");
+        const occurrenceId = parsed.options["occurrence-id"];
+        return api.request("GET", occurrenceId === undefined ? pathname : `${pathname}?occurrenceId=${encodeURIComponent(occurrenceId)}`);
+      }
+      if (action !== "record") throw usageError("Expected continuation checkpoint record or get");
+      if (parsed.options["occurrence-id"] !== undefined) throw usageError("checkpoint record does not accept --occurrence-id");
+      const filename = resolveInputPath(requiredOption(parsed.options, "from-json"), overrides);
+      let body;
+      try {
+        const source = await (overrides.readFile ?? readFile)(filename, "utf8");
+        if (Buffer.byteLength(source, "utf8") > 262_144) throw new Error("Record file exceeds 262144 UTF-8 bytes");
+        body = JSON.parse(source);
+      } catch (error) {
+        throw new TaskctlError("Cannot read continuation checkpoint JSON", {
+          code: "INVALID_RECORD_FILE", details: error.message,
+        });
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw usageError("Checkpoint file must be a JSON object");
+      return api.request("POST", pathname, { ...body, senderThreadId: resolveThreadId({}, overrides) });
+    }
     case "continuation record": {
       expectOperandCount(parsed, 1);
       const filename = resolveInputPath(requiredOption(parsed.options, "record-file"), overrides);

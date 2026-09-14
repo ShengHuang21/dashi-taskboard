@@ -6528,6 +6528,24 @@ export function createTaskboardServer(options = {}) {
         ));
       }
 
+      const continuationCheckpointRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/continuation\/checkpoints$/);
+      if (continuationCheckpointRoute) {
+        const taskId = decodeRouteSegment(continuationCheckpointRoute[1], "Task id");
+        if (request.headers["x-taskboard-client"] !== "taskctl") {
+          throw new ApiError(403, "TASKCTL_REQUIRED", "Continuation checkpoints require protected taskctl");
+        }
+        if (request.method === "GET") {
+          assertAllowedQuery(url.searchParams, new Set(["occurrenceId"]), "GET continuation checkpoint");
+          return sendJson(response, 200, database.getTaskContinuationCheckpoint(taskId, url.searchParams.get("occurrenceId")));
+        }
+        if (request.method === "POST") {
+          assertNoQuery(url.searchParams, "POST continuation checkpoint");
+          const result = database.appendTaskContinuationCheckpoint(taskId, await readJson(request));
+          return sendJson(response, result.applied ? 201 : 200, result);
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
       const continuationRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/continuation$/);
       if (continuationRoute) {
         const taskId = decodeRouteSegment(continuationRoute[1], "Task id");
