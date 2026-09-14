@@ -23,6 +23,7 @@ export class CloudProxyError extends Error {
 export function isLocalCompanionRoute(pathname) {
   return LOCAL_COMPANION_ROUTES.has(pathname)
     || pathname.startsWith("/api/local/")
+    || /^\/api\/runs\/[^/]+\/handoff$/.test(pathname)
     || /^\/api\/projects\/[^/]+\/development-contexts$/.test(pathname);
 }
 

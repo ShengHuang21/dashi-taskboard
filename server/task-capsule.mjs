@@ -696,6 +696,7 @@ function durableRunFor(run) {
     finishedAt: run.finishedAt,
     summary: run.summary,
     nextAction: run.nextAction,
+    ...(run.handoff?.state === "cooperative_returned" ? { handoff: run.handoff } : {}),
   };
 }
 

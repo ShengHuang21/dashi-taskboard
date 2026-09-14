@@ -159,6 +159,8 @@ export function assessTaskContinuation({ record, capsule, evaluation, currentCla
     liveExecution: "unknown", eligibleForDispatch: false,
     recordedTerminalCheckpoint,
     recordedTerminalEffectOrigin,
+    ...(capsule.latestRun?.handoff?.state === "cooperative_returned"
+      ? { recordedRunHandoff: capsule.latestRun.handoff } : {}),
   });
   if (!record) return result("not_enrolled", "continuation_not_recorded", "record_existing_agreement");
   if (capsule.task.archivedAt !== null || ["canceled", "done"].includes(capsule.task.status)) {
@@ -180,6 +182,7 @@ export function assessTaskContinuation({ record, capsule, evaluation, currentCla
   }
   if (currentClaim?.status === "active" || [capsule.activeRun, capsule.latestRun].some((run) => (
     run && ["active", "blocked", "claimed", "running", "admission_uncertain", "expired_unresolved", "interrupted"].includes(run.state)
+      && !(run === capsule.latestRun && run.state === "interrupted" && run.handoff?.state === "cooperative_returned")
   ))) {
     return result("execution_observation_required", "unresolved_execution_evidence", "observe_current_execution");
   }

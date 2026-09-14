@@ -192,6 +192,7 @@ const COMMAND_OPTIONS = new Map([
   ["run get", new Set(["json"])],
   ["run checkpoint", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
   ["run finish", new Set(["summary", "next-action", "status", "thread-id", "if-version", "json"])],
+  ["run handoff", new Set(["checkpoint-occurrence-id", "if-version", "resume-token", "summary", "json"])],
   ["handoff list", new Set(["json"])],
   ["continuation record", new Set(["record-file", "json"])],
   ["continuation assess", new Set(["json"])],
@@ -318,6 +319,7 @@ Commands:
   cloud login --url URL --actor-name NAME
   cloud status|logout
   issue list|get|bootstrap|create|update|move|archive|restore|relation|progress
+  run handoff RUN_ID --checkpoint-occurrence-id ID --if-version N --resume-token TOKEN --summary TEXT [--json]
   dependency-handoff status PROJECT_ID TARGET_ISSUE_ID
   dependency-handoff accept PROJECT_ID TARGET_ISSUE_ID --source SOURCE_ISSUE_ID
     --idempotency-key KEY --holder-task ID --holder-thread-id ID --expected-lease-id ID
@@ -429,6 +431,13 @@ Actions:
     [--status active|blocked] --thread-id ID --if-version N [--json]
   finish RUN_ID --status completed|failed|interrupted --summary TEXT --next-action TEXT
     --thread-id ID --if-version N [--json]
+  handoff RUN_ID --checkpoint-occurrence-id ID --if-version N --resume-token TOKEN --summary TEXT [--json]
+
+Handoff uses the protected local companion and the current CODEX_THREAD_ID only;
+--thread-id cannot substitute for the original run Agent. It ends only the exact
+Taskboard run/claim, keeps the task in_progress, and records its checkpoint link.
+After success, stop using the returned write scope. This does not stop processes,
+release resources, grant a successor claim, or start the next action.
 
 Examples:
   taskctl run get RUN_ID --json
@@ -719,6 +728,7 @@ async function execute(parsed, overrides) {
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
   const usesCompanionControl = command.startsWith("cloud ")
     || command === "project map"
+    || command === "run handoff"
     || command.startsWith("owner-intent ")
     || command.startsWith("coordinator ")
     || command.startsWith("domain-coordinator ")
@@ -1019,6 +1029,15 @@ async function execute(parsed, overrides) {
     case "run finish":
       expectOperandCount(parsed, 1);
       return finishAgentRun(api, parsed.operands[0], parsed.options, overrides);
+    case "run handoff":
+      expectOperandCount(parsed, 1);
+      return api.request("POST", `${agentRunPath(parsed.operands[0])}/handoff`, {
+        agentThreadId: resolveThreadId({}, overrides),
+        checkpointOccurrenceId: requiredOption(parsed.options, "checkpoint-occurrence-id"),
+        version: explicitVersion(parsed.options["if-version"]),
+        expectedResumeToken: requiredOption(parsed.options, "resume-token"),
+        summary: requiredOption(parsed.options, "summary"),
+      });
     case "continuation assess":
       expectOperandCount(parsed, 1);
       return api.request("GET", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/continuation`);
