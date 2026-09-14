@@ -400,6 +400,65 @@ export type TaskConversationRef = TaskConversationRefBase & (
   | { threadId: string; legacyLocal: true }
 );
 
+export type TaskProgressChange = {
+  id: string;
+  createdAt: string;
+} & (
+  | { kind: "created" | "canceled" | "restored" | "reopened" }
+  | { kind: "parent"; beforeParentIdentifier: string | null; afterParentIdentifier: string | null }
+);
+
+export interface ResourceAllocationRecord {
+  id: string;
+  kind: "environment" | "heavy";
+  state: "held" | "available" | "released";
+  ownerThreadId: string;
+  ownerRunId: string;
+  source: string;
+  sourceRef: string;
+  sourceVersion?: number;
+  declaredAt?: string;
+  validUntil?: string;
+  grantedAt?: string;
+  releasedAt: string | null;
+}
+
+export interface ResourceStepRecord {
+  step: {
+    id: string;
+    taskId: string;
+    runId: string;
+    actionId: string;
+    ownerThreadId: string;
+    state: string;
+    createdAt: string;
+    waiter?: { observedAt: string; validUntil: string };
+    grantedAt?: string;
+    consumedAt?: string;
+    resultRecordedAt?: string;
+    result?: { outcome: "exited" | "no_start" | "start_uncertain"; exitCode: number | null; signal: string | null; sourceRef: string };
+  };
+  allocation: ResourceAllocationRecord | null;
+  environment: ResourceAllocationRecord | null;
+  executionOutcome: string;
+  waitingReason: string | null;
+}
+
+export interface TaskGoalWindows {
+  state: "declared" | "invalid";
+  sourceCommentId: string;
+  sourceCommentVersion: number;
+  updatedAt: string;
+  sourceRef: string | null;
+  windows: {
+    threadId: string;
+    title: string;
+    role: "coding" | "qa_guide";
+    threadBinding: CodexThreadBinding | null;
+  }[];
+  resourceRefs: { taskId: string; stepId: string; allocationId: string }[];
+}
+
 export interface Task {
   id: string;
   identifier: string;
@@ -415,10 +474,12 @@ export interface Task {
   threadBinding: CodexThreadBinding | null;
   legacyLocalThreadId: string | null;
   conversationRefs: TaskConversationRef[];
+  goalWindows?: TaskGoalWindows | null;
   participants: ActorIdentity[];
   previewImage: Attachment | null;
   activityKey: string;
   activityUpdatedAt: string;
+  progressChanges?: TaskProgressChange[];
   creatorType: ActorType;
   creatorId: string;
   creatorName: string;
@@ -710,7 +771,7 @@ export interface CoordinationTodoSnapshot {
     deadlineAt: string | null;
     uncertainAt: string | null;
     recoveredAgentThreadId: string | null;
-    deferredReason: "model_capacity" | "domain_reroute" | "admission_absent" | null;
+    deferredReason: "model_capacity" | "coordinator_busy" | "domain_reroute" | "admission_absent" | null;
     retryCount: number;
     retryAfter: string | null;
     rootHostId: string;

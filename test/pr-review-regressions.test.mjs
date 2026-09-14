@@ -45,14 +45,28 @@ test("task list activity queries project metadata while detail routes retain ful
     "async function listComments(env, taskId)",
   );
 
+  assert.match(
+    localListQuery,
+    /SELECT\s+id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, changes, created_at\s+FROM task_activities/s,
+  );
+  assert.match(
+    cloudListQuery,
+    /SELECT\s+id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, created_at\s+FROM task_activities/s,
+  );
+  assert.doesNotMatch(cloudListQuery, /\bchanges\b/);
   for (const listQuery of [localListQuery, cloudListQuery]) {
-    assert.match(
-      listQuery,
-      /SELECT\s+id, task_id, actor_type, actor_id, actor_name, actor_avatar_url, created_at\s+FROM task_activities/s,
-    );
     assert.doesNotMatch(listQuery, /SELECT \* FROM task_activities/);
-    assert.doesNotMatch(listQuery, /\bchanges\b/);
   }
+  const localProgressProjection = between(databaseSource, "  task.progressChanges =", "  task.activityKey =");
+  assert.match(localProgressProjection, /orderedActivities\.flatMap\([\s\S]*?JSON\.parse\(activity\.changes\)\.flatMap/);
+  assert.match(localProgressProjection, /const record = \{ id: `\$\{activity\.id\}:\$\{index\}`, createdAt: activity\.created_at \}/);
+  for (const kind of ["canceled", "restored", "reopened", "parent"]) {
+    assert.match(localProgressProjection, new RegExp(`kind: "${kind}"`));
+  }
+  assert.match(localProgressProjection, /beforeParentIdentifier: change\.before\?\.type === "parent" \? change\.before\.identifier : null/);
+  assert.match(localProgressProjection, /afterParentIdentifier: change\.after\?\.type === "parent" \? change\.after\.identifier : null/);
+  assert.doesNotMatch(localProgressProjection, /\.\.\.(?:activity|change)\b|return\s+\[?\s*(?:activity|change)\b/);
+  assert.doesNotMatch(localProgressProjection, /(?:[{,]\s*|\n\s*)(?:changes|before|after)\s*:/);
   for (const detailQuery of [localDetailQuery, cloudDetailQuery]) {
     assert.match(detailQuery, /SELECT \* FROM task_activities/);
     assert.match(detailQuery, /taskActivityFromRow/);

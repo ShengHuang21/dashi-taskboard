@@ -1143,6 +1143,7 @@ export function createTaskCapsule({
       archivedAt: task.archivedAt,
     },
     relations: task.relations,
+    goalWindows: task.goalWindows ?? null,
     comments: orderedComments,
     attachments: orderedAttachments,
     inbox: inboxFor(inboxReceipts),

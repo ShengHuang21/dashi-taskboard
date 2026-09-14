@@ -3,6 +3,7 @@ import type { DragEvent } from "react";
 import type { ActorIdentity, Task, TaskDraft, TaskStatus } from "../types";
 import { taskStatusLabel, useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation, TaskConversationItem } from "../taskConversations";
+import type { DeliveryProgress } from "../taskProgress";
 import { TaskCard } from "./TaskCard";
 import { PlusIcon, StatusIcon } from "./SemanticIcons";
 
@@ -24,6 +25,7 @@ interface BoardColumnProps {
   status: TaskStatus;
   tasks: Task[];
   presentations: Record<string, TaskCardPresentation>;
+  deliveryProgressByTask: Record<string, DeliveryProgress>;
   now: number;
   emptyMessage: string;
   isDropTarget: boolean;
@@ -56,6 +58,7 @@ export function BoardColumn({
   status,
   tasks,
   presentations,
+  deliveryProgressByTask,
   now,
   emptyMessage,
   isDropTarget,
@@ -179,6 +182,7 @@ export function BoardColumn({
               key={task.id}
               task={task}
               presentation={presentations[task.id]}
+              deliveryProgress={deliveryProgressByTask[task.id]}
               now={now}
               isDragging={draggedTaskId === task.id}
               dragShift={dragShift}
