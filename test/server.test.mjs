@@ -2531,6 +2531,8 @@ test("Root records one immutable Owner decision receipt from the project-level r
     restoreDatabase.upsertAgentLaneProject("local", exactRouteConfig);
     restoreDatabase.close();
   }
+  // The route-rejection fixtures can outlast the host observation's freshness window.
+  assert.equal((await publishRootRuntime("ac".repeat(16))).response.status, 200);
   const delivery = await request(baseUrl, "/api/local/projects/local/owner-decision-delivery/claim", {
     method: "POST",
     headers: injectorHeaders("c".repeat(32)),
