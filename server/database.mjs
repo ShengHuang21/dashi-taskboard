@@ -2569,6 +2569,14 @@ export class TaskboardDatabase {
         ON ai_chat_runs(thread_id)
         WHERE status = 'running';
 
+      CREATE TABLE IF NOT EXISTS ai_chat_run_requests (
+        thread_id TEXT NOT NULL REFERENCES ai_chat_threads(id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        run_id TEXT NOT NULL REFERENCES ai_chat_runs(id) ON DELETE CASCADE,
+        PRIMARY KEY (thread_id, request_id)
+      );
+
       CREATE TABLE IF NOT EXISTS ai_chat_events (
         id TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL REFERENCES ai_chat_threads(id) ON DELETE CASCADE,
@@ -3893,10 +3901,33 @@ export class TaskboardDatabase {
   }
 
   createAiChatRun(input) {
+    return this.reserveAiChatRun(input).run;
+  }
+
+  getRequestedAiChatRun(threadId, requestId, payloadDigest) {
+    const request = this.#prepare(`
+      SELECT payload_digest, run_id FROM ai_chat_run_requests
+      WHERE thread_id = ? AND request_id = ?
+    `).get(threadId, requestId);
+    if (!request) return null;
+    if (request.payload_digest !== payloadDigest) {
+      throw new ApiError(409, "AI_CHAT_REQUEST_CONFLICT", "This requestId was already used with a different turn payload");
+    }
+    return this.getAiChatRun(request.run_id);
+  }
+
+  reserveAiChatRun(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.startedAt ?? now();
     this.database.exec("BEGIN IMMEDIATE");
     try {
+      if (input.requestId !== undefined) {
+        const existing = this.getRequestedAiChatRun(input.threadId, input.requestId, input.payloadDigest);
+        if (existing) {
+          this.database.exec("COMMIT");
+          return { created: false, run: existing };
+        }
+      }
       this.#prepare(`
         INSERT INTO ai_chat_runs (
           id, thread_id, status, exit_code, error, started_at, finished_at
@@ -3917,12 +3948,18 @@ export class TaskboardDatabase {
           WHERE id = ?
         `).run(timestamp, input.threadId);
       }
+      if (input.requestId !== undefined) {
+        this.#prepare(`
+          INSERT INTO ai_chat_run_requests (thread_id, request_id, payload_digest, run_id)
+          VALUES (?, ?, ?, ?)
+        `).run(input.threadId, input.requestId, input.payloadDigest, id);
+      }
       this.database.exec("COMMIT");
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
     }
-    return this.getAiChatRun(id);
+    return { created: true, run: this.getAiChatRun(id) };
   }
 
   updateAiChatRun(id, changes) {
