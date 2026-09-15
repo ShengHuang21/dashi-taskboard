@@ -438,7 +438,8 @@ Actions:
 Statuses: backlog, todo, in_progress, in_review, blocked, done, canceled
 Priorities: none, urgent, high, medium, low
 
-Progress reads recorded excerpts through one Capsule GET; it never sends a message
+Progress reads recorded excerpts through one Capsule GET plus an optional local
+background-run metadata GET; it never sends a message
 or starts a task. queriedAt is retrieval time, not a work checkpoint. Each record
 retains its own version/time; requirementsRevision is not a Git, QA, or run revision.
 Live execution is unknown. Use the full bootstrap before executing work.
@@ -1041,7 +1042,9 @@ async function execute(parsed, overrides) {
     case "issue progress": {
       expectOperandCount(parsed, 1);
       const { capsule } = await api.request("GET", `${taskPath(parsed.operands[0])}/capsule`);
-      return { progress: recordedProgress(capsule) };
+      const progress = recordedProgress(capsule);
+      const backgroundProgress = await readBackgroundProgress(capsule.task, env, overrides);
+      return { progress, backgroundProgress };
     }
     case "issue create":
       expectOperandCount(parsed, 0);
@@ -1304,6 +1307,51 @@ function progressText(field, value) {
   };
 }
 
+async function readBackgroundProgress({ id: taskId, projectId }, env, overrides) {
+  try {
+    const localApi = createApiClient(overrides, { baseUrl: await resolveProgressCompanionUrl(env, overrides) });
+    const query = new URLSearchParams({ projectId, taskId });
+    const { backgroundProgress: value } = await localApi.request(
+      "GET", `/api/local/ai/task-progress?${query}`, undefined, { timeoutMs: 3_000, redirect: "error" },
+    );
+    const isTimestamp = (timestamp) => typeof timestamp === "string" && Number.isFinite(Date.parse(timestamp));
+    const isIdentifier = (identifier) => typeof identifier === "string" && /^[a-z0-9_-]{1,200}$/i.test(identifier);
+    if (!value || value.availability !== "available" || value.source !== "local-ai-chat"
+      || value.projectId !== projectId || value.taskId !== taskId || !isTimestamp(value.queriedAt)
+      || !Array.isArray(value.threads) || value.threads.length > 20 || typeof value.truncated !== "boolean") {
+      throw new Error("Invalid background progress");
+    }
+    const threads = value.threads.map((thread) => {
+      if (!isIdentifier(thread?.threadId)) throw new Error("Invalid background thread");
+      const run = thread.latestRun;
+      if (run === null) return { threadId: thread.threadId, latestRun: null };
+      if (!run || !isIdentifier(run.runId)
+        || !["running", "completed", "failed", "interrupted"].includes(run.recordedStatus)
+        || !isTimestamp(run.startedAt) || (run.finishedAt !== null && !isTimestamp(run.finishedAt))) {
+        throw new Error("Invalid background run");
+      }
+      return {
+        threadId: thread.threadId,
+        latestRun: {
+          runId: run.runId,
+          recordedStatus: run.recordedStatus,
+          startedAt: run.startedAt,
+          finishedAt: run.finishedAt,
+        },
+      };
+    });
+    return {
+      availability: "available", source: "local-ai-chat", projectId, taskId,
+      queriedAt: value.queriedAt, threads, truncated: value.truncated,
+    };
+  } catch {
+    return {
+      availability: "unavailable", source: "local-ai-chat", projectId, taskId,
+      queriedAt: new Date().toISOString(), threads: null, truncated: null,
+    };
+  }
+}
+
 async function readResourceRequest(parsed, overrides) {
   const filename = resolveInputPath(requiredOption(parsed.options, "request-file"), overrides);
   const request = JSON.parse(await (overrides.readFile ?? readFile)(filename, "utf8"));
@@ -1429,7 +1477,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
     waitForRetry: overrides.waitForRetry ?? ((milliseconds) => (
       new Promise((resolve) => setTimeout(resolve, milliseconds))
     )),
-    async request(method, pathname, body, { timeoutMs } = {}) {
+    async request(method, pathname, body, { timeoutMs, redirect } = {}) {
       let response;
       try {
         response = await fetchImplementation(resolveApiUrl(baseUrl, pathname), {
@@ -1441,6 +1489,7 @@ function createApiClient(overrides, { baseUrl: explicitBaseUrl } = {}) {
           },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           ...(timeoutMs === undefined ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
+          ...(redirect === undefined ? {} : { redirect }),
         });
       } catch (error) {
         throw new TaskctlError(`Cannot reach taskboard service at ${baseUrl}`, {
@@ -2599,7 +2648,7 @@ function resolveApiUrl(baseUrl, pathname) {
   return new URL(pathname.replace(/^\//, ""), `${baseUrl}/`);
 }
 
-async function resolveTaskboardBaseUrl(env, overrides) {
+async function resolveTaskboardBaseUrl(env, overrides, { allowDefault = true } = {}) {
   if (env.CODEX_TASKBOARD_URL !== undefined) return env.CODEX_TASKBOARD_URL;
   const configuredDescriptorPath = env.CODEX_TASKBOARD_RUNTIME_FILE;
   const descriptorPath = configuredDescriptorPath ?? sourceRuntimeFile;
@@ -2610,7 +2659,7 @@ async function resolveTaskboardBaseUrl(env, overrides) {
       : (overrides.readFile ?? readFile);
     descriptor = JSON.parse(await read(descriptorPath, "utf8"));
   } catch (error) {
-    if (configuredDescriptorPath === undefined && error?.code === "ENOENT") {
+    if (allowDefault && configuredDescriptorPath === undefined && error?.code === "ENOENT") {
       return DEFAULT_API_URL;
     }
     throw new TaskctlError("Cannot read the active Taskboard launcher endpoint", {
@@ -2626,6 +2675,20 @@ async function resolveTaskboardBaseUrl(env, overrides) {
     });
   }
   return descriptor.url;
+}
+
+async function resolveProgressCompanionUrl(env, overrides) {
+  if (env.CODEX_TASKBOARD_COMPANION_URL !== undefined) return resolveCompanionUrl(env, overrides);
+  if (env.CODEX_TASKBOARD_URL !== undefined) {
+    const url = new URL(env.CODEX_TASKBOARD_URL);
+    if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+      return resolveCompanionUrl(env, overrides);
+    }
+  }
+  const descriptorUrl = await resolveTaskboardBaseUrl(
+    { ...env, CODEX_TASKBOARD_URL: undefined }, overrides, { allowDefault: false },
+  );
+  return resolveCompanionUrl({ CODEX_TASKBOARD_COMPANION_URL: descriptorUrl }, overrides);
 }
 
 async function resolveCompanionUrl(env, overrides) {

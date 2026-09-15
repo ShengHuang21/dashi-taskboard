@@ -3766,6 +3766,38 @@ export class TaskboardDatabase {
     return row ? projectReadmeAttachmentFromRow(row) : null;
   }
 
+  getAiChatTaskProgress(projectId, taskId) {
+    const rows = this.#prepare(`
+      SELECT thread.id AS thread_id, run.id AS run_id, run.status,
+        run.started_at, run.finished_at
+      FROM ai_chat_threads AS thread
+      LEFT JOIN ai_chat_runs AS run ON run.rowid = (
+        SELECT rowid FROM ai_chat_runs
+        WHERE thread_id = thread.id ORDER BY rowid DESC LIMIT 1
+      )
+      WHERE thread.origin_project_id = ? AND thread.origin_issue_id = ?
+      ORDER BY run.rowid DESC, thread.id ASC
+      LIMIT 21
+    `).all(projectId, taskId);
+    return {
+      availability: "available",
+      source: "local-ai-chat",
+      projectId,
+      taskId,
+      queriedAt: new Date().toISOString(),
+      threads: rows.slice(0, 20).map((row) => ({
+        threadId: row.thread_id,
+        latestRun: row.run_id === null ? null : {
+          runId: row.run_id,
+          recordedStatus: row.status,
+          startedAt: row.started_at,
+          finishedAt: row.finished_at,
+        },
+      })),
+      truncated: rows.length > 20,
+    };
+  }
+
   listAiChatThreads() {
     const rows = this.#prepare(`
       SELECT * FROM ai_chat_threads
