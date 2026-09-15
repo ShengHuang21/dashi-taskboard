@@ -32,6 +32,9 @@ const BOOLEAN_OPTIONS = new Set([
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
+  ["background create", new Set(["project", "issue", "title", "model", "reasoning-effort", "sandbox", "json"])],
+  ["background start", new Set(["request-id", "message", "message-file", "json"])],
+  ["background get", new Set(["json"])],
   ["resource-step prepare", new Set(["request-file", "json"])],
   ["resource-step run", new Set(["run-id", "action-id", "request-file", "wait-timeout", "json"])],
   ["resource-step get", new Set(["json"])],
@@ -342,6 +345,10 @@ Commands:
   resource-step wait ISSUE_ID STEP_ID --wait-timeout SECONDS
   resource-step result ISSUE_ID STEP_ID --request-file FILE
   resource-step checkpoint ALLOCATION_ID --request-file FILE
+  background create --project ID --model MODEL --reasoning-effort EFFORT --sandbox MODE
+    [--issue ID --title TEXT]
+  background start THREAD_ID --request-id ID (--message TEXT | --message-file FILE)
+  background get THREAD_ID
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
   comment update COMMENT_ID --body TEXT --if-version N [--thread-id ID]
@@ -362,6 +369,21 @@ Examples:
   taskctl comment list LOCAL-275 --json
 
 Run taskctl issue --help, taskctl coordinator --help, taskctl activation --help, or taskctl run --help for command arguments.`],
+  ["background", `Usage: taskctl background ACTION [arguments] [options]
+
+  create --project ID --model MODEL --reasoning-effort EFFORT --sandbox MODE
+    [--issue ID --title TEXT] [--json]
+  start THREAD_ID --request-id ID (--message TEXT | --message-file FILE) [--json]
+  get THREAD_ID [--json]
+
+Create returns a new Taskboard AI chat thread UUID, not an existing Desktop task.
+Save that UUID before starting work. Retry with the same UUID, request-id, and
+message to return the original run without another dispatch attempt. Reusing the
+key with a different payload returns a conflict. An interrupted/failed run is
+not automatically restarted; inspect it with get before choosing a new request.
+These commands use the protected local companion; they do not prove Desktop idle.
+Sandbox values retain the existing AI chat approval modes. This command does not
+confirm danger-full-access; use a non-dangerous mode for background work.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
 
 Actions:
@@ -727,6 +749,7 @@ async function execute(parsed, overrides) {
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
   const usesCompanionControl = command.startsWith("cloud ")
+    || command.startsWith("background ")
     || command === "project map"
     || command === "run handoff"
     || command.startsWith("owner-intent ")
@@ -745,6 +768,39 @@ async function execute(parsed, overrides) {
       : await resolveTaskboardBaseUrl(env, overrides),
   });
   switch (command) {
+    case "background create":
+      expectOperandCount(parsed, 0);
+      return api.request("POST", "/api/local/ai/threads", {
+        projectId: requiredOption(parsed.options, "project"),
+        model: requiredOption(parsed.options, "model"),
+        reasoningEffort: requiredOption(parsed.options, "reasoning-effort"),
+        sandbox: requiredOption(parsed.options, "sandbox"),
+        ...optionalField("issueId", parsed.options.issue),
+        ...optionalField("title", parsed.options.title),
+      });
+    case "background start": {
+      expectOperandCount(parsed, 1);
+      const requestId = requiredOption(parsed.options, "request-id");
+      if (parsed.options.message !== undefined && parsed.options["message-file"] !== undefined) {
+        throw usageError("Use either --message or --message-file, not both");
+      }
+      let message = parsed.options.message;
+      if (parsed.options["message-file"] !== undefined) {
+        const read = overrides.readFile ?? readFile;
+        try {
+          message = await read(parsed.options["message-file"], "utf8");
+        } catch {
+          throw usageError("Cannot read background message file");
+        }
+      }
+      if (message === undefined) throw usageError("Use --message or --message-file");
+      return api.request("POST", `/api/local/ai/threads/${encodeURIComponent(parsed.operands[0])}/turns`, {
+        requestId, message,
+      });
+    }
+    case "background get":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `/api/local/ai/threads/${encodeURIComponent(parsed.operands[0])}`);
     case "resource-step run":
     case "resource-step get":
     case "resource-step wait":

@@ -6,8 +6,9 @@ import path from "node:path";
 import { test } from "node:test";
 
 import { createTaskboardServer } from "../server/index.mjs";
+import { main as taskctl } from "../cli/taskctl.mjs";
 
-async function createServerFixture(host = "127.0.0.1") {
+async function createServerFixture(host = "127.0.0.1", options = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-ai-server-"));
   const workspacePath = path.join(directory, "workspace");
   await mkdir(workspacePath);
@@ -27,8 +28,12 @@ if (args[0] === "debug") {
     }
   });
 } else {
+  let prompt = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.resume();
   process.stdin.on("end", () => {
+    if (prompt.includes("fixture-run-failure")) process.exit(7);
     process.stdout.write('{"type":"thread.started","thread_id":"session-1"}\\n');
     process.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\\n');
     process.stdout.write('{"type":"turn.completed"}\\n');
@@ -45,6 +50,7 @@ if (args[0] === "debug") {
     codexExecutable,
     codexStatePath,
     skillPath: "/fixture/manage-taskboard/SKILL.md",
+    ...options,
   });
   const address = await app.listen({ host, port: 0 });
   return {
@@ -58,6 +64,107 @@ if (args[0] === "debug") {
     },
   };
 }
+
+test("background taskctl retries preserve one durable run through completion and restart", async () => {
+  const instance = { instanceToken: "fixture-background-token", instanceSecret: "a".repeat(64) };
+  const fixture = await createServerFixture("127.0.0.1", instance);
+  let app = fixture.app;
+  let baseUrl = `${fixture.baseUrl}/${instance.instanceToken}`;
+  const runtimePath = path.join(fixture.directory, "fixture-runtime.json");
+  const messagePath = path.join(fixture.directory, "message.txt");
+  await writeFile(messagePath, "hello");
+  await writeFile(runtimePath, JSON.stringify({ version: 1, url: baseUrl }));
+  async function cli(args) {
+    let output = "";
+    const stream = { write(value) { output += value; } };
+    const code = await taskctl([...args, "--runtime-file", runtimePath, "--json"], {
+      env: {}, stdout: stream, stderr: stream,
+    });
+    return { code, body: JSON.parse(output) };
+  }
+  try {
+    const created = await cli(["background", "create", "--project", "local", "--model", "gpt-real",
+      "--reasoning-effort", "high", "--sandbox", "read-only"]);
+    assert.equal(created.code, 0);
+    const threadId = created.body.thread.id;
+    const command = ["background", "start", threadId, "--request-id", "owner-request-1", "--message", "hello"];
+    const [first, replay] = await Promise.all([
+      cli(["background", "start", threadId, "--request-id", "owner-request-1", "--message-file", messagePath]),
+      cli(command),
+    ]);
+    assert.equal(first.code, 0);
+    assert.equal(replay.code, 0);
+    assert.equal(replay.body.run.id, first.body.run.id);
+    let snapshot;
+    for (let index = 0; index < 100; index += 1) {
+      snapshot = await cli(["background", "get", threadId]);
+      if (snapshot.body.runs[0]?.status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(snapshot.body.runs.length, 1);
+    assert.equal(snapshot.body.runs[0].status, "completed");
+    assert.equal(snapshot.body.events.filter((event) => event.type === "user_message").length, 1);
+    assert.equal((await cli(command)).body.run.id, first.body.run.id);
+    const conflict = await cli([...command.slice(0, -1), "different message"]);
+    assert.notEqual(conflict.code, 0);
+    assert.equal(conflict.body.error.code, "AI_CHAT_REQUEST_CONFLICT");
+    assert.deepEqual((await cli(["background", "get", threadId])).body, snapshot.body);
+    const composer = await request(baseUrl, `/api/local/ai/threads/${threadId}/turns`, {
+      method: "POST", body: { contractVersion: "composer.v1", requestId: "owner-request-1" },
+    });
+    assert.equal(composer.response.status, 400);
+    assert.deepEqual((await cli(["background", "get", threadId])).body, snapshot.body);
+
+    // A settings change or service restart must not turn an old request into new work.
+    await request(baseUrl, `/api/local/ai/threads/${threadId}`, {
+      method: "PATCH", body: { sandbox: "danger-full-access" },
+    });
+    await app.close();
+    app = createTaskboardServer({
+      dataDirectory: fixture.directory,
+      codexExecutable: path.join(fixture.directory, "fake-codex.mjs"),
+      codexStatePath: path.join(fixture.directory, "codex-state.json"),
+      skillPath: "/fixture/manage-taskboard/SKILL.md", ...instance,
+    });
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    baseUrl = `http://127.0.0.1:${address.port}/${instance.instanceToken}`;
+    await writeFile(runtimePath, JSON.stringify({ version: 1, url: baseUrl }));
+    const restartedReplay = await cli(command);
+    assert.equal(restartedReplay.code, 0);
+    assert.equal(restartedReplay.body.run.id, first.body.run.id);
+    assert.equal(restartedReplay.body.run.status, "completed");
+    assert.equal((await cli(["background", "get", threadId])).body.runs.length, 1);
+
+    // A confirmed synchronous failure after reservation remains terminal on retry.
+    const failedThread = await app.aiChat.createThread({ projectId: "local", model: "gpt-real" });
+    const insert = app.database.insertAiChatEvent;
+    app.database.insertAiChatEvent = () => { throw new Error("fixture pre-spawn failure"); };
+    const failedInput = { requestId: "failure-request", message: "hello" };
+    await assert.rejects(app.aiChat.startTurn(failedThread.id, failedInput), /fixture pre-spawn failure/);
+    app.database.insertAiChatEvent = insert;
+    const failedRun = await app.aiChat.startTurn(failedThread.id, failedInput);
+    assert.equal(failedRun.status, "failed");
+    assert.equal(app.database.listAiChatRuns(failedThread.id).length, 1);
+
+    app.database.insertAiChatEvent = function (event) {
+      if (event.type === "error") throw new Error("fixture error-event write failure");
+      return insert.call(this, event);
+    };
+    const terminalInput = { requestId: "terminal-request", message: "fixture-run-failure" };
+    const terminalRun = await app.aiChat.startTurn(failedThread.id, terminalInput);
+    for (let index = 0; index < 100; index += 1) {
+      if (app.aiChat.getRun(terminalRun.id).status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    app.database.insertAiChatEvent = insert;
+    assert.equal(app.aiChat.getRun(terminalRun.id).status, "failed");
+    assert.equal((await app.aiChat.startTurn(failedThread.id, terminalInput)).id, terminalRun.id);
+    assert.equal(app.database.listAiChatRuns(failedThread.id).length, 2);
+  } finally {
+    await app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 function privateLanAddress() {
   return Object.values(os.networkInterfaces())

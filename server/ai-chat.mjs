@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -31,6 +32,17 @@ const CODEX_IMAGE_TYPES = new Set([
 function cappedError(value) {
   const message = value instanceof Error ? value.message : String(value ?? "");
   return message.slice(0, ERROR_CONTENT_LIMIT);
+}
+
+function turnPayloadDigest(input) {
+  return createHash("sha256").update(JSON.stringify({
+    message: input.message,
+    skillIds: input.skillIds ?? [],
+    dangerFullAccessConfirmed: input.dangerFullAccessConfirmed === true,
+    attachments: (input.attachments ?? []).map(({ filename, contentType, data, size }) => ({
+      filename, contentType, size, data: data.toString("base64"),
+    })),
+  })).digest("hex");
 }
 
 function agentDispatchText(agent) {
@@ -379,6 +391,19 @@ export class AiChatService {
 
   async startTurn(threadId, input) {
     let thread = this.getThread(threadId);
+    if (input?.contractVersion === "composer.v1" && input.requestId !== undefined) {
+      throw new ApiError(400, "INVALID_FIELD", "requestId is only supported for the background legacy turn payload");
+    }
+    if (input?.contractVersion !== "composer.v1") this.#validateTurnInput(input);
+    const request = input?.requestId === undefined ? undefined : {
+      requestId: input.requestId.trim(),
+      payloadDigest: turnPayloadDigest(input),
+    };
+    const replay = () => request && this.database.getRequestedAiChatRun(
+      threadId, request.requestId, request.payloadDigest,
+    );
+    const previous = replay();
+    if (previous) return previous;
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
         409,
@@ -389,7 +414,6 @@ export class AiChatService {
     if (input?.contractVersion === "composer.v1") {
       return this.#startComposerTurn(thread, input);
     }
-    this.#validateTurnInput(input);
     if (thread.sandbox === "danger-full-access" && input.dangerFullAccessConfirmed !== true) {
       throw new ApiError(
         400,
@@ -405,6 +429,8 @@ export class AiChatService {
     const catalog = await this.getCatalog(thread.origin.projectId, resolved);
 
     thread = this.getThread(threadId);
+    const pendingReplay = replay();
+    if (pendingReplay) return pendingReplay;
     if (this.#threadIsActive(thread)) {
       throw new ApiError(
         409,
@@ -448,6 +474,7 @@ export class AiChatService {
       attachmentPaths,
       imagePaths,
     } = await this.#writeTurnAttachments(attachments);
+    let run;
     try {
       const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths);
       const prompt = buildCodexPrompt(
@@ -459,7 +486,12 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
       );
-      const run = this.database.createAiChatRun({ threadId });
+      const reservation = this.database.reserveAiChatRun({ threadId, ...request });
+      if (!reservation.created) {
+        if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
+        return reservation.run;
+      }
+      run = reservation.run;
       this.#emit(threadId, { type: "ai.run", run });
       const userEventData = {};
       if (skillIds.length > 0) userEventData.skillIds = skillIds;
@@ -552,6 +584,12 @@ export class AiChatService {
       void finalization.finally(() => this.completions.delete(run.id)).catch(() => {});
       return run;
     } catch (error) {
+      if (run && !this.active.has(run.id)) {
+        const failed = this.database.updateAiChatRun(run.id, {
+          status: "failed", error: cappedError(error), finishedAt: new Date().toISOString(),
+        });
+        this.#emit(threadId, { type: "ai.run", run: failed });
+      }
       if (temporaryDirectory) {
         await rm(temporaryDirectory, { recursive: true, force: true });
       }
@@ -715,6 +753,12 @@ export class AiChatService {
         "INVALID_SKILL",
         "'skillIds' must contain at most 20 skill ids",
       );
+    }
+    if (input.requestId !== undefined && (
+      typeof input.requestId !== "string" || !input.requestId.trim()
+      || input.requestId.trim().length > 256 || input.requestId.includes("\0")
+    )) {
+      throw new ApiError(400, "INVALID_FIELD", "requestId must contain 1 to 256 characters");
     }
   }
 
@@ -1037,6 +1081,13 @@ export class AiChatService {
     }
 
     try {
+      // The durable outcome must not depend on writing its explanatory event.
+      const updated = this.database.updateAiChatRun(run.id, {
+        status,
+        exitCode: result?.exitCode ?? null,
+        error: publicError === null ? null : cappedError(publicError),
+        finishedAt: new Date().toISOString(),
+      });
       if (status === "failed" && terminalOutcome() !== "failed") {
         const errorEvent = this.database.insertAiChatEvent({
           threadId: run.threadId,
@@ -1048,12 +1099,6 @@ export class AiChatService {
         });
         this.#emit(run.threadId, { type: "ai.event", event: errorEvent });
       }
-      const updated = this.database.updateAiChatRun(run.id, {
-        status,
-        exitCode: result?.exitCode ?? null,
-        error: publicError === null ? null : cappedError(publicError),
-        finishedAt: new Date().toISOString(),
-      });
       this.#emit(run.threadId, { type: "ai.run", run: updated });
       return updated;
     } finally {

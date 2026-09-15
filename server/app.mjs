@@ -2856,8 +2856,14 @@ function parseAiAttachments(value) {
 
 function parseAiTurn(body) {
   assertPlainObject(body);
-  if (body.contractVersion !== undefined) return parseComposerTurn(body);
+  if (body.contractVersion !== undefined) {
+    if (body.requestId !== undefined) {
+      throw new ApiError(400, "INVALID_FIELD", "requestId is only supported for the background legacy turn payload");
+    }
+    return parseComposerTurn(body);
+  }
   assertAllowedKeys(body, new Set([
+    "requestId",
     "message",
     "skillIds",
     "dangerFullAccessConfirmed",
@@ -2883,6 +2889,7 @@ function parseAiTurn(body) {
     );
   }
   return {
+    requestId: parseAiSetting(body.requestId, "requestId", 256),
     message,
     skillIds,
     dangerFullAccessConfirmed: body.dangerFullAccessConfirmed,
