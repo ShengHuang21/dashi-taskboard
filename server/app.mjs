@@ -2151,6 +2151,21 @@ function parseAgentRunFinish(body) {
   };
 }
 
+function parseAgentRunHandoff(body) {
+  assertPlainObject(body);
+  assertAllowedKeys(body, new Set(["version", "agentThreadId", "checkpointOccurrenceId", "expectedResumeToken", "summary"]));
+  if (typeof body.checkpointOccurrenceId !== "string" || !/^[a-f0-9]{64}$/.test(body.checkpointOccurrenceId)) {
+    throw new ApiError(400, "INVALID_FIELD", "'checkpointOccurrenceId' must be a checkpoint SHA-256 identifier");
+  }
+  return {
+    version: parseVersion(body.version),
+    agentThreadId: stringField(body.agentThreadId, "agentThreadId", { required: true, maxLength: 256 }),
+    checkpointOccurrenceId: body.checkpointOccurrenceId,
+    expectedResumeToken: stringField(body.expectedResumeToken, "expectedResumeToken", { required: true, maxLength: 256 }),
+    summary: stringField(body.summary, "summary", { required: true, maxLength: 10_000 }),
+  };
+}
+
 function parseArchive(body) {
   assertPlainObject(body);
   assertAllowedKeys(body, new Set(["version", "threadId", "threadBinding"]));
@@ -6897,10 +6912,22 @@ export function createTaskboardServer(options = {}) {
         return sendEmpty(response, 204);
       }
 
-      const taskAgentRunRoute = pathname.match(/^\/api\/runs\/([^/]+)(?:\/(checkpoint|finish))?$/);
+      const taskAgentRunRoute = pathname.match(/^\/api\/runs\/([^/]+)(?:\/(checkpoint|finish|handoff))?$/);
       if (taskAgentRunRoute) {
         const id = decodeRouteSegment(taskAgentRunRoute[1], "Agent Run id");
         const action = taskAgentRunRoute[2];
+        if (action === "handoff") {
+          assertLoopbackRequest(request);
+          if (request.headers["x-taskboard-client"] !== "taskctl") {
+            throw new ApiError(403, "TASKCTL_REQUIRED", "Run handoff requires protected taskctl");
+          }
+          if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+          assertNoQuery(url.searchParams, "POST /api/runs/:id/handoff");
+          const handoff = parseAgentRunHandoff(await readJson(request));
+          const result = database.handoffTaskAgentRun(id, handoff.version, handoff);
+          if (result.applied) events.emit("task.updated", { task: result.task });
+          return sendJson(response, 200, result);
+        }
         if (!action && request.method === "GET") {
           if ([...url.searchParams.keys()].length > 0) {
             throw new ApiError(400, "UNKNOWN_QUERY_PARAMETER", "GET /api/runs/:id does not accept query parameters");

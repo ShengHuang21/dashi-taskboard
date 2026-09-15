@@ -1369,6 +1369,28 @@ function taskAgentRunFromRow(row) {
   };
 }
 
+function runHandoffRowSha256(row) {
+  return createHash("sha256").update(JSON.stringify(Object.entries(row).sort(([left], [right]) => left.localeCompare(right)))).digest("hex");
+}
+
+function runHandoffSummary(receipt, current) {
+  return {
+    state: current ? "cooperative_returned" : "recorded_not_current",
+    source: "taskboard_run_claim_record",
+    scope: "taskboard_run_claim_only",
+    receiptId: receipt.receiptId,
+    checkpointOccurrenceId: receipt.checkpointOccurrenceId,
+    runId: receipt.runId,
+    agreementId: receipt.agreementId,
+    nextActionId: receipt.nextActionId,
+    agentThreadId: receipt.agentThreadId,
+    rootThreadId: receipt.rootThreadId,
+    runVersionBefore: receipt.runVersionBefore,
+    runVersionAfter: receipt.runVersionAfter,
+    recordedAt: receipt.recordedAt,
+  };
+}
+
 function commentFromRow(row) {
   const comment = {
     id: row.id,
@@ -9534,7 +9556,7 @@ export class TaskboardDatabase {
 
   getTaskAgentRun(id) {
     const row = this.#prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(id);
-    return row ? taskAgentRunFromRow(row) : null;
+    return row ? this.#taskAgentRunWithHandoff(row) : null;
   }
 
   getActiveTaskAgentRun(taskId) {
@@ -9840,6 +9862,122 @@ export class TaskboardDatabase {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  handoffTaskAgentRun(id, version, { agentThreadId, checkpointOccurrenceId, expectedResumeToken, summary }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const run = this.#requireTaskAgentRun(id);
+      this.#assertAgentRunThread(run, agentThreadId);
+      const task = this.#requireTask(run.taskId);
+      const runRow = this.#prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(run.id);
+      const receiptId = `continuation-run-handoff:v1:${createHash("sha256")
+        .update(JSON.stringify([checkpointOccurrenceId, run.id])).digest("hex")}`;
+      const requestSha256 = createHash("sha256").update(JSON.stringify({
+        runId: run.id, version, agentThreadId, checkpointOccurrenceId, expectedResumeToken, summary,
+      })).digest("hex");
+      const previous = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE event_id = ?").get(receiptId);
+      if (previous) {
+        const receipt = JSON.parse(previous.envelope_json);
+        if (receipt?.eventType !== "continuation_run_handoff" || receipt.requestSha256 !== requestSha256) {
+          throw new ApiError(409, "RUN_HANDOFF_CONFLICT", "This run/checkpoint already has a different handoff request");
+        }
+        if (!this.#matchesContinuationRunHandoff(runRow, receipt)) {
+          throw new ApiError(409, "RUN_HANDOFF_STALE", "The recorded handoff is historical; read it without reusing its old scope");
+        }
+        const result = this.#runHandoffResult(false, run, task, receipt);
+        this.database.exec("COMMIT");
+        return result;
+      }
+      this.#requireAgentRunVersion(run, version);
+      const latest = this.#taskAgentRunForTask(task.id);
+      const claim = this.#prepare("SELECT * FROM agent_task_claims WHERE task_id = ?").get(task.id);
+      if (task.status !== "in_progress" || !["active", "blocked"].includes(run.status)
+        || latest?.id !== run.id || this.getOpenTaskAgentRun(task.id)?.id !== run.id
+        || !claim || claim.status !== "active" || claim.project_id !== run.projectId
+        || claim.agent_thread_id !== run.agentThreadId || claim.agent_path !== run.agentPath
+        || claim.write_scope_json !== runRow.write_scope_json || claim.completed_at !== null
+        || !Number.isFinite(Date.parse(claim.lease_expires_at)) || Date.parse(claim.lease_expires_at) <= Date.now()) {
+        throw new ApiError(409, "RUN_HANDOFF_SCOPE_MISMATCH", "Handoff requires the current open run and its exact active, unexpired claim");
+      }
+      const row = this.#prepare(`
+        SELECT envelope_json FROM agent_event_receipts WHERE task_id = ? AND event_id = ?
+          AND json_extract(envelope_json, '$.eventType') = 'continuation_cooperative_checkpoint'
+      `).get(task.id, `continuation-cooperative-checkpoint:v1:${checkpointOccurrenceId}`);
+      const checkpoint = row ? JSON.parse(row.envelope_json) : null;
+      const context = this.#taskContinuationContext(task.id);
+      const { capsule, record, evaluation } = context;
+      const binding = capsule.execution.threadBinding;
+      const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
+      if (!checkpoint || !binding || binding.codexHostId !== "local" || binding.codexProjectKind !== "local"
+        || !binding.codexProjectId || !path.isAbsolute(binding.workspacePath ?? "")
+        || run.projectId !== task.projectId || run.rootThreadId !== binding.threadId
+        || checkpoint.recordedBy !== run.rootThreadId || checkpoint.sourceThreadId !== run.rootThreadId
+        || checkpoint.projectId !== task.projectId || !same(checkpoint.bindingAtRecord, binding)
+        || task.developmentContext?.type !== "worktree" || task.developmentContext.path !== run.worktree.path
+        || task.developmentContext.branch !== run.worktree.branch) {
+        throw new ApiError(409, "RUN_HANDOFF_BINDING_MISMATCH", "The checkpoint, run, and current task must share the same original Root and worktree");
+      }
+      if (capsule.resumeToken !== expectedResumeToken || record?.eventId !== checkpoint.agreementId
+        || record.senderThreadId !== run.rootThreadId || record.basis.projectId !== task.projectId
+        || !same(record.basis.binding, binding) || record.basis.requirementsRevision !== capsule.requirementsRevision) {
+        throw new ApiError(409, "CONTINUATION_STALE", "Reread the current Capsule and checkpoint before handing off");
+      }
+      if (task.archivedAt !== null || record.status !== "active"
+        || capsule.relations.blockedBy.some((dependency) => dependency.status !== "done")
+        || capsule.readyWork.reasonCodes.includes("CROSS_DOMAIN_HANDOFF_REQUIRED")) {
+        throw new ApiError(409, "CONTINUATION_STOPPED", "The current task or agreement does not allow this handoff");
+      }
+      const action = evaluation.pendingActions.find((candidate) => candidate.id === checkpoint.nextActionId);
+      const gate = action ? evaluation.gatesById.get(action.gate) : null;
+      if (record.checkpoint.nextActionId !== checkpoint.nextActionId || !record.actionIds.includes(checkpoint.nextActionId)
+        || record.authorizationSource === null || evaluation.effectiveAuthorization.state !== "valid"
+        || !same(record.authorizationSource, evaluation.effectiveAuthorization.source)
+        || !action || gate?.state !== "authorized" || gate.expired) {
+        throw new ApiError(409, "CONTINUATION_NOT_AUTHORIZED", "The checkpoint's exact next action requires current authorization");
+      }
+      const timestamp = now();
+      const updated = this.#prepare(`
+        UPDATE task_agent_runs SET status = 'interrupted', version = version + 1,
+          updated_at = ?, finished_at = ?, summary = ?, next_action = ?
+        WHERE id = ? AND version = ? AND status = ? AND agent_thread_id = ?
+      `).run(timestamp, timestamp, summary, `Pending authorized action: ${checkpoint.nextActionId}`, run.id, version, run.status, agentThreadId);
+      if (updated.changes !== 1) throw new ApiError(409, "RUN_VERSION_CONFLICT", "The exact run changed before handoff");
+      // Match every stored claim field, including its original epoch/lease and any recovery columns.
+      const claimFields = Object.entries(claim);
+      const claimUpdated = this.#prepare(`UPDATE agent_task_claims SET status = 'interrupted', completed_at = ?
+        WHERE ${claimFields.map(([key]) => `"${key.replaceAll('"', '""')}" IS ?`).join(" AND ")}
+      `).run(timestamp, ...claimFields.map(([, value]) => value));
+      if (claimUpdated.changes !== 1) throw new ApiError(409, "RUN_HANDOFF_SCOPE_MISMATCH", "The exact claim changed before handoff");
+      const afterRun = this.#prepare("SELECT * FROM task_agent_runs WHERE id = ?").get(run.id);
+      const afterClaim = this.#prepare("SELECT * FROM agent_task_claims WHERE task_id = ?").get(task.id);
+      const receipt = {
+        receiptId, eventType: "continuation_run_handoff", taskId: task.id, projectId: task.projectId,
+        checkpointOccurrenceId, checkpointReceiptId: checkpoint.receiptId,
+        agreementId: checkpoint.agreementId, nextActionId: checkpoint.nextActionId,
+        runId: run.id, agentThreadId, rootThreadId: run.rootThreadId, bindingAtHandoff: binding,
+        runVersionBefore: run.version, runVersionAfter: afterRun.version,
+        runBeforeSha256: runHandoffRowSha256(runRow), runAfterSha256: runHandoffRowSha256(afterRun),
+        claimBeforeSha256: runHandoffRowSha256(claim), claimAfterSha256: runHandoffRowSha256(afterClaim),
+        requestSha256, recordedAt: timestamp,
+      };
+      this.#prepare(`
+        INSERT INTO agent_event_receipts (event_id, project_id, task_id, comment_id, envelope_json, created_at)
+        VALUES (?, ?, ?, NULL, ?, ?)
+      `).run(receiptId, task.projectId, task.id, JSON.stringify(receipt), timestamp);
+      const result = this.#runHandoffResult(true, this.getTaskAgentRun(run.id), task, receipt);
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  #runHandoffResult(applied, run, task, receipt) {
+    return { applied, run, task, handoff: runHandoffSummary(receipt, true),
+      dispatchEligible: false, executionBridge: "not_implemented", runtimeQuiescence: "not_proven",
+      resourceHandoff: "not_performed" };
   }
 
   recordAgentTaskProgress(taskId, { eventId, agentThreadId, summary, actor }) {
@@ -11096,6 +11234,9 @@ export class TaskboardDatabase {
   #continuationCheckpointResult(context, checkpoint) {
     const taskId = context.capsule.task.id;
     const latestCommand = `taskctl continuation checkpoint get ${taskId} --json`;
+    const handoff = context.capsule.latestRun?.handoff;
+    const matchingHandoff = checkpoint && handoff?.state === "cooperative_returned"
+      && handoff.checkpointOccurrenceId === checkpoint.occurrenceId ? handoff : null;
     return {
       status: checkpoint ? "recorded" : "not_recorded",
       checkpoint,
@@ -11105,7 +11246,8 @@ export class TaskboardDatabase {
       dispatchEligible: false,
       executionBridge: "not_implemented",
       runtimeQuiescence: "not_proven",
-      runClaimHandoff: "not_performed",
+      runClaimHandoff: matchingHandoff?.state ?? "not_performed",
+      ...(matchingHandoff ? { handoff: matchingHandoff } : {}),
       queries: {
         latest: latestCommand,
         occurrence: checkpoint ? `${latestCommand} --occurrence-id ${checkpoint.occurrenceId}` : null,
@@ -15305,7 +15447,39 @@ export class TaskboardDatabase {
       ORDER BY updated_at DESC, id DESC
       LIMIT 1
     `).get(taskId, ...(statuses ?? []));
-    return row ? taskAgentRunFromRow(row) : null;
+    return row ? this.#taskAgentRunWithHandoff(row) : null;
+  }
+
+  #taskAgentRunWithHandoff(row) {
+    const run = taskAgentRunFromRow(row);
+    const receipts = this.#prepare(`
+      SELECT envelope_json FROM agent_event_receipts WHERE task_id = ?
+        AND json_extract(envelope_json, '$.eventType') = 'continuation_run_handoff'
+        AND json_extract(envelope_json, '$.runId') = ?
+    `).all(row.task_id, row.id);
+    if (receipts.length !== 1) return run;
+    const receipt = JSON.parse(receipts[0].envelope_json);
+    return { ...run, handoff: runHandoffSummary(receipt, this.#matchesContinuationRunHandoff(row, receipt)) };
+  }
+
+  #matchesContinuationRunHandoff(row, receipt) {
+    // Deliberately below Capsule/context: run getters are themselves Capsule inputs.
+    const task = this.getTask(row.task_id);
+    const claim = this.#prepare("SELECT * FROM agent_task_claims WHERE task_id = ?").get(row.task_id);
+    const latest = this.#prepare(`SELECT id FROM task_agent_runs WHERE task_id = ?
+      ORDER BY updated_at DESC, id DESC LIMIT 1`).get(row.task_id);
+    return Boolean(task?.status === "in_progress" && task.archivedAt === null && latest?.id === row.id
+      && receipt.eventType === "continuation_run_handoff" && receipt.taskId === task.id
+      && receipt.projectId === task.projectId && row.project_id === task.projectId
+      && receipt.runId === row.id && receipt.agentThreadId === row.agent_thread_id
+      && receipt.rootThreadId === row.root_thread_id && row.root_thread_id === task.threadBinding?.threadId
+      && JSON.stringify(receipt.bindingAtHandoff) === JSON.stringify(task.threadBinding)
+      && task.developmentContext?.type === "worktree" && task.developmentContext.path === row.worktree_path
+      && task.developmentContext.branch === row.worktree_branch
+      && row.status === "interrupted" && receipt.runVersionAfter === row.version
+      && receipt.runVersionBefore + 1 === receipt.runVersionAfter
+      && runHandoffRowSha256(row) === receipt.runAfterSha256
+      && claim?.status === "interrupted" && runHandoffRowSha256(claim) === receipt.claimAfterSha256);
   }
 
   #assertNoOpenTaskAgentRunRebinding(task, changes, threadBinding) {
