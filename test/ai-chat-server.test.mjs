@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +15,8 @@ async function createServerFixture(host = "127.0.0.1", options = {}) {
   const workspace = await realpath(workspacePath);
   const codexExecutable = path.join(directory, "fake-codex.mjs");
   await writeFile(codexExecutable, `#!/usr/bin/env node
+import { appendFileSync, existsSync } from "node:fs";
+import path from "node:path";
 const args = process.argv.slice(2);
 if (args[0] === "debug") {
   process.stdout.write('{"models":[{"slug":"gpt-real","display_name":"GPT Real","description":"","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"service_tiers":[]}]}');
@@ -33,10 +35,17 @@ if (args[0] === "debug") {
   process.stdin.on("data", (chunk) => { prompt += chunk; });
   process.stdin.resume();
   process.stdin.on("end", () => {
+    const workspace = args[args.indexOf("-C") + 1];
+    appendFileSync(path.join(workspace, "fixture-dispatches.jsonl"), JSON.stringify({ args, prompt }) + "\\n");
     if (prompt.includes("fixture-run-failure")) process.exit(7);
     process.stdout.write('{"type":"thread.started","thread_id":"session-1"}\\n');
     process.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\\n');
     process.stdout.write('{"type":"turn.completed"}\\n');
+    if (prompt.includes("fixture-hold-predecessor")) {
+      const timer = setInterval(() => {
+        if (existsSync(path.join(workspace, "fixture-release"))) clearInterval(timer);
+      }, 10);
+    }
   });
 }
 `);
@@ -64,6 +73,364 @@ if (args[0] === "debug") {
     },
   };
 }
+
+async function waitUntil(check) {
+  for (let index = 0; index < 200; index += 1) {
+    const value = await check();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail("Fixture did not reach the expected state");
+}
+
+async function backgroundContinuationFixture() {
+  const instance = { instanceToken: "fixture-next-token", instanceSecret: "c".repeat(64) };
+  const fixture = await createServerFixture("127.0.0.1", instance);
+  fixture.instance = instance;
+  const runtimePath = path.join(fixture.directory, "fixture-runtime.json");
+  await writeFile(runtimePath, JSON.stringify({ version: 1, url: `${fixture.baseUrl}/${instance.instanceToken}` }));
+  fixture.runtimePath = runtimePath;
+  fixture.cli = async (args, expectedCode = 0) => {
+    let output = "";
+    const stream = { write(value) { output += value; } };
+    const code = await taskctl([...args, "--runtime-file", runtimePath, "--json"], {
+      env: {}, stdout: stream, stderr: stream,
+    });
+    if (expectedCode === 0) assert.equal(code, 0, output);
+    else assert.notEqual(code, 0, output);
+    return JSON.parse(output);
+  };
+  fixture.createThread = async () => (await fixture.cli([
+    "background", "create", "--project", "local", "--model", "gpt-real",
+    "--reasoning-effort", "high", "--sandbox", "read-only",
+  ])).thread;
+  fixture.dispatches = async () => (await readFile(path.join(fixture.workspace, "fixture-dispatches.jsonl"), "utf8"))
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  return fixture;
+}
+
+function holdNextPreparation(service) {
+  const original = service.resolveContext;
+  const entered = Promise.withResolvers();
+  const gate = Promise.withResolvers();
+  let armed = true;
+  service.resolveContext = async (...args) => {
+    const resolved = await original(...args);
+    if (armed) {
+      armed = false;
+      entered.resolve();
+      await gate.promise;
+    }
+    return resolved;
+  };
+  return { entered: entered.promise, release: () => gate.resolve() };
+}
+
+async function registerHeldSuccessor(fixture) {
+  const thread = await fixture.createThread();
+  const { run } = await fixture.cli(["background", "start", thread.id, "--request-id", "first",
+    "--message", "fixture-hold-predecessor"]);
+  await waitUntil(() => fixture.app.database.listAiChatEvents(thread.id)
+    .some((event) => event.type === "turn.completed"));
+  const command = ["background", "continue", thread.id, "--after-run", run.id,
+    "--request-id", "next", "--message", "bounded next action"];
+  await fixture.cli(command);
+  return { thread, run, command };
+}
+
+test("background continuation waits for owned close and dispatches the registered next message once", async (context) => {
+  const fixture = await backgroundContinuationFixture();
+  try {
+    const { task } = await fixture.cli(["issue", "create", "--project", "local", "--title", "Managed next",
+      "--thread-id", "fixture-owner"]);
+    const { thread } = await fixture.cli([
+      "background", "create", "--project", "local", "--issue", task.identifier, "--model", "gpt-real",
+      "--reasoning-effort", "high", "--sandbox", "read-only",
+    ]);
+    const { run: first } = await fixture.cli([
+      "background", "start", thread.id, "--request-id", "first", "--message", "fixture-hold-predecessor",
+    ]);
+    await waitUntil(() => fixture.app.database.listAiChatEvents(thread.id)
+      .some((event) => event.type === "turn.completed"));
+    assert.equal(fixture.app.database.getAiChatRun(first.id).status, "running");
+    const messagePath = path.join(fixture.directory, "next-message.txt");
+    await writeFile(messagePath, "bounded next action");
+    const command = ["background", "continue", thread.id, "--after-run", first.id,
+      "--request-id", "next", "--message-file", messagePath];
+    const [accepted, replay] = await Promise.all([fixture.cli(command), fixture.cli(command)]);
+    assert.deepEqual(replay.continuation, accepted.continuation);
+    assert.equal(accepted.continuation.state, "pending");
+    assert.equal(accepted.continuation.waitingReason, "predecessor_running");
+    assert.equal((await fixture.dispatches()).length, 1);
+    await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+    const completed = await waitUntil(async () => {
+      const snapshot = await fixture.cli(["background", "get", thread.id]);
+      return snapshot.runs.length === 2 && snapshot.runs.every((run) => run.status === "completed") && snapshot;
+    });
+    const next = completed.continuations[0];
+    assert.equal(next.state, "dispatched");
+    assert.equal(completed.events.filter((event) => event.type === "user_message").length, 2);
+    assert.equal((await fixture.dispatches()).filter((entry) => entry.prompt.includes("bounded next action")).length, 1);
+    const successorDispatch = (await fixture.dispatches())[1];
+    assert.ok(successorDispatch.args.includes("resume"));
+    assert.ok(successorDispatch.args.includes("session-1"));
+    assert.equal((await fixture.cli(command)).continuation.runId, next.runId);
+    assert.equal((await fixture.cli(["background", "start", thread.id,
+      "--request-id", "next", "--message", "bounded next action"])).run.id, next.runId);
+    const beforeConflict = await fixture.cli(["background", "get", thread.id]);
+    assert.equal((await fixture.cli([...command.slice(0, -2), "--message", "different"], 1))
+      .error.code, "AI_CHAT_REQUEST_CONFLICT");
+    assert.deepEqual(await fixture.cli(["background", "get", thread.id]), beforeConflict);
+    const progress = await fixture.cli(["issue", "progress", task.identifier]);
+    assert.equal(progress.backgroundProgress.threads[0].latestRun.runId, next.runId);
+    assert.equal(progress.backgroundProgress.threads[0].latestRun.recordedStatus, "completed");
+    context.diagnostic(JSON.stringify({ observation: "CAP71-NEXT-OWNED-CLOSE", firstRun: first.id,
+      nextRun: next.runId, nextDispatches: 1, rawCompletedDidNotStartNext: true, codexThreadId: "session-1" }));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("background continuation pause and resume leave the predecessor untouched", async () => {
+  const fixture = await backgroundContinuationFixture();
+  try {
+    const { thread, run, command } = await registerHeldSuccessor(fixture);
+    const beforePause = fixture.app.database.getAiChatRun(run.id);
+    assert.equal((await fixture.cli(["background", "pause", thread.id, "--request-id", "next"]))
+      .continuation.state, "paused");
+    assert.deepEqual(fixture.app.database.getAiChatRun(run.id), beforePause);
+    assert.equal((await fixture.cli(command)).continuation.state, "paused");
+    await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+    await waitUntil(() => fixture.app.database.getAiChatRun(run.id).status === "completed");
+    await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+    assert.equal(fixture.app.database.listAiChatRuns(thread.id).length, 1);
+    assert.equal((await fixture.dispatches()).length, 1);
+    await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+    await waitUntil(() => fixture.app.database.listAiChatRuns(thread.id)
+      .filter((entry) => entry.status === "completed").length === 2);
+    assert.equal((await fixture.dispatches()).length, 2);
+    assert.equal((await fixture.cli(["background", "cancel", thread.id, "--request-id", "next"], 1))
+      .error.code, "AI_CHAT_CONTINUATION_STATE");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("background continuation cancellation during preparation wins before reservation", async (context) => {
+  const fixture = await backgroundContinuationFixture();
+  let preparation;
+  try {
+    const { thread, run, command } = await registerHeldSuccessor(fixture);
+    preparation = holdNextPreparation(fixture.app.aiChat);
+    // Suppress a second eligible handler at the same barrier by pausing while A is still open.
+    await fixture.cli(["background", "pause", thread.id, "--request-id", "next"]);
+    await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+    await waitUntil(() => fixture.app.database.getAiChatRun(run.id).status === "completed");
+    await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+    await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+    await preparation.entered;
+    assert.equal((await fixture.cli(["background", "cancel", thread.id, "--request-id", "next"]))
+      .continuation.state, "canceled");
+    preparation.release();
+    await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+    const canceled = await fixture.cli(["background", "get", thread.id]);
+    assert.equal(canceled.runs.length, 1);
+    assert.equal(canceled.continuations[0].runId, null);
+    assert.equal((await fixture.cli(command)).continuation.state, "canceled");
+    assert.equal((await fixture.cli(["background", "start", thread.id,
+      "--request-id", "next", "--message", "bounded next action"], 1)).error.code, "AI_CHAT_REQUEST_CONFLICT");
+    assert.equal((await fixture.cli(["background", "resume", thread.id, "--request-id", "next"], 1))
+      .error.code, "AI_CHAT_CONTINUATION_STATE");
+    assert.equal((await fixture.cli(["background", "continue", thread.id, "--after-run", run.id,
+      "--request-id", "first", "--message", "bounded next action"], 1)).error.code, "AI_CHAT_REQUEST_CONFLICT");
+    assert.deepEqual(await fixture.cli(["background", "get", thread.id]), canceled);
+    assert.equal((await fixture.dispatches()).length, 1);
+    context.diagnostic(JSON.stringify({ observation: "CAP71-NEXT-CANCEL", state: "canceled",
+      successorRuns: 0, firstRunStatus: fixture.app.database.getAiChatRun(run.id).status }));
+  } finally {
+    preparation?.release();
+    await fixture.close();
+  }
+});
+
+test("background continuation rechecks settings and exact predecessor after asynchronous preparation", async () => {
+  for (const change of ["settings", "newer-run"]) {
+    const fixture = await backgroundContinuationFixture();
+    let preparation;
+    try {
+      const { thread, run } = await registerHeldSuccessor(fixture);
+      await fixture.cli(["background", "pause", thread.id, "--request-id", "next"]);
+      await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+      await waitUntil(() => fixture.app.database.getAiChatRun(run.id).status === "completed");
+      await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+      preparation = holdNextPreparation(fixture.app.aiChat);
+      await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+      await preparation.entered;
+      if (change === "settings") {
+        const changed = await request(`${fixture.baseUrl}/${fixture.instance.instanceToken}`,
+          `/api/local/ai/threads/${thread.id}`, { method: "PATCH", body: { sandbox: "workspace-write" } });
+        assert.equal(changed.response.status, 200);
+      } else {
+        const { run: newer } = await fixture.cli(["background", "start", thread.id,
+          "--request-id", "newer", "--message", "explicit newer work"]);
+        await waitUntil(() => fixture.app.database.getAiChatRun(newer.id).status === "completed");
+      }
+      preparation.release();
+      await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+      const snapshot = await fixture.cli(["background", "get", thread.id]);
+      assert.equal(snapshot.continuations[0].state, "pending");
+      assert.equal(snapshot.continuations[0].runId, null);
+      assert.equal(snapshot.continuations[0].waitingReason,
+        change === "settings" ? "settings_changed" : "stale_predecessor");
+      assert.equal((await fixture.dispatches()).filter((entry) => entry.prompt.includes("bounded next action")).length, 0);
+    } finally {
+      preparation?.release();
+      await fixture.close();
+    }
+  }
+});
+
+test("background continuation close drains preparation and restart waits for explicit resume", async (context) => {
+  const fixture = await backgroundContinuationFixture();
+  let preparation;
+  let app = fixture.app;
+  try {
+    const { thread, run } = await registerHeldSuccessor(fixture);
+    await fixture.cli(["background", "pause", thread.id, "--request-id", "next"]);
+    await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+    await waitUntil(() => app.database.getAiChatRun(run.id).status === "completed");
+    await Promise.all([...app.aiChat.continuationAttempts]);
+    preparation = holdNextPreparation(app.aiChat);
+    await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+    await preparation.entered;
+    const closing = app.close();
+    await waitUntil(() => app.aiChat.closing);
+    assert.equal(app.database.listAiChatRuns(thread.id).length, 1);
+    preparation.release();
+    await closing;
+    app = createTaskboardServer({
+      dataDirectory: fixture.directory, codexExecutable: path.join(fixture.directory, "fake-codex.mjs"),
+      codexStatePath: path.join(fixture.directory, "codex-state.json"),
+      skillPath: "/fixture/manage-taskboard/SKILL.md", ...fixture.instance,
+    });
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    await writeFile(fixture.runtimePath, JSON.stringify({ version: 1,
+      url: `http://127.0.0.1:${address.port}/${fixture.instance.instanceToken}` }));
+    const reopened = await fixture.cli(["background", "get", thread.id]);
+    assert.equal(reopened.continuations[0].state, "pending");
+    assert.equal(reopened.runs.length, 1);
+    assert.equal(app.aiChat.continuationAttempts.size, 0);
+    assert.equal((await fixture.dispatches()).length, 1);
+    await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+    await waitUntil(() => app.database.listAiChatRuns(thread.id)
+      .filter((entry) => entry.status === "completed").length === 2);
+    const once = await fixture.cli(["background", "get", thread.id]);
+    await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+    assert.deepEqual(await fixture.cli(["background", "get", thread.id]), once);
+    assert.equal((await fixture.dispatches()).length, 2);
+    context.diagnostic(JSON.stringify({ observation: "CAP71-NEXT-RESTART", startupDispatches: 0,
+      explicitResumeDispatches: 1, closePreparationDispatches: 0 }));
+  } finally {
+    preparation?.release();
+    await app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("background continuation registration and resume share the whole finalization barrier", async () => {
+  for (const outcome of ["fulfilled", "rejected"]) {
+    const fixture = await backgroundContinuationFixture();
+    const gate = Promise.withResolvers();
+    let releaseFinalization;
+    try {
+      const thread = await fixture.createThread();
+      const { run } = await fixture.cli(["background", "start", thread.id, "--request-id", "first",
+        "--message", "fixture-hold-predecessor"]);
+      const completions = fixture.app.aiChat.completions;
+      const ownedCompletion = completions.get(run.id);
+      // Hold the shared promise seam after real owner close to model pending attachment cleanup.
+      const wholeFinalization = ownedCompletion.then(async (finished) => {
+        await gate.promise;
+        return finished;
+      });
+      void wholeFinalization.catch(() => {});
+      completions.set(run.id, wholeFinalization);
+      const remove = completions.delete.bind(completions);
+      completions.delete = (id) => id === run.id ? false : remove(id);
+      releaseFinalization = () => { completions.delete = remove; remove(run.id); };
+      await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+      await ownedCompletion;
+      assert.equal(fixture.app.aiChat.active.size, 0);
+      assert.equal(fixture.app.database.getAiChatRun(run.id).status, "completed");
+      const command = ["background", "continue", thread.id, "--after-run", run.id,
+        "--request-id", "next", "--message", "bounded next action"];
+      await fixture.cli(command);
+      await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+      assert.equal((await fixture.cli(["background", "get", thread.id])).runs.length, 1);
+      assert.equal((await fixture.dispatches()).length, 1);
+      if (outcome === "fulfilled") gate.resolve();
+      else gate.reject(new Error("fixture cleanup failure"));
+      await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+      releaseFinalization();
+      if (outcome === "fulfilled") {
+        await waitUntil(() => fixture.app.database.listAiChatRuns(thread.id)
+          .filter((entry) => entry.status === "completed").length === 2);
+        assert.equal((await fixture.dispatches()).length, 2);
+      } else {
+        await fixture.cli(command);
+        await Promise.all([...fixture.app.aiChat.continuationAttempts]);
+        const snapshot = await fixture.cli(["background", "get", thread.id]);
+        assert.equal(snapshot.runs.length, 1);
+        assert.equal(snapshot.continuations[0].waitingReason, "finalization_failed");
+      }
+    } finally {
+      gate.resolve();
+      releaseFinalization?.();
+      await fixture.close();
+    }
+  }
+});
+
+test("background continuation never retries interrupted predecessors or linked failed runs", async () => {
+  const fixture = await backgroundContinuationFixture();
+  let app = fixture.app;
+  try {
+    const held = await registerHeldSuccessor(fixture);
+    const interrupted = await request(`${fixture.baseUrl}/${fixture.instance.instanceToken}`,
+      `/api/local/ai/runs/${held.run.id}/interrupt`, { method: "POST" });
+    assert.equal(interrupted.response.status, 200);
+    await Promise.all([...app.aiChat.continuationAttempts]);
+    await fixture.cli(["background", "resume", held.thread.id, "--request-id", "next"]);
+    assert.equal((await fixture.cli(["background", "get", held.thread.id])).continuations[0]
+      .waitingReason, "predecessor_interrupted");
+    assert.equal(app.database.listAiChatRuns(held.thread.id).length, 1);
+
+    const thread = await fixture.createThread();
+    const { run: first } = await fixture.cli(["background", "start", thread.id,
+      "--request-id", "first", "--message", "hello"]);
+    await waitUntil(() => app.database.getAiChatRun(first.id).status === "completed");
+    await fixture.cli(["background", "continue", thread.id, "--after-run", first.id,
+      "--request-id", "next-failure", "--message", "fixture-run-failure"]);
+    const failed = await waitUntil(() => app.database.listAiChatRuns(thread.id)
+      .find((entry) => entry.status === "failed"));
+    await app.close();
+    app = createTaskboardServer({
+      dataDirectory: fixture.directory, codexExecutable: path.join(fixture.directory, "fake-codex.mjs"),
+      codexStatePath: path.join(fixture.directory, "codex-state.json"),
+      skillPath: "/fixture/manage-taskboard/SKILL.md", ...fixture.instance,
+    });
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    await writeFile(fixture.runtimePath, JSON.stringify({ version: 1,
+      url: `http://127.0.0.1:${address.port}/${fixture.instance.instanceToken}` }));
+    assert.equal((await fixture.cli(["background", "resume", thread.id, "--request-id", "next-failure"]))
+      .continuation.runId, failed.id);
+    assert.equal(app.database.listAiChatRuns(thread.id).length, 2);
+    assert.equal((await fixture.dispatches()).filter((entry) => entry.prompt.includes("fixture-run-failure")).length, 1);
+  } finally {
+    await app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
 
 test("issue progress observes the linked background run without changing Capsule or claims", async (context) => {
   const instance = { instanceToken: "fixture-progress-token", instanceSecret: "b".repeat(64) };

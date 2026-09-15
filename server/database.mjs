@@ -1538,6 +1538,35 @@ function aiChatRunFromRow(row) {
   };
 }
 
+export function aiChatExecutionFingerprint(thread, resolved) {
+  return JSON.stringify({
+    projectId: thread.origin.projectId,
+    issueId: thread.origin.issueId ?? null,
+    workspacePath: thread.origin.workspacePath,
+    model: thread.model,
+    reasoningEffort: thread.reasoningEffort,
+    sandbox: thread.sandbox,
+    resolvedWorkspacePath: resolved.workspacePath,
+    addDirectories: resolved.addDirectories,
+  });
+}
+
+function aiChatContinuationFromRow(row) {
+  return {
+    threadId: row.thread_id,
+    afterRunId: row.after_run_id,
+    requestId: row.request_id,
+    message: row.message,
+    payloadDigest: row.payload_digest,
+    executionFingerprint: row.execution_fingerprint,
+    state: row.state,
+    runId: row.run_id,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    waitingReason: row.waiting_reason,
+  };
+}
+
 function aiChatThreadFromRow(row) {
   return {
     id: row.id,
@@ -2575,6 +2604,22 @@ export class TaskboardDatabase {
         payload_digest TEXT NOT NULL,
         run_id TEXT NOT NULL REFERENCES ai_chat_runs(id) ON DELETE CASCADE,
         PRIMARY KEY (thread_id, request_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS ai_chat_continuations (
+        thread_id TEXT NOT NULL REFERENCES ai_chat_threads(id) ON DELETE CASCADE,
+        after_run_id TEXT NOT NULL REFERENCES ai_chat_runs(id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL,
+        message TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        execution_fingerprint TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'paused', 'canceled', 'dispatched')),
+        run_id TEXT REFERENCES ai_chat_runs(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        waiting_reason TEXT,
+        PRIMARY KEY (thread_id, request_id),
+        UNIQUE (thread_id, after_run_id)
       );
 
       CREATE TABLE IF NOT EXISTS ai_chat_events (
@@ -3948,6 +3993,116 @@ export class TaskboardDatabase {
     return this.getAiChatRun(request.run_id);
   }
 
+  getAiChatContinuation(threadId, requestId) {
+    const row = this.#prepare(`
+      SELECT * FROM ai_chat_continuations WHERE thread_id = ? AND request_id = ?
+    `).get(threadId, requestId);
+    return row ? aiChatContinuationFromRow(row) : null;
+  }
+
+  listAiChatContinuations(threadId) {
+    return this.#prepare(`
+      SELECT * FROM ai_chat_continuations WHERE thread_id = ? ORDER BY rowid
+    `).all(threadId).map(aiChatContinuationFromRow);
+  }
+
+  getAiChatContinuationReplay(input) {
+    const existing = this.getAiChatContinuation(input.threadId, input.requestId);
+    if (existing && (existing.afterRunId !== input.afterRunId || existing.payloadDigest !== input.payloadDigest)) {
+      throw new ApiError(409, "AI_CHAT_REQUEST_CONFLICT", "This requestId belongs to a different continuation");
+    }
+    return existing;
+  }
+
+  getAiChatContinuationWaitingReason(continuation) {
+    if (continuation.state !== "pending") return null;
+    const latest = this.#prepare(`
+      SELECT * FROM ai_chat_runs WHERE thread_id = ? ORDER BY rowid DESC LIMIT 1
+    `).get(continuation.threadId);
+    if (latest?.id !== continuation.afterRunId) return "stale_predecessor";
+    if (!this.#prepare("SELECT 1 FROM ai_chat_run_requests WHERE thread_id = ? AND run_id = ?")
+      .get(continuation.threadId, continuation.afterRunId)) return "invalid_predecessor";
+    const thread = this.getAiChatThread(continuation.threadId);
+    const execution = JSON.parse(continuation.executionFingerprint);
+    if (aiChatExecutionFingerprint(thread, {
+      workspacePath: execution.resolvedWorkspacePath,
+      addDirectories: execution.addDirectories,
+    }) !== continuation.executionFingerprint) return "settings_changed";
+    if (latest.status !== "completed") return `predecessor_${latest.status}`;
+    if (latest.exit_code !== 0) return "predecessor_failed";
+    if (thread.currentRun) return "thread_busy";
+    return null;
+  }
+
+  registerAiChatContinuation(input) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.getAiChatContinuationReplay(input);
+      if (existing) {
+        this.database.exec("COMMIT");
+        return existing;
+      }
+      if (this.#prepare("SELECT 1 FROM ai_chat_run_requests WHERE thread_id = ? AND request_id = ?")
+        .get(input.threadId, input.requestId)
+        || this.#prepare("SELECT 1 FROM ai_chat_continuations WHERE thread_id = ? AND after_run_id = ?")
+          .get(input.threadId, input.afterRunId)) {
+        throw new ApiError(409, "AI_CHAT_REQUEST_CONFLICT", "This request or predecessor already has an owner");
+      }
+      const waitingReason = this.getAiChatContinuationWaitingReason({ ...input, state: "pending" });
+      if (waitingReason && waitingReason !== "predecessor_running") {
+        throw new ApiError(409, "AI_CHAT_CONTINUATION_NOT_READY", waitingReason);
+      }
+      const timestamp = now();
+      this.#prepare(`
+        INSERT INTO ai_chat_continuations (
+          thread_id, after_run_id, request_id, message, payload_digest, execution_fingerprint,
+          state, created_at, updated_at, waiting_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+      `).run(input.threadId, input.afterRunId, input.requestId, input.message, input.payloadDigest,
+        input.executionFingerprint, timestamp, timestamp, waitingReason);
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getAiChatContinuation(input.threadId, input.requestId);
+  }
+
+  controlAiChatContinuation(threadId, requestId, action) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const continuation = this.getAiChatContinuation(threadId, requestId);
+      if (!continuation) throw new ApiError(404, "AI_CHAT_CONTINUATION_NOT_FOUND", "Continuation does not exist");
+      const transitions = {
+        pending: { pause: "paused", resume: "pending", cancel: "canceled" },
+        paused: { pause: "paused", resume: "pending", cancel: "canceled" },
+        canceled: { cancel: "canceled" },
+        dispatched: { resume: "dispatched" },
+      };
+      const state = transitions[continuation.state][action];
+      if (!state) throw new ApiError(409, "AI_CHAT_CONTINUATION_STATE", `Continuation is ${continuation.state}`);
+      if (state !== continuation.state) {
+        this.#prepare(`
+          UPDATE ai_chat_continuations SET state = ?, updated_at = ?, waiting_reason = NULL
+          WHERE thread_id = ? AND request_id = ?
+        `).run(state, now(), threadId, requestId);
+      }
+      this.database.exec("COMMIT");
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+    return this.getAiChatContinuation(threadId, requestId);
+  }
+
+  setAiChatContinuationWaitingReason(threadId, requestId, reason) {
+    this.#prepare(`
+      UPDATE ai_chat_continuations SET waiting_reason = ?, updated_at = ?
+      WHERE thread_id = ? AND request_id = ? AND state = 'pending' AND run_id IS NULL
+        AND waiting_reason IS NOT ?
+    `).run(reason, now(), threadId, requestId, reason);
+  }
+
   reserveAiChatRun(input) {
     const id = input.id ?? randomUUID();
     const timestamp = input.startedAt ?? now();
@@ -3958,6 +4113,20 @@ export class TaskboardDatabase {
         if (existing) {
           this.database.exec("COMMIT");
           return { created: false, run: existing };
+        }
+        const continuation = this.getAiChatContinuation(input.threadId, input.requestId);
+        if (continuation || input.continuation) {
+          if (!continuation || !input.continuation
+            || continuation.afterRunId !== input.continuation.afterRunId
+            || continuation.payloadDigest !== input.payloadDigest
+            || continuation.executionFingerprint !== input.continuation.executionFingerprint) {
+            throw new ApiError(409, "AI_CHAT_REQUEST_CONFLICT", "This requestId is reserved for a continuation");
+          }
+          if (continuation.state !== "pending" || continuation.runId) {
+            throw new ApiError(409, "AI_CHAT_CONTINUATION_STATE", `Continuation is ${continuation.state}`);
+          }
+          const reason = this.getAiChatContinuationWaitingReason(continuation);
+          if (reason) throw new ApiError(409, "AI_CHAT_CONTINUATION_NOT_READY", reason);
         }
       }
       this.#prepare(`
@@ -3985,6 +4154,13 @@ export class TaskboardDatabase {
           INSERT INTO ai_chat_run_requests (thread_id, request_id, payload_digest, run_id)
           VALUES (?, ?, ?, ?)
         `).run(input.threadId, input.requestId, input.payloadDigest, id);
+      }
+      if (input.continuation) {
+        this.#prepare(`
+          UPDATE ai_chat_continuations
+          SET state = 'dispatched', run_id = ?, updated_at = ?, waiting_reason = NULL
+          WHERE thread_id = ? AND request_id = ?
+        `).run(id, timestamp, input.threadId, input.requestId);
       }
       this.database.exec("COMMIT");
     } catch (error) {

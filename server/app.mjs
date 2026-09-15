@@ -6057,6 +6057,39 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 202, { run });
       }
 
+      const aiContinuationRoute = pathname.match(/^\/api\/local\/ai\/threads\/([^/]+)\/continuations$/);
+      if (aiContinuationRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai/threads/:id/continuations");
+        const threadId = decodeRouteSegment(aiContinuationRoute[1], "Thread id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["afterRunId", "requestId", "message"]));
+        const continuation = await aiChat.registerContinuation(threadId, {
+          ...parseAiTurn({
+            requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
+            message: body.message,
+          }),
+          afterRunId: stringField(body.afterRunId, "afterRunId", { required: true, maxLength: 256 }),
+        });
+        return sendJson(response, 202, { continuation });
+      }
+
+      const aiContinuationControlRoute = pathname.match(
+        /^\/api\/local\/ai\/threads\/([^/]+)\/continuations\/([^/]+)\/(pause|resume|cancel)$/,
+      );
+      if (aiContinuationControlRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/ai/threads/:id/continuations/:requestId/control");
+        await assertEmptyRequestBody(request, "Continuation control");
+        const continuation = aiChat.controlContinuation(
+          decodeRouteSegment(aiContinuationControlRoute[1], "Thread id"),
+          decodeRouteSegment(aiContinuationControlRoute[2], "Request id"),
+          aiContinuationControlRoute[3],
+        );
+        return sendJson(response, 200, { continuation });
+      }
+
       const aiThreadCompactRoute = pathname.match(/^\/api\/local\/ai\/threads\/([^/]+)\/compact$/);
       if (aiThreadCompactRoute) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);

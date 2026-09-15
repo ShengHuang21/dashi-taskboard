@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { signalProcessTree } from "../shared/process-tree.mjs";
-import { ApiError } from "./database.mjs";
+import { aiChatExecutionFingerprint, ApiError } from "./database.mjs";
 import {
   ComposerCatalog,
   discoverAiCatalog,
@@ -21,6 +21,10 @@ import {
 
 const SANDBOXES = new Set(["read-only", "workspace-write", "danger-full-access"]);
 const ERROR_CONTENT_LIMIT = 65_536;
+const CONTINUATION_WAITING_REASONS = new Set([
+  "predecessor_running", "predecessor_failed", "predecessor_interrupted",
+  "stale_predecessor", "invalid_predecessor", "settings_changed", "thread_busy",
+]);
 const AGENT_DISPATCH_PROTOCOL = "taskboard.agent.v1";
 const CODEX_IMAGE_TYPES = new Set([
   "image/gif",
@@ -168,6 +172,9 @@ export class AiChatService {
       return { ...resolved, issue };
     });
     this.active = new Map();
+    this.closing = false;
+    this.continuationAttempts = new Set();
+    this.failedFinalizations = new Set();
     this.listeners = new Map();
     this.completions = new Map();
     this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
@@ -197,6 +204,8 @@ export class AiChatService {
       thread,
       events: this.database.listAiChatEvents(threadId),
       runs: this.database.listAiChatRuns(threadId),
+      continuations: this.database.listAiChatContinuations(threadId)
+        .map((continuation) => this.#continuationSnapshot(continuation)),
     };
   }
 
@@ -389,7 +398,112 @@ export class AiChatService {
     return this.database.deleteAiChatThread(threadId);
   }
 
-  async startTurn(threadId, input) {
+  async registerContinuation(threadId, input) {
+    this.#assertContinuationOpen();
+    const thread = this.getThread(threadId);
+    this.#validateTurnInput(input);
+    if (!input.requestId || typeof input.afterRunId !== "string" || !input.afterRunId.trim()) {
+      throw new ApiError(400, "INVALID_FIELD", "Continuation requires requestId and afterRunId");
+    }
+    const message = input.message.trim();
+    const registration = {
+      threadId, afterRunId: input.afterRunId.trim(), requestId: input.requestId.trim(),
+      message, payloadDigest: turnPayloadDigest({ message }),
+    };
+    let continuation = this.database.getAiChatContinuationReplay(registration);
+    if (!continuation) {
+      const preparation = this.resolveContext(thread.origin.projectId, thread.origin.issueId);
+      this.continuationAttempts.add(preparation);
+      let resolved;
+      try {
+        resolved = await preparation;
+      } finally {
+        this.continuationAttempts.delete(preparation);
+      }
+      this.#assertContinuationOpen();
+      continuation = this.database.registerAiChatContinuation({
+        ...registration,
+        executionFingerprint: aiChatExecutionFingerprint(thread, resolved),
+      });
+    }
+    this.#scheduleContinuation(continuation);
+    return this.#continuationSnapshot(continuation);
+  }
+
+  controlContinuation(threadId, requestId, action) {
+    this.#assertContinuationOpen();
+    this.getThread(threadId);
+    const continuation = this.database.controlAiChatContinuation(threadId, requestId, action);
+    if (action === "resume") this.#scheduleContinuation(continuation);
+    return this.#continuationSnapshot(continuation);
+  }
+
+  #assertContinuationOpen() {
+    if (this.closing) throw new ApiError(503, "AI_CHAT_CLOSING", "AI chat service is closing");
+  }
+
+  #continuationSnapshot(continuation) {
+    const { payloadDigest, executionFingerprint, ...snapshot } = continuation;
+    snapshot.waitingReason = continuation.state === "pending"
+      ? this.database.getAiChatContinuationWaitingReason(continuation) ?? continuation.waitingReason
+      : null;
+    return snapshot;
+  }
+
+  #scheduleContinuation(continuation) {
+    if (this.closing || continuation.state !== "pending") return;
+    const attempt = this.#tryContinuation(continuation);
+    this.continuationAttempts.add(attempt);
+    void attempt.finally(() => this.continuationAttempts.delete(attempt)).catch(() => {});
+  }
+
+  async #tryContinuation(continuation) {
+    try {
+      const finalization = this.completions.get(continuation.afterRunId);
+      if (finalization) {
+        try {
+          await finalization;
+        } catch {
+          this.failedFinalizations.add(continuation.afterRunId);
+          throw new ApiError(409, "AI_CHAT_FINALIZATION_FAILED", "Predecessor finalization failed");
+        }
+      }
+      this.#assertContinuationOpen();
+      if (this.failedFinalizations.has(continuation.afterRunId)) {
+        throw new ApiError(409, "AI_CHAT_FINALIZATION_FAILED", "Predecessor finalization failed");
+      }
+      continuation = this.database.getAiChatContinuation(continuation.threadId, continuation.requestId);
+      if (!continuation || continuation.state !== "pending") return;
+      const reason = this.database.getAiChatContinuationWaitingReason(continuation);
+      if (reason) {
+        this.database.setAiChatContinuationWaitingReason(continuation.threadId, continuation.requestId, reason);
+        return;
+      }
+      this.database.setAiChatContinuationWaitingReason(continuation.threadId, continuation.requestId, null);
+      await this.startTurn(continuation.threadId, {
+        requestId: continuation.requestId, message: continuation.message,
+      }, continuation);
+    } catch (error) {
+      if (this.closing || !continuation) return;
+      const reason = error?.code === "AI_CHAT_CONTINUATION_NOT_READY" && CONTINUATION_WAITING_REASONS.has(error.message)
+        ? error.message
+        : ({
+          AI_CHAT_SETTINGS_CHANGED: "settings_changed",
+          THREAD_BUSY: "thread_busy",
+          AI_CHAT_FINALIZATION_FAILED: "finalization_failed",
+          DANGER_CONFIRMATION_REQUIRED: "danger_confirmation_required",
+          INVALID_MODEL: "invalid_model",
+          INVALID_REASONING_EFFORT: "invalid_reasoning_effort",
+          PROJECT_WORKSPACE_CHANGED: "settings_changed",
+          PROJECT_WORKSPACE_UNAVAILABLE: "workspace_unavailable",
+          AI_CHAT_ISSUE_NOT_FOUND: "issue_unavailable",
+        }[error?.code] ?? "preparation_failed");
+      this.database.setAiChatContinuationWaitingReason(continuation.threadId, continuation.requestId, reason);
+    }
+  }
+
+  async startTurn(threadId, input, continuation) {
+    if (continuation) this.#assertContinuationOpen();
     let thread = this.getThread(threadId);
     if (input?.contractVersion === "composer.v1" && input.requestId !== undefined) {
       throw new ApiError(400, "INVALID_FIELD", "requestId is only supported for the background legacy turn payload");
@@ -426,8 +540,10 @@ export class AiChatService {
       thread.origin.projectId,
       thread.origin.issueId,
     );
+    if (continuation) this.#assertContinuationOpen();
     const catalog = await this.getCatalog(thread.origin.projectId, resolved);
 
+    if (continuation) this.#assertContinuationOpen();
     thread = this.getThread(threadId);
     const pendingReplay = replay();
     if (pendingReplay) return pendingReplay;
@@ -476,6 +592,15 @@ export class AiChatService {
     } = await this.#writeTurnAttachments(attachments);
     let run;
     try {
+      if (continuation) {
+        this.#assertContinuationOpen();
+        if (aiChatExecutionFingerprint(thread, resolved) !== continuation.executionFingerprint) {
+          throw new ApiError(409, "AI_CHAT_SETTINGS_CHANGED", "Continuation execution settings changed");
+        }
+        if (this.#threadIsActive(this.getThread(threadId))) {
+          throw new ApiError(409, "THREAD_BUSY", "AI chat thread has a running turn");
+        }
+      }
       const args = buildCodexArgs(thread, resolved.addDirectories, imagePaths);
       const prompt = buildCodexPrompt(
         thread,
@@ -486,7 +611,7 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
       );
-      const reservation = this.database.reserveAiChatRun({ threadId, ...request });
+      const reservation = this.database.reserveAiChatRun({ threadId, ...request, continuation });
       if (!reservation.created) {
         if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
         return reservation.run;
@@ -581,7 +706,15 @@ export class AiChatService {
         }),
       );
       this.completions.set(run.id, finalization);
-      void finalization.finally(() => this.completions.delete(run.id)).catch(() => {});
+      void finalization.then((finished) => {
+        if (!this.closing && finished.status === "completed") {
+          for (const next of this.database.listAiChatContinuations(threadId)) {
+            if (next.afterRunId === run.id) this.#scheduleContinuation(next);
+          }
+        }
+      }, () => {
+        this.failedFinalizations.add(run.id);
+      }).finally(() => this.completions.delete(run.id)).catch(() => {});
       return run;
     } catch (error) {
       if (run && !this.active.has(run.id)) {
@@ -643,6 +776,7 @@ export class AiChatService {
   }
 
   async close() {
+    this.closing = true;
     const entries = [...this.active.entries()];
     for (const [, active] of entries) {
       active.interrupted = true;
@@ -681,6 +815,7 @@ export class AiChatService {
         await this.#finishAppServerRun(active, "interrupted");
       }
     }
+    await Promise.allSettled([...this.continuationAttempts]);
     this.unsubscribeAppServer();
     this.composerCatalog.close();
     this.catalogs.clear();
