@@ -65,6 +65,94 @@ if (args[0] === "debug") {
   };
 }
 
+test("issue progress observes the linked background run without changing Capsule or claims", async (context) => {
+  const instance = { instanceToken: "fixture-progress-token", instanceSecret: "b".repeat(64) };
+  const cloudState = { remoteUrl: null, projectMappings: {} };
+  const upstreamCalls = [];
+  let capsuleBefore;
+  const fixture = await createServerFixture("127.0.0.1", {
+    ...instance,
+    cloudConfigStore: { async read() { return { ...cloudState }; } },
+    remoteFetch: async (url, init) => {
+      upstreamCalls.push({ url: url.toString(), method: init.method, body: init.body });
+      return new Response(JSON.stringify({ capsule: capsuleBefore }), {
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const baseUrl = `${fixture.baseUrl}/${instance.instanceToken}`;
+  async function cli(args) {
+    let output = "";
+    const stream = { write(value) { output += value; } };
+    const code = await taskctl([...args, "--json"], {
+      env: { CODEX_TASKBOARD_URL: baseUrl }, stdout: stream, stderr: stream,
+    });
+    assert.equal(code, 0, output);
+    return JSON.parse(output);
+  }
+  try {
+    const { task } = await cli(["issue", "create", "--project", "local", "--title", "Background observation",
+      "--thread-id", "fixture-owner", "--status", "in_progress"]);
+    const createThread = ["background", "create", "--project", task.projectId, "--issue", task.identifier,
+      "--model", "gpt-real", "--reasoning-effort", "high", "--sandbox", "read-only"];
+    const { thread } = await cli(createThread);
+    const { run } = await cli(["background", "start", thread.id, "--request-id", "progress-observation",
+      "--message", "hello"]);
+    for (let index = 0; index < 100; index += 1) {
+      if (fixture.app.database.getAiChatRun(run.id).status !== "running") break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const recordedRun = fixture.app.database.getAiChatRun(run.id);
+    assert.equal(recordedRun.status, "completed");
+    const { thread: noRunThread } = await cli(createThread);
+    capsuleBefore = (await cli(["issue", "bootstrap", task.identifier])).capsule;
+    const taskBefore = fixture.app.database.getTask(task.id);
+    const claimBefore = fixture.app.database.getAgentTaskClaim(task.id);
+    const agentRunBefore = fixture.app.database.getLatestTaskAgentRun(task.id);
+    Object.assign(cloudState, {
+      remoteUrl: "https://tasks.example.test", actorName: "Fixture", sharedKey: "synthetic-fixture-key",
+    });
+
+    const result = await cli(["issue", "progress", task.identifier]);
+    assert.equal(result.schemaVersion, 2);
+    assert.equal(result.progress.liveExecution, "unknown");
+    assert.equal(result.progress.task.id, task.id);
+    assert.equal(result.progress.task.version, taskBefore.version);
+    assert.deepEqual(result.backgroundProgress, {
+      availability: "available", source: "local-ai-chat", projectId: task.projectId, taskId: task.id,
+      queriedAt: result.backgroundProgress.queriedAt,
+      threads: [
+        { threadId: thread.id, latestRun: {
+          runId: run.id, recordedStatus: "completed", startedAt: recordedRun.startedAt,
+          finishedAt: recordedRun.finishedAt,
+        } },
+        { threadId: noRunThread.id, latestRun: null },
+      ],
+      truncated: false,
+    });
+    assert.ok(Number.isFinite(Date.parse(result.backgroundProgress.queriedAt)));
+    assert.deepEqual(upstreamCalls, [{
+      url: `https://tasks.example.test/api/tasks/${task.identifier}/capsule`, method: "GET", body: undefined,
+    }]);
+    assert.deepEqual(fixture.app.database.getTask(task.id), taskBefore);
+    assert.deepEqual(fixture.app.database.getAgentTaskClaim(task.id), claimBefore);
+    assert.deepEqual(fixture.app.database.getLatestTaskAgentRun(task.id), agentRunBefore);
+    const capsuleAfter = fixture.app.database.getTaskCapsule(task.id);
+    for (const key of ["task", "requirementsRevision", "resumeToken", "activeRun", "latestRun", "execution",
+      "comments", "handoffs", "conversation", "relations"]) {
+      assert.deepEqual(capsuleAfter[key], capsuleBefore[key], key);
+    }
+    assert.deepEqual(fixture.app.database.getAiChatRun(run.id), recordedRun);
+    context.diagnostic(JSON.stringify({
+      observation: "CAP71-PROGRESS-W1-OBS1", taskId: task.id, threadId: thread.id, runId: run.id,
+      recordedStatus: recordedRun.status, taskAndCapsuleAndClaimUnchanged: true,
+      cloudRequests: upstreamCalls.length, localMetadataCloudRequests: 0,
+    }));
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("background taskctl retries preserve one durable run through completion and restart", async () => {
   const instance = { instanceToken: "fixture-background-token", instanceSecret: "a".repeat(64) };
   const fixture = await createServerFixture("127.0.0.1", instance);

@@ -5988,6 +5988,18 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, projectSummary.get(projectId));
       }
 
+      if (pathname === "/api/local/ai/task-progress") {
+        if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+        assertAllowedQuery(url.searchParams, new Set(["projectId", "taskId"]), "GET /api/local/ai/task-progress");
+        const projectId = stringField(url.searchParams.get("projectId") ?? undefined, "projectId", {
+          required: true, maxLength: 200,
+        });
+        const taskId = stringField(url.searchParams.get("taskId") ?? undefined, "taskId", {
+          required: true, maxLength: 200,
+        });
+        return sendJson(response, 200, { backgroundProgress: database.getAiChatTaskProgress(projectId, taskId) });
+      }
+
       if (pathname === "/api/local/ai/threads") {
         assertNoQuery(url.searchParams, "/api/local/ai/threads");
         if (request.method === "GET") {

@@ -61,6 +61,73 @@ test("built-in help leads fresh windows through complete Capsule bootstrap", asy
   }
 });
 
+test("issue progress separates canonical Capsule and whitelisted optional local metadata", async () => {
+  const capsule = {
+    task: { id: "canonical-task", identifier: "CAP-71", projectId: "canonical-project",
+      title: "Progress fixture", status: "in_progress", version: 7 },
+    requirementsRevision: "requirements-fixture", comments: [], latestRun: null,
+  };
+  const timestamp = "2026-09-15T13:00:00.000Z";
+  const localProgress = {
+    availability: "available", source: "local-ai-chat", projectId: "canonical-project", taskId: "canonical-task",
+    queriedAt: timestamp, truncated: false, secret: "not-public",
+    threads: [{ threadId: "chat-thread-1", title: "not-public", latestRun: {
+      runId: "chat-run-1", recordedStatus: "completed", startedAt: timestamp, finishedAt: timestamp,
+      error: "not-public",
+    } }],
+  };
+  const overrides = {
+    env: { CODEX_TASKBOARD_URL: "https://canonical.example.test" },
+    readFile: async (filename) => {
+      assert.equal(filename, "/fixture/progress-runtime.json");
+      return JSON.stringify({ version: 1, url: "http://127.0.0.1:47829/fixture-progress-token" });
+    },
+  };
+  const calls = [];
+  let optionalFailure = false;
+  const fetch = async (url, init) => {
+    calls.push({ url: url.toString(), init });
+    if (url.hostname === "canonical.example.test") return response({ capsule });
+    if (optionalFailure) throw new Error("private URL/body/error must not escape");
+    return response({ backgroundProgress: localProgress });
+  };
+  const args = ["issue", "progress", "CAP-71", "--runtime-file", "/fixture/progress-runtime.json", "--json"];
+  const result = await run(args, fetch, overrides);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout.schemaVersion, 2);
+  assert.equal(result.stdout.progress.task.id, capsule.task.id);
+  assert.equal(result.stdout.progress.liveExecution, "unknown");
+  assert.deepEqual(calls.map((call) => call.url), [
+    "https://canonical.example.test/api/tasks/CAP-71/capsule",
+    "http://127.0.0.1:47829/fixture-progress-token/api/local/ai/task-progress?projectId=canonical-project&taskId=canonical-task",
+  ]);
+  assert.equal(calls[0].init.signal, undefined);
+  assert.equal(calls[0].init.redirect, undefined);
+  assert.equal(calls[1].init.redirect, "error");
+  assert.ok(calls[1].init.signal instanceof AbortSignal);
+  assert.ok(calls.every((call) => call.init.method === "GET" && call.init.body === undefined));
+  assert.deepEqual(result.stdout.backgroundProgress, {
+    availability: "available", source: "local-ai-chat", projectId: "canonical-project", taskId: "canonical-task",
+    queriedAt: timestamp, truncated: false,
+    threads: [{ threadId: "chat-thread-1", latestRun: {
+      runId: "chat-run-1", recordedStatus: "completed", startedAt: timestamp, finishedAt: timestamp,
+    } }],
+  });
+  calls.length = 0;
+  optionalFailure = true;
+  const unavailable = await run(args, fetch, overrides);
+  assert.equal(unavailable.exitCode, 0);
+  assert.deepEqual(unavailable.stdout.backgroundProgress, {
+    availability: "unavailable", source: "local-ai-chat", projectId: "canonical-project", taskId: "canonical-task",
+    queriedAt: unavailable.stdout.backgroundProgress.queriedAt, threads: null, truncated: null,
+  });
+  assert.ok(Number.isFinite(Date.parse(unavailable.stdout.backgroundProgress.queriedAt)));
+  assert.equal(calls.length, 2);
+  assert.equal(unavailable.stderr, null);
+  assert.doesNotMatch(JSON.stringify(unavailable), /private|not-public|47829/);
+  assert.deepEqual({ ...unavailable.stdout.progress, queriedAt: result.stdout.progress.queriedAt }, result.stdout.progress);
+});
+
 test("project list uses the default local service and adds schemaVersion", async () => {
   const calls = [];
   const result = await run(["project", "list"], async (url, init) => {
