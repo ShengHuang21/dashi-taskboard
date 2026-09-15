@@ -34,6 +34,10 @@ const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 const COMMAND_OPTIONS = new Map([
   ["background create", new Set(["project", "issue", "title", "model", "reasoning-effort", "sandbox", "json"])],
   ["background start", new Set(["request-id", "message", "message-file", "json"])],
+  ["background continue", new Set(["after-run", "request-id", "message", "message-file", "json"])],
+  ["background pause", new Set(["request-id", "json"])],
+  ["background resume", new Set(["request-id", "json"])],
+  ["background cancel", new Set(["request-id", "json"])],
   ["background get", new Set(["json"])],
   ["resource-step prepare", new Set(["request-file", "json"])],
   ["resource-step run", new Set(["run-id", "action-id", "request-file", "wait-timeout", "json"])],
@@ -348,6 +352,8 @@ Commands:
   background create --project ID --model MODEL --reasoning-effort EFFORT --sandbox MODE
     [--issue ID --title TEXT]
   background start THREAD_ID --request-id ID (--message TEXT | --message-file FILE)
+  background continue THREAD_ID --after-run RUN_ID --request-id ID (--message TEXT | --message-file FILE)
+  background pause/resume/cancel THREAD_ID --request-id ID
   background get THREAD_ID
   comment list ISSUE_ID [--after CURSOR]
   comment add ISSUE_ID (--body TEXT | --body-file FILE) [--thread-id ID]
@@ -374,6 +380,8 @@ Run taskctl issue --help, taskctl coordinator --help, taskctl activation --help,
   create --project ID --model MODEL --reasoning-effort EFFORT --sandbox MODE
     [--issue ID --title TEXT] [--json]
   start THREAD_ID --request-id ID (--message TEXT | --message-file FILE) [--json]
+  continue THREAD_ID --after-run RUN_ID --request-id ID (--message TEXT | --message-file FILE) [--json]
+  pause|resume|cancel THREAD_ID --request-id ID [--json]
   get THREAD_ID [--json]
 
 Create returns a new Taskboard AI chat thread UUID, not an existing Desktop task.
@@ -382,6 +390,10 @@ message to return the original run without another dispatch attempt. Reusing the
 key with a different payload returns a conflict. An interrupted/failed run is
 not automatically restarted; inspect it with get before choosing a new request.
 These commands use the protected local companion; they do not prove Desktop idle.
+Continue registers one immutable next message after an exact successful legacy run.
+It does not interrupt the predecessor. Pause/resume/cancel controls only unreserved
+next work; once dispatched, resume/replay returns its receipt and never retries it.
+Pending work is preserved but not automatically started after a service restart.
 Sandbox values retain the existing AI chat approval modes. This command does not
 confirm danger-full-access; use a non-dangerous mode for background work.`],
   ["issue", `Usage: taskctl issue ACTION [arguments] [options]
@@ -779,7 +791,8 @@ async function execute(parsed, overrides) {
         ...optionalField("issueId", parsed.options.issue),
         ...optionalField("title", parsed.options.title),
       });
-    case "background start": {
+    case "background start":
+    case "background continue": {
       expectOperandCount(parsed, 1);
       const requestId = requiredOption(parsed.options, "request-id");
       if (parsed.options.message !== undefined && parsed.options["message-file"] !== undefined) {
@@ -795,9 +808,20 @@ async function execute(parsed, overrides) {
         }
       }
       if (message === undefined) throw usageError("Use --message or --message-file");
-      return api.request("POST", `/api/local/ai/threads/${encodeURIComponent(parsed.operands[0])}/turns`, {
+      const continuing = command === "background continue";
+      const endpoint = continuing ? "continuations" : "turns";
+      return api.request("POST", `/api/local/ai/threads/${encodeURIComponent(parsed.operands[0])}/${endpoint}`, {
         requestId, message,
+        ...(continuing ? { afterRunId: requiredOption(parsed.options, "after-run") } : {}),
       });
+    }
+    case "background pause":
+    case "background resume":
+    case "background cancel": {
+      expectOperandCount(parsed, 1);
+      const threadId = encodeURIComponent(parsed.operands[0]);
+      const requestId = encodeURIComponent(requiredOption(parsed.options, "request-id"));
+      return api.request("POST", `/api/local/ai/threads/${threadId}/continuations/${requestId}/${parsed.action}`);
     }
     case "background get":
       expectOperandCount(parsed, 1);
