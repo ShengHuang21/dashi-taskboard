@@ -1,7 +1,62 @@
 import assert from "node:assert/strict";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { AiChatService } from "../server/ai-chat.mjs";
+
+test("issue worktree settings and Composer discovery retain the saved issue directory", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "taskboard-issue-catalog-"));
+  let service;
+  try {
+    for (const name of ["project", "worktree", "changed-worktree", "other-project"]) await mkdir(path.join(directory, name));
+    const projectPath = await realpath(path.join(directory, "project"));
+    const worktreePath = await realpath(path.join(directory, "worktree"));
+    const otherPath = await realpath(path.join(directory, "other-project"));
+    const project = { id: "local", name: "Project", workspacePath: projectPath };
+    const projects = [project, { id: "other", name: "Other", workspacePath: otherPath }];
+    const issue = { id: "issue", identifier: "LOCAL-1", projectId: "local", archivedAt: null,
+      developmentContext: { type: "worktree", path: worktreePath } };
+    const statePath = path.join(directory, "codex-state.json");
+    await writeFile(statePath, "{}");
+    let thread;
+    const discovery = [];
+    const composer = [];
+    const database = {
+      getProject: (id) => projects.find((entry) => entry.id === id),
+      listProjects: () => projects,
+      getTask: () => issue,
+      createAiChatThread: (input) => (thread = { ...input, id: "thread", status: "idle", currentRun: null }),
+      getAiChatThread: () => thread,
+      updateAiChatThread: (_id, changes) => (thread = { ...thread, ...changes }),
+    };
+    service = new AiChatService({ database, codexExecutable: "unused-fake", codexStatePath: statePath,
+      manageTaskboardSkillPath: "/fixture/unused-skill", catalogTtlMs: -1,
+      appServer: { subscribe: () => () => {}, close: async () => {} },
+      composerCatalog: { candidates: async (input) => { composer.push(input.workspacePath); return { candidates: [] }; }, close() {} },
+      discoverCatalog: async ({ workspacePath }) => {
+        discovery.push(workspacePath);
+        return { models: [{ slug: "fixture", defaultReasoningEffort: "high", supportedReasoningEfforts: ["high"] }], skills: [] };
+      },
+    });
+    await service.createThread({ projectId: "local", issueId: "issue", model: "fixture", reasoningEffort: "high" });
+    assert.equal(thread.origin.workspacePath, worktreePath);
+    issue.developmentContext.path = path.join(directory, "changed-worktree");
+    await service.updateThread(thread.id, { reasoningEffort: "high" });
+    await service.getComposerCandidates({ projectId: "local", threadId: thread.id, trigger: "$", query: "" });
+    assert.deepEqual(discovery, [worktreePath, worktreePath]);
+    assert.deepEqual(composer, [worktreePath]);
+    const resolved = await service.resolveContext("local", "issue", { origin: thread.origin });
+    assert.deepEqual(resolved.addDirectories, [otherPath]);
+    assert.equal(resolved.addDirectories.includes(projectPath), false);
+    await service.getCatalog("local");
+    assert.equal(discovery.at(-1), projectPath);
+  } finally {
+    if (service) await service.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 function createService(discoverCatalog, options = {}) {
   let notify = () => {};

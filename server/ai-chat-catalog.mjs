@@ -294,6 +294,44 @@ export async function resolveMappedAiWorkspace(projectId, project, projectMappin
   return resolvedWorkspace(projectId, project, workspaces);
 }
 
+export async function resolveAiIssueWorkspace(resolved, issue, origin) {
+  const binding = issue?.threadBinding;
+  if (binding?.codexProjectKind === "remote"
+    || (binding?.codexHostId && binding.codexHostId !== "local")) {
+    throw new ApiError(
+      409,
+      "AI_CHAT_REMOTE_ISSUE_UNSUPPORTED",
+      "A remotely bound task cannot execute through the local AI service",
+    );
+  }
+  let workspacePath = resolved.workspacePath;
+  if (issue && origin) {
+    workspacePath = await existingDirectory(origin.workspacePath);
+    if (!workspacePath || workspacePath !== origin.workspacePath) {
+      throw new ApiError(
+        409,
+        "PROJECT_WORKSPACE_UNAVAILABLE",
+        "The conversation's saved workspace is no longer available at its original path",
+      );
+    }
+  } else if (issue?.developmentContext?.type === "worktree") {
+    workspacePath = await existingDirectory(issue.developmentContext.path);
+    if (!workspacePath) {
+      throw new ApiError(
+        409,
+        "PROJECT_WORKSPACE_UNAVAILABLE",
+        "The task's worktree has no available directory on this device",
+      );
+    }
+  }
+  return {
+    ...resolved,
+    issue,
+    workspacePath,
+    addDirectories: [...new Set(resolved.addDirectories)].filter((directory) => directory !== workspacePath),
+  };
+}
+
 function sanitizeModels(value) {
   if (!Array.isArray(value)) throw new Error("Codex returned an invalid model catalog");
   return value.flatMap((model) => {
