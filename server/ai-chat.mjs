@@ -176,6 +176,8 @@ export class AiChatService {
     this.closing = false;
     this.continuationAttempts = new Set();
     this.failedFinalizations = new Set();
+    this.pendingLegacyFinalizations = new Set();
+    this.removeTurnAttachments = (directory) => rm(directory, { recursive: true, force: true });
     this.listeners = new Map();
     this.completions = new Map();
     this.unsubscribeAppServer = this.appServer.subscribe((notification) => {
@@ -448,6 +450,17 @@ export class AiChatService {
     return this.#continuationSnapshot(continuation);
   }
 
+  recoverPendingContinuations() {
+    for (const thread of this.database.listAiChatThreads()) {
+      for (const continuation of this.database.listAiChatContinuations(thread.id)) {
+        if (continuation.state === "pending"
+          && this.database.hasAiChatRunFinalization(continuation.afterRunId)) {
+          this.#scheduleContinuation(continuation);
+        }
+      }
+    }
+  }
+
   #assertContinuationOpen() {
     if (this.closing) throw new ApiError(503, "AI_CHAT_CLOSING", "AI chat service is closing");
   }
@@ -712,7 +725,12 @@ export class AiChatService {
           pendingError: () => pendingError,
         }),
       );
+      this.pendingLegacyFinalizations.add(finalization);
       this.completions.set(run.id, finalization);
+      void finalization.then(
+        () => this.pendingLegacyFinalizations.delete(finalization),
+        () => this.pendingLegacyFinalizations.delete(finalization),
+      );
       void finalization.then((finished) => {
         if (!this.closing && finished.status === "completed") {
           for (const next of this.database.listAiChatContinuations(threadId)) {
@@ -822,6 +840,8 @@ export class AiChatService {
         await this.#finishAppServerRun(active, "interrupted");
       }
     }
+    // Completed legacy runs can still be cleaning up after leaving active.
+    await Promise.allSettled([...this.pendingLegacyFinalizations]);
     await Promise.allSettled([...this.continuationAttempts]);
     this.unsubscribeAppServer();
     this.composerCatalog.close();
@@ -1219,9 +1239,10 @@ export class AiChatService {
       status = "completed";
     }
 
+    let updated;
     try {
       // The durable outcome must not depend on writing its explanatory event.
-      const updated = this.database.updateAiChatRun(run.id, {
+      updated = this.database.updateAiChatRun(run.id, {
         status,
         exitCode: result?.exitCode ?? null,
         error: publicError === null ? null : cappedError(publicError),
@@ -1239,13 +1260,16 @@ export class AiChatService {
         this.#emit(run.threadId, { type: "ai.event", event: errorEvent });
       }
       this.#emit(run.threadId, { type: "ai.run", run: updated });
-      return updated;
     } finally {
       this.active.delete(run.id);
       if (active.temporaryDirectory) {
-        await rm(active.temporaryDirectory, { recursive: true, force: true });
+        await this.removeTurnAttachments(active.temporaryDirectory);
       }
     }
+    if (updated.status === "completed" && updated.exitCode === 0) {
+      this.database.recordAiChatRunFinalization(run.id);
+    }
+    return updated;
   }
 
   #emit(threadId, event) {

@@ -2591,6 +2591,11 @@ export class TaskboardDatabase {
         finished_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS ai_chat_run_finalizations (
+        run_id TEXT PRIMARY KEY REFERENCES ai_chat_runs(id) ON DELETE CASCADE,
+        finalized_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS ai_chat_runs_thread_started
         ON ai_chat_runs(thread_id, started_at, id);
 
@@ -3975,6 +3980,21 @@ export class TaskboardDatabase {
   getAiChatRun(id) {
     const row = this.#prepare("SELECT * FROM ai_chat_runs WHERE id = ?").get(id);
     return row ? aiChatRunFromRow(row) : null;
+  }
+
+  recordAiChatRunFinalization(runId) {
+    this.#prepare(`
+      INSERT INTO ai_chat_run_finalizations (run_id, finalized_at)
+      SELECT id, ? FROM ai_chat_runs WHERE id = ? AND status = 'completed' AND exit_code = 0
+      ON CONFLICT(run_id) DO NOTHING
+    `).run(now(), runId);
+    if (!this.hasAiChatRunFinalization(runId)) {
+      throw new Error("AI chat run finalization receipt was not persisted");
+    }
+  }
+
+  hasAiChatRunFinalization(runId) {
+    return Boolean(this.#prepare("SELECT 1 FROM ai_chat_run_finalizations WHERE run_id = ?").get(runId));
   }
 
   createAiChatRun(input) {

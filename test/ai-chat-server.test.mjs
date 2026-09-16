@@ -436,16 +436,23 @@ test("background continuation rechecks settings and exact predecessor after asyn
   }
 });
 
-test("background continuation close drains preparation and restart waits for explicit resume", async (context) => {
+test("background continuation startup recovers a finalized predecessor once after restart", async (context) => {
   const fixture = await backgroundContinuationFixture();
   let preparation;
   let app = fixture.app;
   try {
-    const { thread, run } = await registerHeldSuccessor(fixture);
+    const { thread, run, command } = await registerHeldSuccessor(fixture);
+    const finalization = app.aiChat.completions.get(run.id);
+    assert.ok(app.aiChat.pendingLegacyFinalizations.has(finalization));
     await fixture.cli(["background", "pause", thread.id, "--request-id", "next"]);
     await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
     await waitUntil(() => app.database.getAiChatRun(run.id).status === "completed");
     await Promise.all([...app.aiChat.continuationAttempts]);
+    await finalization;
+    assert.equal(app.aiChat.pendingLegacyFinalizations.size, 0);
+    assert.equal(app.database.hasAiChatRunFinalization(run.id), true);
+    const predecessor = app.database.getAiChatRun(run.id);
+    assert.equal(predecessor.exitCode, 0);
     preparation = holdNextPreparation(app.aiChat);
     await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
     await preparation.entered;
@@ -459,26 +466,167 @@ test("background continuation close drains preparation and restart waits for exp
       codexStatePath: path.join(fixture.directory, "codex-state.json"),
       skillPath: "/fixture/manage-taskboard/SKILL.md", ...fixture.instance,
     });
+    assert.equal(app.database.getAiChatContinuation(thread.id, "next").state, "pending");
+    assert.equal(app.database.listAiChatRuns(thread.id).length, 1);
+    assert.equal(app.aiChat.continuationAttempts.size, 0);
+    assert.equal(app.database.hasAiChatRunFinalization(run.id), true);
     const address = await app.listen({ host: "127.0.0.1", port: 0 });
     await writeFile(fixture.runtimePath, JSON.stringify({ version: 1,
       url: `http://127.0.0.1:${address.port}/${fixture.instance.instanceToken}` }));
-    const reopened = await fixture.cli(["background", "get", thread.id]);
-    assert.equal(reopened.continuations[0].state, "pending");
-    assert.equal(reopened.runs.length, 1);
-    assert.equal(app.aiChat.continuationAttempts.size, 0);
-    assert.equal((await fixture.dispatches()).length, 1);
-    await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
     await waitUntil(() => app.database.listAiChatRuns(thread.id)
       .filter((entry) => entry.status === "completed").length === 2);
     const once = await fixture.cli(["background", "get", thread.id]);
+    const next = once.continuations[0];
+    assert.equal(next.state, "dispatched");
+    assert.equal(next.afterRunId, run.id);
+    assert.equal(next.requestId, "next");
+    assert.equal(next.message, "bounded next action");
+    assert.equal(once.runs.length, 2);
+    assert.deepEqual(app.database.getAiChatRun(run.id), predecessor);
+    assert.equal(once.thread.model, thread.model);
+    assert.equal(once.thread.reasoningEffort, thread.reasoningEffort);
+    assert.equal(once.thread.origin.workspacePath, thread.origin.workspacePath);
+    assert.equal(once.thread.codexThreadId, "session-1");
+    const dispatches = await fixture.dispatches();
+    const successorDispatches = dispatches.filter((entry) => entry.prompt.includes(next.message));
+    assert.equal(successorDispatches.length, 1);
+    const successor = successorDispatches[0];
+    assert.equal(successor.args[successor.args.indexOf("-m") + 1], thread.model);
+    assert.ok(successor.args.includes(`model_reasoning_effort="${thread.reasoningEffort}"`));
+    assert.equal(successor.args[successor.args.indexOf("-C") + 1], thread.origin.workspacePath);
+    assert.equal(successor.cwd, thread.origin.workspacePath);
+    assert.ok(successor.args.includes("resume"));
+    assert.ok(successor.args.includes("session-1"));
+    assert.equal((await fixture.cli(command)).continuation.runId, next.runId);
     await fixture.cli(["background", "resume", thread.id, "--request-id", "next"]);
+    assert.equal((await fixture.cli(["background", "start", thread.id,
+      "--request-id", "next", "--message", next.message])).run.id, next.runId);
     assert.deepEqual(await fixture.cli(["background", "get", thread.id]), once);
     assert.equal((await fixture.dispatches()).length, 2);
-    context.diagnostic(JSON.stringify({ observation: "CAP71-NEXT-RESTART", startupDispatches: 0,
-      explicitResumeDispatches: 1, closePreparationDispatches: 0 }));
+    context.diagnostic(JSON.stringify({ observation: "CAP71-STARTUP-C1", predecessor: run.id,
+      receipt: app.database.hasAiChatRunFinalization(run.id), successor: next.runId,
+      startupDispatches: successorDispatches.length, totalRuns: once.runs.length,
+      replayTotalDispatches: (await fixture.dispatches()).length,
+      model: once.thread.model, reasoningEffort: once.thread.reasoningEffort,
+      workspace: successor.cwd, codexThreadId: once.thread.codexThreadId }));
   } finally {
     preparation?.release();
     await app.close();
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("background continuation startup excludes cleanup failure during close without a receipt", async (context) => {
+  const fixture = await backgroundContinuationFixture();
+  const cleanupEntered = Promise.withResolvers();
+  const cleanupGate = Promise.withResolvers();
+  const lifecycle = [];
+  let app = fixture.app;
+  let appClosed = false;
+  let closing;
+  let attachmentDirectory;
+  const service = app.aiChat;
+  const removeAttachments = service.removeTurnAttachments;
+  service.removeTurnAttachments = async (directory) => {
+    cleanupEntered.resolve(directory);
+    try {
+      await cleanupGate.promise;
+    } catch (error) {
+      lifecycle.push("cleanup-rejected");
+      throw error;
+    }
+    await removeAttachments(directory);
+  };
+  try {
+    const thread = await fixture.createThread();
+    const started = await request(`${fixture.baseUrl}/${fixture.instance.instanceToken}`,
+      `/api/local/ai/threads/${thread.id}/turns`, { method: "POST", body: {
+        requestId: "first", message: "fixture-hold-predecessor",
+        attachments: [{ filename: "fixture.txt", contentType: "text/plain",
+          dataBase64: Buffer.from("fixture attachment").toString("base64") }],
+      } });
+    assert.equal(started.response.status, 202);
+    const run = started.body.run;
+    attachmentDirectory = service.active.get(run.id).temporaryDirectory;
+    assert.ok(attachmentDirectory);
+    const finalization = service.completions.get(run.id);
+    assert.ok(service.pendingLegacyFinalizations.has(finalization));
+    void finalization.then(() => lifecycle.push("finalization-fulfilled"),
+      () => lifecycle.push("finalization-rejected"));
+    await fixture.cli(["background", "continue", thread.id, "--after-run", run.id,
+      "--request-id", "next", "--message", "bounded next action"]);
+    await waitUntil(() => app.database.listAiChatEvents(thread.id)
+      .some((event) => event.type === "turn.completed"));
+    await writeFile(path.join(fixture.workspace, "fixture-release"), "release");
+    assert.equal(await cleanupEntered.promise, attachmentDirectory);
+    const predecessor = app.database.getAiChatRun(run.id);
+    assert.equal(predecessor.status, "completed");
+    assert.equal(predecessor.exitCode, 0);
+    assert.equal(service.active.has(run.id), false);
+    assert.ok(service.pendingLegacyFinalizations.has(finalization));
+    assert.equal(service.pendingLegacyFinalizations.size, 1);
+    assert.equal(app.database.hasAiChatRunFinalization(run.id), false);
+    assert.equal(app.database.listAiChatRuns(thread.id).length, 1);
+    assert.equal((await fixture.dispatches()).length, 1);
+    const closeProvider = service.appServer.close.bind(service.appServer);
+    service.appServer.close = async () => {
+      lifecycle.push("provider-close");
+      await closeProvider();
+    };
+    const closeDatabase = app.database.close.bind(app.database);
+    app.database.close = () => {
+      lifecycle.push("database-close");
+      closeDatabase();
+    };
+    closing = app.close().then(() => { appClosed = true; });
+    await waitUntil(() => service.closing);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(appClosed, false);
+    assert.deepEqual(lifecycle, []);
+    assert.ok(service.pendingLegacyFinalizations.has(finalization));
+    assert.equal(app.database.hasAiChatRunFinalization(run.id), false);
+    const rejected = assert.rejects(finalization, /fixture cleanup failure/);
+    cleanupGate.reject(new Error("fixture cleanup failure"));
+    await rejected;
+    await closing;
+    assert.equal(service.pendingLegacyFinalizations.size, 0);
+    assert.deepEqual(lifecycle, ["cleanup-rejected", "finalization-rejected", "provider-close", "database-close"]);
+    app = createTaskboardServer({
+      dataDirectory: fixture.directory, codexExecutable: path.join(fixture.directory, "fake-codex.mjs"),
+      codexStatePath: path.join(fixture.directory, "codex-state.json"),
+      skillPath: "/fixture/manage-taskboard/SKILL.md", ...fixture.instance,
+    });
+    appClosed = false;
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    await writeFile(fixture.runtimePath, JSON.stringify({ version: 1,
+      url: `http://127.0.0.1:${address.port}/${fixture.instance.instanceToken}` }));
+    await Promise.all([...app.aiChat.continuationAttempts]);
+    const reopened = await fixture.cli(["background", "get", thread.id]);
+    const pending = app.database.getAiChatContinuation(thread.id, "next");
+    assert.deepEqual(app.database.getAiChatRun(run.id), predecessor);
+    assert.equal(app.database.hasAiChatRunFinalization(run.id), false);
+    assert.equal(pending.afterRunId, run.id);
+    assert.equal(pending.state, "pending");
+    assert.equal(pending.runId, null);
+    assert.notEqual(pending.waitingReason, "finalization_failed");
+    assert.equal(reopened.runs.length, 1);
+    assert.equal(app.aiChat.continuationAttempts.size, 0);
+    assert.equal(app.aiChat.pendingLegacyFinalizations.size, 0);
+    const dispatches = await fixture.dispatches();
+    const successorDispatches = dispatches.filter((entry) => entry.prompt.includes("bounded next action"));
+    assert.equal(dispatches.length, 1);
+    assert.equal(successorDispatches.length, 0);
+    context.diagnostic(JSON.stringify({ observation: "CAP71-STARTUP-C2", predecessor: run.id,
+      status: predecessor.status, exitCode: predecessor.exitCode,
+      receipt: app.database.hasAiChatRunFinalization(run.id), waitingReason: pending.waitingReason,
+      continuationState: pending.state, successorRunId: pending.runId,
+      successorReservations: reopened.runs.length - 1, successorDispatches: successorDispatches.length,
+      pendingLegacyFinalizations: service.pendingLegacyFinalizations.size, lifecycle }));
+  } finally {
+    cleanupGate.resolve();
+    if (closing) await closing;
+    if (!appClosed) await app.close();
+    if (attachmentDirectory) await rm(attachmentDirectory, { recursive: true, force: true });
     await rm(fixture.directory, { recursive: true, force: true });
   }
 });

@@ -7539,6 +7539,7 @@ export function createTaskboardServer(options = {}) {
         else server.listen({ fd });
       });
       listening = true;
+      aiChat.recoverPendingContinuations();
       await reconcileAgentLanes();
       agentLaneTimer = setInterval(() => {
         reconcileAgentLanes().catch((error) => console.error("Agent lane reconcile failed", error));
