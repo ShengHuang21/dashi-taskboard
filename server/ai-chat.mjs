@@ -145,6 +145,8 @@ export class AiChatService {
     this.codexStatePath = options.codexStatePath;
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
+    this.taskctlPath = options.taskctlPath;
+    this.runtimeFile = options.runtimeFile;
     this.killGraceMs = options.killGraceMs ?? 1_000;
     this.catalogTtlMs = options.catalogTtlMs ?? 30_000;
     this.discoverCatalog = options.discoverCatalog ?? discoverAiCatalog;
@@ -356,9 +358,14 @@ export class AiChatService {
     this.#validateSandbox(sandbox);
 
     const issue = resolved.issue;
+    if (input.purpose === "goal-coordinator") {
+      const existing = this.database.getGoalCoordinatorThread(resolved.project.id, issue.id);
+      if (existing) return existing;
+    }
 
     return this.database.createAiChatThread({
       title: input.title ?? issue?.identifier ?? "New conversation",
+      purpose: input.purpose,
       origin: {
         projectId: resolved.project.id,
         projectName: resolved.project.name,
@@ -369,6 +376,80 @@ export class AiChatService {
       reasoningEffort,
       sandbox,
     });
+  }
+
+  getGoalCoordinator(taskId) {
+    const capsule = this.database.getTaskCapsule(taskId);
+    if (!capsule || capsule.task.archivedAt || !capsule.task.labels.includes("owner-goal")) {
+      throw new ApiError(404, "GOAL_NOT_FOUND", "An active owner goal is required");
+    }
+    const thread = this.database.getGoalCoordinatorThread(capsule.task.projectId, capsule.task.id);
+    const runs = thread ? this.database.listAiChatRuns(thread.id) : [];
+    const claim = this.database.getAgentTaskClaim(capsule.task.id);
+    const taskRun = this.database.getOpenTaskAgentRun(capsule.task.id);
+    const owner = taskRun ?? (claim?.status === "active" ? claim : null);
+    const ownerThreadId = owner?.agentThreadId;
+    const blocker = owner && (!thread?.codexThreadId || ownerThreadId !== thread.codexThreadId)
+      ? { code: "GOAL_OWNED", message: `Recorded execution belongs to ${ownerThreadId ?? owner.agentPath ?? "another agent"}. Open that task to coordinate; this action will not take it over.` }
+      : null;
+    return {
+      goal: {
+        id: capsule.task.id, projectId: capsule.task.projectId, title: capsule.task.title,
+        version: capsule.task.version, resumeToken: capsule.resumeToken,
+        workflowProfile: capsule.task.workflowProfile,
+      },
+      thread,
+      latestRun: runs.at(-1) ?? null,
+      blocker,
+    };
+  }
+
+  async startGoalCoordinator(taskId, input) {
+    const initial = this.getGoalCoordinator(taskId);
+    const message = [
+      "Plan this goal and persist the deliverable tree. This is one bounded hosted planning turn, not a coding run.",
+      `Goal id: ${initial.goal.id}; project id: ${initial.goal.projectId}.`,
+      `Reviewed goal version: ${input.version}; Capsule resume token: ${input.resumeToken}.`,
+      `Goal workflow profile: ${initial.goal.workflowProfile}. Preserve it on every newly created descendant: every taskctl issue create command must explicitly include --workflow-profile ${initial.goal.workflowProfile}. Do not rely on the CLI default or change existing tasks' profiles.`,
+      `Use only the protected taskctl at ${JSON.stringify(this.taskctlPath)} with --runtime-file ${JSON.stringify(this.runtimeFile)}. Never read or print the descriptor's token.`,
+      "First read issue bootstrap for this exact goal, including its full description, comments, current ownership and relationships. Check the reviewed version and resume token before writing; if stale, stop and report the changed goal.",
+      "Read the existing descendants before adding anything. Reuse matching deliverables and preserve existing work. Recursively decompose only genuinely missing outcomes; use parent relations for the tree and blocks/blocked_by for real dependencies. Do not manufacture extra tasks or duplicate an existing plan.",
+      "You may create and link child issues only inside this goal's project and descendant tree, and append one concise planning result comment to the goal using current protected versions. Give children meaningful goal/outcome titles, acceptance criteria and dependencies; leave their status todo. The human supplies the goal, not the breakdown.",
+      "Do not edit repository files, claim implementation work, start developers or validators, spawn agents, launch applications, change original Desktop window bindings, mark work complete, merge, publish or deploy. This turn only plans and writes the task tree.",
+      "Re-read the goal and descendants after the writes. Finish with the exact created/reused child identifiers, hierarchy, dependency links, and remaining uncertainty. A completed planning turn is not a completed goal.",
+    ].join("\n");
+    const payload = { requestId: input.requestId, message };
+    if (initial.thread) {
+      const replay = this.database.getRequestedAiChatRun(
+        initial.thread.id, input.requestId, turnPayloadDigest(payload),
+      );
+      if (replay) return { ...initial, run: replay };
+    }
+    if (initial.blocker) throw new ApiError(409, initial.blocker.code, initial.blocker.message);
+    if (initial.goal.version !== input.version || initial.goal.resumeToken !== input.resumeToken) {
+      throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh it before planning.");
+    }
+    if (initial.thread?.currentRun) {
+      throw new ApiError(409, "THREAD_BUSY", "The goal coordinator is already running. Open its conversation.");
+    }
+    const thread = initial.thread ?? await this.createThread({
+      projectId: initial.goal.projectId,
+      issueId: initial.goal.id,
+      title: `${initial.goal.title} · 协调`,
+      purpose: "goal-coordinator",
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      sandbox: "workspace-write",
+    });
+    const checkGoalAtReservation = () => {
+      const current = this.getGoalCoordinator(taskId);
+      if (current.blocker) throw new ApiError(409, current.blocker.code, current.blocker.message);
+      if (current.goal.version !== input.version || current.goal.resumeToken !== input.resumeToken) {
+        throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh it before planning.");
+      }
+    };
+    const run = await this.startTurn(thread.id, payload, undefined, checkGoalAtReservation);
+    return { ...this.getGoalCoordinator(taskId), run };
   }
 
   async updateThread(threadId, changes) {
@@ -525,7 +606,7 @@ export class AiChatService {
     }
   }
 
-  async startTurn(threadId, input, continuation) {
+  async startTurn(threadId, input, continuation, beforeReservation) {
     if (continuation) this.#assertContinuationOpen();
     let thread = this.getThread(threadId);
     if (input?.contractVersion === "composer.v1" && input.requestId !== undefined) {
@@ -631,6 +712,7 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
       );
+      beforeReservation?.();
       const reservation = this.database.reserveAiChatRun({ threadId, ...request, continuation });
       if (!reservation.created) {
         if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });

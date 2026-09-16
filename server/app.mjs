@@ -4009,6 +4009,8 @@ export function createTaskboardServer(options = {}) {
     codexExecutable: resolved.codexExecutable,
     codexStatePath: resolved.codexStatePath,
     manageTaskboardSkillPath: resolved.skillPath,
+    taskctlPath: path.join(PROJECT_ROOT, "cli", "taskctl.mjs"),
+    runtimeFile: path.join(resolved.dataDirectory, "launcher-runtime.json"),
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
@@ -5998,6 +6000,26 @@ export function createTaskboardServer(options = {}) {
           required: true, maxLength: 200,
         });
         return sendJson(response, 200, { backgroundProgress: database.getAiChatTaskProgress(projectId, taskId) });
+      }
+
+      const goalCoordinatorRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator$/);
+      if (goalCoordinatorRoute) {
+        assertNoQuery(url.searchParams, "/api/local/tasks/:id/goal-coordinator");
+        const taskId = decodeRouteSegment(goalCoordinatorRoute[1], "Goal id");
+        if (request.method === "GET") return sendJson(response, 200, aiChat.getGoalCoordinator(taskId));
+        if (request.method === "POST") {
+          const body = await readJson(request);
+          assertPlainObject(body);
+          assertAllowedKeys(body, new Set(["version", "resumeToken", "requestId", "model", "reasoningEffort"]));
+          return sendJson(response, 202, await aiChat.startGoalCoordinator(taskId, {
+            version: parseVersion(body.version),
+            resumeToken: stringField(body.resumeToken, "resumeToken", { required: true, maxLength: 256 }),
+            requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
+            model: stringField(body.model, "model", { required: true, maxLength: 128 }),
+            reasoningEffort: stringField(body.reasoningEffort, "reasoningEffort", { required: true, maxLength: 64 }),
+          }));
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
       }
 
       if (pathname === "/api/local/ai/threads") {

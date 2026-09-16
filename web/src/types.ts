@@ -289,6 +289,7 @@ export interface AiChatTodoProgress {
 
 export interface AiChatThread {
   id: string;
+  purpose?: "goal-coordinator" | null;
   title: string;
   status: AiChatThreadStatus;
   origin: AiChatOrigin;
@@ -317,6 +318,25 @@ export interface AiChatThreadSnapshot {
   thread: AiChatThread;
   events: AiChatEvent[];
   runs: AiChatRun[];
+}
+
+export interface GoalCoordinatorSnapshot {
+  goal: {
+    id: string; projectId: string; title: string; version: number; resumeToken: string;
+    workflowProfile: "formal" | "vibe";
+  };
+  thread: AiChatThread | null;
+  latestRun: AiChatRun | null;
+  blocker: { code: string; message: string } | null;
+  run?: AiChatRun;
+}
+
+export interface GoalCoordinatorStart {
+  version: number;
+  resumeToken: string;
+  requestId: string;
+  model: string;
+  reasoningEffort: string;
 }
 
 export interface CodexProjectIdentity {

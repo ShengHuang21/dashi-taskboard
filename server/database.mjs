@@ -1570,6 +1570,7 @@ function aiChatContinuationFromRow(row) {
 function aiChatThreadFromRow(row) {
   return {
     id: row.id,
+    purpose: row.purpose ?? null,
     title: row.title,
     status: row.status,
     origin: {
@@ -2647,6 +2648,16 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
+
+    const aiThreadColumns = this.#prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!aiThreadColumns.some((column) => column.name === "purpose")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN purpose TEXT");
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_goal_coordinator
+      ON ai_chat_threads(origin_project_id, origin_issue_id)
+      WHERE purpose = 'goal-coordinator'
+    `);
 
     const coordinatorProvisioningColumns = this.#prepare(
       "PRAGMA table_info(agent_coordinator_provisioning_attempts)",
@@ -3891,6 +3902,14 @@ export class TaskboardDatabase {
     return row ? this.#aiChatThreadWithCurrentRun(row) : null;
   }
 
+  getGoalCoordinatorThread(projectId, taskId) {
+    const row = this.#prepare(`
+      SELECT * FROM ai_chat_threads
+      WHERE origin_project_id = ? AND origin_issue_id = ? AND purpose = 'goal-coordinator'
+    `).get(projectId, taskId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
+  }
+
   hasAiChatThreadProjectConflict(issueRef, projectId) {
     return Boolean(this.#prepare(`
       SELECT 1
@@ -3906,16 +3925,17 @@ export class TaskboardDatabase {
     const timestamp = input.createdAt ?? now();
     this.#prepare(`
       INSERT INTO ai_chat_threads (
-        id, title, status,
+        id, title, status, purpose,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
         codex_thread_id, model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
       input.status ?? "idle",
+      input.purpose ?? null,
       input.origin.projectId,
       input.origin.projectName,
       input.origin.workspacePath,

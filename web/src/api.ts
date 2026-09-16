@@ -17,6 +17,8 @@ import type {
   CodexThreadBinding,
   DevelopmentScan,
   HostContext,
+  GoalCoordinatorSnapshot,
+  GoalCoordinatorStart,
   IssueRelationOrigin,
   IssueRelationType,
   JiraConnection,
@@ -334,6 +336,17 @@ export async function listAiChatThreads(signal?: AbortSignal): Promise<AiChatThr
   return data.threads;
 }
 
+export function getGoalCoordinator(taskId: string, signal?: AbortSignal): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator`, { signal });
+}
+
+export function startGoalCoordinator(taskId: string, input: GoalCoordinatorStart): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 export async function createAiChatThread(input: {
   projectId: string;
   issueId?: string;
@@ -389,6 +402,7 @@ export async function startAiChatTurn(
   threadId: string,
   input: {
     message: string;
+    requestId?: string;
     skillIds?: string[];
     attachments?: AiChatAttachmentInput[];
     dangerFullAccessConfirmed?: boolean;

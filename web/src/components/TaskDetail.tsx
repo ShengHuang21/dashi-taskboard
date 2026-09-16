@@ -101,6 +101,7 @@ import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
 import { GoalWindows } from "./GoalWindows";
+import { GoalCoordinator } from "./GoalCoordinator";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { TaskCardPresentation, TaskExecutionState } from "../taskConversations";
 
@@ -140,6 +141,9 @@ interface TaskDetailProps {
   ) => Promise<RelationMutationResult>;
   onOpenThread: (binding: CodexThreadBinding) => void;
   onOpenLegacyLocalThread: (threadId: string) => void;
+  goalCoordinatorAvailable?: boolean;
+  onOpenGoalCoordinator?: (threadId: string) => void;
+  onRefreshGoalTree?: () => void;
   onOpenInThread: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
   openingThread: boolean;
@@ -397,6 +401,9 @@ export function TaskDetail({
   onRemoveRelation,
   onOpenThread,
   onOpenLegacyLocalThread,
+  goalCoordinatorAvailable,
+  onOpenGoalCoordinator,
+  onRefreshGoalTree,
   onOpenInThread,
   onCopy,
   openingThread,
@@ -1103,6 +1110,14 @@ export function TaskDetail({
                   <TaskExecutionStatus state={execution} />
                   {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </section>
+                {goalCoordinatorAvailable && currentTask.labels.includes("owner-goal")
+                  && onOpenGoalCoordinator && onRefreshGoalTree ? (
+                    <GoalCoordinator
+                      task={currentTask}
+                      onOpenConversation={onOpenGoalCoordinator}
+                      onRefreshTree={onRefreshGoalTree}
+                    />
+                  ) : null}
                 <GoalWindows declaration={currentTask.goalWindows} onOpenThread={onOpenThread} />
                 <IssueSubIssues
                   task={currentTask}
