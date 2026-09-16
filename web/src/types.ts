@@ -328,6 +328,29 @@ export interface GoalCoordinatorSnapshot {
   thread: AiChatThread | null;
   latestRun: AiChatRun | null;
   blocker: { code: string; message: string } | null;
+  activity?: "planning" | "team";
+  teamAdmission?: {
+    available: boolean;
+    requestId?: string;
+    used?: boolean;
+    authorizationReference?: string;
+    resourceAdmissionReference?: string;
+    expiresAt?: string;
+  };
+  teamResult?: {
+    verification: "verified" | "recorded" | "unverified";
+    status: "review_pass" | "needs_fix" | "blocked";
+    summary: string;
+    roundId?: string;
+    childId?: string | null;
+    childIdentifier?: string;
+    commentId: string;
+    ownerAcceptance?: "pending";
+    developerStatus?: AiChatRunStatus;
+    validatorStatus?: AiChatRunStatus;
+    artifact?: { id: string; filename: string };
+    report?: { id: string; filename: string };
+  } | null;
   run?: AiChatRun;
 }
 
@@ -337,6 +360,14 @@ export interface GoalCoordinatorStart {
   requestId: string;
   model: string;
   reasoningEffort: string;
+}
+
+export interface GoalTeamStart {
+  version: number;
+  resumeToken: string;
+  requestId: string;
+  authorizationReference: string;
+  resourceAdmissionReference: string;
 }
 
 export interface CodexProjectIdentity {

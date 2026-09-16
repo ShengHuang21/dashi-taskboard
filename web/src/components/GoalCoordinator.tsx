@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import {
   ApiError, getAiChatCatalog, getGoalCoordinator, interruptAiChatRun,
-  startGoalCoordinator, subscribeAiChatThread,
+  resolveTaskboardUrl, startGoalCoordinator, startGoalTeamRound, subscribeAiChatThread,
 } from "../api";
 import { useTaskboardI18n } from "../i18n";
-import type { AiChatModel, GoalCoordinatorSnapshot, GoalCoordinatorStart, Task } from "../types";
+import type { AiChatModel, GoalCoordinatorSnapshot, GoalCoordinatorStart, GoalTeamStart, Task } from "../types";
 import "./GoalCoordinator.css";
 
 interface GoalCoordinatorProps {
@@ -22,12 +22,15 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const pendingRequest = useRef<GoalCoordinatorStart | null>(null);
+  const pendingTeamRequest = useRef<GoalTeamStart | null>(null);
   const observedTerminal = useRef<string | null>(null);
   const refreshTree = useRef(onRefreshTree);
   refreshTree.current = onRefreshTree;
   const thread = snapshot?.thread;
   const run = snapshot?.latestRun;
   const selectedModel = models.find((candidate) => candidate.slug === model);
+  const teamResult = snapshot?.teamResult;
+  const admission = snapshot?.teamAdmission;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -112,13 +115,48 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
     }
   }
 
+  async function executeNext() {
+    if (!snapshot || !admission?.available || !admission.requestId
+      || !admission.authorizationReference || !admission.resourceAdmissionReference) return;
+    setBusy(true);
+    setError(null);
+    const input = pendingTeamRequest.current ?? {
+      version: snapshot.goal.version, resumeToken: snapshot.goal.resumeToken,
+      requestId: admission.requestId, authorizationReference: admission.authorizationReference,
+      resourceAdmissionReference: admission.resourceAdmissionReference,
+    };
+    pendingTeamRequest.current = input;
+    try {
+      const next = await startGoalTeamRound(task.id, input);
+      setSnapshot(next);
+      pendingTeamRequest.current = null;
+      if (next.thread) onOpenConversation(next.thread.id);
+      if (next.run?.status !== "running") onRefreshTree();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : text("未能执行下一项", "Could not execute the next deliverable"));
+      if (failure instanceof ApiError && failure.status > 0 && failure.status < 500) {
+        pendingTeamRequest.current = null;
+        const next = await getGoalCoordinator(task.id).catch(() => null);
+        if (next) setSnapshot(next);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
   const stateLabel = !run ? text("尚未执行", "Not started")
-    : run.status === "running" ? text("协调执行中", "Planning in progress")
-      : run.status === "completed" ? text("本次协调已结束 · 不代表目标完成", "Planning turn finished · goal is not complete")
+    : run.status === "running" ? snapshot?.activity === "team"
+      ? text("本轮开发与独立验证协调中", "Coordinating development and independent validation")
+      : text("协调执行中", "Planning in progress")
+      : run.status === "completed" ? snapshot?.activity === "team"
+        ? text("本轮协调已结束 · 交付结果见下方", "Team coordination ended · see the delivery result below")
+        : text("本次协调已结束 · 不代表目标完成", "Planning turn finished · goal is not complete")
         : run.status === "interrupted" ? text("本次执行已停止", "This run was stopped")
           : text("本次执行失败 · 请查看对话", "This run failed · inspect the conversation");
   const canStart = snapshot && !snapshot.blocker && (!run || run.status === "completed")
     && (thread || (model && effort));
+  const canExecute = !snapshot?.blocker && thread?.codexThreadId && run?.status === "completed"
+    && run.exitCode === 0 && admission?.available;
 
   return (
     <section className="goal-coordinator" aria-label={text("目标协调", "Goal coordination")}>
@@ -127,8 +165,8 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
         <span role="status">{snapshot ? stateLabel : text("读取协调状态…", "Loading coordination state…")}</span>
       </div>
       <p>{text(
-        "Agent 读取目标并维护子任务与依赖。本阶段只拆解和协调，不自动启动编码或测试；原有工作窗口不受影响。",
-        "The agent reads this goal and maintains its deliverables and dependencies. This stage plans only; it does not launch coding or testing or take over existing work windows.",
+        "“开始拆解 / 继续协调”只维护子任务与依赖。“执行下一项”单独安排一个就绪子项的开发和独立验证；原有工作窗口不受影响。",
+        "Planning maintains deliverables and dependencies only. Execute next separately coordinates one ready deliverable through development and independent validation; existing work windows stay unchanged.",
       )}</p>
       {!thread && snapshot && !snapshot.blocker ? (
         <div className="goal-coordinator-settings">
@@ -161,10 +199,45 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
         {thread ? <button className="button secondary" type="button" onClick={() => onOpenConversation(thread.id)}>
           {text("查看协调对话", "Open coordinator")}
         </button> : null}
-        {run?.status === "running" ? <button className="button secondary" type="button" disabled={busy} onClick={() => void stop()}>
+        {thread?.codexThreadId ? <button className="button secondary" type="button" disabled={busy || !canExecute} onClick={() => void executeNext()}>
+          {text("执行下一项", "Execute next")}
+        </button> : null}
+        {run?.status === "running" && snapshot?.activity !== "team" ? <button className="button secondary" type="button" disabled={busy} onClick={() => void stop()}>
           {text("停止本次执行", "Stop this run")}
         </button> : null}
       </div>
+      {thread?.codexThreadId && admission?.used ? <p>{text(
+        "本轮执行记录已保留；下一轮尚未安排。",
+        "This round's execution receipt is retained; another round has not been scheduled.",
+      )}</p> : thread?.codexThreadId && !admission?.available ? <p>{text(
+        "本机尚未提供此目标本轮的授权与资源准入证据，暂不可派发执行。规划仍可使用。",
+        "Execution is unavailable until this goal has current operator-provided authorization and resource admission. Planning remains available.",
+      )}</p> : null}
+      {teamResult ? (
+        <section className="goal-team-result" aria-label={text("最近交付结果", "Latest team result")}>
+          <strong>{teamResult.verification === "verified" && teamResult.status === "review_pass"
+            ? text("实现和独立验证已完成，等待最终验收", "Implementation and independent validation complete; awaiting acceptance")
+            : teamResult.verification === "verified" && teamResult.status === "needs_fix"
+              ? text("独立验证发现待修正项", "Independent validation found changes needed")
+              : text("本轮尚未确认完成", "This round is not confirmed complete")}</strong>
+          <p>{teamResult.childIdentifier ? `${teamResult.childIdentifier} · ` : ""}{teamResult.summary}</p>
+          {teamResult.developerStatus && teamResult.validatorStatus ? <p>{text(
+            "开发执行已结束 · 独立验证执行已结束 · 子项保持待验收",
+            "Developer run finished · independent validator run finished · deliverable remains in review",
+          )}</p> : null}
+          <div className="goal-coordinator-actions">
+            {teamResult.artifact ? <a className="button secondary" href={resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(teamResult.artifact.id)}/download`)} download={teamResult.artifact.filename}>
+              {text("查看产物", "View artifact")}
+            </a> : null}
+            {teamResult.report ? <a className="button secondary" href={resolveTaskboardUrl(`/api/attachments/${encodeURIComponent(teamResult.report.id)}/download`)} download={teamResult.report.filename}>
+              {text("独立验证报告", "Validation report")}
+            </a> : null}
+          </div>
+        </section>
+      ) : snapshot?.activity === "team" && run?.status === "completed" ? <p>{text(
+        "协调执行虽已结束，但还没有可核实的产物与独立验证记录；未认定交付完成。",
+        "The coordinator ended without a verifiable artifact and independent report; delivery is not confirmed.",
+      )}</p> : null}
     </section>
   );
 }

@@ -13,6 +13,7 @@ import {
   resolveAiWorkspace,
 } from "./ai-chat-catalog.mjs";
 import { CodexAppServer } from "./codex-app-server.mjs";
+import { buildGoalTeamPrompt, goalTeamContext, readGoalTeamResult } from "./goal-team.mjs";
 import {
   buildCodexArgs,
   buildCodexPrompt,
@@ -147,6 +148,8 @@ export class AiChatService {
     this.processEnv = options.processEnv ?? process.env;
     this.taskctlPath = options.taskctlPath;
     this.runtimeFile = options.runtimeFile;
+    this.attachmentsDirectory = options.attachmentsDirectory;
+    this.goalTeamAdmission = options.goalTeamAdmission ?? null;
     this.killGraceMs = options.killGraceMs ?? 1_000;
     this.catalogTtlMs = options.catalogTtlMs ?? 30_000;
     this.discoverCatalog = options.discoverCatalog ?? discoverAiCatalog;
@@ -402,6 +405,76 @@ export class AiChatService {
       latestRun: runs.at(-1) ?? null,
       blocker,
     };
+  }
+
+  #goalTeamAdmissionFor(taskId) {
+    const admission = this.goalTeamAdmission;
+    if (admission?.goalId !== taskId || !(Date.parse(admission.expiresAt) > Date.now())
+      || typeof admission.requestId !== "string" || !admission.requestId.trim()
+      || typeof admission.authorizationReference !== "string" || !admission.authorizationReference.trim()
+      || typeof admission.resourceAdmissionReference !== "string" || !admission.resourceAdmissionReference.trim()) {
+      return { available: false };
+    }
+    return {
+      available: true,
+      requestId: admission.requestId,
+      authorizationReference: admission.authorizationReference,
+      resourceAdmissionReference: admission.resourceAdmissionReference,
+      expiresAt: admission.expiresAt,
+    };
+  }
+
+  async getGoalCoordinatorSnapshot(taskId) {
+    const snapshot = this.getGoalCoordinator(taskId);
+    const events = snapshot.thread ? this.database.listAiChatEvents(snapshot.thread.id) : [];
+    const context = snapshot.thread && snapshot.latestRun
+      ? goalTeamContext(events, snapshot.latestRun.id)
+      : null;
+    const admission = this.#goalTeamAdmissionFor(snapshot.goal.id);
+    const used = admission.available && events.some((event) => event.type === "user_message"
+      && goalTeamContext([event], event.runId)?.roundId === admission.requestId);
+    return {
+      ...snapshot,
+      activity: context ? "team" : "planning",
+      teamAdmission: { ...admission, available: admission.available && !used, used },
+      teamResult: await readGoalTeamResult({
+        database: this.database, goal: snapshot.goal, thread: snapshot.thread,
+        attachmentsDirectory: this.attachmentsDirectory,
+      }),
+    };
+  }
+
+  async startGoalTeamRound(taskId, input) {
+    const initial = this.getGoalCoordinator(taskId);
+    const thread = initial.thread;
+    if (!thread?.codexThreadId) {
+      throw new ApiError(409, "GOAL_PLANNING_REQUIRED", "Complete the goal's planning turn before executing a deliverable.");
+    }
+    const message = buildGoalTeamPrompt({
+      goal: initial.goal, thread, input, taskctlPath: this.taskctlPath, runtimeFile: this.runtimeFile,
+    });
+    const payload = { requestId: input.requestId, message };
+    const replay = this.database.getRequestedAiChatRun(thread.id, input.requestId, turnPayloadDigest(payload));
+    if (replay) return { ...await this.getGoalCoordinatorSnapshot(taskId), run: replay };
+    const checkGoalAtReservation = () => {
+      const current = this.getGoalCoordinator(taskId);
+      const admission = this.#goalTeamAdmissionFor(current.goal.id);
+      if (!admission.available || admission.authorizationReference !== input.authorizationReference
+        || admission.resourceAdmissionReference !== input.resourceAdmissionReference
+        || admission.requestId !== input.requestId) {
+        throw new ApiError(409, "GOAL_TEAM_NOT_ADMITTED", "This goal has no current operator-provided authorization and resource admission for a team round.");
+      }
+      if (current.blocker) throw new ApiError(409, current.blocker.code, current.blocker.message);
+      if (current.goal.version !== input.version || current.goal.resumeToken !== input.resumeToken) {
+        throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh before executing the next deliverable.");
+      }
+      if (current.latestRun?.status !== "completed" || current.latestRun.exitCode !== 0 || current.thread.currentRun) {
+        throw new ApiError(409, "GOAL_COORDINATOR_NOT_READY", "Inspect the current coordinator run before starting another round.");
+      }
+    };
+    checkGoalAtReservation();
+    const run = await this.startTurn(thread.id, payload, undefined, checkGoalAtReservation);
+    return { ...await this.getGoalCoordinatorSnapshot(taskId), run };
   }
 
   async startGoalCoordinator(taskId, input) {

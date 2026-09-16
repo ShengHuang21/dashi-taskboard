@@ -19,6 +19,7 @@ import type {
   HostContext,
   GoalCoordinatorSnapshot,
   GoalCoordinatorStart,
+  GoalTeamStart,
   IssueRelationOrigin,
   IssueRelationType,
   JiraConnection,
@@ -342,6 +343,13 @@ export function getGoalCoordinator(taskId: string, signal?: AbortSignal): Promis
 
 export function startGoalCoordinator(taskId: string, input: GoalCoordinatorStart): Promise<GoalCoordinatorSnapshot> {
   return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function startGoalTeamRound(taskId: string, input: GoalTeamStart): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator/execute-next`, {
     method: "POST",
     body: JSON.stringify(input),
   });

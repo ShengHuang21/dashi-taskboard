@@ -4011,6 +4011,8 @@ export function createTaskboardServer(options = {}) {
     manageTaskboardSkillPath: resolved.skillPath,
     taskctlPath: path.join(PROJECT_ROOT, "cli", "taskctl.mjs"),
     runtimeFile: path.join(resolved.dataDirectory, "launcher-runtime.json"),
+    attachmentsDirectory: resolved.attachmentsDirectory,
+    goalTeamAdmission: options.goalTeamAdmission,
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
@@ -6006,7 +6008,7 @@ export function createTaskboardServer(options = {}) {
       if (goalCoordinatorRoute) {
         assertNoQuery(url.searchParams, "/api/local/tasks/:id/goal-coordinator");
         const taskId = decodeRouteSegment(goalCoordinatorRoute[1], "Goal id");
-        if (request.method === "GET") return sendJson(response, 200, aiChat.getGoalCoordinator(taskId));
+        if (request.method === "GET") return sendJson(response, 200, await aiChat.getGoalCoordinatorSnapshot(taskId));
         if (request.method === "POST") {
           const body = await readJson(request);
           assertPlainObject(body);
@@ -6020,6 +6022,23 @@ export function createTaskboardServer(options = {}) {
           }));
         }
         return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const goalTeamRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator\/execute-next$/);
+      if (goalTeamRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/goal-coordinator/execute-next");
+        const taskId = decodeRouteSegment(goalTeamRoute[1], "Goal id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["version", "resumeToken", "requestId", "authorizationReference", "resourceAdmissionReference"]));
+        return sendJson(response, 202, await aiChat.startGoalTeamRound(taskId, {
+          version: parseVersion(body.version),
+          resumeToken: stringField(body.resumeToken, "resumeToken", { required: true, maxLength: 256 }),
+          requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
+          authorizationReference: stringField(body.authorizationReference, "authorizationReference", { required: true, maxLength: 2000 }),
+          resourceAdmissionReference: stringField(body.resourceAdmissionReference, "resourceAdmissionReference", { required: true, maxLength: 2000 }),
+        }));
       }
 
       if (pathname === "/api/local/ai/threads") {
