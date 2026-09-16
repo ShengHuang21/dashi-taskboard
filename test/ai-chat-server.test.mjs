@@ -212,8 +212,10 @@ test("issue worktree cloud selection uses the existing localized branch counterp
   });
   try {
     const execute = promisify(execFile);
+    const gitConfigPath = path.join(fixture.directory, "empty-gitconfig");
+    await writeFile(gitConfigPath, "");
     const git = (args) => execute("git", ["-c", `core.hooksPath=${path.join(fixture.directory, "no-hooks")}`, ...args], {
-      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull },
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: gitConfigPath },
     });
     const worktree = path.join(fixture.directory, "cloud-local-worktree");
     const remotePath = path.join(fixture.directory, "remote-path-that-also-exists");
