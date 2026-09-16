@@ -24,7 +24,7 @@ import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment
 import { createAgentLaneSnapshotProvider } from "./agent-lane-snapshot.mjs";
 import { createAgentCapabilityCatalog } from "./agent-capability-catalog.mjs";
 import { AiChatService } from "./ai-chat.mjs";
-import { resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
+import { resolveAiIssueWorkspace, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
 import {
@@ -3937,7 +3937,7 @@ export function createTaskboardServer(options = {}) {
     return payload;
   }
 
-  async function resolveAiChatContext(projectId, issueId) {
+  async function resolveAiChatContext(projectId, issueId, { origin } = {}) {
     const config = await cloudConfig.read();
     if (!config.remoteUrl) {
       let resolvedWorkspace;
@@ -3972,7 +3972,7 @@ export function createTaskboardServer(options = {}) {
           );
         }
       }
-      return { ...resolvedWorkspace, issue };
+      return resolveAiIssueWorkspace(resolvedWorkspace, issue, origin);
     }
 
     const projectPayload = await readCloudJson("/api/projects");
@@ -4001,7 +4001,7 @@ export function createTaskboardServer(options = {}) {
       project,
       config.projectMappings,
     );
-    return { ...resolvedWorkspace, issue };
+    return resolveAiIssueWorkspace(resolvedWorkspace, issue, origin);
   }
 
   const aiChat = new AiChatService({

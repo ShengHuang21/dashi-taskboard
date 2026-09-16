@@ -9,6 +9,7 @@ import {
   ComposerCatalog,
   discoverAiCatalog,
   loadSlashCommands,
+  resolveAiIssueWorkspace,
   resolveAiWorkspace,
 } from "./ai-chat-catalog.mjs";
 import { CodexAppServer } from "./codex-app-server.mjs";
@@ -156,7 +157,7 @@ export class AiChatService {
       appServer: this.appServer,
       issueSlashCommands: () => loadSlashCommands(),
     });
-    this.resolveContext = options.resolveContext ?? (async (projectId, issueId) => {
+    this.resolveContext = options.resolveContext ?? (async (projectId, issueId, { origin } = {}) => {
       const resolved = await resolveAiWorkspace(projectId, this.codexStatePath, this.database);
       let issue;
       if (issueId !== undefined) {
@@ -169,7 +170,7 @@ export class AiChatService {
           );
         }
       }
-      return { ...resolved, issue };
+      return resolveAiIssueWorkspace(resolved, issue, origin);
     });
     this.active = new Map();
     this.closing = false;
@@ -261,6 +262,12 @@ export class AiChatService {
     return this.#catalogForWorkspace(resolved.workspacePath);
   }
 
+  #resolveThreadContext(thread) {
+    return this.resolveContext(thread.origin.projectId, thread.origin.issueId, {
+      origin: thread.origin.issueId === undefined ? undefined : thread.origin,
+    });
+  }
+
   async getComposerCandidates({ projectId, threadId, trigger, query }) {
     let thread;
     if (threadId !== undefined) {
@@ -295,7 +302,9 @@ export class AiChatService {
 
     let resolved;
     try {
-      resolved = await this.resolveContext(projectId, thread?.origin.issueId);
+      resolved = thread
+        ? await this.#resolveThreadContext(thread)
+        : await this.resolveContext(projectId);
     } catch (error) {
       if (error instanceof ApiError && ["PROJECT_NOT_FOUND", "AI_CHAT_ISSUE_NOT_FOUND"].includes(error.code)) {
         throw new ApiError(400, "INVALID_COMPOSER_QUERY", "Composer project is invalid");
@@ -369,7 +378,8 @@ export class AiChatService {
 
     if (Object.hasOwn(changes, "sandbox")) this.#validateSandbox(changes.sandbox);
     if (Object.hasOwn(changes, "model") || Object.hasOwn(changes, "reasoningEffort")) {
-      const catalog = await this.getCatalog(thread.origin.projectId);
+      const resolved = await this.#resolveThreadContext(thread);
+      const catalog = await this.getCatalog(thread.origin.projectId, resolved);
       thread = this.getThread(threadId);
       const model = this.#resolveModel(catalog, changes.model ?? thread.model);
       const reasoningEffort = changes.reasoningEffort ?? thread.reasoningEffort;
@@ -412,7 +422,7 @@ export class AiChatService {
     };
     let continuation = this.database.getAiChatContinuationReplay(registration);
     if (!continuation) {
-      const preparation = this.resolveContext(thread.origin.projectId, thread.origin.issueId);
+      const preparation = this.#resolveThreadContext(thread);
       this.continuationAttempts.add(preparation);
       let resolved;
       try {
@@ -536,10 +546,7 @@ export class AiChatService {
       );
     }
 
-    const resolved = await this.resolveContext(
-      thread.origin.projectId,
-      thread.origin.issueId,
-    );
+    const resolved = await this.#resolveThreadContext(thread);
     if (continuation) this.#assertContinuationOpen();
     const catalog = await this.getCatalog(thread.origin.projectId, resolved);
 
@@ -906,10 +913,7 @@ export class AiChatService {
       );
     }
 
-    const resolved = await this.resolveContext(
-      thread.origin.projectId,
-      thread.origin.issueId,
-    );
+    const resolved = await this.#resolveThreadContext(thread);
     thread = this.getThread(thread.id);
     if (this.#threadIsActive(thread)) {
       throw new ApiError(409, "THREAD_BUSY", `AI chat thread '${thread.id}' has a running turn`);

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { request as httpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { test } from "node:test";
 
 import { createTaskboardServer } from "../server/index.mjs";
@@ -36,7 +38,8 @@ if (args[0] === "debug") {
   process.stdin.resume();
   process.stdin.on("end", () => {
     const workspace = args[args.indexOf("-C") + 1];
-    appendFileSync(path.join(workspace, "fixture-dispatches.jsonl"), JSON.stringify({ args, prompt }) + "\\n");
+    process.chdir(workspace);
+    appendFileSync(path.join(workspace, "fixture-dispatches.jsonl"), JSON.stringify({ args, prompt, cwd: process.cwd() }) + "\\n");
     if (prompt.includes("fixture-run-failure")) process.exit(7);
     process.stdout.write('{"type":"thread.started","thread_id":"session-1"}\\n');
     process.stdout.write('{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\\n');
@@ -83,9 +86,9 @@ async function waitUntil(check) {
   assert.fail("Fixture did not reach the expected state");
 }
 
-async function backgroundContinuationFixture() {
+async function backgroundContinuationFixture(options = {}) {
   const instance = { instanceToken: "fixture-next-token", instanceSecret: "c".repeat(64) };
-  const fixture = await createServerFixture("127.0.0.1", instance);
+  const fixture = await createServerFixture("127.0.0.1", { ...options, ...instance });
   fixture.instance = instance;
   const runtimePath = path.join(fixture.directory, "fixture-runtime.json");
   await writeFile(runtimePath, JSON.stringify({ version: 1, url: `${fixture.baseUrl}/${instance.instanceToken}` }));
@@ -104,10 +107,153 @@ async function backgroundContinuationFixture() {
     "background", "create", "--project", "local", "--model", "gpt-real",
     "--reasoning-effort", "high", "--sandbox", "read-only",
   ])).thread;
-  fixture.dispatches = async () => (await readFile(path.join(fixture.workspace, "fixture-dispatches.jsonl"), "utf8"))
+  fixture.dispatches = async (workspace = fixture.workspace) => (await readFile(path.join(workspace, "fixture-dispatches.jsonl"), "utf8"))
     .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   return fixture;
 }
+
+test("issue worktree background threads pin their origin through card changes and successors", async (context) => {
+  const fixture = await backgroundContinuationFixture();
+  try {
+    const worktree = path.join(fixture.directory, "worktree");
+    const changedWorktree = path.join(fixture.directory, "changed-worktree");
+    const worktreeLink = path.join(fixture.directory, "worktree-link");
+    await mkdir(worktree); await mkdir(changedWorktree);
+    await symlink(worktree, worktreeLink, process.platform === "win32" ? "junction" : "dir");
+    const canonicalWorktree = await realpath(worktree);
+    const statePath = path.join(fixture.directory, "codex-state.json");
+    const stateBefore = await readFile(statePath, "utf8");
+    const { task } = await fixture.cli(["issue", "create", "--project", "local", "--title", "Pinned worktree",
+      "--thread-id", "fixture-owner"]);
+    const createArgs = ["background", "create", "--project", "local", "--issue", task.identifier,
+      "--model", "gpt-real", "--reasoning-effort", "high", "--sandbox", "read-only"];
+    const { thread: oldThread } = await fixture.cli(createArgs);
+    assert.equal(oldThread.origin.workspacePath, fixture.workspace);
+    await fixture.cli(["issue", "update", task.identifier, "--worktree-path", worktreeLink]);
+    const { thread: worktreeThread } = await fixture.cli(createArgs);
+    assert.equal(worktreeThread.origin.workspacePath, canonicalWorktree);
+    await fixture.cli(["issue", "update", task.identifier, "--worktree-path", changedWorktree]);
+    const { run: oldRun } = await fixture.cli(["background", "start", oldThread.id,
+      "--request-id", "old-project", "--message", "existing project origin"]);
+    await waitUntil(() => fixture.app.database.getAiChatRun(oldRun.id).status === "completed");
+    const { run: first } = await fixture.cli(["background", "start", worktreeThread.id,
+      "--request-id", "first-worktree", "--message", "pinned worktree origin"]);
+    await waitUntil(() => fixture.app.database.getAiChatRun(first.id).status === "completed");
+    await fixture.cli(["background", "continue", worktreeThread.id, "--after-run", first.id,
+      "--request-id", "next-worktree", "--message", "same worktree successor"]);
+    const completed = await waitUntil(async () => {
+      const snapshot = await fixture.cli(["background", "get", worktreeThread.id]);
+      return snapshot.runs.length === 2 && snapshot.runs.every((run) => run.status === "completed") && snapshot;
+    });
+    assert.equal(completed.thread.origin.workspacePath, canonicalWorktree);
+    assert.equal(completed.continuations[0].state, "dispatched");
+    const worktreeDispatches = await fixture.dispatches(canonicalWorktree);
+    assert.equal(worktreeDispatches.length, 2);
+    for (const dispatch of worktreeDispatches) {
+      assert.equal(dispatch.args[dispatch.args.indexOf("-C") + 1], canonicalWorktree);
+      assert.equal(dispatch.cwd, canonicalWorktree);
+      assert.equal(dispatch.args.includes("--add-dir"), false);
+    }
+    const projectDispatches = await fixture.dispatches();
+    assert.equal(projectDispatches.length, 1);
+    assert.equal(projectDispatches[0].cwd, fixture.workspace);
+    assert.equal((await fixture.createThread()).origin.workspacePath, fixture.workspace);
+    await fixture.cli(["issue", "update", task.identifier, "--git-branch", "metadata-only-branch"]);
+    assert.equal((await fixture.cli(createArgs)).thread.origin.workspacePath, fixture.workspace);
+    assert.equal(await readFile(statePath, "utf8"), stateBefore);
+    await rename(worktree, path.join(fixture.directory, "retired-worktree"));
+    const unavailable = await fixture.cli(["background", "start", worktreeThread.id,
+      "--request-id", "unavailable", "--message", "must not fall back"], 1);
+    assert.equal(unavailable.error.code, "PROJECT_WORKSPACE_UNAVAILABLE");
+    assert.deepEqual(await fixture.cli(["background", "get", worktreeThread.id]), completed);
+    context.diagnostic(JSON.stringify({ contract: "CAP71-ISSUE-WORKTREE-v1", proof: "fake-executable-cwd",
+      oldOrigin: fixture.workspace, newOrigin: canonicalWorktree, successorOrigin: worktreeDispatches[1].cwd,
+      worktreeDispatches: worktreeDispatches.length, addedWriteRoots: 0, mappingUnchanged: true }));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("issue worktree creation rejects unavailable directories and known remote bindings", async () => {
+  const fixture = await backgroundContinuationFixture();
+  try {
+    const missingPath = path.join(fixture.directory, "missing");
+    const { task } = await fixture.cli(["issue", "create", "--project", "local", "--title", "Unavailable worktree",
+      "--thread-id", "fixture-owner", "--worktree-path", missingPath]);
+    const createArgs = ["background", "create", "--project", "local", "--issue", task.identifier,
+      "--model", "gpt-real", "--reasoning-effort", "high", "--sandbox", "read-only"];
+    assert.equal((await fixture.cli(createArgs, 1)).error.code, "PROJECT_WORKSPACE_UNAVAILABLE");
+    await fixture.cli(["issue", "update", task.identifier, "--worktree-path", fixture.workspace,
+      "--binding-thread-id", "fixture-remote", "--binding-codex-project-id", "remote-project",
+      "--binding-codex-project-kind", "remote", "--binding-codex-host-id", "remote-host",
+      "--binding-workspace-path", fixture.workspace]);
+    assert.equal((await fixture.cli(createArgs, 1)).error.code, "AI_CHAT_REMOTE_ISSUE_UNSUPPORTED");
+    assert.equal((await fixture.app.aiChat.listThreads()).length, 0);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("issue worktree cloud selection uses the existing localized branch counterpart", async (context) => {
+  const cloudState = { remoteUrl: null, projectMappings: {} };
+  const calls = [];
+  let cloudTask;
+  const fixture = await backgroundContinuationFixture({
+    cloudConfigStore: { async read() { return { ...cloudState }; } },
+    remoteFetch: async (url, init) => {
+      const pathname = new URL(url).pathname;
+      calls.push({ pathname, method: init.method });
+      const value = pathname === "/api/projects"
+        ? { projects: [{ id: "cloud-project", name: "Cloud project", workspacePath: "/remote/project" }] }
+        : pathname === "/api/tasks/cloud-issue" ? { task: cloudTask } : null;
+      assert.ok(value, pathname);
+      return new Response(JSON.stringify(value), { headers: { "content-type": "application/json" } });
+    },
+  });
+  try {
+    const execute = promisify(execFile);
+    const gitConfigPath = path.join(fixture.directory, "empty-gitconfig");
+    await writeFile(gitConfigPath, "");
+    const git = (args) => execute("git", ["-c", `core.hooksPath=${path.join(fixture.directory, "no-hooks")}`, ...args], {
+      env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: gitConfigPath },
+    });
+    const worktree = path.join(fixture.directory, "cloud-local-worktree");
+    const remotePath = path.join(fixture.directory, "remote-path-that-also-exists");
+    await mkdir(remotePath);
+    await git(["init", "--quiet", fixture.workspace]);
+    await git(["-C", fixture.workspace, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+      "-c", "commit.gpgsign=false",
+      "commit", "--quiet", "--allow-empty", "-m", "isolated fixture"]);
+    await git(["-C", fixture.workspace, "worktree", "add", "--quiet", "-b", "fixture-cloud-worktree", worktree]);
+    const canonicalWorktree = await realpath(worktree);
+    cloudTask = { id: "cloud-issue", identifier: "CLOUD-1", projectId: "cloud-project", title: "Cloud worktree",
+      archivedAt: null, developmentContext: { type: "worktree", path: remotePath, branch: "fixture-cloud-worktree" } };
+    Object.assign(cloudState, { remoteUrl: "https://tasks.example.test", actorName: "Fixture",
+      sharedKey: "synthetic-fixture-key", projectMappings: { "cloud-project": fixture.workspace } });
+    const mappingBefore = JSON.stringify(cloudState.projectMappings);
+    const createArgs = ["background", "create", "--project", "cloud-project", "--issue", "cloud-issue",
+      "--model", "gpt-real", "--reasoning-effort", "high", "--sandbox", "read-only"];
+    const { thread } = await fixture.cli(createArgs);
+    assert.equal(thread.origin.workspacePath, canonicalWorktree);
+    const { run } = await fixture.cli(["background", "start", thread.id, "--request-id", "cloud-local",
+      "--message", "localized worktree only"]);
+    await waitUntil(() => fixture.app.database.getAiChatRun(run.id).status === "completed");
+    const [dispatch] = await fixture.dispatches(canonicalWorktree);
+    assert.equal(dispatch.cwd, canonicalWorktree);
+    assert.equal(dispatch.args.includes(remotePath), false);
+    assert.equal(dispatch.args.includes("--add-dir"), false);
+    cloudTask.developmentContext.branch = "no-local-counterpart";
+    assert.equal((await fixture.cli(createArgs, 1)).error.code, "PROJECT_WORKSPACE_UNAVAILABLE");
+    assert.equal((await fixture.app.aiChat.listThreads()).length, 1);
+    assert.equal(JSON.stringify(cloudState.projectMappings), mappingBefore);
+    assert.ok(calls.every((call) => call.method === "GET"));
+    context.diagnostic(JSON.stringify({ contract: "CAP71-ISSUE-WORKTREE-v1", proof: "fake-cloud-localized-cwd",
+      selected: dispatch.cwd, upstreamPathDiscarded: true, unresolvedWorktreeRejected: true,
+      projectMappingUnchanged: true, fixtureCloudReads: calls.length }));
+  } finally {
+    await fixture.close();
+  }
+});
 
 function holdNextPreparation(service) {
   const original = service.resolveContext;
