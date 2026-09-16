@@ -70,6 +70,17 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
     return () => { active = false; unsubscribe(); };
   }, [thread?.id, task.id]);
 
+  useEffect(() => {
+    if (admission?.state !== "resources_checking") return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      void getGoalCoordinator(task.id, controller.signal).then(setSnapshot).catch((failure: Error) => {
+        if (failure.name !== "AbortError") setError(failure.message);
+      });
+    }, 500);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [task.id, admission?.state]);
+
   async function start() {
     if (!snapshot) return;
     setBusy(true);
@@ -116,14 +127,12 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
   }
 
   async function executeNext() {
-    if (!snapshot || !admission?.available || !admission.requestId
-      || !admission.authorizationReference || !admission.resourceAdmissionReference) return;
+    if (!snapshot || (!admission?.available && !pendingTeamRequest.current)) return;
     setBusy(true);
     setError(null);
     const input = pendingTeamRequest.current ?? {
       version: snapshot.goal.version, resumeToken: snapshot.goal.resumeToken,
-      requestId: admission.requestId, authorizationReference: admission.authorizationReference,
-      resourceAdmissionReference: admission.resourceAdmissionReference,
+      requestId: crypto.randomUUID(),
     };
     pendingTeamRequest.current = input;
     try {
@@ -156,7 +165,7 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
   const canStart = snapshot && !snapshot.blocker && (!run || run.status === "completed")
     && (thread || (model && effort));
   const canExecute = !snapshot?.blocker && thread?.codexThreadId && run?.status === "completed"
-    && run.exitCode === 0 && admission?.available;
+    && run.exitCode === 0 && (admission?.available || pendingTeamRequest.current);
 
   return (
     <section className="goal-coordinator" aria-label={text("目标协调", "Goal coordination")}>
@@ -206,13 +215,14 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree }: Goa
           {text("停止本次执行", "Stop this run")}
         </button> : null}
       </div>
-      {thread?.codexThreadId && admission?.used ? <p>{text(
-        "本轮执行记录已保留；下一轮尚未安排。",
-        "This round's execution receipt is retained; another round has not been scheduled.",
-      )}</p> : thread?.codexThreadId && !admission?.available ? <p>{text(
-        "本机尚未提供此目标本轮的授权与资源准入证据，暂不可派发执行。规划仍可使用。",
-        "Execution is unavailable until this goal has current operator-provided authorization and resource admission. Planning remains available.",
-      )}</p> : null}
+      {thread?.codexThreadId && admission ? <p role="status">{admission.message}</p> : null}
+      {thread?.codexThreadId && !admission?.available && run?.status !== "running" ? (
+        <button className="button secondary" type="button" disabled={busy} onClick={() => {
+          setBusy(true);
+          void getGoalCoordinator(task.id).then(setSnapshot).catch((failure: Error) => setError(failure.message))
+            .finally(() => setBusy(false));
+        }}>{text("重新检查执行条件", "Recheck execution readiness")}</button>
+      ) : null}
       {teamResult ? (
         <section className="goal-team-result" aria-label={text("最近交付结果", "Latest team result")}>
           <strong>{teamResult.verification === "verified" && teamResult.status === "review_pass"

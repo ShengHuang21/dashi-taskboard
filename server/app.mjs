@@ -24,6 +24,7 @@ import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment
 import { createAgentLaneSnapshotProvider } from "./agent-lane-snapshot.mjs";
 import { createAgentCapabilityCatalog } from "./agent-capability-catalog.mjs";
 import { AiChatService } from "./ai-chat.mjs";
+import { createGoalExecutionAdmissionResolver } from "./goal-execution-admission.mjs";
 import { resolveAiIssueWorkspace, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
@@ -4012,7 +4013,10 @@ export function createTaskboardServer(options = {}) {
     taskctlPath: path.join(PROJECT_ROOT, "cli", "taskctl.mjs"),
     runtimeFile: path.join(resolved.dataDirectory, "launcher-runtime.json"),
     attachmentsDirectory: resolved.attachmentsDirectory,
-    goalTeamAdmission: options.goalTeamAdmission,
+    goalExecutionAdmission: createGoalExecutionAdmissionResolver({
+      database, resolveContext: resolveAiChatContext, processEnv: codexProcessEnvironment,
+      runGit: worktreeRepositoryExecFile,
+    }),
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
@@ -6031,13 +6035,11 @@ export function createTaskboardServer(options = {}) {
         const taskId = decodeRouteSegment(goalTeamRoute[1], "Goal id");
         const body = await readJson(request);
         assertPlainObject(body);
-        assertAllowedKeys(body, new Set(["version", "resumeToken", "requestId", "authorizationReference", "resourceAdmissionReference"]));
+        assertAllowedKeys(body, new Set(["version", "resumeToken", "requestId"]));
         return sendJson(response, 202, await aiChat.startGoalTeamRound(taskId, {
           version: parseVersion(body.version),
           resumeToken: stringField(body.resumeToken, "resumeToken", { required: true, maxLength: 256 }),
           requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
-          authorizationReference: stringField(body.authorizationReference, "authorizationReference", { required: true, maxLength: 2000 }),
-          resourceAdmissionReference: stringField(body.resourceAdmissionReference, "resourceAdmissionReference", { required: true, maxLength: 2000 }),
         }));
       }
 

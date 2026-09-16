@@ -331,11 +331,8 @@ export interface GoalCoordinatorSnapshot {
   activity?: "planning" | "team";
   teamAdmission?: {
     available: boolean;
-    requestId?: string;
-    used?: boolean;
-    authorizationReference?: string;
-    resourceAdmissionReference?: string;
-    expiresAt?: string;
+    state: "ready" | "permission_unavailable" | "ownership_unavailable" | "owner_busy" | "resources_checking" | "resources_waiting";
+    message: string;
   };
   teamResult?: {
     verification: "verified" | "recorded" | "unverified";
@@ -366,8 +363,6 @@ export interface GoalTeamStart {
   version: number;
   resumeToken: string;
   requestId: string;
-  authorizationReference: string;
-  resourceAdmissionReference: string;
 }
 
 export interface CodexProjectIdentity {

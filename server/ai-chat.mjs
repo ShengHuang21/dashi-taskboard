@@ -149,7 +149,8 @@ export class AiChatService {
     this.taskctlPath = options.taskctlPath;
     this.runtimeFile = options.runtimeFile;
     this.attachmentsDirectory = options.attachmentsDirectory;
-    this.goalTeamAdmission = options.goalTeamAdmission ?? null;
+    this.goalExecutionAdmission = options.goalExecutionAdmission;
+    this.goalTeamStarts = new Map();
     this.killGraceMs = options.killGraceMs ?? 1_000;
     this.catalogTtlMs = options.catalogTtlMs ?? 30_000;
     this.discoverCatalog = options.discoverCatalog ?? discoverAiCatalog;
@@ -407,36 +408,21 @@ export class AiChatService {
     };
   }
 
-  #goalTeamAdmissionFor(taskId) {
-    const admission = this.goalTeamAdmission;
-    if (admission?.goalId !== taskId || !(Date.parse(admission.expiresAt) > Date.now())
-      || typeof admission.requestId !== "string" || !admission.requestId.trim()
-      || typeof admission.authorizationReference !== "string" || !admission.authorizationReference.trim()
-      || typeof admission.resourceAdmissionReference !== "string" || !admission.resourceAdmissionReference.trim()) {
-      return { available: false };
-    }
-    return {
-      available: true,
-      requestId: admission.requestId,
-      authorizationReference: admission.authorizationReference,
-      resourceAdmissionReference: admission.resourceAdmissionReference,
-      expiresAt: admission.expiresAt,
-    };
-  }
-
   async getGoalCoordinatorSnapshot(taskId) {
     const snapshot = this.getGoalCoordinator(taskId);
     const events = snapshot.thread ? this.database.listAiChatEvents(snapshot.thread.id) : [];
     const context = snapshot.thread && snapshot.latestRun
       ? goalTeamContext(events, snapshot.latestRun.id)
       : null;
-    const admission = this.#goalTeamAdmissionFor(snapshot.goal.id);
-    const used = admission.available && events.some((event) => event.type === "user_message"
-      && goalTeamContext([event], event.runId)?.roundId === admission.requestId);
+    const admission = snapshot.blocker
+      ? { available: false, state: "owner_busy", message: snapshot.blocker.message }
+      : snapshot.latestRun?.status === "running"
+        ? { available: false, state: "owner_busy", message: "当前协调正在执行，结束后再检查下一项。" }
+      : await this.goalExecutionAdmission.resolve(snapshot.goal, snapshot.thread);
     return {
       ...snapshot,
       activity: context ? "team" : "planning",
-      teamAdmission: { ...admission, available: admission.available && !used, used },
+      teamAdmission: admission,
       teamResult: await readGoalTeamResult({
         database: this.database, goal: snapshot.goal, thread: snapshot.thread,
         attachmentsDirectory: this.attachmentsDirectory,
@@ -445,25 +431,37 @@ export class AiChatService {
   }
 
   async startGoalTeamRound(taskId, input) {
+    const key = `${taskId}\0${input.requestId}`;
+    const identity = JSON.stringify([input.version, input.resumeToken, input.requestId]);
+    const pending = this.goalTeamStarts.get(key);
+    if (pending) {
+      if (pending.identity !== identity) throw new ApiError(409, "REQUEST_ID_CONFLICT", "This request is already bound to another goal snapshot.");
+      return pending.promise;
+    }
+    const promise = this.#startGoalTeamRound(taskId, input);
+    this.goalTeamStarts.set(key, { identity, promise });
+    try { return await promise; } finally { this.goalTeamStarts.delete(key); }
+  }
+
+  async #startGoalTeamRound(taskId, input) {
     const initial = this.getGoalCoordinator(taskId);
     const thread = initial.thread;
     if (!thread?.codexThreadId) {
       throw new ApiError(409, "GOAL_PLANNING_REQUIRED", "Complete the goal's planning turn before executing a deliverable.");
     }
-    const message = buildGoalTeamPrompt({
-      goal: initial.goal, thread, input, taskctlPath: this.taskctlPath, runtimeFile: this.runtimeFile,
-    });
-    const payload = { requestId: input.requestId, message };
-    const replay = this.database.getRequestedAiChatRun(thread.id, input.requestId, turnPayloadDigest(payload));
-    if (replay) return { ...await this.getGoalCoordinatorSnapshot(taskId), run: replay };
-    const checkGoalAtReservation = () => {
-      const current = this.getGoalCoordinator(taskId);
-      const admission = this.#goalTeamAdmissionFor(current.goal.id);
-      if (!admission.available || admission.authorizationReference !== input.authorizationReference
-        || admission.resourceAdmissionReference !== input.resourceAdmissionReference
-        || admission.requestId !== input.requestId) {
-        throw new ApiError(409, "GOAL_TEAM_NOT_ADMITTED", "This goal has no current operator-provided authorization and resource admission for a team round.");
+    const originalEvent = this.database.listAiChatEvents(thread.id).find((event) => event.type === "user_message"
+      && goalTeamContext([event], event.runId)?.roundId === input.requestId);
+    if (originalEvent) {
+      const context = goalTeamContext([originalEvent], originalEvent.runId);
+      if (context.version !== input.version || context.resumeToken !== input.resumeToken) {
+        throw new ApiError(409, "REQUEST_ID_CONFLICT", "This request is already bound to another goal snapshot.");
       }
+      const replay = this.database.getRequestedAiChatRun(thread.id, input.requestId,
+        turnPayloadDigest({ requestId: input.requestId, message: originalEvent.content }));
+      if (replay) return { ...await this.getGoalCoordinatorSnapshot(taskId), run: replay };
+    }
+    const checkGoal = () => {
+      const current = this.getGoalCoordinator(taskId);
       if (current.blocker) throw new ApiError(409, current.blocker.code, current.blocker.message);
       if (current.goal.version !== input.version || current.goal.resumeToken !== input.resumeToken) {
         throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh before executing the next deliverable.");
@@ -471,8 +469,20 @@ export class AiChatService {
       if (current.latestRun?.status !== "completed" || current.latestRun.exitCode !== 0 || current.thread.currentRun) {
         throw new ApiError(409, "GOAL_COORDINATOR_NOT_READY", "Inspect the current coordinator run before starting another round.");
       }
+      return current;
     };
-    checkGoalAtReservation();
+    checkGoal();
+    const admission = await this.goalExecutionAdmission.resolve(initial.goal, thread, { warm: true });
+    if (!admission.available) throw new ApiError(409, admission.code, admission.message);
+    const payload = { requestId: input.requestId, message: buildGoalTeamPrompt({
+      goal: initial.goal, thread, input: { ...input, admission },
+      taskctlPath: this.taskctlPath, runtimeFile: this.runtimeFile,
+    }) };
+    const checkGoalAtReservation = () => {
+      const current = checkGoal();
+      const checked = this.goalExecutionAdmission.revalidate(current.goal, current.thread, admission);
+      if (!checked.available) throw new ApiError(409, checked.code, checked.message);
+    };
     const run = await this.startTurn(thread.id, payload, undefined, checkGoalAtReservation);
     return { ...await this.getGoalCoordinatorSnapshot(taskId), run };
   }
