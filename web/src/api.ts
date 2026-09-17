@@ -355,6 +355,18 @@ export function startGoalTeamRound(taskId: string, input: GoalTeamStart): Promis
   });
 }
 
+export function controlGoalSupervision(taskId: string, input: { action: "enable" | "pause"; requestId: string }): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator/supervision`, {
+    method: "POST", body: JSON.stringify(input),
+  });
+}
+
+export function queueGoalIdea(taskId: string, input: { deliveryId: string; body: string }): Promise<unknown> {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/inbox-deliveries`, {
+    method: "POST", body: JSON.stringify({ ...input, sourceKind: "owner-ui" }),
+  });
+}
+
 export async function createAiChatThread(input: {
   projectId: string;
   issueId?: string;

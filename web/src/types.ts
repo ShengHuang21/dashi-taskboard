@@ -321,6 +321,18 @@ export interface AiChatThreadSnapshot {
 }
 
 export interface GoalCoordinatorSnapshot {
+  supervision?: {
+    generation: string; state: "active" | "paused" | "blocked" | "endpoint_reached";
+    message: string; threadId: string; scopeRevision: string;
+  } | null;
+  ideas?: Array<{
+    deliveryId: string; body: string; status: "queued" | "applied" | "deferred" | "needs-decision";
+    disposition?: { action: string; revision: string; runId: string };
+  }>;
+  adoptedInputs?: Array<{
+    consumerTaskId: string; consumerTitle: string; producerTaskId: string; fullCoverage: boolean;
+    artifactAttachmentId: string; reportAttachmentId: string; adoptionId: string;
+  }>;
   goal: {
     id: string; projectId: string; title: string; version: number; resumeToken: string;
     workflowProfile: "formal" | "vibe";

@@ -38,7 +38,17 @@
 .goal-coordinator code { overflow-wrap: anywhere; }
 .goal-coordinator [role="alert"] { color: var(--danger, var(--text-primary)); }
 .goal-coordinator summary { cursor: pointer; }
-.goal-coordinator :is(button, select, summary):focus-visible {
+.goal-coordinator :is(button, select, summary, textarea, a):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 3px;
 }
+
+.goal-idea-form { display: grid; gap: 6px; margin-top: 16px; }
+.goal-idea-form textarea {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 72px;
+  color: var(--text-primary); background: var(--bg); font: inherit;
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+}
+.goal-idea-form button { justify-self: start; }
+.goal-idea-list { padding-left: 20px; overflow-wrap: anywhere; }
+.goal-idea-list span { color: var(--text-secondary); }

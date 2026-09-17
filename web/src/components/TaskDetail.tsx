@@ -101,7 +101,7 @@ import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
 import { GoalWindows } from "./GoalWindows";
-import { GoalCoordinator } from "./GoalCoordinator";
+import { GoalCoordinator, type GoalAdoptedInputs } from "./GoalCoordinator";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { TaskCardPresentation, TaskExecutionState } from "../taskConversations";
 
@@ -411,6 +411,7 @@ export function TaskDetail({
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
+  const [goalAdoptedInputs, setGoalAdoptedInputs] = useState<GoalAdoptedInputs | null>(null);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
@@ -1107,15 +1108,19 @@ export function TaskDetail({
                     progress={deliveryProgress}
                     label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
                   />
-                  <TaskExecutionStatus state={execution} />
+                  {!(execution === "not_started" && currentTask.labels.includes("owner-goal")
+                    && currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
+                    && goalAdoptedInputs.hasCoordinatorHistory) ? <TaskExecutionStatus state={execution} /> : null}
                   {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </section>
                 {goalCoordinatorAvailable && currentTask.labels.includes("owner-goal")
                   && onOpenGoalCoordinator && onRefreshGoalTree ? (
                     <GoalCoordinator
+                      key={currentTask.id}
                       task={currentTask}
                       onOpenConversation={onOpenGoalCoordinator}
                       onRefreshTree={onRefreshGoalTree}
+                      onAdoptedInputsChange={setGoalAdoptedInputs}
                     />
                   ) : null}
                 <GoalWindows declaration={currentTask.goalWindows} onOpenThread={onOpenThread} />
@@ -1125,6 +1130,8 @@ export function TaskDetail({
                   referenceTasks={progressTasks}
                   progressModel={progressModel}
                   presentations={presentations}
+                  adoptedInputs={currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
+                    ? goalAdoptedInputs.inputs : []}
                   expandedTaskIds={expandedTaskIds}
                   onToggleTaskExpansion={onToggleTaskExpansion}
                   onOpenTask={onOpenTask}

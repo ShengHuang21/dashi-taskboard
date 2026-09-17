@@ -2219,8 +2219,13 @@ function parseCommentCreate(body) {
 
 function parseInboxDelivery(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["deliveryId", "body", "threadId", "threadBinding"]));
-  const threadId = stringField(body.threadId, "threadId", { required: true, maxLength: 256 });
+  assertAllowedKeys(body, new Set(["deliveryId", "body", "threadId", "threadBinding", "sourceKind"]));
+  const ownerUi = body.sourceKind === "owner-ui";
+  if (body.sourceKind !== undefined && !["owner-ui", "codex-thread"].includes(body.sourceKind)) {
+    throw new ApiError(400, "INVALID_FIELD", "Unknown inbox source");
+  }
+  if (ownerUi && (body.threadId || body.threadBinding)) throw new ApiError(400, "INVALID_FIELD", "Owner UI does not impersonate a Codex thread");
+  const threadId = ownerUi ? null : stringField(body.threadId, "threadId", { required: true, maxLength: 256 });
   const threadBinding = parseThreadBinding(body.threadBinding);
   if (threadBinding && threadBinding.threadId !== threadId) {
     throw new ApiError(400, "INVALID_FIELD", "threadBinding.threadId must match threadId");
@@ -2230,6 +2235,7 @@ function parseInboxDelivery(body) {
     body: stringField(body.body, "body", { required: true, maxLength: 100_000 }),
     threadId,
     threadBinding,
+    sourceKind: ownerUi ? "owner-ui" : "codex-thread",
   };
 }
 
@@ -3544,6 +3550,7 @@ export function createTaskboardServer(options = {}) {
   });
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath, {
+    attachmentsDirectory: resolved.attachmentsDirectory,
     admissionTtlMs: options.admissionTtlMs,
     hostExecutorClock: options.hostExecutorClock,
   });
@@ -6028,6 +6035,22 @@ export function createTaskboardServer(options = {}) {
         return methodNotAllowed(response, ["GET", "POST"]);
       }
 
+      const goalSupervisionRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator\/supervision$/);
+      if (goalSupervisionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Goal supervision");
+        const actor = actorFromRequest(request);
+        if (actor.type !== "user") throw new ApiError(403, "OWNER_UI_REQUIRED", "Goal continuation intent belongs to the local user");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["action", "requestId"]));
+        if (!["enable", "pause"].includes(body.action)) throw new ApiError(400, "INVALID_FIELD", "Unknown goal control");
+        return sendJson(response, 200, await aiChat.controlGoalSupervision(
+          decodeRouteSegment(goalSupervisionRoute[1], "Goal id"), {
+            action: body.action, requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }), actor,
+          }));
+      }
+
       const goalTeamRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator\/execute-next$/);
       if (goalTeamRoute) {
         if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
@@ -6605,9 +6628,14 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "POST") {
           assertNoQuery(url.searchParams, "POST /api/tasks/:id/inbox-deliveries");
+          const input = parseInboxDelivery(await readJson(request));
+          const actor = actorFromRequest(request);
+          if (input.sourceKind === "owner-ui" && (actor.type !== "user"
+            || !database.getTask(taskId)?.labels.includes("owner-goal"))) {
+            throw new ApiError(403, "OWNER_UI_REQUIRED", "Owner UI ideas require a user and owner goal");
+          }
           const result = database.deliverTaskInboxMessage(taskId, {
-            ...resolveInputThreadBinding(parseInboxDelivery(await readJson(request))),
-            actor: actorFromRequest(request),
+            ...(input.sourceKind === "owner-ui" ? input : resolveInputThreadBinding(input)), actor,
           });
           if (result.applied) {
             events.emit("comment.created", { comment: result.comment, task: database.getTask(taskId) });

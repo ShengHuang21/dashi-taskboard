@@ -237,9 +237,48 @@ function selectedModelRouting(plan, readyWork) {
   };
 }
 
-function authorizationFor(task, comments) {
+function pendingStandingCapabilities(envelope) {
+  if (envelope.useStandingAuthority !== true) return null;
+  const gateKeys = ["id", "kind", "scope", "state", "approver", "approvalRequest"];
+  if (!envelope.gates.every((gate) => ["edit", "test"].includes(gate.kind)
+    && gate.state === "approval_required"
+    && Object.keys(gate).length === gateKeys.length
+    && gateKeys.every((key) => Object.hasOwn(gate, key)))) return null;
+  const gates = new Map(envelope.gates.map((gate) => [gate.id, gate]));
+  const capabilities = new Set();
+  for (const action of envelope.actions) {
+    const kind = gates.get(action.gate)?.kind;
+    if (action.status !== "pending" || !validateStandingAction(action, kind)) return null;
+    for (const value of kind === "edit" ? action.standingScope.paths : action.standingScope.suites) {
+      capabilities.add(`${kind}:${value}`);
+    }
+  }
+  return capabilities;
+}
+
+function isAgentStandingNarrowing(task, source, envelope, history, previous, ownerDecisionReceipts) {
+  const predecessor = history.at(-1);
+  const binding = task.threadBinding;
+  if (previous?.state !== "valid" || source.authorType !== "agent"
+    || predecessor.authorType !== "agent" || !nonEmptyString(source.authorId)
+    || source.authorId !== predecessor.authorId || !nonEmptyString(source.threadId)
+    || source.threadId !== predecessor.threadId || !binding
+    || !["threadId", "codexProjectId", "codexProjectKind", "codexHostId", "workspacePath"]
+      .every((key) => nonEmptyString(binding[key]))
+    || source.threadId !== binding.threadId
+    || history.some((comment) => comment.authorType === "user")
+    || !Array.isArray(ownerDecisionReceipts)
+    || ownerDecisionReceipts.some((receipt) => [source, ...history]
+      .some((comment) => comment.id === receipt.authorizationCommentId))
+    || normalizeRepository(envelope.repository) !== normalizeRepository(previous.envelope.repository)) return false;
+  const before = pendingStandingCapabilities(previous.envelope);
+  const after = pendingStandingCapabilities(envelope);
+  return before !== null && after !== null && after.size < before.size
+    && [...after].every((capability) => before.has(capability));
+}
+
+function authorizationFor(task, comments, ownerDecisionReceipts) {
   const markerLinePattern = /(?:^|\n)Task Authorization Envelope V1[ \t]*(?:\n|$)/g;
-  const envelopePattern = /(?:^|\n)Task Authorization Envelope V1\s*```json\s*([\s\S]*?)\s*```/g;
   const sources = comments.flatMap((comment) => (
     [...comment.body.matchAll(markerLinePattern)].map(() => comment)
   ));
@@ -248,7 +287,17 @@ function authorizationFor(task, comments) {
     return { state: "invalid", envelope: null, source: null };
   }
 
-  const source = sources.at(-1);
+  // Agent reductions need the immediately preceding valid plan. A genuine user
+  // replacement still validates its own full supersedes list after invalid history.
+  let authorization = null;
+  for (let index = 0; index < sources.length; index += 1) {
+    authorization = authorizationSourceFor(task, sources[index], sources.slice(0, index), authorization, ownerDecisionReceipts);
+  }
+  return authorization;
+}
+
+function authorizationSourceFor(task, source, history, previous, ownerDecisionReceipts) {
+  const envelopePattern = /(?:^|\n)Task Authorization Envelope V1\s*```json\s*([\s\S]*?)\s*```/g;
   const matches = [...source.body.matchAll(envelopePattern)];
   if (matches.length !== 1 || hasDuplicateJsonKeys(matches[0][1])) {
     return { state: "invalid", envelope: null, source: null };
@@ -273,7 +322,7 @@ function authorizationFor(task, comments) {
   if (envelope.useStandingAuthority === true && normalizeRepository(envelope.repository) === null) {
     return { state: "invalid", envelope: null, source: null };
   }
-  const priorSourceIds = sources.slice(0, -1).map((comment) => comment.id);
+  const priorSourceIds = history.map((comment) => comment.id);
   const supersedesCommentIds = envelope.supersedesCommentIds;
   if (priorSourceIds.length === 0) {
     if (supersedesCommentIds !== undefined
@@ -345,7 +394,7 @@ function authorizationFor(task, comments) {
     || !nonEmptyString(source.authorId)
     || !task.threadBinding?.threadId
     || source.threadId !== task.threadBinding.threadId
-  )) {
+  ) && !isAgentStandingNarrowing(task, source, envelope, history, previous, ownerDecisionReceipts)) {
     return { state: "invalid", envelope: null, source: null };
   }
 
@@ -809,7 +858,7 @@ export function evaluateTaskAuthorization({ task, comments, ownerDecisionReceipt
   const orderedComments = [...comments].sort((left, right) => (
     left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
   ));
-  const authorization = authorizationFor(task, orderedComments);
+  const authorization = authorizationFor(task, orderedComments, ownerDecisionReceipts);
   const resolution = applyOwnerDecisionReceipts(authorization, ownerDecisionReceipts);
   const effectiveAuthorization = resolution.authorization;
   const standingAuthority = standingAuthorityFor(task, effectiveAuthorization, standingAuthorities, now);
@@ -855,6 +904,7 @@ function readyWorkFor(
   pendingActions,
   gates,
   latestContinuationRecord,
+  verifiedGoalInputs,
 ) {
   const reasonCodes = [];
   const continuationHoldReason = {
@@ -870,7 +920,8 @@ function readyWorkFor(
   if (task.archivedAt !== null) reasonCodes.push("TASK_ARCHIVED");
   if (task.status === "backlog") reasonCodes.push("BACKLOG_NOT_ELIGIBLE");
   else if (task.status !== "todo") reasonCodes.push("TASK_STATUS_NOT_TODO");
-  if (task.relations.blockedBy.some((blockedBy) => blockedBy.status !== "done")) {
+  if (task.relations.blockedBy.some((blockedBy) => blockedBy.status !== "done"
+    && !verifiedGoalInputs.some((input) => input.producerTaskId === blockedBy.id))) {
     reasonCodes.push("BLOCKED_BY_INCOMPLETE");
   }
   if (dependencyClearances.some((clearance) => (
@@ -1010,6 +1061,8 @@ export function createTaskCapsule({
   domainRoute = null,
   globalCoordinatorFrontier = null,
   dependencyClearances = [],
+  verifiedGoalInputs = [],
+  goalRequirementsRevision = null,
   latestContinuationRecord = null,
   resourceSteps = [],
   authorizationEvaluation = null,
@@ -1051,6 +1104,7 @@ export function createTaskCapsule({
     pendingActions,
     gatesById,
     latestContinuationRecord,
+    verifiedGoalInputs,
   );
   const modelRouting = selectedModelRouting(plannedModelRouting, readyWork);
   const workflow = workflowFor(task);
@@ -1148,6 +1202,8 @@ export function createTaskCapsule({
     comments: orderedComments,
     attachments: orderedAttachments,
     inbox: inboxFor(inboxReceipts),
+    goalRequirementsRevision,
+    verifiedGoalInputs,
     clarifications,
     handoffs,
     conversation: conversationFor(task),
