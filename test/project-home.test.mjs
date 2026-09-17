@@ -57,9 +57,8 @@ test("the selected project exposes the current board surfaces", () => {
   assert.match(appSource, /<div className="board-toolbar">/);
   assert.match(appSource, /boardView === "dashboard"[\s\S]*?<OwnerGoalsView[\s\S]*?referenceTasks=\{referenceTasks\}[\s\S]*?onOpenTask=\{openTaskDetail\}[\s\S]*?onOpenAgentDetails=\{\(\) => selectBoardView\("issues"\)\}/);
   assert.match(ownerGoalsSource, /\.filter\(\(task\) => task\.labels\.includes\("owner-goal"\)\)/);
-  assert.match(ownerGoalsSource, /import \{ taskWindowDisplayName \} from "\.\.\/taskWindowDisplayName";/);
-  assert.match(ownerGoalsSource, /const displayName = taskWindowDisplayName\(goal\);/);
-  assert.match(ownerGoalsSource, /<button type="button" title=\{displayName\.fullTitle\} onClick=\{\(\) => onOpenTask\(goal\)\}>\{displayName\.shortTitle\}<\/button>/);
+  assert.doesNotMatch(ownerGoalsSource, /taskWindowDisplayName/);
+  assert.match(ownerGoalsSource, /<button type="button" title=\{goal\.title\} onClick=\{\(\) => onOpenTask\(goal\)\}>\{goal\.title\}<\/button>/);
   assert.match(appSource, /<IssueListView/);
   assert.match(appSource, /<GanttView/);
   assert.match(appSource, /<BoardColumn/);
