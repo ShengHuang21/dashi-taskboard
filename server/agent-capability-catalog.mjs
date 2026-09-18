@@ -46,18 +46,18 @@ const supportedCapabilities = [
     outputModes: [JSON_MODE],
     prerequisites: ["active-task-claim"],
   },
-];
-
-const plannedCapabilities = [
   {
     id: "external.agent-card.inspect",
     name: "Inspect an external Agent Card",
     description: "Import and compare a remote agent capability declaration without dispatching work.",
-    state: "planned",
+    state: "supported",
     inputModes: [JSON_MODE],
     outputModes: [JSON_MODE],
     prerequisites: ["explicitly-configured-source"],
   },
+];
+
+const plannedCapabilities = [
   {
     id: "external.task.dispatch",
     name: "Dispatch work to an external agent",
