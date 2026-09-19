@@ -67,11 +67,15 @@ export class ProjectSummaryService {
     this.codexExecutable = options.codexExecutable;
     this.workspacePath = options.workspacePath;
     this.processEnv = options.processEnv ?? process.env;
+    this.enabled = options.enabled !== false;
     this.active = new Map();
     this.closed = false;
-    this.timer = setInterval(() => void this.refreshDueProjects(), CHECK_INTERVAL_MS);
-    this.timer.unref();
-    void this.refreshDueProjects();
+    this.timer = null;
+    if (this.enabled) {
+      this.timer = setInterval(() => void this.refreshDueProjects(), CHECK_INTERVAL_MS);
+      this.timer.unref();
+      void this.refreshDueProjects();
+    }
   }
 
   get(projectId) {
@@ -79,7 +83,7 @@ export class ProjectSummaryService {
       throw new ApiError(404, "PROJECT_NOT_FOUND", `Project '${projectId}' was not found`);
     }
     const summary = this.database.getProjectSummary(projectId);
-    if (isDue(summary)) void this.refresh(projectId);
+    if (this.enabled !== false && isDue(summary)) void this.refresh(projectId);
     const visibleSummary = visibleProjectSummary(summary);
     return {
       projectId,
@@ -91,6 +95,7 @@ export class ProjectSummaryService {
   }
 
   refresh(projectId) {
+    if (this.enabled === false) return Promise.resolve();
     const current = this.active.get(projectId);
     if (current) return current.promise;
     const active = { child: null, promise: null };
@@ -101,6 +106,7 @@ export class ProjectSummaryService {
   }
 
   async refreshDueProjects() {
+    if (this.enabled === false) return;
     for (const summary of this.database.listProjectSummaries()) {
       if (isDue(summary)) await this.refresh(summary.projectId);
     }

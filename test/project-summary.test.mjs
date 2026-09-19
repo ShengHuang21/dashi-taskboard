@@ -3,6 +3,36 @@ import { test } from "node:test";
 
 import { ProjectSummaryService } from "../server/project-summary.mjs";
 
+test("explicitly disabled summaries remain readable without scheduling or generating work", async () => {
+  const calls = { due: 0, tasks: 0, writes: 0 };
+  const service = new ProjectSummaryService({
+    enabled: false,
+    codexExecutable: "disabled-summary-must-not-spawn",
+    workspacePath: process.cwd(),
+    database: {
+      getProject: (id) => ({ id }),
+      getProjectSummary: (id) => ({
+        summary: id === "cached" ? "TASKBOARD_SUMMARY_V2\nCached summary" : null,
+        generatedAt: "2020-01-01T00:00:00.000Z", attemptedAt: null, error: null,
+      }),
+      listProjectSummaries: () => { calls.due += 1; return []; },
+      listTasks: () => { calls.tasks += 1; return []; },
+      saveProjectSummary: () => { calls.writes += 1; },
+      saveProjectSummaryError: () => { calls.writes += 1; },
+    },
+  });
+  try {
+    assert.equal(service.get("cached").summary, "Cached summary");
+    assert.equal(service.get("empty").summary, null);
+    assert.equal(service.get("cached").refreshing, false);
+    await service.refreshDueProjects();
+    await service.refresh("cached");
+    assert.equal(service.timer, null);
+    assert.equal(service.active.size, 0);
+    assert.deepEqual(calls, { due: 0, tasks: 0, writes: 0 });
+  } finally { await service.close(); }
+});
+
 test("a recent project summary using the retired Owner-review label is hidden and refreshed", () => {
   const active = new Map();
   let refreshCount = 0;

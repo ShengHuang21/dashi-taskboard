@@ -16,6 +16,7 @@ import { CodexAppServer } from "./codex-app-server.mjs";
 import { buildGoalTeamPrompt, goalTeamContext, readGoalTeamResult, fencedJson, goalRequirements,
   isGoalDescendant, goalSupervisionEvidence, buildGoalSupervisionPrompt, validateGoalSupervisionResult,
   reconcileGoalIdeaScope } from "./goal-team.mjs";
+import { resolveGoalTeamRole } from "./task-capsule.mjs";
 import {
   buildCodexArgs,
   buildCodexPrompt,
@@ -359,8 +360,25 @@ export class AiChatService {
   async createThread(input) {
     const resolved = await this.resolveContext(input.projectId, input.issueId);
     const catalog = await this.getCatalog(input.projectId, resolved);
-    const model = this.#resolveModel(catalog, input.model);
-    const reasoningEffort = input.reasoningEffort ?? model.defaultReasoningEffort;
+    let roleRoute = null;
+    if (input.goalTeamRole !== undefined) {
+      if (input.model !== undefined || input.reasoningEffort !== undefined) {
+        throw new ApiError(400, "GOAL_TEAM_CALLER_OVERRIDE", "Goal-team role creation resolves model settings server-side");
+      }
+      const routing = resolved.issue && this.database.getTaskCapsule(resolved.issue.id)?.modelRouting;
+      if (!routing || routing.state !== "valid" || routing.selectionState !== "matched"
+        || routing.selectedExecution.safeActionId !== input.expectedSafeActionId
+        || routing.source?.commentId !== input.routingCommentId
+        || routing.source?.commentVersion !== input.routingCommentVersion) {
+        throw new ApiError(409, "GOAL_TEAM_ROUTING_UNAVAILABLE", "Goal-team routing is absent, stale, invalid, or does not match this child");
+      }
+      roleRoute = resolveGoalTeamRole(routing, input.goalTeamRole);
+      if (!roleRoute || roleRoute.blocked) {
+        throw new ApiError(409, roleRoute?.blocked ?? "GOAL_TEAM_ROUTING_UNAVAILABLE", "Goal-team validator pin does not meet the required effort floor");
+      }
+    }
+    const model = this.#resolveModel(catalog, roleRoute?.model ?? input.model);
+    const reasoningEffort = roleRoute?.reasoningEffort ?? input.reasoningEffort ?? model.defaultReasoningEffort;
     this.#validateReasoningEffort(model, reasoningEffort);
     const sandbox = input.sandbox ?? "workspace-write";
     this.#validateSandbox(sandbox);

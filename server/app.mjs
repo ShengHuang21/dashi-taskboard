@@ -2768,6 +2768,10 @@ function parseAiThreadCreate(body) {
     "model",
     "reasoningEffort",
     "sandbox",
+    "goalTeamRole",
+    "expectedSafeActionId",
+    "routingCommentId",
+    "routingCommentVersion",
   ]));
   return {
     projectId: validateProjectId(body.projectId),
@@ -2776,6 +2780,10 @@ function parseAiThreadCreate(body) {
     model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
+    goalTeamRole: parseAiSetting(body.goalTeamRole, "goalTeamRole", 32),
+    expectedSafeActionId: parseAiSetting(body.expectedSafeActionId, "expectedSafeActionId", 256),
+    routingCommentId: parseAiSetting(body.routingCommentId, "routingCommentId", 128),
+    routingCommentVersion: body.routingCommentVersion === undefined ? undefined : parseVersion(body.routingCommentVersion),
   };
 }
 
@@ -4051,6 +4059,7 @@ export function createTaskboardServer(options = {}) {
   });
   const projectSummary = new ProjectSummaryService({
     database,
+    enabled: options.projectSummaryEnabled,
     codexExecutable: resolved.codexExecutable,
     processEnv: codexProcessEnvironment,
     workspacePath: PROJECT_ROOT,
@@ -4060,6 +4069,7 @@ export function createTaskboardServer(options = {}) {
     getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
+    hasReconciliationWork: (projectId) => database.hasAgentTaskReconciliationWork(projectId),
     getAdmission: (taskId) => database.getTaskSafeActionAdmission(taskId),
     listResourceSteps: (projectId) => database.listResourceSteps(projectId),
     getTaskCapsule: (taskId) => verifiedTaskCapsule(taskId),

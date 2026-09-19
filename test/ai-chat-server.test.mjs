@@ -21,7 +21,7 @@ import { appendFileSync, existsSync } from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
 if (args[0] === "debug") {
-  process.stdout.write('{"models":[{"slug":"gpt-real","display_name":"GPT Real","description":"","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"service_tiers":[]}]}');
+  process.stdout.write('{"models":[{"slug":"gpt-real","display_name":"GPT Real","description":"","default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"service_tiers":[]},{"slug":"gpt-5.6-terra","display_name":"GPT Terra","description":"","default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}],"service_tiers":[]}]}');
 } else if (args[0] === "app-server") {
   process.stdin.setEncoding("utf8"); let buffer="";
   process.stdin.on("data", chunk => { buffer += chunk; let i;
@@ -111,6 +111,82 @@ async function backgroundContinuationFixture(options = {}) {
     .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   return fixture;
 }
+
+function createGoalTeamRoleTask(fixture, { pins, difficulty = "standard" } = {}) {
+  const actor = { type: "agent", id: "fixture-agent", name: "Fixture Agent", avatarUrl: null };
+  const task = fixture.app.database.createTask({
+    projectId: "local", title: "Goal-team child", description: "", status: "todo", priority: "high",
+    labels: ["agent-todo"], threadId: "fixture-root", threadBinding: {
+      threadId: "fixture-root", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: fixture.workspace,
+    }, actor, assignee: actor, workflowId: null,
+    developmentContext: { type: "worktree", path: fixture.workspace, branch: "codex/fixture" },
+    workingLog: { path: `${fixture.workspace}/WORKING-LOG.md`, status: "active" }, startDate: null, dueDate: null, recurrence: null,
+  });
+  fixture.app.database.createComment(task.id, {
+    body: `Task Authorization Envelope V1\n\n\`\`\`json\n${JSON.stringify({
+      gates: [{ id: "edit", kind: "edit", state: "authorized", scope: "fixture", approver: "Owner", approvalRequest: "fixture", evidence: "fixture", receipt: "fixture" }],
+      actions: [{ id: "edit-child", order: 10, text: "Edit child", gate: "edit", target: "fixture", status: "pending" }],
+    })}\n\`\`\``, threadId: "fixture-root", threadBinding: { threadId: "fixture-root", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: fixture.workspace }, actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+  });
+  const routing = fixture.app.database.createComment(task.id, {
+    body: `Task Model Routing V1\n\`\`\`json\n${JSON.stringify({
+      workflow: "ai-coding-end-to-end", profileSource: "fixture-policy", planningProfile: "capable", validationProfile: "capable",
+      profiles: { fast: { model: "gpt-5.6-luna", reasoningEffort: "medium" }, balanced: { model: "gpt-5.6-terra", reasoningEffort: "medium" }, capable: { model: "gpt-6-astra", reasoningEffort: "high" } },
+      execution: { safeActionId: "edit-child", difficulty, profile: difficulty === "simple" ? "fast" : difficulty === "standard" ? "balanced" : "capable", reason: "fixture" },
+      ...(pins === undefined ? {} : { goalTeamRolePins: pins }),
+    })}\n\`\`\``, threadId: "fixture-root", threadBinding: { threadId: "fixture-root", codexProjectId: "local-project", codexProjectKind: "local", codexHostId: "local", workspacePath: fixture.workspace }, actor: { type: "user", id: "owner", name: "Owner", avatarUrl: null },
+  });
+  return { task, routing };
+}
+
+test("goal-team role create resolves child Capsule routing and rejects stale or unsafe inputs", async () => {
+  const fixture = await backgroundContinuationFixture();
+  try {
+    const { task, routing } = createGoalTeamRoleTask(fixture);
+    assert.equal(fixture.app.database.getTaskCapsule(task.id).modelRouting.selectionState, "matched");
+    const args = ["background", "create", "--project", "local", "--issue", task.identifier,
+      "--goal-team-role", "developer", "--expected-safe-action-id", "edit-child",
+      "--routing-comment-id", routing.id, "--routing-comment-version", String(routing.version), "--sandbox", "workspace-write"];
+    const developer = (await fixture.cli(args)).thread;
+    assert.equal(developer.model, "gpt-5.6-terra");
+    assert.equal(developer.reasoningEffort, "medium");
+    const validator = (await fixture.cli([...args.slice(0, 7), "validator", ...args.slice(8)])).thread;
+    assert.equal(validator.model, "gpt-5.6-terra");
+    assert.equal(validator.reasoningEffort, "high");
+
+    const pinned = createGoalTeamRoleTask(fixture, { pins: { developer: { model: "gpt-5.6-terra", reasoningEffort: "high" }, validator: { model: "gpt-5.6-terra", reasoningEffort: "xhigh" } } });
+    const pinnedDeveloper = (await fixture.cli(["background", "create", "--project", "local", "--issue", pinned.task.identifier,
+      "--goal-team-role", "developer", "--expected-safe-action-id", "edit-child", "--routing-comment-id", pinned.routing.id,
+      "--routing-comment-version", String(pinned.routing.version), "--sandbox", "workspace-write"])).thread;
+    assert.equal(pinnedDeveloper.reasoningEffort, "high");
+    const pinnedValidator = (await fixture.cli(["background", "create", "--project", "local", "--issue", pinned.task.identifier,
+      "--goal-team-role", "validator", "--expected-safe-action-id", "edit-child", "--routing-comment-id", pinned.routing.id,
+      "--routing-comment-version", String(pinned.routing.version), "--sandbox", "workspace-write"])).thread;
+    assert.equal(pinnedValidator.reasoningEffort, "xhigh");
+
+    const beforeRejected = fixture.app.database.listAiChatThreads().length;
+    const stale = await fixture.cli([...args.slice(0, 11), "wrong-comment", ...args.slice(12)], 1);
+    assert.equal(stale.error.code, "GOAL_TEAM_ROUTING_UNAVAILABLE");
+    const callerOverride = await fixture.cli([...args, "--model", "gpt-real"], 1);
+    assert.equal(callerOverride.error.code, "USAGE_ERROR");
+    const belowFloor = createGoalTeamRoleTask(fixture, { pins: { validator: { model: "gpt-5.6-terra", reasoningEffort: "medium" } } });
+    const rejected = await fixture.cli(["background", "create", "--project", "local", "--issue", belowFloor.task.identifier,
+      "--goal-team-role", "validator", "--expected-safe-action-id", "edit-child", "--routing-comment-id", belowFloor.routing.id,
+      "--routing-comment-version", String(belowFloor.routing.version), "--sandbox", "workspace-write"], 1);
+    assert.equal(rejected.error.code, "GOAL_TEAM_VALIDATOR_PIN_BELOW_FLOOR");
+    const invalid = createGoalTeamRoleTask(fixture, { pins: { reviewer: { model: "gpt-5.6-terra", reasoningEffort: "high" } } });
+    const invalidRejected = await fixture.cli(["background", "create", "--project", "local", "--issue", invalid.task.identifier,
+      "--goal-team-role", "developer", "--expected-safe-action-id", "edit-child", "--routing-comment-id", invalid.routing.id,
+      "--routing-comment-version", String(invalid.routing.version), "--sandbox", "workspace-write"], 1);
+    assert.equal(invalidRejected.error.code, "GOAL_TEAM_ROUTING_UNAVAILABLE");
+    const unavailable = createGoalTeamRoleTask(fixture, { pins: { developer: { model: "not-in-catalog", reasoningEffort: "high" } } });
+    const unavailableRejected = await fixture.cli(["background", "create", "--project", "local", "--issue", unavailable.task.identifier,
+      "--goal-team-role", "developer", "--expected-safe-action-id", "edit-child", "--routing-comment-id", unavailable.routing.id,
+      "--routing-comment-version", String(unavailable.routing.version), "--sandbox", "workspace-write"], 1);
+    assert.equal(unavailableRejected.error.code, "INVALID_MODEL");
+    assert.equal(fixture.app.database.listAiChatThreads().length, beforeRejected);
+  } finally { await fixture.close(); }
+});
 
 test("issue worktree background threads pin their origin through card changes and successors", async (context) => {
   const fixture = await backgroundContinuationFixture();

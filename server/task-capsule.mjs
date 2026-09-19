@@ -16,6 +16,8 @@ const MODEL_ROUTING_DIFFICULTIES = new Map([
   ["standard", "balanced"],
   ["complex", "capable"],
 ]);
+const GOAL_TEAM_ROLES = new Set(["developer", "validator"]);
+const REASONING_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const AUTHORIZATION_GATE_KINDS = new Set([
   "inspect",
   "edit",
@@ -172,6 +174,20 @@ function modelRoutingFor(comments) {
       return { state: "invalid", source: null, plan: null };
     }
   }
+  if (plan.goalTeamRolePins !== undefined) {
+    if (!plan.goalTeamRolePins || typeof plan.goalTeamRolePins !== "object" || Array.isArray(plan.goalTeamRolePins)
+      || !Object.keys(plan.goalTeamRolePins).every((role) => GOAL_TEAM_ROLES.has(role))) {
+      return { state: "invalid", source: null, plan: null };
+    }
+    for (const role of Object.keys(plan.goalTeamRolePins)) {
+      const pin = plan.goalTeamRolePins[role];
+      if (!pin || typeof pin !== "object" || Array.isArray(pin)
+        || Object.keys(pin).length !== 2 || !Object.hasOwn(pin, "model") || !Object.hasOwn(pin, "reasoningEffort")
+        || !nonEmptyString(pin.model) || !nonEmptyString(pin.reasoningEffort)) {
+        return { state: "invalid", source: null, plan: null };
+      }
+    }
+  }
   if (plan.execution.profile !== MODEL_ROUTING_DIFFICULTIES.get(plan.execution.difficulty)) {
     return { state: "invalid", source: null, plan: null };
   }
@@ -197,6 +213,7 @@ function selectedModelRouting(plan, readyWork) {
       planningProfile: plan.plan.planningProfile,
       validationProfile: plan.plan.validationProfile,
       execution: plan.plan.execution,
+      goalTeamRolePins: plan.plan.goalTeamRolePins,
       selectionState: "no_safe_action",
       selectedExecution: null,
     };
@@ -211,6 +228,7 @@ function selectedModelRouting(plan, readyWork) {
       planningProfile: plan.plan.planningProfile,
       validationProfile: plan.plan.validationProfile,
       execution: plan.plan.execution,
+      goalTeamRolePins: plan.plan.goalTeamRolePins,
       selectionState: "safe_action_mismatch",
       selectedExecution: null,
     };
@@ -225,6 +243,7 @@ function selectedModelRouting(plan, readyWork) {
     planningProfile: plan.plan.planningProfile,
     validationProfile: plan.plan.validationProfile,
     execution: plan.plan.execution,
+    goalTeamRolePins: plan.plan.goalTeamRolePins,
     selectionState: "matched",
     selectedExecution: {
       safeActionId,
@@ -235,6 +254,22 @@ function selectedModelRouting(plan, readyWork) {
       reasoningEffort: profile.reasoningEffort,
     },
   };
+}
+
+export function resolveGoalTeamRole(modelRouting, role) {
+  if (!GOAL_TEAM_ROLES.has(role) || modelRouting?.state !== "valid" || modelRouting.selectionState !== "matched") return null;
+  const selected = modelRouting.selectedExecution;
+  const pin = modelRouting.goalTeamRolePins?.[role];
+  const floor = selected.difficulty === "simple" ? "medium" : "high";
+  if (role === "developer") return pin ?? { model: selected.model, reasoningEffort: selected.reasoningEffort };
+  if (pin) {
+    const effort = REASONING_EFFORT_ORDER.indexOf(pin.reasoningEffort);
+    const required = REASONING_EFFORT_ORDER.indexOf(floor);
+    return effort < required ? { blocked: "GOAL_TEAM_VALIDATOR_PIN_BELOW_FLOOR" } : pin;
+  }
+  const effort = REASONING_EFFORT_ORDER.indexOf(selected.reasoningEffort);
+  const required = REASONING_EFFORT_ORDER.indexOf(floor);
+  return { model: selected.model, reasoningEffort: effort >= required ? selected.reasoningEffort : floor };
 }
 
 function pendingStandingCapabilities(envelope) {

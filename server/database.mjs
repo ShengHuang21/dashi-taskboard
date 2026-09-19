@@ -9822,6 +9822,19 @@ export class TaskboardDatabase {
     return row?.protected_until ?? null;
   }
 
+  hasAgentTaskReconciliationWork(projectId) {
+    return Boolean(this.#prepare(`
+      SELECT 1
+      FROM agent_task_claims AS claim
+      JOIN tasks AS task ON task.id = claim.task_id AND task.project_id = claim.project_id
+      WHERE claim.project_id = ?
+        AND claim.status = 'active'
+        AND task.archived_at IS NULL
+        AND task.status IN ('in_progress', 'in_review')
+      LIMIT 1
+    `).get(projectId));
+  }
+
   getAgentTaskClaim(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
