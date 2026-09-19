@@ -2,7 +2,6 @@ import { useMemo, type Ref } from "react";
 import { useTaskboardI18n } from "../i18n";
 import type { TaskCardPresentation } from "../taskConversations";
 import { createTaskProgressModel } from "../taskProgress";
-import { taskWindowDisplayName } from "../taskWindowDisplayName";
 import type { CodexThreadBinding, Task } from "../types";
 import { GoalWindows } from "./GoalWindows";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
@@ -76,11 +75,10 @@ export function OwnerGoalsView({
         {goals.length > 0 ? (
           <div className="owner-goals-grid">
             {goals.map((goal) => {
-              const displayName = taskWindowDisplayName(goal);
               return (
                 <article className="owner-goal-card" key={goal.id}>
                   <h2>
-                    <button type="button" title={displayName.fullTitle} onClick={() => onOpenTask(goal)}>{displayName.shortTitle}</button>
+                    <button type="button" title={goal.title} onClick={() => onOpenTask(goal)}>{goal.title}</button>
                   </h2>
                   <TaskProgress
                     progress={progressModel.forTask(goal.id)}

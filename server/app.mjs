@@ -24,6 +24,7 @@ import { withoutTaskboardLauncherEnvironment } from "../shared/codex-environment
 import { createAgentLaneSnapshotProvider } from "./agent-lane-snapshot.mjs";
 import { createAgentCapabilityCatalog } from "./agent-capability-catalog.mjs";
 import { AiChatService } from "./ai-chat.mjs";
+import { createGoalExecutionAdmissionResolver } from "./goal-execution-admission.mjs";
 import { resolveAiIssueWorkspace, resolveAiWorkspace, resolveMappedAiWorkspace } from "./ai-chat-catalog.mjs";
 import { decodeComposerReferenceKey } from "./composer-reference.mjs";
 import { createCloudConfigStore } from "./cloud-config.mjs";
@@ -2218,8 +2219,13 @@ function parseCommentCreate(body) {
 
 function parseInboxDelivery(body) {
   assertPlainObject(body);
-  assertAllowedKeys(body, new Set(["deliveryId", "body", "threadId", "threadBinding"]));
-  const threadId = stringField(body.threadId, "threadId", { required: true, maxLength: 256 });
+  assertAllowedKeys(body, new Set(["deliveryId", "body", "threadId", "threadBinding", "sourceKind"]));
+  const ownerUi = body.sourceKind === "owner-ui";
+  if (body.sourceKind !== undefined && !["owner-ui", "codex-thread"].includes(body.sourceKind)) {
+    throw new ApiError(400, "INVALID_FIELD", "Unknown inbox source");
+  }
+  if (ownerUi && (body.threadId || body.threadBinding)) throw new ApiError(400, "INVALID_FIELD", "Owner UI does not impersonate a Codex thread");
+  const threadId = ownerUi ? null : stringField(body.threadId, "threadId", { required: true, maxLength: 256 });
   const threadBinding = parseThreadBinding(body.threadBinding);
   if (threadBinding && threadBinding.threadId !== threadId) {
     throw new ApiError(400, "INVALID_FIELD", "threadBinding.threadId must match threadId");
@@ -2229,6 +2235,7 @@ function parseInboxDelivery(body) {
     body: stringField(body.body, "body", { required: true, maxLength: 100_000 }),
     threadId,
     threadBinding,
+    sourceKind: ownerUi ? "owner-ui" : "codex-thread",
   };
 }
 
@@ -2761,6 +2768,10 @@ function parseAiThreadCreate(body) {
     "model",
     "reasoningEffort",
     "sandbox",
+    "goalTeamRole",
+    "expectedSafeActionId",
+    "routingCommentId",
+    "routingCommentVersion",
   ]));
   return {
     projectId: validateProjectId(body.projectId),
@@ -2769,6 +2780,10 @@ function parseAiThreadCreate(body) {
     model: parseAiSetting(body.model, "model", 128),
     reasoningEffort: parseAiSetting(body.reasoningEffort, "reasoningEffort", 64),
     sandbox: parseAiSandbox(body.sandbox),
+    goalTeamRole: parseAiSetting(body.goalTeamRole, "goalTeamRole", 32),
+    expectedSafeActionId: parseAiSetting(body.expectedSafeActionId, "expectedSafeActionId", 256),
+    routingCommentId: parseAiSetting(body.routingCommentId, "routingCommentId", 128),
+    routingCommentVersion: body.routingCommentVersion === undefined ? undefined : parseVersion(body.routingCommentVersion),
   };
 }
 
@@ -3543,6 +3558,7 @@ export function createTaskboardServer(options = {}) {
   });
   const routePrefix = resolved.instanceToken ? `/${resolved.instanceToken}` : "";
   const database = new TaskboardDatabase(resolved.databasePath, {
+    attachmentsDirectory: resolved.attachmentsDirectory,
     admissionTtlMs: options.admissionTtlMs,
     hostExecutorClock: options.hostExecutorClock,
   });
@@ -4009,6 +4025,13 @@ export function createTaskboardServer(options = {}) {
     codexExecutable: resolved.codexExecutable,
     codexStatePath: resolved.codexStatePath,
     manageTaskboardSkillPath: resolved.skillPath,
+    taskctlPath: path.join(PROJECT_ROOT, "cli", "taskctl.mjs"),
+    runtimeFile: path.join(resolved.dataDirectory, "launcher-runtime.json"),
+    attachmentsDirectory: resolved.attachmentsDirectory,
+    goalExecutionAdmission: createGoalExecutionAdmissionResolver({
+      database, resolveContext: resolveAiChatContext, processEnv: codexProcessEnvironment,
+      runGit: worktreeRepositoryExecFile,
+    }),
     processEnv: codexProcessEnvironment,
     resolveContext: resolveAiChatContext,
   });
@@ -4036,6 +4059,7 @@ export function createTaskboardServer(options = {}) {
   });
   const projectSummary = new ProjectSummaryService({
     database,
+    enabled: options.projectSummaryEnabled,
     codexExecutable: resolved.codexExecutable,
     processEnv: codexProcessEnvironment,
     workspacePath: PROJECT_ROOT,
@@ -4045,6 +4069,7 @@ export function createTaskboardServer(options = {}) {
     getLaneConfig: (projectId) => database.getAgentLaneProject(projectId),
     listTasks: (projectId) => database.listTasks({ projectId, archived: "false" }),
     getClaim: (taskId) => database.getAgentTaskClaim(taskId),
+    hasReconciliationWork: (projectId) => database.hasAgentTaskReconciliationWork(projectId),
     getAdmission: (taskId) => database.getTaskSafeActionAdmission(taskId),
     listResourceSteps: (projectId) => database.listResourceSteps(projectId),
     getTaskCapsule: (taskId) => verifiedTaskCapsule(taskId),
@@ -6000,6 +6025,57 @@ export function createTaskboardServer(options = {}) {
         return sendJson(response, 200, { backgroundProgress: database.getAiChatTaskProgress(projectId, taskId) });
       }
 
+      const goalCoordinatorRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator$/);
+      if (goalCoordinatorRoute) {
+        assertNoQuery(url.searchParams, "/api/local/tasks/:id/goal-coordinator");
+        const taskId = decodeRouteSegment(goalCoordinatorRoute[1], "Goal id");
+        if (request.method === "GET") return sendJson(response, 200, await aiChat.getGoalCoordinatorSnapshot(taskId));
+        if (request.method === "POST") {
+          const body = await readJson(request);
+          assertPlainObject(body);
+          assertAllowedKeys(body, new Set(["version", "resumeToken", "requestId", "model", "reasoningEffort"]));
+          return sendJson(response, 202, await aiChat.startGoalCoordinator(taskId, {
+            version: parseVersion(body.version),
+            resumeToken: stringField(body.resumeToken, "resumeToken", { required: true, maxLength: 256 }),
+            requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
+            model: stringField(body.model, "model", { required: true, maxLength: 128 }),
+            reasoningEffort: stringField(body.reasoningEffort, "reasoningEffort", { required: true, maxLength: 64 }),
+          }));
+        }
+        return methodNotAllowed(response, ["GET", "POST"]);
+      }
+
+      const goalSupervisionRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator\/supervision$/);
+      if (goalSupervisionRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "Goal supervision");
+        const actor = actorFromRequest(request);
+        if (actor.type !== "user") throw new ApiError(403, "OWNER_UI_REQUIRED", "Goal continuation intent belongs to the local user");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["action", "requestId"]));
+        if (!["enable", "pause"].includes(body.action)) throw new ApiError(400, "INVALID_FIELD", "Unknown goal control");
+        return sendJson(response, 200, await aiChat.controlGoalSupervision(
+          decodeRouteSegment(goalSupervisionRoute[1], "Goal id"), {
+            action: body.action, requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }), actor,
+          }));
+      }
+
+      const goalTeamRoute = pathname.match(/^\/api\/local\/tasks\/([^/]+)\/goal-coordinator\/execute-next$/);
+      if (goalTeamRoute) {
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        assertNoQuery(url.searchParams, "POST /api/local/tasks/:id/goal-coordinator/execute-next");
+        const taskId = decodeRouteSegment(goalTeamRoute[1], "Goal id");
+        const body = await readJson(request);
+        assertPlainObject(body);
+        assertAllowedKeys(body, new Set(["version", "resumeToken", "requestId"]));
+        return sendJson(response, 202, await aiChat.startGoalTeamRound(taskId, {
+          version: parseVersion(body.version),
+          resumeToken: stringField(body.resumeToken, "resumeToken", { required: true, maxLength: 256 }),
+          requestId: stringField(body.requestId, "requestId", { required: true, maxLength: 256 }),
+        }));
+      }
+
       if (pathname === "/api/local/ai/threads") {
         assertNoQuery(url.searchParams, "/api/local/ai/threads");
         if (request.method === "GET") {
@@ -6562,9 +6638,14 @@ export function createTaskboardServer(options = {}) {
         }
         if (request.method === "POST") {
           assertNoQuery(url.searchParams, "POST /api/tasks/:id/inbox-deliveries");
+          const input = parseInboxDelivery(await readJson(request));
+          const actor = actorFromRequest(request);
+          if (input.sourceKind === "owner-ui" && (actor.type !== "user"
+            || !database.getTask(taskId)?.labels.includes("owner-goal"))) {
+            throw new ApiError(403, "OWNER_UI_REQUIRED", "Owner UI ideas require a user and owner goal");
+          }
           const result = database.deliverTaskInboxMessage(taskId, {
-            ...resolveInputThreadBinding(parseInboxDelivery(await readJson(request))),
-            actor: actorFromRequest(request),
+            ...(input.sourceKind === "owner-ui" ? input : resolveInputThreadBinding(input)), actor,
           });
           if (result.applied) {
             events.emit("comment.created", { comment: result.comment, task: database.getTask(taskId) });

@@ -3758,6 +3758,15 @@ export function App() {
             )}
             onOpenThread={openThread}
             onOpenLegacyLocalThread={openLegacyLocalThread}
+            goalCoordinatorAvailable={localAiChatAvailable && !isAllProjects}
+            onOpenGoalCoordinator={(threadId) => setAiOpenThreadRequest((current) => ({
+              threadId,
+              requestId: (current?.requestId ?? 0) + 1,
+            }))}
+            onRefreshGoalTree={() => {
+              void refreshTasks(detailTask.projectId, { quiet: true });
+              setCommentsRevision((current) => current + 1);
+            }}
             onOpenInThread={openTaskInThread}
             onCopy={(text, message) => void copyText(text, message)}
             openingThread={openingThreadTaskId === detailTask.id}

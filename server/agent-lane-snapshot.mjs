@@ -1266,6 +1266,7 @@ export function createAgentLaneSnapshotProvider({
   getTaskCapsule = null,
   recordProgress = null,
   recordCompletion = null,
+  hasReconciliationWork = null,
   getTask = null,
   listComments = null,
   getPendingOwnerIntent = null,
@@ -1781,6 +1782,7 @@ export function createAgentLaneSnapshotProvider({
     },
     async reconcileProject(projectId) {
       if (!recordProgress && !recordCompletion) return { applied: 0 };
+      if (hasReconciliationWork && (await hasReconciliationWork(projectId)) === false) return { applied: 0 };
       const snapshot = await this.getProjectSnapshot(projectId);
       let applied = 0;
       const projectSubagents = allSubagentsByProject.get(projectId) ?? snapshot.rootSubagents;

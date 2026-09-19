@@ -7,6 +7,7 @@ import {
 } from "react";
 
 import type {
+  GoalCoordinatorSnapshot,
   IssueRelationType,
   Task,
   TaskRelationSummary,
@@ -338,6 +339,7 @@ export function IssueSubIssues({
   referenceTasks,
   progressModel,
   presentations,
+  adoptedInputs = [],
   expandedTaskIds,
   onToggleTaskExpansion,
   onOpenTask,
@@ -347,6 +349,7 @@ export function IssueSubIssues({
   referenceTasks: Task[];
   progressModel: ReturnType<typeof createTaskProgressModel>;
   presentations: Record<string, TaskCardPresentation>;
+  adoptedInputs?: GoalCoordinatorSnapshot["adoptedInputs"];
   expandedTaskIds: string[];
   onToggleTaskExpansion: (taskId: string) => void;
 }) {
@@ -388,6 +391,12 @@ export function IssueSubIssues({
         const hasChildren = [...(childrenById.get(issue.id)?.keys() ?? [])]
           .some((id) => !childPath.has(id));
         const expanded = expandedTaskIds.includes(issue.id);
+        const execution = presentations[issue.id]?.execution ?? "uncertain";
+        const unfinishedPrerequisites = child?.relations.blockedBy.filter((dependency) => dependency.status !== "done") ?? [];
+        const inputsAdopted = execution === "dependency" && unfinishedPrerequisites.length > 0
+          && unfinishedPrerequisites.every((dependency) => adoptedInputs.some((input) => (
+            input.consumerTaskId === issue.id && input.producerTaskId === dependency.id
+          )));
         return (
           <li className="issue-tree-node" data-task-id={issue.id} key={issue.id}>
             <div className="issue-tree-row">
@@ -419,7 +428,9 @@ export function IssueSubIssues({
                 </button>
                 <div className="issue-tree-status">
                   <span>{taskStatusLabel(language, issue.status)}</span>
-                  <TaskExecutionStatus state={presentations[issue.id]?.execution ?? "uncertain"} />
+                  {inputsAdopted ? <span data-execution-state="artifact_input">
+                    {text("前置产物输入已采用", "Prerequisite artifact input adopted")}
+                  </span> : <TaskExecutionStatus state={execution} />}
                   {child?.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </div>
                 <TaskProgress

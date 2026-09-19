@@ -110,6 +110,7 @@ function readMemoryObservation({
 
 export function createHostResourceObserver({
   hostId = "local",
+  reporter = "resident-injector",
   now = Date.now,
   platform = os.platform,
   readCpuInfo = os.cpus,
@@ -157,7 +158,7 @@ export function createHostResourceObserver({
     const detectedPlatform = platform();
     cached = {
       schemaVersion: 1,
-      source: "resident-injector",
+      source: reporter,
       hostId,
       observedAt: new Date(observedAtMs).toISOString(),
       platform: detectedPlatform,

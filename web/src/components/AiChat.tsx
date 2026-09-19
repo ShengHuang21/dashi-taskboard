@@ -1884,7 +1884,18 @@ export function AiChat({
       setPanelOpen(true);
       return;
     }
-    if (!threads.some((thread) => thread.id === openThreadRequest.threadId)) return;
+    if (!threads.some((thread) => thread.id === openThreadRequest.threadId)) {
+      const controller = new AbortController();
+      void getAiChatThread(openThreadRequest.threadId, controller.signal).then((next) => {
+        if (!controller.signal.aborted) replaceThread(next.thread);
+      }).catch((nextError) => {
+        if (controller.signal.aborted) return;
+        handledOpenThreadRequestRef.current = openThreadRequest.requestId;
+        setError(messageFor(nextError));
+        setPanelOpen(true);
+      });
+      return () => controller.abort();
+    }
     handledOpenThreadRequestRef.current = openThreadRequest.requestId;
     const selectedChanged = selectedThreadRef.current !== openThreadRequest.threadId;
     const leavingDraft = draftOrigin !== null;
@@ -1907,6 +1918,7 @@ export function AiChat({
     draftOrigin,
     loadSnapshot,
     openThreadRequest,
+    replaceThread,
     selectThread,
     snapshot?.thread.id,
     threads,

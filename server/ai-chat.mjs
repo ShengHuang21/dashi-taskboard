@@ -13,6 +13,10 @@ import {
   resolveAiWorkspace,
 } from "./ai-chat-catalog.mjs";
 import { CodexAppServer } from "./codex-app-server.mjs";
+import { buildGoalTeamPrompt, goalTeamContext, readGoalTeamResult, fencedJson, goalRequirements,
+  isGoalDescendant, goalSupervisionEvidence, buildGoalSupervisionPrompt, validateGoalSupervisionResult,
+  reconcileGoalIdeaScope } from "./goal-team.mjs";
+import { resolveGoalTeamRole } from "./task-capsule.mjs";
 import {
   buildCodexArgs,
   buildCodexPrompt,
@@ -145,6 +149,11 @@ export class AiChatService {
     this.codexStatePath = options.codexStatePath;
     this.manageTaskboardSkillPath = options.manageTaskboardSkillPath;
     this.processEnv = options.processEnv ?? process.env;
+    this.taskctlPath = options.taskctlPath;
+    this.runtimeFile = options.runtimeFile;
+    this.attachmentsDirectory = options.attachmentsDirectory;
+    this.goalExecutionAdmission = options.goalExecutionAdmission;
+    this.goalTeamStarts = new Map();
     this.killGraceMs = options.killGraceMs ?? 1_000;
     this.catalogTtlMs = options.catalogTtlMs ?? 30_000;
     this.discoverCatalog = options.discoverCatalog ?? discoverAiCatalog;
@@ -175,6 +184,8 @@ export class AiChatService {
     this.active = new Map();
     this.closing = false;
     this.continuationAttempts = new Set();
+    this.goalSupervisionAttempts = new Map();
+    this.goalContinuationAttempts = new Map();
     this.failedFinalizations = new Set();
     this.pendingLegacyFinalizations = new Set();
     this.removeTurnAttachments = (directory) => rm(directory, { recursive: true, force: true });
@@ -349,16 +360,38 @@ export class AiChatService {
   async createThread(input) {
     const resolved = await this.resolveContext(input.projectId, input.issueId);
     const catalog = await this.getCatalog(input.projectId, resolved);
-    const model = this.#resolveModel(catalog, input.model);
-    const reasoningEffort = input.reasoningEffort ?? model.defaultReasoningEffort;
+    let roleRoute = null;
+    if (input.goalTeamRole !== undefined) {
+      if (input.model !== undefined || input.reasoningEffort !== undefined) {
+        throw new ApiError(400, "GOAL_TEAM_CALLER_OVERRIDE", "Goal-team role creation resolves model settings server-side");
+      }
+      const routing = resolved.issue && this.database.getTaskCapsule(resolved.issue.id)?.modelRouting;
+      if (!routing || routing.state !== "valid" || routing.selectionState !== "matched"
+        || routing.selectedExecution.safeActionId !== input.expectedSafeActionId
+        || routing.source?.commentId !== input.routingCommentId
+        || routing.source?.commentVersion !== input.routingCommentVersion) {
+        throw new ApiError(409, "GOAL_TEAM_ROUTING_UNAVAILABLE", "Goal-team routing is absent, stale, invalid, or does not match this child");
+      }
+      roleRoute = resolveGoalTeamRole(routing, input.goalTeamRole);
+      if (!roleRoute || roleRoute.blocked) {
+        throw new ApiError(409, roleRoute?.blocked ?? "GOAL_TEAM_ROUTING_UNAVAILABLE", "Goal-team validator pin does not meet the required effort floor");
+      }
+    }
+    const model = this.#resolveModel(catalog, roleRoute?.model ?? input.model);
+    const reasoningEffort = roleRoute?.reasoningEffort ?? input.reasoningEffort ?? model.defaultReasoningEffort;
     this.#validateReasoningEffort(model, reasoningEffort);
     const sandbox = input.sandbox ?? "workspace-write";
     this.#validateSandbox(sandbox);
 
     const issue = resolved.issue;
+    if (input.purpose === "goal-coordinator") {
+      const existing = this.database.getGoalCoordinatorThread(resolved.project.id, issue.id);
+      if (existing) return existing;
+    }
 
     return this.database.createAiChatThread({
       title: input.title ?? issue?.identifier ?? "New conversation",
+      purpose: input.purpose,
       origin: {
         projectId: resolved.project.id,
         projectName: resolved.project.name,
@@ -369,6 +402,179 @@ export class AiChatService {
       reasoningEffort,
       sandbox,
     });
+  }
+
+  getGoalCoordinator(taskId) {
+    const capsule = this.database.getTaskCapsule(taskId);
+    if (!capsule || capsule.task.archivedAt || !capsule.task.labels.includes("owner-goal")) {
+      throw new ApiError(404, "GOAL_NOT_FOUND", "An active owner goal is required");
+    }
+    const thread = this.database.getGoalCoordinatorThread(capsule.task.projectId, capsule.task.id);
+    const runs = thread ? this.database.listAiChatRuns(thread.id) : [];
+    const claim = this.database.getAgentTaskClaim(capsule.task.id);
+    const taskRun = this.database.getOpenTaskAgentRun(capsule.task.id);
+    const owner = taskRun ?? (claim?.status === "active" ? claim : null);
+    const ownerThreadId = owner?.agentThreadId;
+    const blocker = owner && (!thread?.codexThreadId || ownerThreadId !== thread.codexThreadId)
+      ? { code: "GOAL_OWNED", message: `Recorded execution belongs to ${ownerThreadId ?? owner.agentPath ?? "another agent"}. Open that task to coordinate; this action will not take it over.` }
+      : null;
+    return {
+      goal: {
+        id: capsule.task.id, projectId: capsule.task.projectId, title: capsule.task.title,
+        version: capsule.task.version, resumeToken: capsule.resumeToken,
+        workflowProfile: capsule.task.workflowProfile,
+      },
+      thread,
+      latestRun: runs.at(-1) ?? null,
+      blocker,
+    };
+  }
+
+  async getGoalCoordinatorSnapshot(taskId) {
+    const snapshot = this.getGoalCoordinator(taskId);
+    let supervision = this.database.getGoalSupervision(taskId);
+    if (supervision?.state === "endpoint_reached" && !this.database.isGoalEndpointCurrent(taskId, supervision.generation)) {
+      supervision = { ...supervision, state: "blocked", message: "有待处理的新想法，或目标/交付范围已变化；旧完成记录不代表当前目标已覆盖。等待再次继续协调，未自动启动工作。" };
+    }
+    const events = snapshot.thread ? this.database.listAiChatEvents(snapshot.thread.id) : [];
+    const context = snapshot.thread && snapshot.latestRun
+      ? goalTeamContext(events, snapshot.latestRun.id)
+      : null;
+    const admission = snapshot.blocker
+      ? { available: false, state: "owner_busy", message: snapshot.blocker.message }
+      : snapshot.latestRun?.status === "running"
+        ? { available: false, state: "owner_busy", message: "当前协调正在执行，结束后再检查下一项。" }
+      : await this.goalExecutionAdmission.resolve(snapshot.goal, snapshot.thread);
+    return {
+      ...snapshot,
+      supervision,
+      ideas: this.database.listTaskInboxDeliveryReceipts(taskId).filter((item) => item.sourceKind === "owner-ui")
+        .map((item) => ({ ...item, body: this.database.getComment(item.commentId)?.body ?? "" })),
+      adoptedInputs: this.database.listTasks({ projectId: snapshot.goal.projectId, archived: "false" })
+        .filter((item) => item.id !== taskId && isGoalDescendant(this.database, item, snapshot.goal))
+        .flatMap((item) => this.database.getValidGoalInputs(item.id).map((input) => ({
+          consumerTaskId: item.id, consumerTitle: item.title, producerTaskId: input.producerTaskId,
+          fullCoverage: input.fullCoverage, artifactAttachmentId: input.candidate.artifactAttachmentId,
+          reportAttachmentId: input.reportAttachmentId, adoptionId: input.adoptionId,
+        }))),
+      activity: context ? "team" : "planning",
+      teamAdmission: admission,
+      teamResult: await readGoalTeamResult({
+        database: this.database, goal: snapshot.goal, thread: snapshot.thread,
+        attachmentsDirectory: this.attachmentsDirectory,
+      }),
+    };
+  }
+
+  async startGoalTeamRound(taskId, input) {
+    if (this.database.getGoalSupervision(taskId)?.state === "active") {
+      throw new ApiError(409, "GOAL_SUPERVISION_ACTIVE", "持续推进已接管后续串行预约；先暂停后续推进再手动执行。");
+    }
+    const key = `${taskId}\0${input.requestId}`;
+    const identity = JSON.stringify([input.version, input.resumeToken, input.requestId]);
+    const pending = this.goalTeamStarts.get(key);
+    if (pending) {
+      if (pending.identity !== identity) throw new ApiError(409, "REQUEST_ID_CONFLICT", "This request is already bound to another goal snapshot.");
+      return pending.promise;
+    }
+    const promise = this.#startGoalTeamRound(taskId, input);
+    this.goalTeamStarts.set(key, { identity, promise });
+    try { return await promise; } finally { this.goalTeamStarts.delete(key); }
+  }
+
+  async #startGoalTeamRound(taskId, input) {
+    const initial = this.getGoalCoordinator(taskId);
+    const thread = initial.thread;
+    if (!thread?.codexThreadId) {
+      throw new ApiError(409, "GOAL_PLANNING_REQUIRED", "Complete the goal's planning turn before executing a deliverable.");
+    }
+    const originalEvent = this.database.listAiChatEvents(thread.id).find((event) => event.type === "user_message"
+      && goalTeamContext([event], event.runId)?.roundId === input.requestId);
+    if (originalEvent) {
+      const context = goalTeamContext([originalEvent], originalEvent.runId);
+      if (context.version !== input.version || context.resumeToken !== input.resumeToken) {
+        throw new ApiError(409, "REQUEST_ID_CONFLICT", "This request is already bound to another goal snapshot.");
+      }
+      const replay = this.database.getRequestedAiChatRun(thread.id, input.requestId,
+        turnPayloadDigest({ requestId: input.requestId, message: originalEvent.content }));
+      if (replay) return { ...await this.getGoalCoordinatorSnapshot(taskId), run: replay };
+    }
+    const checkGoal = () => {
+      const current = this.getGoalCoordinator(taskId);
+      if (current.blocker) throw new ApiError(409, current.blocker.code, current.blocker.message);
+      if (current.goal.version !== input.version || current.goal.resumeToken !== input.resumeToken) {
+        throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh before executing the next deliverable.");
+      }
+      if (current.latestRun?.status !== "completed" || current.latestRun.exitCode !== 0 || current.thread.currentRun) {
+        throw new ApiError(409, "GOAL_COORDINATOR_NOT_READY", "Inspect the current coordinator run before starting another round.");
+      }
+      return current;
+    };
+    checkGoal();
+    const admission = await this.goalExecutionAdmission.resolve(initial.goal, thread, { warm: true });
+    if (!admission.available) throw new ApiError(409, admission.code, admission.message);
+    const payload = { requestId: input.requestId, message: buildGoalTeamPrompt({
+      goal: initial.goal, thread, input: { ...input, admission },
+      taskctlPath: this.taskctlPath, runtimeFile: this.runtimeFile,
+    }) };
+    const checkGoalAtReservation = () => {
+      const current = checkGoal();
+      const checked = this.goalExecutionAdmission.revalidate(current.goal, current.thread, admission);
+      if (!checked.available) throw new ApiError(409, checked.code, checked.message);
+    };
+    const run = await this.startTurn(thread.id, payload, undefined, checkGoalAtReservation);
+    return { ...await this.getGoalCoordinatorSnapshot(taskId), run };
+  }
+
+  async startGoalCoordinator(taskId, input) {
+    if (this.database.getGoalSupervision(taskId)?.state === "active") {
+      throw new ApiError(409, "GOAL_SUPERVISION_ACTIVE", "持续推进中；先暂停后续推进再手动规划。");
+    }
+    const initial = this.getGoalCoordinator(taskId);
+    const message = [
+      "Plan this goal and persist the deliverable tree. This is one bounded hosted planning turn, not a coding run.",
+      `Goal id: ${initial.goal.id}; project id: ${initial.goal.projectId}.`,
+      `Reviewed goal version: ${input.version}; Capsule resume token: ${input.resumeToken}.`,
+      `Goal workflow profile: ${initial.goal.workflowProfile}. Preserve it on every newly created descendant: every taskctl issue create command must explicitly include --workflow-profile ${initial.goal.workflowProfile}. Do not rely on the CLI default or change existing tasks' profiles.`,
+      `Use only the protected taskctl at ${JSON.stringify(this.taskctlPath)} with --runtime-file ${JSON.stringify(this.runtimeFile)}. Never read or print the descriptor's token.`,
+      "First read issue bootstrap for this exact goal, including its full description, comments, current ownership and relationships. Check the reviewed version and resume token before writing; if stale, stop and report the changed goal.",
+      "Read the existing descendants before adding anything. Reuse matching deliverables and preserve existing work. Recursively decompose only genuinely missing outcomes; use parent relations for the tree and blocks/blocked_by for real dependencies. Do not manufacture extra tasks or duplicate an existing plan.",
+      "You may create and link child issues only inside this goal's project and descendant tree, and append one concise planning result comment to the goal using current protected versions. Give children meaningful goal/outcome titles, acceptance criteria and dependencies; leave their status todo. The human supplies the goal, not the breakdown.",
+      "Do not edit repository files, claim implementation work, start developers or validators, spawn agents, launch applications, change original Desktop window bindings, mark work complete, merge, publish or deploy. This turn only plans and writes the task tree.",
+      "Re-read the goal and descendants after the writes. Finish with the exact created/reused child identifiers, hierarchy, dependency links, and remaining uncertainty. A completed planning turn is not a completed goal.",
+    ].join("\n");
+    const payload = { requestId: input.requestId, message };
+    if (initial.thread) {
+      const replay = this.database.getRequestedAiChatRun(
+        initial.thread.id, input.requestId, turnPayloadDigest(payload),
+      );
+      if (replay) return { ...initial, run: replay };
+    }
+    if (initial.blocker) throw new ApiError(409, initial.blocker.code, initial.blocker.message);
+    if (initial.goal.version !== input.version || initial.goal.resumeToken !== input.resumeToken) {
+      throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh it before planning.");
+    }
+    if (initial.thread?.currentRun) {
+      throw new ApiError(409, "THREAD_BUSY", "The goal coordinator is already running. Open its conversation.");
+    }
+    const thread = initial.thread ?? await this.createThread({
+      projectId: initial.goal.projectId,
+      issueId: initial.goal.id,
+      title: `${initial.goal.title} · 协调`,
+      purpose: "goal-coordinator",
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      sandbox: "workspace-write",
+    });
+    const checkGoalAtReservation = () => {
+      const current = this.getGoalCoordinator(taskId);
+      if (current.blocker) throw new ApiError(409, current.blocker.code, current.blocker.message);
+      if (current.goal.version !== input.version || current.goal.resumeToken !== input.resumeToken) {
+        throw new ApiError(409, "VERSION_CONFLICT", "The goal changed. Refresh it before planning.");
+      }
+    };
+    const run = await this.startTurn(thread.id, payload, undefined, checkGoalAtReservation);
+    return { ...this.getGoalCoordinator(taskId), run };
   }
 
   async updateThread(threadId, changes) {
@@ -458,7 +664,172 @@ export class AiChatService {
           this.#scheduleContinuation(continuation);
         }
       }
+      if (thread.purpose === "goal-coordinator" && thread.origin.issueId) {
+        this.#scheduleGoalSupervision(thread.origin.issueId);
+      }
     }
+  }
+
+  async controlGoalSupervision(taskId, input) {
+    this.#assertContinuationOpen();
+    const current = this.getGoalCoordinator(taskId);
+    if (!current.thread?.codexThreadId || !current.latestRun) {
+      throw new ApiError(409, "GOAL_PLANNING_REQUIRED", "先完成目标拆解，再启用持续推进。");
+    }
+    const prior = this.database.getGoalSupervision(taskId);
+    const context = fencedJson(this.database.listAiChatEvents(current.thread.id)
+      .find((event) => event.runId === current.latestRun.id && event.type === "user_message")?.content,
+    "taskboard-goal-supervision-context");
+    if (input.action === "enable" && !this.database.getGoalRecord(taskId, `control:${input.requestId}`)
+      && prior && context?.generation === prior.generation
+      && !this.database.getGoalRecord(taskId, `result:${current.latestRun.id}`)
+      && goalRequirements(this.database, this.database.getTask(taskId)) !== prior.scopeRevision) {
+      // Finalize the existing result before enable can create a different generation.
+      await this.#prepareGoalSupervision(taskId, { finalizeOnly: true });
+    }
+    const { intent, applyEffects } = this.database.controlGoalSupervision(taskId, { ...input, thread: current.thread });
+    if (!applyEffects) return this.getGoalCoordinatorSnapshot(taskId);
+    for (const continuation of this.database.listAiChatContinuations(current.thread.id)) {
+      const context = fencedJson(continuation.message, "taskboard-goal-supervision-context");
+      if (context?.goalId !== taskId || !["pending", "paused"].includes(continuation.state)) continue;
+      if (context.generation !== intent.generation) this.controlContinuation(current.thread.id, continuation.requestId, "cancel");
+      else if (input.action === "pause" && continuation.state === "pending") this.controlContinuation(current.thread.id, continuation.requestId, "pause");
+      else if (input.action === "enable" && continuation.state === "paused") this.controlContinuation(current.thread.id, continuation.requestId, "resume");
+    }
+    if (input.action === "enable") this.#scheduleGoalSupervision(taskId);
+    return this.getGoalCoordinatorSnapshot(taskId);
+  }
+
+  #scheduleGoalSupervision(taskId) {
+    if (this.closing || this.goalSupervisionAttempts.has(taskId)) return;
+    const promise = this.#prepareGoalSupervision(taskId);
+    this.goalSupervisionAttempts.set(taskId, promise);
+    this.continuationAttempts.add(promise);
+    void promise.finally(() => {
+      this.goalSupervisionAttempts.delete(taskId);
+      this.continuationAttempts.delete(promise);
+    }).catch(() => {});
+  }
+
+  async #prepareGoalSupervision(taskId, { finalizeOnly = false } = {}) {
+    let intent = this.database.getGoalSupervision(taskId);
+    if (!intent || !["active", "paused", ...(finalizeOnly ? ["blocked"] : [])].includes(intent.state)) return;
+    let current;
+    try {
+      current = this.getGoalCoordinator(taskId);
+      const { thread, latestRun: run } = current;
+      if (run?.status === "running" || thread?.currentRun) {
+        if (finalizeOnly) throw new Error("当前协调仍在执行；已入队想法需等本次结果完整收尾后再继续。");
+        return;
+      }
+      if (run?.status !== "completed" || run.exitCode !== 0 || !this.database.hasAiChatRunFinalization(run.id)) {
+        throw new Error("当前协调未成功完成全部收尾，后续推进已停止；不会自动重试失败执行。");
+      }
+      if (current.blocker) throw new Error(current.blocker.message);
+      if (thread.id !== intent.threadId || thread.codexThreadId !== intent.codexThreadId) {
+        throw new Error("目标范围或协调身份已改变，持续推进停在原授权边界。");
+      }
+      const userEvent = this.database.listAiChatEvents(thread.id)
+        .find((event) => event.runId === run.id && event.type === "user_message");
+      const context = fencedJson(userEvent?.content, "taskboard-goal-supervision-context");
+      const scopeChanged = goalRequirements(this.database, this.database.getTask(taskId)) !== intent.scopeRevision;
+      if (scopeChanged && (context?.generation !== intent.generation || context.scopeRevision !== intent.scopeRevision
+        || this.database.getGoalRecord(taskId, `result:${run.id}`))) {
+        throw new Error("目标范围或协调身份已改变，持续推进停在原授权边界。");
+      }
+      if (context?.generation === intent.generation) {
+        let receipt = this.database.getGoalRecord(taskId, `result:${run.id}`);
+        if (!receipt) {
+          const checked = await validateGoalSupervisionResult({ database: this.database, goal: current.goal,
+            thread, run, context, attachmentsDirectory: this.attachmentsDirectory });
+          let scopeChange = null;
+          if (scopeChanged) {
+            scopeChange = reconcileGoalIdeaScope({ database: this.database, goal: this.database.getTask(taskId),
+              thread, run, context, result: checked.result });
+            const admission = await this.goalExecutionAdmission.resolve(current.goal, thread, { warm: true });
+            if (!admission.available) throw new Error(admission.message);
+            const priorAdmission = userEvent.data?.goalAdmission;
+            const authority = (value) => value && [value.authority?.projectId,
+              value.authority?.repository?.repository, value.authority?.repository?.commonDirectory,
+              value.authority?.policies?.map(({ id, version }) => ({ id, version })), value.ownership?.route];
+            if (priorAdmission?.source !== "taskboard-api" || JSON.stringify(authority(priorAdmission)) !== JSON.stringify(authority(admission))) {
+              throw new Error("本次计划追加的原项目授权或协调归属已变化，未采纳新的执行范围。");
+            }
+            const fresh = this.goalExecutionAdmission.revalidate(current.goal, thread, admission);
+            if (!fresh.available) throw new Error(fresh.message);
+          }
+          const latest = this.getGoalCoordinator(taskId);
+          if (latest.blocker || latest.latestRun?.id !== run.id || latest.thread?.id !== thread.id
+            || latest.thread.codexThreadId !== thread.codexThreadId) {
+            throw new Error("结果收尾期间协调归属或实际运行已变化。");
+          }
+          receipt = this.database.recordGoalSupervisionResult(taskId, intent.generation, run.id, checked.result, checked.adoptions, scopeChange);
+        }
+        if (finalizeOnly) return;
+        const newIdeas = this.database.listTaskInboxDeliveryReceipts(taskId).some((item) => item.status === "queued");
+        if (receipt.status === "endpoint" && !this.database.isGoalEndpointBasisCurrent(taskId, intent.generation)) {
+          throw new Error("既有收尾记录的交付范围或成果已变化，不能按旧验收覆盖继续。");
+        }
+        if (receipt.status !== "continue" && !(receipt.status === "endpoint" && newIdeas)) {
+          this.database.setGoalSupervisionState(taskId, intent.generation,
+            receipt.status === "endpoint" ? "endpoint_reached" : "blocked",
+            receipt.status === "endpoint" ? "已授权范围内的工作与独立验证已完成，等待最终验收。" : receipt.summary);
+          this.#emit(thread.id, { type: "ai.run", run });
+          return;
+        }
+      }
+      intent = this.database.getGoalSupervision(taskId);
+      if (intent.state !== "active") return;
+      const requestId = `goal:${intent.generation}:${run.id}`;
+      const existing = this.database.listAiChatContinuations(thread.id).find((item) => item.afterRunId === run.id);
+      if (existing) {
+        if (existing.requestId !== requestId) throw new Error("该完成边界已有另一个后续请求，未创建重复执行。");
+        this.#scheduleContinuation(existing);
+        return;
+      }
+      const evidence = await goalSupervisionEvidence({ database: this.database, goal: current.goal,
+        thread, attachmentsDirectory: this.attachmentsDirectory });
+      const tasks = this.database.listTasks({ projectId: current.goal.projectId, archived: "false" })
+        .filter((item) => item.id !== taskId && isGoalDescendant(this.database, item, current.goal))
+        .map((item) => ({ id: item.id, title: item.title, status: item.status,
+          requirementsRevision: goalRequirements(this.database, item) }));
+      const ideas = this.database.listTaskInboxDeliveryReceipts(taskId).filter((item) => item.status === "queued")
+        .map((item) => ({ deliveryId: item.deliveryId, body: this.database.getComment(item.commentId)?.body ?? "", sourceKind: item.sourceKind }));
+      const message = buildGoalSupervisionPrompt({ goal: current.goal, thread, intent, afterRunId: run.id,
+        requestId, evidence, ideas, tasks, taskctlPath: this.taskctlPath, runtimeFile: this.runtimeFile });
+      if (this.database.getGoalSupervision(taskId)?.state !== "active") return;
+      await this.registerContinuation(thread.id, { requestId, afterRunId: run.id, message });
+    } catch (error) {
+      this.database.setGoalSupervisionState(taskId, intent.generation, "blocked", error.message);
+      if (finalizeOnly) throw new ApiError(409, "GOAL_SCOPE_RECONCILIATION_BLOCKED", error.message);
+    } finally {
+      if (current?.thread && current.latestRun) this.#emit(current.thread.id, { type: "ai.run", run: current.latestRun });
+    }
+  }
+
+  async #startGoalContinuation(continuation, context) {
+    const check = () => {
+      const current = this.getGoalCoordinator(context.goalId);
+      const intent = this.database.getGoalSupervision(context.goalId);
+      if (intent?.state !== "active" || intent.generation !== context.generation
+        || intent.threadId !== continuation.threadId || current.thread?.codexThreadId !== intent.codexThreadId
+        || goalRequirements(this.database, this.database.getTask(context.goalId)) !== context.scopeRevision
+        || current.latestRun?.id !== continuation.afterRunId || current.blocker
+        || !this.database.hasAiChatRunFinalization(continuation.afterRunId)) {
+        throw new ApiError(409, "GOAL_CONTINUATION_CHANGED", current.blocker?.message ?? "持续推进已暂停，或当前范围/完成边界已变化。");
+      }
+      return current;
+    };
+    const current = check();
+    const admission = await this.goalExecutionAdmission.resolve(current.goal, current.thread, { warm: true });
+    if (!admission.available) throw new ApiError(409, admission.code, admission.message);
+    return this.startTurn(continuation.threadId, { requestId: continuation.requestId, message: continuation.message },
+      continuation, () => {
+        const latest = check();
+        const checked = this.goalExecutionAdmission.revalidate(latest.goal, latest.thread, admission);
+        if (!checked.available) throw new ApiError(409, checked.code, checked.message);
+        return { goalAdmission: admission };
+      });
   }
 
   #assertContinuationOpen() {
@@ -475,9 +846,16 @@ export class AiChatService {
 
   #scheduleContinuation(continuation) {
     if (this.closing || continuation.state !== "pending") return;
+    const goalKey = fencedJson(continuation.message, "taskboard-goal-supervision-context")
+      ? `${continuation.threadId}:${continuation.requestId}` : null;
+    if (goalKey && this.goalContinuationAttempts.has(goalKey)) return;
     const attempt = this.#tryContinuation(continuation);
+    if (goalKey) this.goalContinuationAttempts.set(goalKey, attempt);
     this.continuationAttempts.add(attempt);
-    void attempt.finally(() => this.continuationAttempts.delete(attempt)).catch(() => {});
+    void attempt.finally(() => {
+      this.continuationAttempts.delete(attempt);
+      if (goalKey) this.goalContinuationAttempts.delete(goalKey);
+    }).catch(() => {});
   }
 
   async #tryContinuation(continuation) {
@@ -500,9 +878,16 @@ export class AiChatService {
       const reason = this.database.getAiChatContinuationWaitingReason(continuation);
       if (reason) {
         this.database.setAiChatContinuationWaitingReason(continuation.threadId, continuation.requestId, reason);
+        const context = fencedJson(continuation.message, "taskboard-goal-supervision-context");
+        if (context) this.database.setGoalSupervisionState(context.goalId, context.generation, "blocked", `后续推进停在完成边界：${reason}`);
         return;
       }
       this.database.setAiChatContinuationWaitingReason(continuation.threadId, continuation.requestId, null);
+      const goalContext = fencedJson(continuation.message, "taskboard-goal-supervision-context");
+      if (goalContext) {
+        await this.#startGoalContinuation(continuation, goalContext);
+        return;
+      }
       await this.startTurn(continuation.threadId, {
         requestId: continuation.requestId, message: continuation.message,
       }, continuation);
@@ -522,10 +907,16 @@ export class AiChatService {
           AI_CHAT_ISSUE_NOT_FOUND: "issue_unavailable",
         }[error?.code] ?? "preparation_failed");
       this.database.setAiChatContinuationWaitingReason(continuation.threadId, continuation.requestId, reason);
+      const goalContext = fencedJson(continuation.message, "taskboard-goal-supervision-context");
+      if (goalContext) {
+        this.database.setGoalSupervisionState(goalContext.goalId, goalContext.generation, "blocked", error.message);
+        const run = this.database.getAiChatRun(continuation.afterRunId);
+        if (run) this.#emit(continuation.threadId, { type: "ai.run", run });
+      }
     }
   }
 
-  async startTurn(threadId, input, continuation) {
+  async startTurn(threadId, input, continuation, beforeReservation) {
     if (continuation) this.#assertContinuationOpen();
     let thread = this.getThread(threadId);
     if (input?.contractVersion === "composer.v1" && input.requestId !== undefined) {
@@ -631,6 +1022,7 @@ export class AiChatService {
         },
         this.manageTaskboardSkillPath,
       );
+      const reservationData = beforeReservation?.();
       const reservation = this.database.reserveAiChatRun({ threadId, ...request, continuation });
       if (!reservation.created) {
         if (temporaryDirectory) await rm(temporaryDirectory, { recursive: true, force: true });
@@ -638,7 +1030,7 @@ export class AiChatService {
       }
       run = reservation.run;
       this.#emit(threadId, { type: "ai.run", run });
-      const userEventData = {};
+      const userEventData = { ...reservationData };
       if (skillIds.length > 0) userEventData.skillIds = skillIds;
       if (attachments.length > 0) {
         userEventData.attachments = attachments.map(({ filename, contentType, size }) => ({
@@ -732,6 +1124,9 @@ export class AiChatService {
         () => this.pendingLegacyFinalizations.delete(finalization),
       );
       void finalization.then((finished) => {
+        if (!this.closing && thread.purpose === "goal-coordinator" && thread.origin.issueId) {
+          this.#scheduleGoalSupervision(thread.origin.issueId);
+        }
         if (!this.closing && finished.status === "completed") {
           for (const next of this.database.listAiChatContinuations(threadId)) {
             if (next.afterRunId === run.id) this.#scheduleContinuation(next);

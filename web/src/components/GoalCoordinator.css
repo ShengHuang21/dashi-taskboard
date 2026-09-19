@@ -1,0 +1,54 @@
+.goal-coordinator {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.goal-coordinator-heading,
+.goal-coordinator-actions,
+.goal-coordinator-settings {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.goal-coordinator-heading span,
+.goal-coordinator p {
+  color: var(--text-secondary);
+}
+
+.goal-coordinator p { margin: 8px 0; }
+.goal-coordinator-actions { margin-top: 12px; }
+.goal-team-result { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 12px; }
+.goal-team-result a { text-decoration: none; }
+.goal-coordinator-settings { align-items: end; margin: 12px 0; }
+.goal-coordinator-settings label { display: grid; gap: 4px; min-width: 0; }
+.goal-coordinator select {
+  max-width: 100%;
+  padding: 6px 8px;
+  color: var(--text-primary);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.goal-coordinator code { overflow-wrap: anywhere; }
+.goal-coordinator [role="alert"] { color: var(--danger, var(--text-primary)); }
+.goal-coordinator summary { cursor: pointer; }
+.goal-coordinator :is(button, select, summary, textarea, a):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.goal-idea-form { display: grid; gap: 6px; margin-top: 16px; }
+.goal-idea-form textarea {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 72px;
+  color: var(--text-primary); background: var(--bg); font: inherit;
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+}
+.goal-idea-form button { justify-self: start; }
+.goal-idea-list { padding-left: 20px; overflow-wrap: anywhere; }
+.goal-idea-list span { color: var(--text-secondary); }

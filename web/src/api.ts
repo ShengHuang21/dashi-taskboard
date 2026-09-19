@@ -17,6 +17,9 @@ import type {
   CodexThreadBinding,
   DevelopmentScan,
   HostContext,
+  GoalCoordinatorSnapshot,
+  GoalCoordinatorStart,
+  GoalTeamStart,
   IssueRelationOrigin,
   IssueRelationType,
   JiraConnection,
@@ -334,6 +337,36 @@ export async function listAiChatThreads(signal?: AbortSignal): Promise<AiChatThr
   return data.threads;
 }
 
+export function getGoalCoordinator(taskId: string, signal?: AbortSignal): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator`, { signal });
+}
+
+export function startGoalCoordinator(taskId: string, input: GoalCoordinatorStart): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function startGoalTeamRound(taskId: string, input: GoalTeamStart): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator/execute-next`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function controlGoalSupervision(taskId: string, input: { action: "enable" | "pause"; requestId: string }): Promise<GoalCoordinatorSnapshot> {
+  return request(`/api/local/tasks/${encodeURIComponent(taskId)}/goal-coordinator/supervision`, {
+    method: "POST", body: JSON.stringify(input),
+  });
+}
+
+export function queueGoalIdea(taskId: string, input: { deliveryId: string; body: string }): Promise<unknown> {
+  return request(`/api/tasks/${encodeURIComponent(taskId)}/inbox-deliveries`, {
+    method: "POST", body: JSON.stringify({ ...input, sourceKind: "owner-ui" }),
+  });
+}
+
 export async function createAiChatThread(input: {
   projectId: string;
   issueId?: string;
@@ -389,6 +422,7 @@ export async function startAiChatTurn(
   threadId: string,
   input: {
     message: string;
+    requestId?: string;
     skillIds?: string[];
     attachments?: AiChatAttachmentInput[];
     dangerFullAccessConfirmed?: boolean;

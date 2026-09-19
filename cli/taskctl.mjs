@@ -32,7 +32,7 @@ const BOOLEAN_OPTIONS = new Set([
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
-  ["background create", new Set(["project", "issue", "title", "model", "reasoning-effort", "sandbox", "json"])],
+  ["background create", new Set(["project", "issue", "title", "model", "reasoning-effort", "sandbox", "goal-team-role", "expected-safe-action-id", "routing-comment-id", "routing-comment-version", "json"])],
   ["background start", new Set(["request-id", "message", "message-file", "json"])],
   ["background continue", new Set(["after-run", "request-id", "message", "message-file", "json"])],
   ["background pause", new Set(["request-id", "json"])],
@@ -351,6 +351,8 @@ Commands:
   resource-step checkpoint ALLOCATION_ID --request-file FILE
   background create --project ID --model MODEL --reasoning-effort EFFORT --sandbox MODE
     [--issue ID --title TEXT]
+  background create --project ID --issue ID --goal-team-role developer|validator
+    --expected-safe-action-id ID --routing-comment-id ID --routing-comment-version N --sandbox MODE [--title TEXT]
   background start THREAD_ID --request-id ID (--message TEXT | --message-file FILE)
   background continue THREAD_ID --after-run RUN_ID --request-id ID (--message TEXT | --message-file FILE)
   background pause/resume/cancel THREAD_ID --request-id ID
@@ -783,6 +785,21 @@ async function execute(parsed, overrides) {
   switch (command) {
     case "background create":
       expectOperandCount(parsed, 0);
+      if (parsed.options["goal-team-role"] !== undefined) {
+        if (parsed.options.model !== undefined || parsed.options["reasoning-effort"] !== undefined) {
+          throw usageError("Goal-team role creation does not accept --model or --reasoning-effort");
+        }
+        return api.request("POST", "/api/local/ai/threads", {
+          projectId: requiredOption(parsed.options, "project"),
+          issueId: requiredOption(parsed.options, "issue"),
+          sandbox: requiredOption(parsed.options, "sandbox"),
+          goalTeamRole: requiredOption(parsed.options, "goal-team-role"),
+          expectedSafeActionId: requiredOption(parsed.options, "expected-safe-action-id"),
+          routingCommentId: requiredOption(parsed.options, "routing-comment-id"),
+          routingCommentVersion: Number(requiredOption(parsed.options, "routing-comment-version")),
+          ...optionalField("title", parsed.options.title),
+        });
+      }
       return api.request("POST", "/api/local/ai/threads", {
         projectId: requiredOption(parsed.options, "project"),
         model: requiredOption(parsed.options, "model"),

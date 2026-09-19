@@ -101,6 +101,7 @@ import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
 import { GoalWindows } from "./GoalWindows";
+import { GoalCoordinator, type GoalAdoptedInputs } from "./GoalCoordinator";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { TaskCardPresentation, TaskExecutionState } from "../taskConversations";
 
@@ -140,6 +141,9 @@ interface TaskDetailProps {
   ) => Promise<RelationMutationResult>;
   onOpenThread: (binding: CodexThreadBinding) => void;
   onOpenLegacyLocalThread: (threadId: string) => void;
+  goalCoordinatorAvailable?: boolean;
+  onOpenGoalCoordinator?: (threadId: string) => void;
+  onRefreshGoalTree?: () => void;
   onOpenInThread: (task: Task) => void;
   onCopy: (text: string, announcement: string) => void;
   openingThread: boolean;
@@ -397,6 +401,9 @@ export function TaskDetail({
   onRemoveRelation,
   onOpenThread,
   onOpenLegacyLocalThread,
+  goalCoordinatorAvailable,
+  onOpenGoalCoordinator,
+  onRefreshGoalTree,
   onOpenInThread,
   onCopy,
   openingThread,
@@ -404,6 +411,7 @@ export function TaskDetail({
 }: TaskDetailProps) {
   const { language, locale, text } = useTaskboardI18n();
   const [currentTask, setCurrentTask] = useState(task);
+  const [goalAdoptedInputs, setGoalAdoptedInputs] = useState<GoalAdoptedInputs | null>(null);
   const [title, setTitle] = useState(task.title);
   const [description, setDescription] = useState(task.description);
   const [descriptionSegments, setDescriptionSegments] = useState<InlineMediaSegment[]>(
@@ -1100,9 +1108,21 @@ export function TaskDetail({
                     progress={deliveryProgress}
                     label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
                   />
-                  <TaskExecutionStatus state={execution} />
+                  {!(execution === "not_started" && currentTask.labels.includes("owner-goal")
+                    && currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
+                    && goalAdoptedInputs.hasCoordinatorHistory) ? <TaskExecutionStatus state={execution} /> : null}
                   {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </section>
+                {goalCoordinatorAvailable && currentTask.labels.includes("owner-goal")
+                  && onOpenGoalCoordinator && onRefreshGoalTree ? (
+                    <GoalCoordinator
+                      key={currentTask.id}
+                      task={currentTask}
+                      onOpenConversation={onOpenGoalCoordinator}
+                      onRefreshTree={onRefreshGoalTree}
+                      onAdoptedInputsChange={setGoalAdoptedInputs}
+                    />
+                  ) : null}
                 <GoalWindows declaration={currentTask.goalWindows} onOpenThread={onOpenThread} />
                 <IssueSubIssues
                   task={currentTask}
@@ -1110,6 +1130,8 @@ export function TaskDetail({
                   referenceTasks={progressTasks}
                   progressModel={progressModel}
                   presentations={presentations}
+                  adoptedInputs={currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
+                    ? goalAdoptedInputs.inputs : []}
                   expandedTaskIds={expandedTaskIds}
                   onToggleTaskExpansion={onToggleTaskExpansion}
                   onOpenTask={onOpenTask}

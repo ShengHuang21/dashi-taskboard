@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, mkdirSync, readdirSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -14,6 +14,7 @@ import {
   normalizeContinuationCheckpoint, normalizeContinuationRecord, normalizeOwnedTerminalNotification,
 } from "./task-continuation.mjs";
 import { normalizeRepository, normalizeStandingActions } from "./standing-authority.mjs";
+import { goalRequirements, isGoalDescendant } from "./goal-team.mjs";
 
 const DEFAULT_PROJECT_LABELS_JSON = JSON.stringify(DEFAULT_LABEL_NAMES);
 const OWNER_DECISION_DELIVERY_TTL_MS = 30_000;
@@ -1419,7 +1420,8 @@ function taskInboxDeliveryReceiptFromRow(row) {
     taskId: row.task_id,
     projectId: row.project_id,
     commentId: row.comment_id,
-    sourceThreadId: row.source_thread_id,
+    sourceThreadId: row.source_thread_id || null,
+    sourceKind: row.source_thread_id ? "codex-thread" : "owner-ui",
     status: "queued",
     executionDisposition: "current_execution_continues",
     createdAt: row.created_at,
@@ -1570,6 +1572,7 @@ function aiChatContinuationFromRow(row) {
 function aiChatThreadFromRow(row) {
   return {
     id: row.id,
+    purpose: row.purpose ?? null,
     title: row.title,
     status: row.status,
     origin: {
@@ -1632,6 +1635,7 @@ export class TaskboardDatabase {
   #ordinaryDeliveryBuffers = new Map();
 
   constructor(filename, {
+    attachmentsDirectory = null,
     admissionTtlMs = TASK_SAFE_ACTION_ADMISSION_TTL_MS,
     hostExecutorClock = Date.now,
     isPathCaseSensitive = defaultIsPathCaseSensitive,
@@ -1639,6 +1643,7 @@ export class TaskboardDatabase {
   } = {}) {
     mkdirSync(path.dirname(filename), { recursive: true });
     this.database = new DatabaseSync(filename);
+    this.goalInputAttachmentsDirectory = attachmentsDirectory;
     this.statementCache = new Map();
     this.statementCacheMax = Number.isSafeInteger(statementCacheMax) && statementCacheMax > 0
       ? statementCacheMax
@@ -2647,6 +2652,16 @@ export class TaskboardDatabase {
     if (!projectColumns.some((column) => column.name === "workspace_path")) {
       this.database.exec("ALTER TABLE projects ADD COLUMN workspace_path TEXT");
     }
+
+    const aiThreadColumns = this.#prepare("PRAGMA table_info(ai_chat_threads)").all();
+    if (!aiThreadColumns.some((column) => column.name === "purpose")) {
+      this.database.exec("ALTER TABLE ai_chat_threads ADD COLUMN purpose TEXT");
+    }
+    this.database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ai_chat_goal_coordinator
+      ON ai_chat_threads(origin_project_id, origin_issue_id)
+      WHERE purpose = 'goal-coordinator'
+    `);
 
     const coordinatorProvisioningColumns = this.#prepare(
       "PRAGMA table_info(agent_coordinator_provisioning_attempts)",
@@ -3891,6 +3906,14 @@ export class TaskboardDatabase {
     return row ? this.#aiChatThreadWithCurrentRun(row) : null;
   }
 
+  getGoalCoordinatorThread(projectId, taskId) {
+    const row = this.#prepare(`
+      SELECT * FROM ai_chat_threads
+      WHERE origin_project_id = ? AND origin_issue_id = ? AND purpose = 'goal-coordinator'
+    `).get(projectId, taskId);
+    return row ? this.#aiChatThreadWithCurrentRun(row) : null;
+  }
+
   hasAiChatThreadProjectConflict(issueRef, projectId) {
     return Boolean(this.#prepare(`
       SELECT 1
@@ -3906,16 +3929,17 @@ export class TaskboardDatabase {
     const timestamp = input.createdAt ?? now();
     this.#prepare(`
       INSERT INTO ai_chat_threads (
-        id, title, status,
+        id, title, status, purpose,
         origin_project_id, origin_project_name, origin_workspace_path,
         origin_issue_id, origin_issue_identifier,
         codex_thread_id, model, reasoning_effort, sandbox,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       input.title,
       input.status ?? "idle",
+      input.purpose ?? null,
       input.origin.projectId,
       input.origin.projectName,
       input.origin.workspacePath,
@@ -9798,6 +9822,19 @@ export class TaskboardDatabase {
     return row?.protected_until ?? null;
   }
 
+  hasAgentTaskReconciliationWork(projectId) {
+    return Boolean(this.#prepare(`
+      SELECT 1
+      FROM agent_task_claims AS claim
+      JOIN tasks AS task ON task.id = claim.task_id AND task.project_id = claim.project_id
+      WHERE claim.project_id = ?
+        AND claim.status = 'active'
+        AND task.archived_at IS NULL
+        AND task.status IN ('in_progress', 'in_review')
+      LIMIT 1
+    `).get(projectId));
+  }
+
   getAgentTaskClaim(taskId) {
     const task = this.getTask(taskId);
     if (!task) return null;
@@ -10955,6 +10992,8 @@ export class TaskboardDatabase {
       domainRoute: domainAssignment ? this.getAgentTaskDomainRoute(task.id) : null,
       globalCoordinatorFrontier,
       dependencyClearances: this.listCrossDomainDependencyClearances(task.id),
+      verifiedGoalInputs: this.getValidGoalInputs(task.id),
+      goalRequirementsRevision: goalRequirements(this, task),
       latestContinuationRecord: this.#latestTaskContinuation(task.id),
       resourceSteps: this.#recordedResourceSteps(task.id),
     };
@@ -13703,9 +13742,9 @@ export class TaskboardDatabase {
         WHERE task_id = ? AND delivery_id = ?
       `).get(task.id, input.deliveryId);
       if (existing) {
-        const receipt = taskInboxDeliveryReceiptFromRow(existing);
+        const receipt = this.#goalInboxReceipt(existing);
         const comment = this.getComment(receipt.commentId);
-        const incomingBinding = storedThreadBinding(input.threadBinding, input.threadId);
+        const incomingBinding = storedThreadBinding(input.threadBinding, input.threadId) ?? [null, null, null, null, null];
         const existingBinding = [
           comment.threadBinding?.threadId ?? comment.threadId ?? comment.legacyLocalThreadId ?? null,
           comment.threadBinding?.codexProjectId ?? null,
@@ -13721,7 +13760,7 @@ export class TaskboardDatabase {
         );
         if (
           comment.body !== input.body
-          || receipt.sourceThreadId !== input.threadId
+          || receipt.sourceThreadId !== (input.threadId ?? null)
           || JSON.stringify(existingBinding) !== JSON.stringify(incomingBinding)
           || !actorMatches
         ) {
@@ -13769,7 +13808,7 @@ export class TaskboardDatabase {
         task.id,
         task.projectId,
         commentId,
-        input.threadId,
+        input.threadId ?? "",
         timestamp,
       );
       this.database.exec("COMMIT");
@@ -13788,7 +13827,7 @@ export class TaskboardDatabase {
     const row = this.#prepare(
       "SELECT * FROM task_inbox_delivery_receipts WHERE id = ?",
     ).get(id);
-    return row ? taskInboxDeliveryReceiptFromRow(row) : null;
+    return row ? this.#goalInboxReceipt(row) : null;
   }
 
   listTaskInboxDeliveryReceipts(taskId) {
@@ -13797,7 +13836,212 @@ export class TaskboardDatabase {
       SELECT * FROM task_inbox_delivery_receipts
       WHERE task_id = ?
       ORDER BY created_at DESC, rowid DESC
-    `).all(task.id).map(taskInboxDeliveryReceiptFromRow);
+    `).all(task.id).map((row) => this.#goalInboxReceipt(row));
+  }
+
+  #goalInboxReceipt(row) {
+    const receipt = taskInboxDeliveryReceiptFromRow(row);
+    const disposition = this.getGoalRecord(row.task_id, `idea:${row.delivery_id}`);
+    return { ...receipt, ...(disposition ? { status: disposition.disposition, disposition } : {}) };
+  }
+
+  getGoalRecord(taskId, key) {
+    const row = this.#prepare("SELECT envelope_json FROM agent_event_receipts WHERE task_id = ? AND idempotency_key = ?")
+      .get(taskId, `goal:${key}`);
+    return row ? JSON.parse(row.envelope_json) : null;
+  }
+
+  listGoalRecords(taskId, eventType) {
+    return this.#prepare(`SELECT envelope_json FROM agent_event_receipts
+      WHERE task_id = ? AND json_extract(envelope_json, '$.eventType') = ? ORDER BY rowid`)
+      .all(taskId, eventType).map((row) => JSON.parse(row.envelope_json));
+  }
+
+  #insertGoalRecord(taskId, key, value) {
+    const previous = this.getGoalRecord(taskId, key);
+    if (previous) {
+      if (JSON.stringify(previous.value) !== JSON.stringify(value)) {
+        throw new ApiError(409, "GOAL_RECEIPT_CONFLICT", "This goal receipt already has a different disposition");
+      }
+      return previous;
+    }
+    const task = this.#requireTask(taskId);
+    const event = { ...value, value, eventId: randomUUID(), createdAt: now() };
+    this.#prepare(`INSERT INTO agent_event_receipts
+      (event_id, project_id, task_id, comment_id, idempotency_key, envelope_json, created_at)
+      VALUES (?, ?, ?, NULL, ?, ?, ?)`)
+      .run(event.eventId, task.projectId, task.id, `goal:${key}`, JSON.stringify(event), event.createdAt);
+    return event;
+  }
+
+  getGoalSupervision(taskId) {
+    return this.listGoalRecords(taskId, "goal_supervision_intent").at(-1) ?? null;
+  }
+
+  isGoalEndpointCurrent(taskId, generation) {
+    return this.isGoalEndpointBasisCurrent(taskId, generation)
+      && !this.listTaskInboxDeliveryReceipts(taskId).some((item) => item.status === "queued");
+  }
+
+  // Pending ideas withdraw today's completion claim, not the prior coverage basis.
+  isGoalEndpointBasisCurrent(taskId, generation) {
+    const result = this.listGoalRecords(taskId, "goal_supervision_result").findLast((item) => item.generation === generation);
+    if (result?.status !== "endpoint" || !result.endpointTasks) return false;
+    const goal = this.#requireTask(taskId);
+    const intent = this.getGoalSupervision(taskId);
+    if (intent?.generation !== generation || intent.scopeRevision !== goalRequirements(this, goal)) return false;
+    const tasks = this.listTasks({ projectId: goal.projectId, archived: "false" })
+      .filter((task) => task.id !== taskId && isGoalDescendant(this, task, goal));
+    return tasks.length === result.endpointTasks.length && tasks.every((task) => result.endpointTasks.some((basis) =>
+      basis.id === task.id && basis.version === task.version && basis.status === task.status
+      && basis.requirementsRevision === goalRequirements(this, task)));
+  }
+
+  controlGoalSupervision(taskId, { requestId, action, actor, thread }) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.getGoalRecord(taskId, `control:${requestId}`);
+      if (previous) {
+        if (previous.action !== action || JSON.stringify(previous.actor) !== JSON.stringify(actor)) {
+          throw new ApiError(409, "GOAL_RECEIPT_CONFLICT", "Control request already belongs to another action");
+        }
+        const intent = this.getGoalSupervision(taskId);
+        const latestControl = this.listGoalRecords(taskId, "goal_supervision_intent")
+          .findLast((record) => record.action === "enable" || record.action === "pause");
+        const applyEffects = latestControl?.eventId === previous.eventId
+          && intent?.generation === previous.generation
+          && intent.state === (action === "pause" ? "paused" : "active");
+        this.database.exec("COMMIT");
+        return { intent, applyEffects };
+      }
+      const task = this.#requireTask(taskId);
+      const current = this.getGoalSupervision(taskId);
+      const scopeRevision = goalRequirements(this, task);
+      const generation = current?.scopeRevision === scopeRevision && current.threadId === thread.id
+        && current.state !== "endpoint_reached"
+        ? current.generation : randomUUID();
+      const intent = this.#insertGoalRecord(taskId, `control:${requestId}`, {
+        eventType: "goal_supervision_intent", action, actor, generation, scopeRevision,
+        taskId, threadId: thread.id, codexThreadId: thread.codexThreadId,
+        state: action === "pause" ? "paused" : "active",
+        message: action === "pause" ? "已暂停后续推进；当前执行不会被中断。" : "持续推进已启用，等待当前安全边界。",
+      });
+      this.database.exec("COMMIT");
+      return { intent, applyEffects: true };
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
+  }
+
+  setGoalSupervisionState(taskId, generation, state, message) {
+    const current = this.getGoalSupervision(taskId);
+    if (!current || current.generation !== generation || current.state === "paused") return current;
+    if (current.state === state && current.message === message) return current;
+    return this.#insertGoalRecord(taskId, `state:${randomUUID()}`, {
+      eventType: "goal_supervision_intent", taskId, generation, threadId: current.threadId,
+      codexThreadId: current.codexThreadId, scopeRevision: current.scopeRevision, actor: current.actor, state, message,
+    });
+  }
+
+  // Capsule and claim use this same predicate. A historical handoff alone never clears an edge.
+  getValidGoalInputs(taskId) {
+    const consumer = this.getTask(taskId);
+    if (!consumer || consumer.archivedAt || !["todo", "in_progress", "in_review"].includes(consumer.status)) return [];
+    return this.listGoalRecords(taskId, "goal_verified_input").filter((record) => {
+      const producer = this.getTask(record.producerTaskId);
+      const goal = this.getTask(record.goalId);
+      const thread = goal && this.getGoalCoordinatorThread(goal.projectId, goal.id);
+      if (!producer || !goal || producer.status !== "in_review" || record.semantic !== "artifact-input"
+        || producer.version !== record.producerTaskVersion
+        || !isGoalDescendant(this, consumer, goal) || !isGoalDescendant(this, producer, goal)
+        || producer.id === consumer.id || thread?.codexThreadId !== record.coordinatorCodexThreadId
+        || consumer.threadBinding?.threadId !== record.coordinatorCodexThreadId
+        || producer.threadBinding?.threadId !== record.coordinatorCodexThreadId
+        || goalRequirements(this, producer) !== record.producerRequirementsRevision
+        || goalRequirements(this, consumer) !== record.consumerRequirementsRevision
+        || this.getAgentTaskDomainAssignment(consumer.id) || this.getAgentTaskDomainAssignment(producer.id)
+        || this.getOpenTaskAgentRun(producer.id) || this.getAgentTaskClaim(producer.id)?.status === "active") return false;
+      const lane = this.getAgentLaneProject(consumer.projectId);
+      const lease = lane?.coordinatorLease;
+      if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(consumer.projectId)
+        || (lease && (lease.holderThreadId !== record.coordinatorCodexThreadId
+          || !this.#exactActiveCoordinatorLease(consumer.projectId, lane, lease)))) return false;
+      const publication = this.#getResultHandoffEvent(producer.id, consumer.id, "result_publication");
+      const adoption = this.#getResultHandoffEvent(producer.id, consumer.id, "result_adoption");
+      if (publication?.eventId !== record.publicationId || adoption?.eventId !== record.adoptionId
+        || adoption.publicationEventId !== record.publicationId) return false;
+      const sourceComment = this.getComment(record.sourceCommentId);
+      if (!sourceComment || createHash("sha256").update(sourceComment.body).digest("hex") !== record.sourceCommentSha256
+        || [record.developer, record.validator].some((member) => !member
+          || this.getAiChatThread(member.threadId)?.codexThreadId !== member.codexThreadId
+          || this.getAiChatRun(member.runId)?.status !== "completed")) return false;
+      try {
+        return this.goalInputAttachmentsDirectory && [
+          [record.candidate.artifactAttachmentId, record.candidate.artifactSha256],
+          [record.reportAttachmentId, record.reportSha256],
+        ].every(([id, digest]) => this.getAttachment(id)?.taskId === producer.id
+          && createHash("sha256").update(readFileSync(path.join(this.goalInputAttachmentsDirectory, id))).digest("hex") === digest);
+      } catch { return false; }
+    });
+  }
+
+  recordGoalSupervisionResult(taskId, generation, runId, result, adoptions, scopeChange = null) {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const replay = this.getGoalRecord(taskId, `result:${runId}`);
+      if (replay) {
+        this.database.exec("COMMIT");
+        return replay;
+      }
+      const intent = this.getGoalSupervision(taskId);
+      if (!intent || intent.generation !== generation) throw new ApiError(409, "GOAL_INTENT_CHANGED", "Goal supervision changed");
+      if (goalRequirements(this, this.#requireTask(taskId)) !== (scopeChange?.toScopeRevision ?? intent.scopeRevision)
+        || (scopeChange && (scopeChange.fromScopeRevision !== intent.scopeRevision
+          || createHash("sha256").update(this.getComment(scopeChange.commentId)?.body ?? "").digest("hex") !== scopeChange.commentSha256))) {
+        throw new ApiError(409, "GOAL_SCOPE_CHANGED", "Goal scope or reconciliation evidence changed before finalization");
+      }
+      for (const adoption of adoptions) {
+        const producer = this.#requireTask(adoption.producerTaskId);
+        const consumer = this.#requireTask(adoption.consumerTaskId);
+        if (consumer.status !== "todo" || goalRequirements(this, producer) !== adoption.producerRequirementsRevision
+          || goalRequirements(this, consumer) !== adoption.consumerRequirementsRevision
+          || this.getOpenTaskAgentRun(consumer.id) || this.getAgentTaskClaim(consumer.id)?.status === "active") {
+          throw new ApiError(409, "GOAL_INPUT_CHANGED", "Input adoption changed or belongs to active work");
+        }
+        this.#insertGoalRecord(consumer.id, `input:${adoption.adoptionId}`, { ...adoption,
+          eventType: "goal_verified_input", goalId: taskId, runId, generation,
+          coordinatorCodexThreadId: intent.codexThreadId });
+        if (!this.getValidGoalInputs(consumer.id).some((item) => item.adoptionId === adoption.adoptionId)) {
+          throw new ApiError(409, "GOAL_INPUT_INVALID", "Exact goal input bridge is not currently valid");
+        }
+        if (adoption.fullCoverage) {
+          this.#prepare("UPDATE tasks SET status = 'in_review', version = version + 1, updated_at = ? WHERE id = ?")
+            .run(now(), consumer.id);
+          this.#recordTaskActivity(consumer.id, { type: "agent", id: "codex", name: "Codex", avatarUrl: null },
+            taskFieldChanges(consumer, { status: "in_review" }), now());
+        }
+      }
+      for (const idea of result.ideas) {
+        this.#insertGoalRecord(taskId, `idea:${idea.deliveryId}`, {
+          eventType: "goal_idea_disposition", ...idea, runId, generation,
+        });
+      }
+      if (scopeChange) {
+        this.#insertGoalRecord(taskId, `scope:${runId}`, {
+          eventType: "goal_supervision_intent", taskId, generation, threadId: intent.threadId,
+          codexThreadId: intent.codexThreadId, scopeRevision: scopeChange.toScopeRevision,
+          actor: intent.actor, state: intent.state, message: intent.message,
+          scopeReconciliation: { ...scopeChange, runId },
+        });
+      }
+      const receipt = this.#insertGoalRecord(taskId, `result:${runId}`, {
+        eventType: "goal_supervision_result", ...result, runId, generation,
+        ...(scopeChange ? { scopeReconciliation: scopeChange } : {}),
+        ...(result.status === "endpoint" ? { endpointTasks: this.listTasks({ projectId: this.#requireTask(taskId).projectId, archived: "false" })
+          .filter((task) => task.id !== taskId && isGoalDescendant(this, task, this.#requireTask(taskId)))
+          .map((task) => ({ id: task.id, version: task.version, status: task.status, requirementsRevision: goalRequirements(this, task) })) } : {}),
+      });
+      this.database.exec("COMMIT");
+      return receipt;
+    } catch (error) { this.database.exec("ROLLBACK"); throw error; }
   }
 
   recordProjectOwnerIntent(projectId, input, sourceThreadBinding, actor) {

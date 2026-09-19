@@ -289,6 +289,7 @@ export interface AiChatTodoProgress {
 
 export interface AiChatThread {
   id: string;
+  purpose?: "goal-coordinator" | null;
   title: string;
   status: AiChatThreadStatus;
   origin: AiChatOrigin;
@@ -317,6 +318,63 @@ export interface AiChatThreadSnapshot {
   thread: AiChatThread;
   events: AiChatEvent[];
   runs: AiChatRun[];
+}
+
+export interface GoalCoordinatorSnapshot {
+  supervision?: {
+    generation: string; state: "active" | "paused" | "blocked" | "endpoint_reached";
+    message: string; threadId: string; scopeRevision: string;
+  } | null;
+  ideas?: Array<{
+    deliveryId: string; body: string; status: "queued" | "applied" | "deferred" | "needs-decision";
+    disposition?: { action: string; revision: string; runId: string };
+  }>;
+  adoptedInputs?: Array<{
+    consumerTaskId: string; consumerTitle: string; producerTaskId: string; fullCoverage: boolean;
+    artifactAttachmentId: string; reportAttachmentId: string; adoptionId: string;
+  }>;
+  goal: {
+    id: string; projectId: string; title: string; version: number; resumeToken: string;
+    workflowProfile: "formal" | "vibe";
+  };
+  thread: AiChatThread | null;
+  latestRun: AiChatRun | null;
+  blocker: { code: string; message: string } | null;
+  activity?: "planning" | "team";
+  teamAdmission?: {
+    available: boolean;
+    state: "ready" | "permission_unavailable" | "ownership_unavailable" | "owner_busy" | "resources_checking" | "resources_waiting";
+    message: string;
+  };
+  teamResult?: {
+    verification: "verified" | "recorded" | "unverified";
+    status: "review_pass" | "needs_fix" | "blocked";
+    summary: string;
+    roundId?: string;
+    childId?: string | null;
+    childIdentifier?: string;
+    commentId: string;
+    ownerAcceptance?: "pending";
+    developerStatus?: AiChatRunStatus;
+    validatorStatus?: AiChatRunStatus;
+    artifact?: { id: string; filename: string };
+    report?: { id: string; filename: string };
+  } | null;
+  run?: AiChatRun;
+}
+
+export interface GoalCoordinatorStart {
+  version: number;
+  resumeToken: string;
+  requestId: string;
+  model: string;
+  reasoningEffort: string;
+}
+
+export interface GoalTeamStart {
+  version: number;
+  resumeToken: string;
+  requestId: string;
 }
 
 export interface CodexProjectIdentity {
