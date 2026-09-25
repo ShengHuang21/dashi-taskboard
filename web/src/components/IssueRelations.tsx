@@ -19,6 +19,11 @@ import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon } from "./LinearIcon";
 import { TaskProgress } from "./TaskProgress";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
+import type { GoalWindowMapDeclaration } from "./GoalWindowMap";
+import type { CodexThreadBinding } from "../types";
+import { taskDependencyGraph } from "../taskDependencyGraph";
+import { listComments } from "../api";
+import { latestRegisteredReviewReceipt, type RegisteredReviewReceipt } from "../registeredReview";
 import {
   BlockingRelationIcon,
   PlusIcon,
@@ -340,6 +345,8 @@ export function IssueSubIssues({
   progressModel,
   presentations,
   adoptedInputs = [],
+  goalWindowMaps = [],
+  onOpenThread,
   expandedTaskIds,
   onToggleTaskExpansion,
   onOpenTask,
@@ -350,11 +357,14 @@ export function IssueSubIssues({
   progressModel: ReturnType<typeof createTaskProgressModel>;
   presentations: Record<string, TaskCardPresentation>;
   adoptedInputs?: GoalCoordinatorSnapshot["adoptedInputs"];
+  goalWindowMaps?: GoalWindowMapDeclaration[];
+  onOpenThread: (binding: CodexThreadBinding) => void;
   expandedTaskIds: string[];
   onToggleTaskExpansion: (taskId: string) => void;
 }) {
   const { language, text } = useTaskboardI18n();
   const [savingId, setSavingId] = useState<string | null>(null);
+  const [collapsedTaskIds, setCollapsedTaskIds] = useState<Set<string>>(() => new Set());
   const taskById = new Map(referenceTasks.map((candidate) => [candidate.id, candidate]));
   const orderedTasks = [...taskById.values()].sort((left, right) => (
     left.createdAt.localeCompare(right.createdAt) || left.identifier.localeCompare(right.identifier)
@@ -368,6 +378,44 @@ export function IssueSubIssues({
     if (parentId) childrenById.get(parentId)?.set(candidate.id, candidate);
   }
   const subIssues = [...(childrenById.get(task.id)?.values() ?? [])];
+  const graph = taskDependencyGraph(subIssues, referenceTasks.filter((item) => item.projectId === task.projectId));
+  const graphRef = useRef<HTMLDivElement>(null);
+  const [lines, setLines] = useState<{ key: string; path: string; partial: boolean }[]>([]);
+  const [receipts, setReceipts] = useState<Record<string, RegisteredReviewReceipt | null>>({});
+  const childKey = subIssues.map((item) => `${item.id}:${taskById.get(item.id)?.updatedAt ?? ""}`).join("|");
+  const edgeKey = JSON.stringify(graph.edges);
+  useEffect(() => {
+    const controller = new AbortController();
+    setReceipts({});
+    void Promise.all(subIssues.map(async (item) => [item.id, latestRegisteredReviewReceipt(await listComments(item.id, controller.signal))] as const))
+      .then((entries) => { if (!controller.signal.aborted) setReceipts(Object.fromEntries(entries)); })
+      .catch(() => { /* Missing evidence remains unknown; no mutation or retry. */ });
+    return () => controller.abort();
+  }, [task.id, childKey]);
+  useEffect(() => {
+    const element = graphRef.current;
+    if (!element) return;
+    const measure = () => {
+      const bounds = element.getBoundingClientRect();
+      const cards = new Map([...element.querySelectorAll<HTMLElement>("[data-task-id]")].map((card) => [card.dataset.taskId, card.getBoundingClientRect()]));
+      const next = graph.edges.flatMap((edge) => {
+        // Partial leaf dependencies are listed explicitly, not drawn as stage gates.
+        if (edge.partial) return [];
+        const a = cards.get(edge.from), b = cards.get(edge.to);
+        if (!a || !b) return [];
+        const x1 = a.left + a.width / 2 - bounds.left, x2 = b.left + b.width / 2 - bounds.left;
+        const y1 = a.bottom - bounds.top, y2 = b.top - bounds.top;
+        const mid = y2 > y1 ? (y1 + y2) / 2 : Math.max(y1, b.bottom - bounds.top) + 24;
+        return [{ key: `${edge.from}:${edge.to}`, path: `M${x1},${y1} C${x1},${mid} ${x2},${mid} ${x2},${y2}`, partial: edge.partial }];
+      });
+      setLines((current) => JSON.stringify(current) === JSON.stringify(next) ? current : next);
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    element.querySelectorAll("[data-task-id]").forEach((card) => observer.observe(card));
+    measure();
+    return () => observer.disconnect();
+  }, [task.id, childKey, edgeKey, goalWindowMaps]);
   const directIds = new Set(subIssues.map((issue) => issue.id));
   const ancestors = new Set<string>([task.id]);
   let parent = task.relations.parent;
@@ -381,8 +429,28 @@ export function IssueSubIssues({
     && !directIds.has(candidate.id)
   ));
 
-  function renderChildren(parentId: string, path: ReadonlySet<string>): ReactNode {
-    return [...(childrenById.get(parentId)?.values() ?? [])]
+  function groupedChildren(children: Iterable<TaskRelationSummary>) {
+    const planGroups = new Map<number, Map<string, TaskRelationSummary[]>>();
+    const unplanned: TaskRelationSummary[] = [];
+    for (const issue of children) {
+      const child = taskById.get(issue.id);
+      const groupLabel = child?.labels.find((label) => /^plan-group\s*[:=-]?\s*\d+$/i.test(label.trim()));
+      const group = groupLabel ? Number(groupLabel.match(/\d+/)?.[0]) : Number.NaN;
+      if (!Number.isFinite(group)) {
+        unplanned.push(issue);
+        continue;
+      }
+      const laneLabel = child?.labels.find((label) => /^plan-lane\s*[:=-]?\s*.+$/i.test(label.trim()));
+      const lane = laneLabel?.replace(/^plan-lane\s*[:=-]?\s*/i, "").trim() || text("未分泳道", "Unassigned lane");
+      const lanes = planGroups.get(group) ?? new Map<string, TaskRelationSummary[]>();
+      lanes.set(lane, [...(lanes.get(lane) ?? []), issue]);
+      planGroups.set(group, lanes);
+    }
+    return { planGroups, unplanned };
+  }
+
+  function renderChildren(parentId: string, path: ReadonlySet<string>, children?: Iterable<TaskRelationSummary>): ReactNode {
+    return [...(children ?? childrenById.get(parentId)?.values() ?? [])]
       .filter((relation) => !path.has(relation.id))
       .map((relation) => {
         const child = taskById.get(relation.id);
@@ -390,8 +458,16 @@ export function IssueSubIssues({
         const childPath = new Set([...path, issue.id]);
         const hasChildren = [...(childrenById.get(issue.id)?.keys() ?? [])]
           .some((id) => !childPath.has(id));
-        const expanded = expandedTaskIds.includes(issue.id);
+        const expanded = !collapsedTaskIds.has(issue.id);
         const execution = presentations[issue.id]?.execution ?? "uncertain";
+        const responsibleWindows = goalWindowMaps.flatMap((declaration) => declaration.nodes.filter((node) => node.issueRefs?.some((reference) => (
+          (reference.role === "owned" || reference.role === "current")
+          && reference.taskId === issue.id
+          && reference.identifier === (issue.externalKey ?? issue.identifier)
+        ))).map((node) => ({ declaration, node })));
+        const reviewers = (declaration: GoalWindowMapDeclaration, ownerId: string) => declaration.edges.filter((edge) => edge.kind === "review" && edge.from === ownerId)
+          .map((edge) => declaration.nodes.find((node) => node.id === edge.to))
+          .filter((node): node is NonNullable<typeof node> => Boolean(node));
         const unfinishedPrerequisites = child?.relations.blockedBy.filter((dependency) => dependency.status !== "done") ?? [];
         const inputsAdopted = execution === "dependency" && unfinishedPrerequisites.length > 0
           && unfinishedPrerequisites.every((dependency) => adoptedInputs.some((input) => (
@@ -400,19 +476,6 @@ export function IssueSubIssues({
         return (
           <li className="issue-tree-node" data-task-id={issue.id} key={issue.id}>
             <div className="issue-tree-row">
-              {hasChildren ? (
-                <button
-                  className="issue-tree-toggle"
-                  type="button"
-                  aria-expanded={expanded}
-                  aria-label={expanded
-                    ? text(`收起 ${issue.title} 的子议题`, `Collapse sub-issues of ${issue.title}`)
-                    : text(`展开 ${issue.title} 的子议题`, `Expand sub-issues of ${issue.title}`)}
-                  onClick={() => onToggleTaskExpansion(issue.id)}
-                >
-                  <LinearIcon name={expanded ? "chevronDown" : "chevronRight"} />
-                </button>
-              ) : <span className="issue-tree-toggle-space" aria-hidden="true" />}
               <div className="issue-tree-content">
                 <button
                   className="issue-tree-target"
@@ -428,6 +491,12 @@ export function IssueSubIssues({
                 </button>
                 <div className="issue-tree-status">
                   <span>{taskStatusLabel(language, issue.status)}</span>
+                  {responsibleWindows.map(({ declaration, node: window }) => <details className="issue-tree-window" key={`${declaration.sourceCommentId}:${window.id}`}>
+                    <summary>{text("负责窗口", "Responsible window")} · {window.roleLabel}</summary>
+                    <p>{window.title}</p><p>{text("职责", "Scope")} · {window.scope}</p><p>{text("记录状态", "Recorded state")} · {window.recordedState}</p><p>{declaration.sourceCommentId} · v{declaration.sourceCommentVersion}</p>
+                    {window.threadBinding ? <button className="button secondary" type="button" onClick={() => onOpenThread(window.threadBinding!)}>{text("打开窗口", "Open window")}</button> : <p>{text("窗口绑定未登记", "Window binding not recorded")}</p>}
+                    {reviewers(declaration, window.id).map((reviewer) => <details key={reviewer.id}><summary>{text("独立审查 sub-agent", "Independent review sub-agent")} · {reviewer.roleLabel}</summary><p>{reviewer.title}</p><p>{reviewer.recordedState}</p>{reviewer.threadBinding ? <button className="button secondary" type="button" onClick={() => onOpenThread(reviewer.threadBinding!)}>{text("打开窗口", "Open window")}</button> : <p>{text("窗口绑定未登记", "Window binding not recorded")}</p>}</details>)}
+                  </details>)}
                   {inputsAdopted ? <span data-execution-state="artifact_input">
                     {text("前置产物输入已采用", "Prerequisite artifact input adopted")}
                   </span> : <TaskExecutionStatus state={execution} />}
@@ -436,7 +505,14 @@ export function IssueSubIssues({
                 <TaskProgress
                   progress={progressModel.forTask(issue.id)}
                   label={text(`${issue.title}的进度`, `Progress for ${issue.title}`)}
+                  showStages
+                  leafStatus={!hasChildren ? issue.status : undefined}
+                  reviewReceipt={receipts[issue.id] ?? null}
                 />
+                <p className="dependency-card-summary">{text("方法 / 产物", "Method / output")} · {child?.description.split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#") && !line.startsWith("```"))?.replace(/^[\s>*-]+/, "").slice(0, 110) || text("未记录", "Not recorded")}</p>
+                <p className="dependency-card-model">{text("实际模型（登记）", "Actual model (recorded)")} · {receipts[issue.id]?.implementation?.threadId === child?.threadBinding?.threadId && receipts[issue.id]?.implementation
+                  ? `${receipts[issue.id]!.implementation!.model} / ${receipts[issue.id]!.implementation!.reasoningEffort}`
+                  : text("未知", "Unknown")}</p>
               </div>
               {parentId === task.id && child ? (
                 <button
@@ -458,19 +534,60 @@ export function IssueSubIssues({
                 </button>
               ) : null}
             </div>
-            {hasChildren && expanded ? (
-              <ul className="issue-tree-children">{renderChildren(issue.id, childPath)}</ul>
-            ) : null}
+            {hasChildren ? <p className="issue-tree-next-level">{text("打开此任务查看下一层依赖图", "Open this task for the next dependency graph level")}</p> : null}
           </li>
         );
       });
+  }
+
+  function renderChildLayout(parentId: string, path: ReadonlySet<string>, children?: Iterable<TaskRelationSummary>): ReactNode {
+    const childIssues = [...(children ?? childrenById.get(parentId)?.values() ?? [])]
+      .filter((relation) => !path.has(relation.id));
+    const { planGroups, unplanned } = groupedChildren(childIssues);
+    if (planGroups.size === 0) return renderChildren(parentId, path, childIssues);
+
+    return (
+      <>
+        {[...planGroups.entries()].sort(([left], [right]) => left - right).map(([group, lanes]) => (
+          <li className="issue-tree-plan-group" key={group}>
+            <section className="plan-group" aria-label={text(`计划组 ${String(group).padStart(2, "0")}`, `Plan group ${String(group).padStart(2, "0")}`)}>
+              <h3>{text(`计划组 ${String(group).padStart(2, "0")}`, `Plan group ${String(group).padStart(2, "0")}`)}</h3>
+              <div className="plan-group-lanes">
+                {[...lanes.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([lane, issues]) => (
+                  <section className="plan-lane" key={lane} aria-label={text(`泳道 ${lane}`, `Lane ${lane}`)}>
+                    <h4>{lane}</h4>
+                    <ul className="issue-tree-children">{renderChildren(parentId, path, issues)}</ul>
+                  </section>
+                ))}
+              </div>
+            </section>
+          </li>
+        ))}
+        {unplanned.length > 0 ? renderChildren(parentId, path, unplanned) : null}
+      </>
+    );
+  }
+
+  function dependencyLayers(issues: TaskRelationSummary[]) {
+    const ids = new Set(issues.map((issue) => issue.id));
+    const depth = new Map(issues.map((issue) => [issue.id, 0]));
+    const incoming = new Map(issues.map((issue) => [issue.id, 0]));
+    const outgoing = new Map<string, string[]>();
+    for (const issue of issues) for (const dependency of taskById.get(issue.id)?.relations.blockedBy ?? []) {
+      if (!ids.has(dependency.id)) continue;
+      incoming.set(issue.id, (incoming.get(issue.id) ?? 0) + 1);
+      outgoing.set(dependency.id, [...(outgoing.get(dependency.id) ?? []), issue.id]);
+    }
+    const ready = issues.filter((issue) => incoming.get(issue.id) === 0);
+    while (ready.length) { const issue = ready.shift()!; for (const target of outgoing.get(issue.id) ?? []) { depth.set(target, Math.max(depth.get(target) ?? 0, (depth.get(issue.id) ?? 0) + 1)); const left = (incoming.get(target) ?? 0) - 1; incoming.set(target, left); if (!left) ready.push(issues.find((item) => item.id === target)!); } }
+    return [...depth.entries()].reduce<Map<number, TaskRelationSummary[]>>((layers, [id, layer]) => { layers.set(layer, [...(layers.get(layer) ?? []), issues.find((issue) => issue.id === id)!]); return layers; }, new Map());
   }
 
   return (
     <section className="issue-sub-issues" aria-labelledby="sub-issues-heading">
       <header>
         <div>
-          <h2 id="sub-issues-heading">{text("子议题", "Sub-issues")}</h2>
+          <h2 id="sub-issues-heading">{text("任务依赖图", "Task dependency graph")}</h2>
           {subIssues.length > 0 && (
             <span className="sub-issue-summary">
               {text(`${subIssues.length} 个直接子议题`, `${subIssues.length} direct sub-issues`)}
@@ -492,9 +609,16 @@ export function IssueSubIssues({
         />
       </header>
       {subIssues.length > 0 && (
-        <ul className="issue-sub-issue-list issue-tree">
-          {renderChildren(task.id, new Set([task.id]))}
-        </ul>
+        <div>
+          <p className="dependency-legend">{text("实线箭头＝整张卡的前置依赖。并排阶段可交叠推进；其中部分任务仍需等待具体前置，见下方依赖说明。排列不代表启动授权。点击卡片查看下一层。", "Solid arrows: whole-card prerequisites. Side-by-side stages may overlap; individual tasks still wait for the exact inputs listed below. Layout is not start authorization. Open a card to drill down.")}</p>
+          {graph.crossed && <p>{text("此层存在交叉局部依赖；请按下方具体任务关系下钻。", "Crossed dependencies at this level; inspect the exact task links below.")}</p>}
+          {graph.edges.some((edge) => edge.partial) && <p className="dependency-legend"><strong>{text("部分任务依赖，可交叠推进", "Partial task dependencies; stages may overlap")}</strong> · {text("无需等待整个前一阶段完成；具体前置见图下方。横向滚动查看同层任务。", "No whole-stage completion gate; exact prerequisites are listed below. Scroll horizontally for same-level tasks.")}</p>}
+          <div ref={graphRef} className="issue-sub-issue-list issue-tree dependency-graph">
+            <svg className="dependency-edges" aria-hidden="true"><defs><marker id="task-dependency-head" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="var(--accent)" /></marker></defs>{lines.map((line) => <path key={line.key} d={line.path} fill="none" stroke="var(--accent)" strokeWidth="2" strokeDasharray={line.partial ? "6 4" : undefined} markerEnd="url(#task-dependency-head)" />)}</svg>
+            {graph.layers.map(([layer, issues]) => <section className="dependency-layer" key={layer}><ul className="issue-tree-children">{renderChildren(task.id, new Set([task.id]), issues)}</ul></section>)}
+          </div>
+          <ul className="dependency-evidence">{graph.edges.map((edge) => <li key={`${edge.from}:${edge.to}`}><strong>{edge.partial ? text("部分任务依赖，可交叠推进", "Partial task dependency; stages may overlap") : text("前置依赖", "Prerequisite")}</strong> · {subIssues.find((issue) => issue.id === edge.from)?.title} → {subIssues.find((issue) => issue.id === edge.to)?.title}<br />{edge.evidence.map((pair) => `${pair.from} → ${pair.to}`).join(" · ")}</li>)}{graph.external.map((edge, index) => <li key={`external:${index}`}>{text("本层外的前置", "Prerequisite outside this view")} · {edge.prerequisite} → {edge.task}</li>)}</ul>
+        </div>
       )}
     </section>
   );

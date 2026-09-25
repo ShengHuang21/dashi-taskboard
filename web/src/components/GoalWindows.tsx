@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { ApiError, getResourceStep } from "../api";
 import { useTaskboardI18n } from "../i18n";
-import { shortWindowTitle } from "../taskWindowDisplayName";
 import type { CodexThreadBinding, ResourceAllocationRecord, ResourceStepRecord, TaskGoalWindows } from "../types";
 import "./OwnerGoalsView.css";
 
@@ -23,25 +22,25 @@ function DeclaredGoalWindows({ declaration, onOpenThread }: GoalWindowsProps & {
     }}>
       <summary title={declaration.windows.map(({ title }) => title).join("\n")}>
         {text("协作窗口", "Collaborating windows")}
-        {declaration.state === "declared" ? ` · ${declaration.windows.map(({ title }) => shortWindowTitle(title)).join(" / ")}` : ""}
+        {declaration.state === "declared" ? ` · ${declaration.windows.map((member, index) => windowRoleLabel(member.role, index, text)).join(" / ")}` : ""}
       </summary>
       {declaration.state !== "declared" ? (
         <p>{text("待关联 · 最新窗口记录需核实", "Association pending · latest window record needs verification")}</p>
       ) : (
         <>
           <ul className="goal-windows-members">
-            {declaration.windows.map((member) => (
+            {declaration.windows.map((member, index) => (
               <li key={member.threadId}>
                 <div>
-                  <span className="goal-window-title" title={member.title}>{shortWindowTitle(member.title)}</span>
+                  <span className="goal-window-title" title={member.title}>{windowRoleLabel(member.role, index, text)}</span>
                   <span className="goal-window-role">{member.role === "coding"
-                    ? text("代码处理", "Coding") : text("图文说明", "Illustrated guide")}</span>
+                    ? text("开发执行", "Development") : text("图文说明", "Illustrated guide")}</span>
                 </div>
                 {member.threadBinding ? (
                   <button
                     className="button secondary"
                     type="button"
-                    aria-label={text(`打开 ${member.title}`, `Open ${member.title}`)}
+                    aria-label={text(`打开 ${windowRoleLabel(member.role, index, text)}`, `Open ${windowRoleLabel(member.role, index, text)}`)}
                     onClick={() => onOpenThread(member.threadBinding!)}
                   >{text("打开", "Open")}</button>
                 ) : <span className="goal-window-location">{text("定位待核实", "Location unverified")}</span>}
@@ -67,6 +66,13 @@ function DeclaredGoalWindows({ declaration, onOpenThread }: GoalWindowsProps & {
       )}
     </details>
   );
+}
+
+function windowRoleLabel(role: TaskGoalWindows["windows"][number]["role"], index: number, text: Text) {
+  const prefix = String(index + 1).padStart(2, "0");
+  return role === "coding"
+    ? text(`${prefix}开发窗口`, `${prefix} development window`)
+    : text(`${prefix}说明协调窗口`, `${prefix} guide coordination window`);
 }
 
 const WAITING_REASONS: Record<string, [string, string]> = {

@@ -78,6 +78,7 @@ import { ProjectAutomationMenu } from "./components/ProjectAutomationMenu";
 import { TaskboardIcon } from "./components/TaskboardIcon";
 import { TaskContextMenu } from "./components/TaskContextMenu";
 import { TaskDetail } from "./components/TaskDetail";
+import type { GoalWindowMapDeclaration } from "./components/GoalWindowMap";
 import {
   TaskEditor,
   type NewTaskCreateOptions,
@@ -584,6 +585,7 @@ function taskToDraft(task: Task): TaskDraft {
 interface LocalRealtimeSyncProps {
   selectedProjectId: string;
   detailTaskId: string | null;
+  ancestorCommentIds: string;
   refreshProjectList: () => Promise<void>;
   refreshTasks: (
     projectId: string,
@@ -598,6 +600,7 @@ interface LocalRealtimeSyncProps {
 function LocalRealtimeSync({
   selectedProjectId,
   detailTaskId,
+  ancestorCommentIds,
   refreshProjectList,
   refreshTasks,
   setConnection,
@@ -662,7 +665,7 @@ function LocalRealtimeSync({
         return;
       }
       if (event.type.startsWith("comment.")) {
-        if (!detailTaskId || !payload.taskId || payload.taskId === detailTaskId) {
+        if (!detailTaskId || !payload.taskId || payload.taskId === detailTaskId || ancestorCommentIds.split(",").includes(payload.taskId)) {
           setCommentsRevision((current) => current + 1);
         }
         scheduleRefresh({ tasks: true });
@@ -697,6 +700,7 @@ function LocalRealtimeSync({
     };
   }, [
     detailTaskId,
+    ancestorCommentIds,
     refreshProjectList,
     refreshTasks,
     selectedProjectId,
@@ -785,6 +789,7 @@ export function App() {
   );
   const [expandedDetailTaskIds, setExpandedDetailTaskIds] = useState<Record<string, string[]>>({});
   const [commentsRevision, setCommentsRevision] = useState(0);
+  const [goalWindowMaps, setGoalWindowMaps] = useState<Record<string, Record<string, GoalWindowMapDeclaration>>>({});
   const [attachmentsRevision, setAttachmentsRevision] = useState(0);
   const [readmeRevision, setReadmeRevision] = useState(0);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -3395,6 +3400,17 @@ export function App() {
         <LocalRealtimeSync
           selectedProjectId={taskScopeProjectId}
           detailTaskId={detailTaskId}
+          ancestorCommentIds={(() => {
+            const ids = new Set<string>();
+            let parentId = detailTask?.relations.parent?.id;
+            while (parentId && !ids.has(parentId)) {
+              const parent = referenceTasks.find((item) => item.id === parentId && item.projectId === detailTask?.projectId);
+              if (!parent) break;
+              ids.add(parent.id);
+              parentId = parent.relations.parent?.id;
+            }
+            return [...ids].join(",");
+          })()}
           refreshProjectList={refreshProjectList}
           refreshTasks={refreshTasks}
           setConnection={setConnection}
@@ -3728,6 +3744,16 @@ export function App() {
             referenceTasks={referenceTasks}
             execution={taskPresentations[detailTask.id].execution}
             presentations={taskPresentations}
+            aiThreads={aiThreads}
+            goalWindowMaps={Object.values(goalWindowMaps[detailTask.projectId] ?? {})}
+            onGoalWindowMapObserved={(declaration) => setGoalWindowMaps((current) => {
+              const projectMaps = current[detailTask.projectId] ?? {};
+              if (!declaration) {
+                const { [detailTask.id]: _removed, ...remainingProjectMaps } = projectMaps;
+                return { ...current, [detailTask.projectId]: remainingProjectMaps };
+              }
+              return { ...current, [detailTask.projectId]: { ...projectMaps, [detailTask.id]: declaration } };
+            })}
             expandedTaskIds={expandedDetailTaskIds[detailTask.id] ?? []}
             onToggleTaskExpansion={(taskId) => setExpandedDetailTaskIds((current) => {
               const expanded = current[detailTask.id] ?? [];

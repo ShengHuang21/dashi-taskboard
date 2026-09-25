@@ -3154,6 +3154,68 @@ kbd {
   background: var(--surface);
 }
 
+.dependency-graph { position: relative; padding: 18px 12px 40px; overflow: auto; }
+.dependency-edges { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.dependency-layer { position: relative; display: grid; padding: 0; }
+.dependency-layer + .dependency-layer { margin-top: 72px; }
+.dependency-layer > .issue-tree-children { display: flex; flex-wrap: nowrap; gap: 20px; width: 100%; margin: 0; padding: 0; border: 0; list-style: none; }
+.dependency-layer > .issue-tree-children > .issue-tree-node { flex: 1 0 250px; min-width: 230px; margin: 0; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; }
+.dependency-graph .issue-tree-row { padding: 0; align-items: start; grid-template-columns: minmax(0, 1fr); }
+.dependency-graph .issue-tree-status { align-items: start; }
+.dependency-graph .issue-tree-target { flex-wrap: wrap; white-space: normal; text-align: left; }
+.dependency-graph .issue-tree-title { white-space: normal; }
+.dependency-graph .issue-tree-remove { display: none; }
+.dependency-card-summary, .dependency-card-model, .dependency-legend, .dependency-evidence, .issue-tree-next-level { font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+.dependency-evidence { padding-left: 18px; }
+.dependency-graph .task-progress-stages { display: flex; flex-direction: column; gap: 3px; }
+
+.plan-group + .plan-group,
+.issue-tree-plan-group + .issue-tree-plan-group,
+.issue-sub-issue-unplanned {
+  border-top: var(--border-hairline) solid var(--border);
+}
+
+.issue-tree-plan-group {
+  list-style: none;
+}
+
+.plan-group > h3,
+.plan-lane > h4 {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 560;
+}
+
+.plan-group > h3 {
+  padding: 10px 12px 0;
+}
+
+.plan-group-lanes {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding: 10px 12px 12px;
+}
+
+.plan-lane {
+  flex: 1 0 min(280px, 80vw);
+}
+
+.plan-lane > h4 {
+  margin-bottom: 6px;
+}
+
+.plan-lane .issue-tree-children,
+.issue-sub-issue-unplanned {
+  margin-left: 0;
+}
+
+.issue-sub-issue-unplanned {
+  padding: 0;
+  list-style: none;
+}
+
 .issue-sub-issue-list .issue-relation-row + .issue-relation-row {
   border-top: var(--border-hairline) solid var(--border);
 }

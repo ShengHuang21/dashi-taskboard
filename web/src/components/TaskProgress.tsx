@@ -1,8 +1,15 @@
 import { useTaskboardI18n } from "../i18n";
 import type { DeliveryProgress } from "../taskProgress";
+import type { TaskStatus } from "../types";
 import "./TaskProgress.css";
 
-export function TaskProgress({ progress, label }: { progress: DeliveryProgress; label: string }) {
+export function TaskProgress({ progress, label, showStages = false, reviewReceipt = null, leafStatus }: {
+  progress: DeliveryProgress;
+  label: string;
+  showStages?: boolean;
+  leafStatus?: TaskStatus;
+  reviewReceipt?: { status: "changes_requested" | "pass"; reviewerThreadId: string; model: string; reasoningEffort: string; sourceRef: string } | null;
+}) {
   const { text, locale } = useTaskboardI18n();
   const value = progress.reason === "canceled"
     ? text("已取消 · 不计入完成度", "Canceled · excluded from completion")
@@ -35,7 +42,8 @@ export function TaskProgress({ progress, label }: { progress: DeliveryProgress; 
       <span
         className="task-progress-track"
         role="progressbar"
-        aria-label={label}
+        aria-label={text(`${label}（用户验收）`, `${label} (user acceptance)`)}
+        title={text("此进度条表示用户验收完成度", "This progress bar represents user acceptance")}
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={progress.percent ?? undefined}
@@ -43,6 +51,18 @@ export function TaskProgress({ progress, label }: { progress: DeliveryProgress; 
       >
         <span style={{ width: `${progress.percent ?? 0}%` }} />
       </span>
+      {showStages ? <span className="task-progress-stages" aria-label={text("交付阶段", "Delivery stages")}>
+        <span>{text("实现", "Implementation")} · {progress.reason === "canceled"
+          ? text("已取消", "Canceled") : leafStatus ? (["in_review", "done"].includes(leafStatus) ? text("已交付", "Delivered") : text("尚未交付", "Not delivered")) : progress.percent === null ? text("未记录", "Not recorded")
+            : text(`已交付 ${progress.implemented ?? 0}/${progress.implementationTotal ?? progress.total}`, `Delivered ${progress.implemented ?? 0}/${progress.implementationTotal ?? progress.total}`)}</span>
+        <span>{text("AI 审查", "AI review")} · {reviewReceipt
+          ? reviewReceipt.status === "changes_requested" ? text("已登记：要求修改", "Registered: changes requested")
+            : text("已登记：通过（非平台验证）", "Registered: pass (not platform-verified)")
+          : text("已验证收据未记录", "Verified receipt not recorded")}</span>
+        <span>{text("用户验收", "User acceptance")} · {progress.reason === "canceled"
+          ? text("已取消", "Canceled") : leafStatus ? (leafStatus === "done" ? text("已验收", "Accepted") : text("未验收", "Not accepted")) : progress.percent === null ? text("未记录", "Not recorded")
+            : text(`已验收 ${progress.completed}/${progress.total}`, `Accepted ${progress.completed}/${progress.total}`)}</span>
+      </span> : null}
     </span>
   );
 }
