@@ -291,10 +291,6 @@
   flex: 1;
 }
 
-.dashboard-view .dashboard-roadmap-item .task-progress-text {
-  color: var(--text-secondary);
-}
-
 .dashboard-view .dashboard-roadmap-item:hover {
   background: var(--surface-hover);
 }

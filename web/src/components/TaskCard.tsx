@@ -510,7 +510,6 @@ export function TaskCard({
       <h3 id={`task-${task.id}-title`}>{task.title}</h3>
 
       <div className="card-delivery-progress">
-        <span>{text("交付完成度", "Deliverable completion")}</span>
         <TaskProgress
           progress={deliveryProgress}
           label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} deliverable completion`)}
