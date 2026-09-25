@@ -18,6 +18,7 @@ import type { TaskCardPresentation } from "../taskConversations";
 import { ActorAvatar } from "./ActorAvatar";
 import { LinearIcon } from "./LinearIcon";
 import { TaskProgress } from "./TaskProgress";
+import { TaskFlowCanvas } from "./TaskFlowCanvas";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { GoalWindowMapDeclaration } from "./GoalWindowMap";
 import type { CodexThreadBinding } from "../types";
@@ -610,6 +611,8 @@ export function IssueSubIssues({
       </header>
       {subIssues.length > 0 && (
         <div>
+          <TaskFlowCanvas task={task} tasks={referenceTasks} onOpenTask={onOpenTask} />
+          <details><summary>{text("任务卡片与依赖明细", "Task cards and dependency details")}</summary>
           <p className="dependency-legend">{text("实线箭头＝整张卡的前置依赖。并排阶段可交叠推进；其中部分任务仍需等待具体前置，见下方依赖说明。排列不代表启动授权。点击卡片查看下一层。", "Solid arrows: whole-card prerequisites. Side-by-side stages may overlap; individual tasks still wait for the exact inputs listed below. Layout is not start authorization. Open a card to drill down.")}</p>
           {graph.crossed && <p>{text("此层存在交叉局部依赖；请按下方具体任务关系下钻。", "Crossed dependencies at this level; inspect the exact task links below.")}</p>}
           {graph.edges.some((edge) => edge.partial) && <p className="dependency-legend"><strong>{text("部分任务依赖，可交叠推进", "Partial task dependencies; stages may overlap")}</strong> · {text("无需等待整个前一阶段完成；具体前置见图下方。横向滚动查看同层任务。", "No whole-stage completion gate; exact prerequisites are listed below. Scroll horizontally for same-level tasks.")}</p>}
@@ -618,6 +621,7 @@ export function IssueSubIssues({
             {graph.layers.map(([layer, issues]) => <section className="dependency-layer" key={layer}><ul className="issue-tree-children">{renderChildren(task.id, new Set([task.id]), issues)}</ul></section>)}
           </div>
           <ul className="dependency-evidence">{graph.edges.map((edge) => <li key={`${edge.from}:${edge.to}`}><strong>{edge.partial ? text("部分任务依赖，可交叠推进", "Partial task dependency; stages may overlap") : text("前置依赖", "Prerequisite")}</strong> · {subIssues.find((issue) => issue.id === edge.from)?.title} → {subIssues.find((issue) => issue.id === edge.to)?.title}<br />{edge.evidence.map((pair) => `${pair.from} → ${pair.to}`).join(" · ")}</li>)}{graph.external.map((edge, index) => <li key={`external:${index}`}>{text("本层外的前置", "Prerequisite outside this view")} · {edge.prerequisite} → {edge.task}</li>)}</ul>
+          </details>
         </div>
       )}
     </section>
