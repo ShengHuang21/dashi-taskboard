@@ -16,6 +16,14 @@
   gap: 8px 12px;
 }
 
+.goal-coordinator > .goal-coordinator-heading {
+  cursor: pointer;
+}
+
+.goal-coordinator-content {
+  padding-top: 12px;
+}
+
 .goal-coordinator-heading span,
 .goal-coordinator p {
   color: var(--text-secondary);

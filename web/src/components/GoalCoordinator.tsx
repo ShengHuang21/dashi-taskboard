@@ -248,11 +248,12 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree, onAdo
     && run.exitCode === 0 && (admission?.available || pendingTeamRequest.current);
 
   return (
-    <section className="goal-coordinator" aria-label={text("目标协调", "Goal coordination")}>
-      <div className="goal-coordinator-heading">
-        <strong>{text("目标协调", "Goal coordination")}</strong>
+    <details className="goal-coordinator" aria-label={text("目标协调", "Goal coordination")}>
+      <summary className="goal-coordinator-heading">
+        <strong>{text("协调工具（可选）", "Coordination tools (optional)")}</strong>
         <span role="status">{snapshot ? stateLabel : text("读取协调状态…", "Loading coordination state…")}</span>
-      </div>
+      </summary>
+      <div className="goal-coordinator-content">
       <p>{text(
         "“开始拆解 / 继续协调”只维护子任务与依赖。“执行下一项”单独安排一个就绪子项的开发和独立验证；原有工作窗口不受影响。",
         "Planning maintains deliverables and dependencies only. Execute next separately coordinates one ready deliverable through development and independent validation; existing work windows stay unchanged.",
@@ -368,6 +369,7 @@ export function GoalCoordinator({ task, onOpenConversation, onRefreshTree, onAdo
         "协调执行虽已结束，但还没有可核实的产物与独立验证记录；未认定交付完成。",
         "The coordinator ended without a verifiable artifact and independent report; delivery is not confirmed.",
       )}</p> : null}
-    </section>
+      </div>
+    </details>
   );
 }

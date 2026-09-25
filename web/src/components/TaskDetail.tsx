@@ -40,6 +40,7 @@ import type {
   IssueRelationType,
   Recurrence,
   Task,
+  AiChatThread,
   TaskChangeActivity,
   TaskDraft,
   TaskPriority,
@@ -101,11 +102,49 @@ import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
 import { TaskProgress } from "./TaskProgress";
 import { GoalWindows } from "./GoalWindows";
+import { GoalWindowAssignments, GoalWindowMap, latestGoalWindowMap, type GoalWindowMapDeclaration } from "./GoalWindowMap";
 import { GoalCoordinator, type GoalAdoptedInputs } from "./GoalCoordinator";
 import { TaskExecutionStatus } from "./TaskExecutionStatus";
 import type { TaskCardPresentation, TaskExecutionState } from "../taskConversations";
 
 type TaskDetailError = string | readonly [string, string];
+
+export interface RegisteredReviewReceipt {
+  status: "changes_requested" | "pass";
+  reviewerThreadId: string;
+  model: string;
+  reasoningEffort: string;
+  sourceRef: string;
+  implementation?: { threadId: string; model: string; reasoningEffort: string };
+}
+
+export function latestRegisteredReviewReceipt(comments: Comment[]): RegisteredReviewReceipt | null {
+  for (const comment of [...comments].sort((left, right) => (
+    right.updatedAt.localeCompare(left.updatedAt) || right.id.localeCompare(left.id)
+  ))) {
+    const match = comment.body.match(/```taskboard-review-receipt\s+v1\s*\n([\s\S]*?)```/i);
+    if (!match) continue;
+    try {
+      const receipt = JSON.parse(match[1]) as Record<string, unknown>;
+      const candidate = receipt.candidate;
+      const implementation = receipt.implementation;
+      if ((receipt.status !== "changes_requested" && receipt.status !== "pass")
+        || typeof receipt.reviewerThreadId !== "string" || typeof receipt.model !== "string"
+        || typeof receipt.reasoningEffort !== "string" || typeof receipt.sourceRef !== "string"
+        || !candidate || typeof candidate !== "object" || typeof (candidate as { digest?: unknown }).digest !== "string"
+        || (implementation !== undefined && (!implementation || typeof implementation !== "object"
+          || typeof (implementation as { threadId?: unknown }).threadId !== "string"
+          || typeof (implementation as { model?: unknown }).model !== "string"
+          || typeof (implementation as { reasoningEffort?: unknown }).reasoningEffort !== "string"))) continue;
+      return { status: receipt.status, reviewerThreadId: receipt.reviewerThreadId, model: receipt.model,
+        reasoningEffort: receipt.reasoningEffort, sourceRef: receipt.sourceRef,
+        ...(implementation ? { implementation: implementation as RegisteredReviewReceipt["implementation"] } : {}) };
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
 interface TaskDetailProps {
   task: Task;
@@ -113,6 +152,9 @@ interface TaskDetailProps {
   referenceTasks: Task[];
   execution: TaskExecutionState;
   presentations: Record<string, TaskCardPresentation>;
+  aiThreads: AiChatThread[];
+  goalWindowMaps: GoalWindowMapDeclaration[];
+  onGoalWindowMapObserved: (declaration: GoalWindowMapDeclaration | null) => void;
   expandedTaskIds: string[];
   onToggleTaskExpansion: (taskId: string) => void;
   initialScrollTop: number;
@@ -383,6 +425,9 @@ export function TaskDetail({
   referenceTasks,
   execution,
   presentations,
+  aiThreads,
+  goalWindowMaps,
+  onGoalWindowMapObserved,
   expandedTaskIds,
   onToggleTaskExpansion,
   initialScrollTop,
@@ -429,6 +474,32 @@ export function TaskDetail({
   const [pendingAttachmentDelete, setPendingAttachmentDelete] = useState<Attachment | null>(null);
   const [deletingAttachment, setDeletingAttachment] = useState(false);
   const [comments, setComments] = useState<Comment[]>([]);
+  const ancestorGoal = (() => {
+    const seen = new Set<string>();
+    let candidate: Task | undefined = currentTask;
+    while (candidate && !seen.has(candidate.id)) {
+      seen.add(candidate.id);
+      if (candidate.labels.includes("owner-goal")) return candidate;
+      const parentId: string | undefined = candidate.relations.parent?.id;
+      candidate = referenceTasks.find((item) => item.id === parentId && item.projectId === currentTask.projectId);
+    }
+    return undefined;
+  })();
+  const ancestorKey = ancestorGoal && ancestorGoal.id !== currentTask.id ? `${ancestorGoal.id}:${ancestorGoal.updatedAt}` : "";
+  const [inheritedMaps, setInheritedMaps] = useState<{ key: string; maps: GoalWindowMapDeclaration[] }>({ key: "", maps: [] });
+  useEffect(() => {
+    if (!ancestorKey || !ancestorGoal) return;
+    const controller = new AbortController();
+    void listComments(ancestorGoal.id, controller.signal).then((items) => {
+      const declaration = latestGoalWindowMap(items);
+      if (!controller.signal.aborted) setInheritedMaps({ key: ancestorKey, maps: declaration ? [declaration] : [] });
+    }).catch(() => {
+      if (!controller.signal.aborted) setInheritedMaps({ key: ancestorKey, maps: [] });
+    });
+    return () => controller.abort();
+  }, [ancestorKey, commentsRevision]);
+  const ownMap = currentTask.labels.includes("owner-goal") ? latestGoalWindowMap(comments) : null;
+  const scopedWindowMaps = ownMap ? [ownMap] : ancestorKey && inheritedMaps.key === ancestorKey ? inheritedMaps.maps : [];
   const [taskActivities, setTaskActivities] = useState<TaskChangeActivity[]>([]);
   const [commentsLoading, setCommentsLoading] = useState(true);
   const [commentsError, setCommentsError] = useState<TaskDetailError | null>(null);
@@ -469,6 +540,17 @@ export function TaskDetail({
   ];
   const progressModel = createTaskProgressModel(progressTasks);
   const deliveryProgress = progressModel.forTask(currentTask.id);
+  const actualModelRecords = aiThreads.filter((thread) => (
+    thread.origin.projectId === currentTask.projectId && thread.origin.issueId === currentTask.id
+  ));
+  const actualModelSignatures = [...new Set(actualModelRecords.map((thread) => `${thread.model} / ${thread.reasoningEffort}`))];
+  const actualModel = actualModelSignatures.length === 1 ? actualModelSignatures[0]
+    : actualModelSignatures.length === 0 ? text("实际模型未记录", "Actual model not recorded")
+      : text("多条实际模型记录，未显示为当前模型", "Multiple actual model records; no current model inferred");
+  const reviewReceipt = latestRegisteredReviewReceipt(comments);
+  const registeredImplementation = reviewReceipt?.implementation
+    && reviewReceipt.implementation.threadId === currentTask.threadBinding?.threadId
+    ? reviewReceipt.implementation : null;
   const editingInlineImages = inlineMediaImages(editingSegments);
 
   useLayoutEffect(() => {
@@ -1102,26 +1184,28 @@ export function TaskDetail({
                     () => onRemoveRelation(anchor, type, relatedTaskId),
                   )}
                 />
+                {currentTask.labels.includes("owner-goal") ? <GoalWindowMap comments={comments} onOpenThread={onOpenThread} tasks={tasks} onOpenTask={onOpenTask} onDeclaration={onGoalWindowMapObserved} presentation="none" /> : null}
+                <GoalWindowAssignments declarations={scopedWindowMaps} task={currentTask} tasks={referenceTasks} />
                 <section className="issue-delivery-progress" aria-label={text("交付完成度", "Delivery completion")}>
                   <TaskProgress
                     progress={deliveryProgress}
                     label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
+                    showStages
+                    reviewReceipt={reviewReceipt}
                   />
+                  <p className="issue-delivery-model">{registeredImplementation
+                    ? `${text("实现模型（已登记）", "Implementation model (registered)")} · ${registeredImplementation.model} / ${registeredImplementation.reasoningEffort}`
+                    : `${text("实际模型", "Actual model")} · ${actualModel}`}</p>
+                  {reviewReceipt ? <details className="issue-delivery-review-source">
+                    <summary>{text("AI 审查回执已登记（非平台验证）", "AI review receipt registered (not platform-verified)")}</summary>
+                    <p>{`${reviewReceipt.reviewerThreadId} · ${reviewReceipt.model} / ${reviewReceipt.reasoningEffort}`}</p>
+                    <p>{reviewReceipt.sourceRef}</p>
+                  </details> : null}
                   {!(execution === "not_started" && currentTask.labels.includes("owner-goal")
                     && currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
                     && goalAdoptedInputs.hasCoordinatorHistory) ? <TaskExecutionStatus state={execution} /> : null}
                   {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </section>
-                {goalCoordinatorAvailable && currentTask.labels.includes("owner-goal")
-                  && onOpenGoalCoordinator && onRefreshGoalTree ? (
-                    <GoalCoordinator
-                      key={currentTask.id}
-                      task={currentTask}
-                      onOpenConversation={onOpenGoalCoordinator}
-                      onRefreshTree={onRefreshGoalTree}
-                      onAdoptedInputsChange={setGoalAdoptedInputs}
-                    />
-                  ) : null}
                 <GoalWindows declaration={currentTask.goalWindows} onOpenThread={onOpenThread} />
                 <IssueSubIssues
                   task={currentTask}
@@ -1131,6 +1215,8 @@ export function TaskDetail({
                   presentations={presentations}
                   adoptedInputs={currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
                     ? goalAdoptedInputs.inputs : []}
+                  goalWindowMaps={scopedWindowMaps}
+                  onOpenThread={onOpenThread}
                   expandedTaskIds={expandedTaskIds}
                   onToggleTaskExpansion={onToggleTaskExpansion}
                   onOpenTask={onOpenTask}

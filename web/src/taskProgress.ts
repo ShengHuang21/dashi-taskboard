@@ -1,6 +1,8 @@
 import type { Task, TaskProgressChange } from "./types";
 
 export interface DeliveryProgress {
+  implemented?: number;
+  implementationTotal?: number;
   completed: number;
   total: number;
   percent: number | null;
@@ -70,7 +72,13 @@ export function createTaskProgressModel(referenceTasks: Task[]) {
     ids.forEach(visit);
     const total = leaves.size;
     const completed = [...leaves.values()].filter((task) => task.status === "done").length;
+    const implementationLeaves = [...leaves.values()].filter((task) => !task.labels.includes("progress-stage:acceptance"));
+    const implemented = implementationLeaves.filter((task) => (
+      task.status === "in_review" || task.status === "done"
+    )).length;
     return {
+      implemented,
+      implementationTotal: implementationLeaves.length,
       completed,
       total,
       percent: incomplete || total === 0 ? null
@@ -82,13 +90,13 @@ export function createTaskProgressModel(referenceTasks: Task[]) {
 
   function forTask(id: string): DeliveryProgress {
     const task = taskById.get(id);
-    if (!task) return { completed: 0, total: 0, percent: null, reason: "incomplete" };
+    if (!task) return { implemented: 0, implementationTotal: 0, completed: 0, total: 0, percent: null, reason: "incomplete" };
     const progress = progressFor([id], id);
     if (task.status === "canceled") {
-      return { ...progress, completed: 0, total: 0, percent: null, reason: "canceled" };
+      return { ...progress, implemented: 0, implementationTotal: 0, completed: 0, total: 0, percent: null, reason: "canceled" };
     }
     if (childIds.get(id)!.size === 0 && task.status !== "done") {
-      return { ...progress, completed: 0, total: 0, percent: null, reason: "unplanned" };
+      return { ...progress, implemented: 0, implementationTotal: 0, completed: 0, total: 0, percent: null, reason: "unplanned" };
     }
     return progress;
   }

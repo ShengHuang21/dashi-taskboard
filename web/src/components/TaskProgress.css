@@ -21,6 +21,15 @@
   background: var(--accent);
 }
 
+.task-progress-stages {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .issue-delivery-progress {
   display: grid;
   gap: 8px;
@@ -28,6 +37,22 @@
   padding: 14px 16px;
   border: 1px solid var(--border);
   border-radius: 10px;
+}
+
+.issue-delivery-model,
+.issue-delivery-review-source {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.issue-delivery-review-source summary {
+  cursor: pointer;
+}
+
+.issue-delivery-review-source p {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
 }
 
 .card-delivery-progress {
