@@ -1103,7 +1103,6 @@ export function TaskDetail({
                   )}
                 />
                 <section className="issue-delivery-progress" aria-label={text("交付完成度", "Delivery completion")}>
-                  <span>{text("交付完成度 · 按完成项计算，不代表剩余时间", "Delivery completion · item count, not a time estimate")}</span>
                   <TaskProgress
                     progress={deliveryProgress}
                     label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}

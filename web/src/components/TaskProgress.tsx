@@ -27,9 +27,11 @@ export function TaskProgress({ progress, label }: { progress: DeliveryProgress; 
         parent: text("调整子任务", "Subtasks changed"),
       }[change.kind]
       : null;
+  const changeDate = change && changeLabel
+    ? new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(new Date(change.createdAt))
+    : null;
   return (
     <span className={`task-progress${progress.percent === null ? " is-unestimated" : ""}`}>
-      <span className="task-progress-text"><b>{value}</b>{detail ? <span>{detail}</span> : null}</span>
       <span
         className="task-progress-track"
         role="progressbar"
@@ -37,18 +39,10 @@ export function TaskProgress({ progress, label }: { progress: DeliveryProgress; 
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={progress.percent ?? undefined}
-        aria-valuetext={[value, detail].filter(Boolean).join(" · ")}
+        aria-valuetext={[value, detail, changeLabel, changeDate].filter(Boolean).join(" · ")}
       >
         <span style={{ width: `${progress.percent ?? 0}%` }} />
       </span>
-      {change && changeLabel ? (
-        <span className="task-progress-change">
-          <span>{changeLabel}</span>
-          <time dateTime={change.createdAt}>
-            {new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(new Date(change.createdAt))}
-          </time>
-        </span>
-      ) : null}
     </span>
   );
 }
