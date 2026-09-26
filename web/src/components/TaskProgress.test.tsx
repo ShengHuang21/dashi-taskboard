@@ -10,7 +10,7 @@ import { TaskProgress } from "./TaskProgress";
 afterEach(cleanup);
 
 describe("TaskProgress compact presentation", () => {
-  it("shows only the progress track while retaining detailed accessible evidence", () => {
+  it("shows progress numbers while retaining detailed accessible evidence", () => {
     const progress: DeliveryProgress = {
       completed: 2,
       total: 4,
@@ -31,7 +31,7 @@ describe("TaskProgress compact presentation", () => {
     expect(track.getAttribute("aria-valuetext")).toMatch(/2\/4 deliverables complete/);
     expect(track.getAttribute("aria-valuetext")).toMatch(/Last scope change/);
     expect(track.getAttribute("aria-valuetext")).toMatch(/Sep 25/);
-    expect(screen.queryByText("50%")).toBeNull();
+    expect(screen.getByText("User acceptance · 50%")).toBeTruthy();
     expect(screen.queryByText("2/4 deliverables complete")).toBeNull();
     expect(screen.queryByText(/Last scope change/)).toBeNull();
     expect(screen.queryByText(/Sep 25/)).toBeNull();
@@ -50,6 +50,8 @@ describe("TaskProgress compact presentation", () => {
     expect(selected?.sourceRef).toBe("new-report");
     expect(selected?.implementation).toEqual({ threadId: "bound-thread", model: "gpt-6-astra", reasoningEffort: "medium" });
     render(<TaskProgress progress={progress} label="CAP-ETH3" showStages reviewReceipt={selected} />);
+    expect(screen.getByText("Implementation · 100% (3/3)")).toBeTruthy();
+    expect(screen.getByText("User acceptance · 0%")).toBeTruthy();
     expect(screen.getByText("Implementation · Delivered 3/3")).toBeTruthy();
     expect(screen.getByText("AI review · Registered: changes requested")).toBeTruthy();
     expect(screen.getByText("User acceptance · Accepted 0/4")).toBeTruthy();
