@@ -11,6 +11,11 @@ export function TaskProgress({ progress, label, showStages = false, reviewReceip
   reviewReceipt?: { status: "changes_requested" | "pass"; reviewerThreadId: string; model: string; reasoningEffort: string; sourceRef: string } | null;
 }) {
   const { text, locale } = useTaskboardI18n();
+  const implementationTotal = progress.implementationTotal ?? 0;
+  const implementationPercent = progress.reason === "canceled" ? null
+    : leafStatus ? (["in_review", "done"].includes(leafStatus) ? 100 : null)
+    : progress.reason === "incomplete" || implementationTotal === 0 ? null
+    : Math.round(((progress.implemented ?? 0) / implementationTotal) * 100);
   const value = progress.reason === "canceled"
     ? text("已取消 · 不计入完成度", "Canceled · excluded from completion")
     : progress.percent === null
@@ -39,6 +44,10 @@ export function TaskProgress({ progress, label, showStages = false, reviewReceip
     : null;
   return (
     <span className={`task-progress${progress.percent === null ? " is-unestimated" : ""}`}>
+      <span className="task-progress-numbers">
+        <strong>{text("实现", "Implementation")} · {implementationPercent === null ? text("待评估", "Not estimated") : `${implementationPercent}%`}{!leafStatus && implementationTotal > 0 ? ` (${progress.implemented ?? 0}/${implementationTotal})` : ""}</strong>
+        <span>{text("用户验收", "User acceptance")} · {value}</span>
+      </span>
       <span
         className="task-progress-track"
         role="progressbar"
