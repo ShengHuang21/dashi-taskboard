@@ -67,7 +67,7 @@ export function TaskProgress({ progress, label, showStages = false, reviewReceip
         <span>{text("AI 审查", "AI review")} · {reviewReceipt
           ? reviewReceipt.status === "changes_requested" ? text("已登记：要求修改", "Registered: changes requested")
             : text("已登记：通过（非平台验证）", "Registered: pass (not platform-verified)")
-          : text("已验证收据未记录", "Verified receipt not recorded")}</span>
+          : text("结构化审查回执未记录", "Structured review receipt not recorded")}</span>
         <span>{text("用户验收", "User acceptance")} · {progress.reason === "canceled"
           ? text("已取消", "Canceled") : leafStatus ? (leafStatus === "done" ? text("已验收", "Accepted") : text("未验收", "Not accepted")) : progress.percent === null ? text("未记录", "Not recorded")
             : text(`已验收 ${progress.completed}/${progress.total}`, `Accepted ${progress.completed}/${progress.total}`)}</span>

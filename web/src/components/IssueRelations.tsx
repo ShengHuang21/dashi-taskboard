@@ -365,6 +365,7 @@ export function IssueSubIssues({
 }) {
   const { language, text } = useTaskboardI18n();
   const [savingId, setSavingId] = useState<string | null>(null);
+  const [showDependencyGraph, setShowDependencyGraph] = useState(false);
   const [collapsedTaskIds, setCollapsedTaskIds] = useState<Set<string>>(() => new Set());
   const taskById = new Map(referenceTasks.map((candidate) => [candidate.id, candidate]));
   const orderedTasks = [...taskById.values()].sort((left, right) => (
@@ -474,9 +475,10 @@ export function IssueSubIssues({
           && unfinishedPrerequisites.every((dependency) => adoptedInputs.some((input) => (
             input.consumerTaskId === issue.id && input.producerTaskId === dependency.id
           )));
+        const compact = !showDependencyGraph;
         return (
           <li className="issue-tree-node" data-task-id={issue.id} key={issue.id}>
-            <div className="issue-tree-row">
+            <div className={`issue-tree-row${compact ? " is-compact" : ""}`}>
               <div className="issue-tree-content">
                 <button
                   className="issue-tree-target"
@@ -492,6 +494,7 @@ export function IssueSubIssues({
                 </button>
                 <div className="issue-tree-status">
                   <span>{taskStatusLabel(language, issue.status)}</span>
+                  {responsibleWindows.length === 0 ? <span>{text("负责窗口 · 未登记", "Responsible window · Not recorded")}</span> : null}
                   {responsibleWindows.map(({ declaration, node: window }) => <details className="issue-tree-window" key={`${declaration.sourceCommentId}:${window.id}`}>
                     <summary>{text("负责窗口", "Responsible window")} · {window.roleLabel}</summary>
                     <p>{window.title}</p><p>{text("职责", "Scope")} · {window.scope}</p><p>{text("记录状态", "Recorded state")} · {window.recordedState}</p><p>{declaration.sourceCommentId} · v{declaration.sourceCommentVersion}</p>
@@ -501,9 +504,10 @@ export function IssueSubIssues({
                   {inputsAdopted ? <span data-execution-state="artifact_input">
                     {text("前置产物输入已采用", "Prerequisite artifact input adopted")}
                   </span> : <TaskExecutionStatus state={execution} />}
+                  {unfinishedPrerequisites.length > 0 ? <span>{inputsAdopted ? text("登记前置（输入已采用）", "Recorded prerequisites (inputs adopted)") : text("登记前置", "Recorded prerequisites")} · {unfinishedPrerequisites.map((dependency) => `${dependency.externalKey ?? dependency.identifier} (${taskStatusLabel(language, dependency.status)})`).join(" · ")}</span> : null}
                   {child?.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </div>
-                <TaskProgress
+                {!compact ? <><TaskProgress
                   progress={progressModel.forTask(issue.id)}
                   label={text(`${issue.title}的进度`, `Progress for ${issue.title}`)}
                   showStages
@@ -513,7 +517,7 @@ export function IssueSubIssues({
                 <p className="dependency-card-summary">{text("方法 / 产物", "Method / output")} · {child?.description.split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith("#") && !line.startsWith("```"))?.replace(/^[\s>*-]+/, "").slice(0, 110) || text("未记录", "Not recorded")}</p>
                 <p className="dependency-card-model">{text("实际模型（登记）", "Actual model (recorded)")} · {receipts[issue.id]?.implementation?.threadId === child?.threadBinding?.threadId && receipts[issue.id]?.implementation
                   ? `${receipts[issue.id]!.implementation!.model} / ${receipts[issue.id]!.implementation!.reasoningEffort}`
-                  : text("未知", "Unknown")}</p>
+                  : text("未知", "Unknown")}</p></> : null}
               </div>
               {parentId === task.id && child ? (
                 <button
@@ -535,7 +539,7 @@ export function IssueSubIssues({
                 </button>
               ) : null}
             </div>
-            {hasChildren ? <p className="issue-tree-next-level">{text("打开此任务查看下一层依赖图", "Open this task for the next dependency graph level")}</p> : null}
+            {!compact && hasChildren ? <p className="issue-tree-next-level">{text("打开此任务查看下一层依赖图", "Open this task for the next dependency graph level")}</p> : null}
           </li>
         );
       });
@@ -588,13 +592,14 @@ export function IssueSubIssues({
     <section className="issue-sub-issues" aria-labelledby="sub-issues-heading">
       <header>
         <div>
-          <h2 id="sub-issues-heading">{text("任务依赖图", "Task dependency graph")}</h2>
+          <h2 id="sub-issues-heading">{text("本范围任务", "Tasks in this scope")}</h2>
           {subIssues.length > 0 && (
             <span className="sub-issue-summary">
               {text(`${subIssues.length} 个直接子议题`, `${subIssues.length} direct sub-issues`)}
             </span>
           )}
         </div>
+        <button className="button secondary" type="button" aria-pressed={showDependencyGraph} onClick={() => setShowDependencyGraph((value) => !value)}>{showDependencyGraph ? text("显示纵向列表", "Show vertical list") : text("查看依赖图", "View dependency graph")}</button>
         <IssuePicker
           label={text("添加子议题", "Add sub-issue")}
           candidates={candidates}
@@ -611,8 +616,9 @@ export function IssueSubIssues({
       </header>
       {subIssues.length > 0 && (
         <div>
+          {!showDependencyGraph ? <ul className="issue-sub-issue-vertical">{renderChildren(task.id, new Set([task.id]), subIssues)}</ul> : <>
           <TaskFlowCanvas task={task} tasks={referenceTasks} onOpenTask={onOpenTask} />
-          <details><summary>{text("任务卡片与依赖明细", "Task cards and dependency details")}</summary>
+          <details open><summary>{text("任务卡片与依赖明细", "Task cards and dependency details")}</summary>
           <p className="dependency-legend">{text("实线箭头＝整张卡的前置依赖。并排阶段可交叠推进；其中部分任务仍需等待具体前置，见下方依赖说明。排列不代表启动授权。点击卡片查看下一层。", "Solid arrows: whole-card prerequisites. Side-by-side stages may overlap; individual tasks still wait for the exact inputs listed below. Layout is not start authorization. Open a card to drill down.")}</p>
           {graph.crossed && <p>{text("此层存在交叉局部依赖；请按下方具体任务关系下钻。", "Crossed dependencies at this level; inspect the exact task links below.")}</p>}
           {graph.edges.some((edge) => edge.partial) && <p className="dependency-legend"><strong>{text("部分任务依赖，可交叠推进", "Partial task dependencies; stages may overlap")}</strong> · {text("无需等待整个前一阶段完成；具体前置见图下方。横向滚动查看同层任务。", "No whole-stage completion gate; exact prerequisites are listed below. Scroll horizontally for same-level tasks.")}</p>}
@@ -621,7 +627,7 @@ export function IssueSubIssues({
             {graph.layers.map(([layer, issues]) => <section className="dependency-layer" key={layer}><ul className="issue-tree-children">{renderChildren(task.id, new Set([task.id]), issues)}</ul></section>)}
           </div>
           <ul className="dependency-evidence">{graph.edges.map((edge) => <li key={`${edge.from}:${edge.to}`}><strong>{edge.partial ? text("部分任务依赖，可交叠推进", "Partial task dependency; stages may overlap") : text("前置依赖", "Prerequisite")}</strong> · {subIssues.find((issue) => issue.id === edge.from)?.title} → {subIssues.find((issue) => issue.id === edge.to)?.title}<br />{edge.evidence.map((pair) => `${pair.from} → ${pair.to}`).join(" · ")}</li>)}{graph.external.map((edge, index) => <li key={`external:${index}`}>{text("本层外的前置", "Prerequisite outside this view")} · {edge.prerequisite} → {edge.task}</li>)}</ul>
-          </details>
+          </details></>}
         </div>
       )}
     </section>

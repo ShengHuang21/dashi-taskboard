@@ -1,6 +1,9 @@
 import type { Task, TaskProgressChange } from "./types";
 
 export interface DeliveryProgress {
+  leaves?: Task[];
+  implementationLeafIds?: string[];
+  isLeaf?: boolean;
   implemented?: number;
   implementationTotal?: number;
   completed: number;
@@ -77,6 +80,8 @@ export function createTaskProgressModel(referenceTasks: Task[]) {
       task.status === "in_review" || task.status === "done"
     )).length;
     return {
+      leaves: [...leaves.values()],
+      implementationLeafIds: implementationLeaves.map((task) => task.id),
       implemented,
       implementationTotal: implementationLeaves.length,
       completed,
@@ -91,7 +96,7 @@ export function createTaskProgressModel(referenceTasks: Task[]) {
   function forTask(id: string): DeliveryProgress {
     const task = taskById.get(id);
     if (!task) return { implemented: 0, implementationTotal: 0, completed: 0, total: 0, percent: null, reason: "incomplete" };
-    const progress = progressFor([id], id);
+    const progress = { ...progressFor([id], id), isLeaf: childIds.get(id)!.size === 0 };
     if (task.status === "canceled") {
       return { ...progress, implemented: 0, implementationTotal: 0, completed: 0, total: 0, percent: null, reason: "canceled" };
     }

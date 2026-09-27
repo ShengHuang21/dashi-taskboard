@@ -3154,6 +3154,41 @@ kbd {
   background: var(--surface);
 }
 
+.issue-sub-issue-vertical { margin: 0; padding: 0; list-style: none; border: var(--border-hairline) solid var(--border); border-radius: 7px; background: var(--surface); }
+.issue-sub-issue-vertical > .issue-tree-node + .issue-tree-node { border-top: var(--border-hairline) solid var(--border); }
+.task-parent-chain { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; font-size: 12px; color: var(--text-secondary); }
+.task-parent-chain button { border: 0; padding: 0; color: var(--accent); background: transparent; text-align: left; cursor: pointer; }
+.task-parent-chain > * + *::before { content: "/"; margin-right: 6px; color: var(--text-secondary); }
+.issue-tree-row.is-compact { grid-template-columns: minmax(0, 1fr) 28px; }
+.issue-tree-row.is-compact .issue-tree-content { gap: 4px; }
+.issue-tree-row.is-compact .issue-tree-target { width: 100%; }
+.issue-tree-row.is-compact .issue-relation-id,
+.issue-tree-row.is-compact .issue-relation-assignee { flex-shrink: 0; }
+.issue-tree-row.is-compact .issue-tree-title { flex: 1; }
+.issue-sub-issues > header { flex-wrap: wrap; }
+.issue-content-disclosure { margin: 16px 0; }
+.issue-content-disclosure > summary { cursor: pointer; color: var(--text-secondary); font-size: 13px; padding: 8px 0; }
+.issue-content-disclosure > summary:focus-visible,
+.task-parent-chain button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.issue-evidence-details { margin: 6px 0; font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.issue-evidence-details > summary { cursor: pointer; padding: 4px 0; }
+.issue-evidence-details p { margin: 8px 0; line-height: 1.5; }
+.issue-evidence-details ul { margin: 8px 0; padding-left: 18px; }
+.issue-evidence-details li { margin: 8px 0; }
+.issue-evidence-details li > span { display: block; }
+.issue-evidence-details button { border: 0; background: transparent; color: var(--accent); padding: 3px 0; text-align: left; cursor: pointer; font: inherit; }
+.issue-evidence-links { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.issue-evidence-details button:focus-visible,
+.issue-evidence-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.issue-work-summary { margin: 12px 0; padding: 10px 12px; border: var(--border-hairline) solid var(--border); border-radius: 7px; background: var(--surface); }
+.issue-work-summary > p { font-size: 13px; line-height: 1.5; margin: 4px 0; overflow-wrap: anywhere; }
+.issue-work-summary h3 { font-size: 12px; margin: 12px 0 6px; }
+.issue-work-summary .issue-description-document { font-size: 12px; }
+.issue-description-change { margin: 10px 0; }
+.issue-description-change > summary { cursor: pointer; }
+.issue-description-change pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; padding: 8px; border: var(--border-hairline) solid var(--border); font: inherit; }
+.issue-execution-observation { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 12px; color: var(--text-secondary); }
+
 .dependency-graph { position: relative; padding: 18px 12px 40px; overflow: auto; }
 .task-flow-canvas { border: 1px solid var(--border); border-radius: 12px; padding: 16px; background: var(--surface); }
 .task-flow-canvas > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -8527,7 +8562,7 @@ kbd {
 
   .issue-properties {
     position: static;
-    order: -1;
+    order: 0;
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 1px 8px;

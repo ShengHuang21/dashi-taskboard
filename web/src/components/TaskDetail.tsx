@@ -100,6 +100,7 @@ import copyIdIcon from "../assets/figma-taskboard/copy-id.svg";
 import copyLinkIcon from "../assets/figma-taskboard/copy-link.svg";
 import { DescriptionDocument } from "./DescriptionDocument";
 import { createTaskProgressModel } from "../taskProgress";
+import { compactWorkExcerpt, projectTaskWork, taskDescriptionHistory } from "../taskWorkSummary";
 import { TaskProgress } from "./TaskProgress";
 import { GoalWindows } from "./GoalWindows";
 import { GoalWindowAssignments, GoalWindowMap, latestGoalWindowMap, type GoalWindowMapDeclaration } from "./GoalWindowMap";
@@ -115,6 +116,10 @@ export interface RegisteredReviewReceipt {
   model: string;
   reasoningEffort: string;
   sourceRef: string;
+  candidate: { digest: string };
+  commentId: string;
+  commentVersion: number;
+  commentUpdatedAt: string;
   implementation?: { threadId: string; model: string; reasoningEffort: string };
 }
 
@@ -138,6 +143,8 @@ export function latestRegisteredReviewReceipt(comments: Comment[]): RegisteredRe
           || typeof (implementation as { reasoningEffort?: unknown }).reasoningEffort !== "string"))) continue;
       return { status: receipt.status, reviewerThreadId: receipt.reviewerThreadId, model: receipt.model,
         reasoningEffort: receipt.reasoningEffort, sourceRef: receipt.sourceRef,
+        candidate: { digest: (candidate as { digest: string }).digest },
+        commentId: comment.id, commentVersion: comment.version, commentUpdatedAt: comment.updatedAt,
         ...(implementation ? { implementation: implementation as RegisteredReviewReceipt["implementation"] } : {}) };
     } catch {
       continue;
@@ -463,6 +470,8 @@ export function TaskDetail({
     () => createInlineMediaSegments(task.description, referenceTasks),
   );
   const [editingDescription, setEditingDescription] = useState(false);
+  const descriptionDisclosureRef = useRef<HTMLDetailsElement>(null);
+  const activityDisclosureRef = useRef<HTMLDetailsElement>(null);
   const [propertyMenu, setPropertyMenu] = useState<
     "status" | "priority" | "assignee" | "labels" | "development" | "recurrence" | null
   >(null);
@@ -484,6 +493,17 @@ export function TaskDetail({
       candidate = referenceTasks.find((item) => item.id === parentId && item.projectId === currentTask.projectId);
     }
     return undefined;
+  })();
+  const parentChain = (() => {
+    const chain: TaskRelationSummary[] = [];
+    const seen = new Set<string>([currentTask.id]);
+    let parent = currentTask.relations.parent;
+    while (parent && !seen.has(parent.id)) {
+      chain.unshift(parent);
+      seen.add(parent.id);
+      parent = referenceTasks.find((candidate) => candidate.id === parent!.id)?.relations.parent ?? null;
+    }
+    return chain;
   })();
   const ancestorKey = ancestorGoal && ancestorGoal.id !== currentTask.id ? `${ancestorGoal.id}:${ancestorGoal.updatedAt}` : "";
   const [inheritedMaps, setInheritedMaps] = useState<{ key: string; maps: GoalWindowMapDeclaration[] }>({ key: "", maps: [] });
@@ -540,17 +560,27 @@ export function TaskDetail({
   ];
   const progressModel = createTaskProgressModel(progressTasks);
   const deliveryProgress = progressModel.forTask(currentTask.id);
+  const workSummary = projectTaskWork(currentTask);
+  const descriptionHistory = taskDescriptionHistory(currentTask.id, taskActivities);
   const actualModelRecords = aiThreads.filter((thread) => (
     thread.origin.projectId === currentTask.projectId && thread.origin.issueId === currentTask.id
   ));
   const actualModelSignatures = [...new Set(actualModelRecords.map((thread) => `${thread.model} / ${thread.reasoningEffort}`))];
-  const actualModel = actualModelSignatures.length === 1 ? actualModelSignatures[0]
-    : actualModelSignatures.length === 0 ? text("实际模型未记录", "Actual model not recorded")
-      : text("多条实际模型记录，未显示为当前模型", "Multiple actual model records; no current model inferred");
   const reviewReceipt = latestRegisteredReviewReceipt(comments);
   const registeredImplementation = reviewReceipt?.implementation
     && reviewReceipt.implementation.threadId === currentTask.threadBinding?.threadId
     ? reviewReceipt.implementation : null;
+  const conversations = presentations[currentTask.id]?.conversations ?? [];
+  const modelDeclarationLabels = currentTask.labels.filter((label) => /model|模型|reasoning|推理/i.test(label));
+  const modelConflict = actualModelSignatures.length > 1 || Boolean(registeredImplementation
+    && actualModelSignatures.some((model) => model !== `${registeredImplementation.model} / ${registeredImplementation.reasoningEffort}`));
+  function revealEvidence(section: "description" | "activity") {
+    const element = section === "description" ? descriptionDisclosureRef.current : activityDisclosureRef.current;
+    if (!element) return;
+    element.open = true;
+    element.scrollIntoView({ block: "start" });
+    element.querySelector("summary")?.focus();
+  }
   const editingInlineImages = inlineMediaImages(editingSegments);
 
   useLayoutEffect(() => {
@@ -1173,6 +1203,10 @@ export function TaskDetail({
                   onKeyDown={handleTitleKeyDown}
                   onBlur={() => void saveTitle()}
                 />
+                {parentChain.length > 0 ? <nav className="task-parent-chain" aria-label={text("父级路径", "Parent path")}>
+                  {parentChain.map((parent) => <button type="button" key={parent.id} onClick={() => onOpenTask(parent)}>{parent.externalKey ?? parent.identifier} · {parent.title}</button>)}
+                  <span aria-current="page">{displayIdentifier}</span>
+                </nav> : null}
                 <IssueParentLink
                   task={currentTask}
                   tasks={tasks}
@@ -1184,6 +1218,53 @@ export function TaskDetail({
                     () => onRemoveRelation(anchor, type, relatedTaskId),
                   )}
                 />
+                <section className="issue-work-summary" aria-label={text("当前正文工作摘要", "Current description work summary")}>
+                  <p><strong>{text("当前记录", "Current record")}</strong> · {compactWorkExcerpt(workSummary.current) ?? text("未找到明确当前状态段落，待核对", "No explicit current-state section found; needs verification")}</p>
+                  <p><strong>{text("下一步", "Next step")}</strong> · {compactWorkExcerpt(workSummary.next) ?? text("未单独记录，待核对", "Not separately recorded; needs verification")}</p>
+                  <details className="issue-evidence-details" key={`work-source-${currentTask.id}`}>
+                    <summary>{text("展开当前记录、职责与来源 · 确认状态待核对", "Expand current record, scope and source · confirmation needs verification")}</summary>
+                    <p>{text("仅引用本卡当前正文，不是全项目已确认计划；父子任务或窗口声明不一致时保留各自来源，不自动决定哪个生效。", "Quotes only this task's current description, not a confirmed project-wide plan. Parent, child and window records remain separate; no effective plan is inferred when they differ.")}</p>
+                    <p>{displayIdentifier} · v{workSummary.source.version} · {text("任务记录更新时间（非计划生效时间）", "Task record update (not plan effective time)")} · {exactTime(workSummary.source.updatedAt, locale)}</p>
+                    <p>{text("确认人、确认时间及计划生效时间未作为独立字段提供，待核对。", "Confirmer, confirmation time and plan effective time are not supplied as separate fields; verification is needed.")}</p>
+                    {workSummary.historyLine ? <p>{text(`正文第 ${workSummary.historyLine} 行起明确标为历史，不参与当前摘要。`, `The description explicitly marks history starting at line ${workSummary.historyLine}; it is excluded from the current summary.`)}</p> : null}
+                    {([
+                      [text("当前记录原文", "Current record source"), workSummary.current],
+                      [text("下一步原文", "Next-step source"), workSummary.next],
+                      [text("范围与职责原文", "Scope and responsibility source"), workSummary.scope],
+                    ] as const).map(([label, excerpt]) => <div key={label}>
+                      <h3>{label}{excerpt ? ` · ${text(`正文第 ${excerpt.line} 行`, `Description line ${excerpt.line}`)}` : ""}</h3>
+                      {excerpt ? <DescriptionDocument value={[excerpt.heading, excerpt.text].filter(Boolean).join("\n\n")} referenceTasks={referenceTasks} onOpenTask={onOpenTask} /> : <p>{text("未找到独立对应段落；请查看完整说明，不作推断。", "No separate matching section found; see the full description. No inference is made.")}</p>}
+                    </div>)}
+                    <button type="button" onClick={() => revealEvidence("description")}>{text("查看完整任务说明", "View full task description")}</button>
+                  </details>
+                  <details className="issue-evidence-details" key={`work-output-${currentTask.id}`}>
+                    <summary>{text("输入 / 输出与产出 / 验收证据原文", "Input / output and artifacts / acceptance evidence sources")}</summary>
+                    <p>{text("以下为明确段落的正文自述，不代表机器核验、QA通过或用户验收。", "These are self-reported description sections, not machine verification, QA approval or user acceptance.")}</p>
+                    {([
+                      ["Input", workSummary.input],
+                      [text("Output / 产出", "Output / artifacts"), workSummary.output],
+                      [text("验证与验收证据", "Verification and acceptance evidence"), workSummary.evidence],
+                      [text("后续交接流程原文（不代表立即下一步）", "Handoff procedure source (not an immediate next step)"), workSummary.handoff],
+                    ] as const).map(([label, excerpt]) => <div key={label}>
+                      <h3>{label}{excerpt ? ` · ${text(`正文第 ${excerpt.line} 行`, `Description line ${excerpt.line}`)}` : ""}</h3>
+                      {excerpt ? <DescriptionDocument value={[excerpt.heading, excerpt.text].filter(Boolean).join("\n\n")} referenceTasks={referenceTasks} onOpenTask={onOpenTask} /> : <p>{text("对应明确字段或段落未记录；完整正文仍可查看。", "No explicit matching field or section recorded; the full description remains available.")}</p>}
+                    </div>)}
+                    <button type="button" onClick={() => revealEvidence("description")}>{text("查看完整任务说明", "View full task description")}</button>
+                  </details>
+                  <details className="issue-evidence-details" key={`work-history-${currentTask.id}`}>
+                    <summary>{text("正文计划变更记录", "Description plan-change records")} · {commentsLoading ? text("加载中", "Loading") : descriptionHistory.length}</summary>
+                    <p>{text("修改记录者不是确认人，记录时间不是生效时间。变更原因、确认人和完整影响范围未单独记录；标题变化仅用于定位原文，不证明业务含义。", "The recorded editor is not a confirmer and record time is not effective time. Change reason, confirmer and full impact scope are not separately recorded; changed headings locate source text, not business meaning.")}</p>
+                    {!commentsLoading && !descriptionHistory.length ? <p>{text("当前已加载活动中没有可对比的正文改前/改后记录。", "No comparable description before/after record exists in the loaded activities.")}</p> : null}
+                    {descriptionHistory.map((change) => <details className="issue-description-change" key={change.id}>
+                      <summary>{exactTime(change.createdAt, locale)} · {change.actorName} · {text("正文更新", "Description updated")}{change.headings.length ? ` · ${change.headings.slice(0, 2).map((heading) => heading || text("无标题段落", "Untitled section")).join(" / ")}${change.headings.length > 2 ? "…" : ""}` : ""}</summary>
+                      <p>{text("来源活动", "Source activity")} · {change.activityId} · {text("修改记录者", "Recorded editor")} · {change.actorName}</p>
+                      <p>{text("变化的当前段落标题", "Changed current-section headings")} · {change.headings.join(" · ") || text("未提取到明确标题，请比较原文", "No explicit changed heading extracted; compare source text")}</p>
+                      <h3>{text("改前原文", "Source before")}</h3><pre>{change.before}</pre>
+                      <h3>{text("改后原文", "Source after")}</h3><pre>{change.after}</pre>
+                    </details>)}
+                    <button type="button" onClick={() => revealEvidence("activity")}>{text("查看完整活动与关系变更", "View full activity and relation changes")}</button>
+                  </details>
+                </section>
                 {currentTask.labels.includes("owner-goal") ? <GoalWindowMap comments={comments} onOpenThread={onOpenThread} tasks={tasks} onOpenTask={onOpenTask} onDeclaration={onGoalWindowMapObserved} presentation="none" /> : null}
                 <GoalWindowAssignments declarations={scopedWindowMaps} task={currentTask} tasks={referenceTasks} />
                 <section className="issue-delivery-progress" aria-label={text("交付完成度", "Delivery completion")}>
@@ -1192,22 +1273,62 @@ export function TaskDetail({
                     label={text(`${displayIdentifier} 交付完成度`, `${displayIdentifier} delivery completion`)}
                     showStages
                     reviewReceipt={reviewReceipt}
+                    leafStatus={deliveryProgress.isLeaf ? currentTask.status : undefined}
                   />
-                  <p className="issue-delivery-model">{registeredImplementation
-                    ? `${text("实现模型（已登记）", "Implementation model (registered)")} · ${registeredImplementation.model} / ${registeredImplementation.reasoningEffort}`
-                    : `${text("实际模型", "Actual model")} · ${actualModel}`}</p>
-                  {reviewReceipt ? <details className="issue-delivery-review-source">
-                    <summary>{text("AI 审查回执已登记（非平台验证）", "AI review receipt registered (not platform-verified)")}</summary>
-                    <p>{`${reviewReceipt.reviewerThreadId} · ${reviewReceipt.model} / ${reviewReceipt.reasoningEffort}`}</p>
-                    <p>{reviewReceipt.sourceRef}</p>
+                  <p className="issue-delivery-model">{text("待审查只计实现交付，不代表审查通过或用户验收。", "In review counts as implementation delivery, not review approval or user acceptance.")}</p>
+                  {deliveryProgress.total > 0 ? <details className="issue-evidence-details" key={`progress-${currentTask.id}`}>
+                    <summary>{text(`查看进度组成 · 实现 ${deliveryProgress.implementationTotal} 项 / 验收 ${deliveryProgress.total} 项`, `Progress breakdown · ${deliveryProgress.implementationTotal} implementation / ${deliveryProgress.total} acceptance items`)}</summary>
+                    <p>{text("按同一去重叶任务集合计算；已取消项不计入，验收专用项不计入实现分母。归档不等于完成。", "Uses the same deduplicated leaf tasks; canceled items are excluded and acceptance-only items are excluded from implementation. Archived does not mean complete.")}</p>
+                    {deliveryProgress.reason === "incomplete" ? <p>{text("关联资料不完整，下列仅为已知组成，不代表完整分母。", "Relation details are incomplete; these are known items, not a complete denominator.")}</p> : null}
+                    <ul>{deliveryProgress.leaves?.map((leaf) => <li key={leaf.id}>
+                      <button type="button" onClick={() => onOpenTask(leaf)}>{leaf.externalKey ?? leaf.identifier} · {leaf.title}</button>
+                      <span>{taskStatusLabel(language, leaf.status)} · {deliveryProgress.implementationLeafIds?.includes(leaf.id) ? text("实现 + 验收", "Implementation + acceptance") : text("仅验收", "Acceptance only")}</span>
+                    </li>)}</ul>
+                  </details> : null}
+                  <details className="issue-evidence-details" key={`execution-${currentTask.id}`}>
+                    <summary>{text("执行记录与模型来源", "Execution records and model sources")} · {conversations.length ? text(`${conversations.length} 条会话记录`, `${conversations.length} conversation records`) : text("状态待核对", "State needs verification")}</summary>
+                    <p>{text("以下是最近记录，不是实时连接状态；会话更新时间不等于执行时间。", "These are recorded observations, not live connection status; conversation updates are not execution timestamps.")}</p>
+                    <ul>{conversations.map((conversation) => <li key={conversation.key}>
+                      <strong>{conversation.title}</strong>
+                      <span>{text("来源", "Source")} · {conversation.source} · {conversation.nativeThreadId ?? conversation.aiThreadId ?? conversation.key}</span>
+                      <span>{text("最近回报（记录更新）", "Latest report (record update)")} · {exactTime(conversation.updatedAt, locale)}</span>
+                      <span>{text("运行记录", "Run record")} · {conversation.currentRun?.status ?? text("无可用运行记录，状态待核对", "No available run record; state needs verification")}</span>
+                      {conversation.currentRun?.startedAt ? <span>{text("开始记录", "Recorded start")} · {exactTime(conversation.currentRun.startedAt, locale)}</span> : null}
+                      {conversation.currentRun?.finishedAt ? <span>{text("结束记录", "Recorded end")} · {exactTime(conversation.currentRun.finishedAt, locale)}</span> : null}
+                    </li>)}</ul>
+                    <p>{text("模型标签声明（原文，不代表实际运行）", "Model label declarations (verbatim, not actual execution)")} · {modelDeclarationLabels.join(" · ") || text("未记录", "Not recorded")}</p>
+                    <p>{text("任务级模型配置未提供；未切换或启动任何模型。", "Task-level model configuration is unavailable; no model is switched or started.")}</p>
+                    {actualModelRecords.map((thread) => <p key={thread.id}>{text("会话模型记录（非逐次调用证明）", "Conversation model record (not per-run proof)")} · {thread.id} · {thread.model} / {thread.reasoningEffort} · {exactTime(thread.updatedAt, locale)}</p>)}
+                    {registeredImplementation ? <p>{text("回执登记的实现模型", "Implementation model registered in receipt")} · {registeredImplementation.threadId} · {registeredImplementation.model} / {registeredImplementation.reasoningEffort}</p> : null}
+                    {!actualModelRecords.length && !registeredImplementation ? <p>{text("实际模型的结构化记录未提供；可查看正文自述。", "No structured actual-model record supplied; see the description for self-reported information.")}</p> : null}
+                    {modelConflict ? <p>{text("模型来源存在差异：以上记录并列保留，未推断当前模型。", "Model sources differ: records are retained separately; no current model is inferred.")}</p> : null}
+                  </details>
+                  <details className="issue-evidence-details" key={`review-${currentTask.id}`}>
+                    <summary>{text("验证与交付", "Verification and delivery")} · {reviewReceipt ? text("有结构化审查回执（非平台验证）", "Structured review receipt available (not platform-verified)") : text("结构化审查回执未记录", "Structured review receipt not recorded")}</summary>
+                    {reviewReceipt ? <>
+                      <p>{text("回执结果", "Receipt result")} · {reviewReceipt.status}</p>
+                      <p>{text("候选摘要", "Candidate digest")} · {reviewReceipt.candidate.digest}</p>
+                      <p>{text("审查记录模型", "Recorded reviewer model")} · {reviewReceipt.reviewerThreadId} · {reviewReceipt.model} / {reviewReceipt.reasoningEffort}</p>
+                      {reviewReceipt.implementation ? <p>{text("实现模型自述", "Reported implementation model")} · {reviewReceipt.implementation.threadId} · {reviewReceipt.implementation.model} / {reviewReceipt.implementation.reasoningEffort}{!registeredImplementation ? ` · ${text("与当前绑定窗口不匹配，未作为当前实现记录", "Does not match the current binding; not treated as the current implementation")}` : ""}</p> : null}
+                      <p>{text("证据来源", "Evidence source")} · {reviewReceipt.sourceRef}</p>
+                      <p>{text("回执评论", "Receipt comment")} · {reviewReceipt.commentId} · v{reviewReceipt.commentVersion} · {text("更新时间", "Updated")} {exactTime(reviewReceipt.commentUpdatedAt, locale)}</p>
+                      <p>{text("此记录未核验当前候选一致性；评论更新时间不是审查发生时间。", "This record does not verify the current candidate matches; the comment update time is not the review time.")}</p>
+                    </> : <p>{text("尚无可核验的结构化审查记录。说明和历史评论可能包含产物、测试与 QA 等证据自述，不等于没有证据。", "No verifiable structured review record yet. The description and historical comments may contain self-reported artifacts, tests, and QA evidence; their absence here does not mean no evidence exists.")}</p>}
+                    <div className="issue-evidence-links"><button type="button" onClick={() => revealEvidence("description")}>{text("查看任务说明与证据自述", "View description and reported evidence")}</button><button type="button" onClick={() => revealEvidence("activity")}>{text("查看历史活动与回执来源", "View history and receipt sources")}</button></div>
+                  </details>
+                  {currentTask.relations.blockedBy.length ? <details className="issue-evidence-details" key={`prerequisites-${currentTask.id}`}>
+                    <summary>{text("登记前置状态", "Recorded prerequisite states")}</summary>
+                    <p>{text("前置未验收不必然代表当前任务运行受阻；此处仅显示登记关系，不改执行状态判断。", "An unaccepted prerequisite does not necessarily block this task's execution; this shows recorded relations without changing execution-state logic.")}</p>
+                    <ul>{currentTask.relations.blockedBy.map((dependency) => <li key={dependency.id}><button type="button" onClick={() => onOpenTask(dependency)}>{dependency.externalKey ?? dependency.identifier} · {dependency.title}</button><span>{taskStatusLabel(language, dependency.status)}</span></li>)}</ul>
                   </details> : null}
                   {!(execution === "not_started" && currentTask.labels.includes("owner-goal")
                     && currentTask.id === task.id && goalAdoptedInputs?.goalId === currentTask.id
-                    && goalAdoptedInputs.hasCoordinatorHistory) ? <TaskExecutionStatus state={execution} /> : null}
+                    && goalAdoptedInputs.hasCoordinatorHistory) ? <span className="issue-execution-observation">{text("执行观测：", "Execution observation: ")}<TaskExecutionStatus state={execution} />{text("（见记录，非实时连接；具体等待原因以正文登记为准）", " (see records, not live connectivity; consult the description for recorded waiting reasons)")}</span> : null}
                   {currentTask.archivedAt ? <span>{text("已归档 · 归档不等于完成", "Archived · archiving does not mean completion")}</span> : null}
                 </section>
                 <GoalWindows declaration={currentTask.goalWindows} onOpenThread={onOpenThread} />
                 <IssueSubIssues
+                  key={currentTask.id}
                   task={currentTask}
                   tasks={tasks}
                   referenceTasks={progressTasks}
@@ -1227,6 +1348,8 @@ export function TaskDetail({
                     () => onRemoveRelation(anchor, type, relatedTaskId),
                   )}
                 />
+                <details ref={descriptionDisclosureRef} className="issue-content-disclosure" key={`description-${currentTask.id}`} open={!description}>
+                  <summary>{text("任务说明", "Task description")}</summary>
                 {editingDescription ? (
                   <div
                     className="issue-description-composer"
@@ -1290,6 +1413,7 @@ export function TaskDetail({
                       : text("添加描述…", "Add description…")}
                   </div>
                 )}
+                </details>
                 {(currentTask.threadBinding || currentTask.legacyLocalThreadId) && (
                   <div
                     className="issue-conversation-list"
@@ -1391,6 +1515,8 @@ export function TaskDetail({
                 <span>{activityTimeline.length}</span>
               </header>
 
+              <details ref={activityDisclosureRef} className="issue-content-disclosure" key={`activity-${currentTask.id}`}>
+                <summary>{text("查看历史活动与评论", "View activity and comment history")}</summary>
               <div className="activity-stream">
                 <div className={`activity-entry activity-created is-${currentTask.creatorType}`}>
                   <span className="activity-rail-icon activity-creator-icon" aria-hidden="true">
@@ -1678,6 +1804,7 @@ export function TaskDetail({
                   );
                 })}
               </div>
+              </details>
 
               {commentsError && (
                 <div className="comments-error" role="alert">
