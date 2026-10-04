@@ -37,7 +37,7 @@ test("issue details mirror Linear parent, sub-issue, dependency, and related sec
   assert.match(detailSource, /<IssueParentLink/);
   assert.match(detailSource, /<IssueSubIssues/);
   assert.match(detailSource, /<IssueRelationSidebar/);
-  assert.match(relationsSource, /\{text\("子议题", "Sub-issues"\)\}/);
+  assert.match(relationsSource, /<h2 id="sub-issues-heading">\{text\("任务依赖图", "Task dependency graph"\)\}<\/h2>/);
   assert.match(relationsSource, /chineseLabel: "阻塞于", englishLabel: "Blocked by"/);
   assert.match(relationsSource, /chineseLabel: "阻塞", englishLabel: "Blocks"/);
   assert.match(relationsSource, /chineseLabel: "相关议题", englishLabel: "Related issues"/);

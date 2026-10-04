@@ -919,6 +919,11 @@ export class AiChatService {
   async startTurn(threadId, input, continuation, beforeReservation) {
     if (continuation) this.#assertContinuationOpen();
     let thread = this.getThread(threadId);
+    this.database.symphonyLocal?.assertLegacyAllowed({
+      projectId: thread.origin.projectId,
+      taskId: thread.origin.issueId,
+      workspacePath: thread.origin.workspacePath,
+    });
     if (input?.contractVersion === "composer.v1" && input.requestId !== undefined) {
       throw new ApiError(400, "INVALID_FIELD", "requestId is only supported for the background legacy turn payload");
     }

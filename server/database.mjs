@@ -5042,11 +5042,24 @@ export class TaskboardDatabase {
     }
   }
 
-  beginHostExecutorEffectDispatch(rawInput) {
+  beginHostExecutorEffectDispatch(rawInput, symphonyContexts = null) {
     const input = this.#hostExecutorEffectRequest(rawInput);
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const { execution, observedAtMs } = this.#requireActiveHostExecutorFence(input.execution);
+      if (execution.codexHostId === "local" && this.symphonyLocal?.enabled) {
+        this.symphonyLocal.assertNativeReceiptAllowed(input.ordinaryDelivery);
+        if (!Array.isArray(symphonyContexts) || symphonyContexts.length !== input.operations.length) {
+          throw new ApiError(409, "SYMPHONY_RPC_SCOPE_UNKNOWN", "Native RPC requires verified thread ownership");
+        }
+        for (const contexts of symphonyContexts) {
+          for (const context of contexts) this.symphonyLocal.assertLegacyAllowed(context);
+        }
+        // Persisted bindings may have appeared while the adapter's thread/read was awaiting.
+        for (const operation of input.operations) {
+          if (operation.params.threadId) this.symphonyLocal.assertLegacyAllowed({ threadId: operation.params.threadId });
+        }
+      }
       const timestamp = new Date(observedAtMs).toISOString();
       this.#pruneHostExecutorHistoryInTransaction(observedAtMs);
       const row = this.#retainHostExecutorEffectRow(this.#prepare(`
@@ -9883,6 +9896,7 @@ export class TaskboardDatabase {
     agentPath, agentThreadId = null, rootThreadId = null, leaseExpiresAt, writeScope,
     admissionReceiptId = null, admissionAttemptId = null,
   }) {
+    this.symphonyLocal?.assertLegacyAllowed({ taskId: id });
     if (!agentThreadId) {
       throw new ApiError(400, "AGENT_THREAD_REQUIRED", "A durable Sub-Agent claim requires its thread id");
     }
@@ -11743,6 +11757,7 @@ export class TaskboardDatabase {
     },
     { worktreeRepositoryProbe = null } = {},
   ) {
+    this.symphonyLocal?.assertLegacyAllowed({ taskId: id });
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const task = this.#requireTask(id);
@@ -13142,6 +13157,10 @@ export class TaskboardDatabase {
 
   updateTask(id, version, changes, threadId, threadBinding, actor) {
     const current = this.#requireTask(id);
+    this.symphonyLocal?.assertTaskMutation(current, {
+      ...changes,
+      ...(threadBinding !== undefined ? { threadBinding } : {}),
+    });
     if (this.hasAgentLaneAuthorizedDomainCoordinatorShutdown(current.projectId)) {
       throw new ApiError(409, "DOMAIN_COORDINATOR_ARCHIVE_FENCE_ACTIVE", "Task changes wait for authorized thread archival");
     }
@@ -13696,6 +13715,17 @@ export class TaskboardDatabase {
       ORDER BY change_revision
     `).all(task.id, after.revision)
       .map((row) => this.#commentWithAttachments(row));
+  }
+
+  // Called only within SymphonyLocalStore's result/receipt transaction.
+  appendSymphonyResultComment(taskId, body) {
+    const timestamp = now();
+    this.#prepare(`
+      INSERT INTO comments (
+        id, task_id, body, author_type, author_id, author_name,
+        version, created_at, updated_at, change_revision
+      ) VALUES (?, ?, ?, 'agent', 'symphony-local', 'Symphony', 1, ?, ?, ?)
+    `).run(randomUUID(), taskId, body, timestamp, timestamp, this.#nextCommentAttachmentRevision());
   }
 
   createComment(taskId, input) {

@@ -1,0 +1,1416 @@
+--- a/SPEC.md
++++ b/SPEC.md
+@@ -2310,3 +2310,34 @@
+ - Cleanup and observability:
+   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
+     happened on the right machine.
++
++## Local immutable-release extension
++
++The optional `local` tracker maps a Taskboard release ID to the scheduler issue ID.
++Read APIs include ready and non-ready states; transport failure remains an error.
++Dispatch requires an immutable execution snapshot and a project-scoped atomic claim
++before workspace preparation or task-related app-server creation. The same release
++has at most one attempt and one launch guard, with durable checkout exclusion.
++Local omits workspace hooks, provider-native tools, retry/continuation relaunch and
++workspace deletion. A running, claimed Local release is retained for reconciliation
++even though it is no longer a fresh dispatch candidate.
++
++The Local supervisor freezes each process's model/effort and verifies the actual
++executable capability receipt, input hashes and optional Git baseline before spawn.
++It records a separate process group and observed descendant identities. Result
++receipts do not imply process termination: only verified absence of wrapper, group
++and observed descendants permits a stopped receipt and releases durable occupancy.
++Uncertainty, PID reuse and unavailable result delivery preserve the attempt; recovery
++only replays immutable receipts and never starts another Worker. Local workspaces
++and artifacts are retained. These provider-specific rules do not alter the existing
++issue trackers' lifecycle described above.
++
++Local context also freezes protected Taskboard state paths and the input root. The
++runner adds its own state, workflow and original Todo; the supervisor protects the
++effective Codex home without copying authentication. A native per-process permission
++profile restricts Codex-managed tool writes to the workspace, makes inputs read-only
++and denies private state reads. The controller/app-server remain trusted. Inherited
++MCP, plugins and unneeded tool surfaces are disabled and verified in the effective
++configuration. Local thread/turn requests explicitly select the verified profile,
++never legacy sandbox fields; ineffective/unknown permissions fail before a model
++turn. This extension does not claim a filesystem read allowlist for the whole host.
+--- a/elixir/README.md
++++ b/elixir/README.md
+@@ -397,3 +397,29 @@
+ ## License
+ 
+ This project is licensed under the [Apache License 2.0](../LICENSE).
++
++### Local Taskboard releases (optional local extension)
++
++`tracker.kind: local` polls immutable releases from a protected loopback Taskboard
++service. Provider settings require `url`, `project_id`, `instance_id`, `token_env`,
++`state_root`, `supervisor`, `python`, and `capability_file`. Use active states
++`[ready, running]` and terminal states `[in_review, failed, canceled, superseded]`.
++No provider-native issue tools are advertised. Hooks and SSH workers are rejected
++for this provider; the owner prepares workspaces and read-only input snapshots.
++
++Each release is claimed before task-related writes or app-server creation. Per-package
++model/effort are consumed as child-process configuration. One durable launch guard
++prevents relaunch after exit, stall or restart; workspaces and artifacts are retained.
++Result and process-stop receipts are independent. Unknown process state retains its
++checkout occupancy. An observed result is not user acceptance. Other providers keep
++their existing retry and cleanup behavior. The optional Taskboard integration bundle
++contains the supervisor, protected launcher, full configuration example and controlled
++process tests; it is configured explicitly and never installed automatically.
++
++Local also requires the verified native Codex permission-profile protocol. The
++trusted app-server applies a process-only profile to managed tools; private runtime
++state, original Todo and Codex home are denied, while frozen inputs are read-only.
++Inherited MCP/plugins and unneeded optional tools are disabled and checked before
++turn creation. Thread and turn requests select the profile explicitly, omitting
++legacy sandbox fields. Unsupported or changed permissions fail closed; global
++configuration and other tracker sessions are unchanged.
+--- a/elixir/lib/symphony_elixir/agent_runner.ex
++++ b/elixir/lib/symphony_elixir/agent_runner.ex
+@@ -6,6 +6,7 @@
+   require Logger
+   alias SymphonyElixir.Codex.AppServer
+   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
++  alias SymphonyElixir.Local.Runner, as: LocalRunner
+   alias SymphonyElixir.Tracker.Issue
+ 
+   @type worker_host :: String.t() | nil
+@@ -20,6 +21,14 @@
+ 
+   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
+   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
++    if match?(%Issue{native_ref: %{"backend" => "taskboard-local"}}, issue) do
++      LocalRunner.run(issue, codex_update_recipient)
++    else
++      run_provider(issue, codex_update_recipient, opts)
++    end
++  end
++
++  defp run_provider(issue, codex_update_recipient, opts) do
+     # The orchestrator owns host retries so one worker lifetime never hops machines.
+     worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+ 
+--- a/elixir/lib/symphony_elixir/codex/app_server.ex
++++ b/elixir/lib/symphony_elixir/codex/app_server.ex
+@@ -16,8 +16,9 @@
+           metadata: map(),
+           approval_policy: String.t() | map(),
+           auto_approve_requests: boolean(),
+-          thread_sandbox: String.t(),
+-          turn_sandbox_policy: map(),
++          thread_sandbox: String.t() | nil,
++          permission_profile: String.t() | nil,
++          turn_sandbox_policy: map() | nil,
+           thread_id: String.t(),
+           workspace: Path.t(),
+           worker_host: String.t() | nil,
+@@ -38,13 +39,13 @@
+   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
+   def start_session(workspace, opts \\ []) do
+     worker_host = Keyword.get(opts, :worker_host)
+-    dynamic_tool_binding = DynamicTool.bind()
++    dynamic_tool_binding = Keyword.get_lazy(opts, :dynamic_tool_binding, &DynamicTool.bind/0)
+ 
+     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
+-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
++         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding, opts) do
+       metadata = port_metadata(port, worker_host)
+ 
+-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
++      with {:ok, session_policies} <- frozen_session_policies(expanded_workspace, worker_host, opts),
+            {:ok, thread_id} <-
+              do_start_session(port, expanded_workspace, session_policies, dynamic_tool_binding) do
+         {:ok,
+@@ -55,6 +56,7 @@
+            auto_approve_requests: session_policies.approval_policy == "never",
+            thread_sandbox: session_policies.thread_sandbox,
+            turn_sandbox_policy: session_policies.turn_sandbox_policy,
++           permission_profile: Map.get(session_policies, :permission_profile),
+            thread_id: thread_id,
+            workspace: expanded_workspace,
+            worker_host: worker_host,
+@@ -79,7 +81,7 @@
+           thread_id: thread_id,
+           workspace: workspace,
+           dynamic_tool_binding: dynamic_tool_binding
+-        },
++        } = session,
+         prompt,
+         issue,
+         opts \\ []
+@@ -91,7 +93,7 @@
+         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
+       end)
+ 
+-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
++    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, Map.get(session, :permission_profile)) do
+       {:ok, turn_id} ->
+         session_id = "#{thread_id}-#{turn_id}"
+         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
+@@ -189,7 +191,7 @@
+     end
+   end
+ 
+-  defp start_port(workspace, nil, dynamic_tool_binding) do
++  defp start_port(workspace, nil, dynamic_tool_binding, opts) do
+     executable = System.find_executable("bash")
+ 
+     if is_nil(executable) do
+@@ -202,7 +204,7 @@
+             :binary,
+             :exit_status,
+             :stderr_to_stdout,
+-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
++            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding, opts))],
+             cd: String.to_charlist(workspace),
+             env: tracker_secret_port_env(dynamic_tool_binding),
+             line: @port_line_bytes
+@@ -213,15 +215,15 @@
+     end
+   end
+ 
+-  defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
++  defp start_port(workspace, worker_host, dynamic_tool_binding, _opts) when is_binary(worker_host) do
+     remote_command = remote_launch_command(workspace, dynamic_tool_binding)
+     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+   end
+ 
+-  defp local_launch_command(dynamic_tool_binding) do
++  defp local_launch_command(dynamic_tool_binding, opts) do
+     [
+       tracker_secret_unset_command(dynamic_tool_binding),
+-      "exec #{Config.settings!().codex.command}"
++      "exec #{Keyword.get(opts, :launch_command, Config.settings!().codex.command)}"
+     ]
+     |> Enum.reject(&is_nil/1)
+     |> Enum.join(" && ")
+@@ -296,6 +298,13 @@
+     end
+   end
+ 
++  defp frozen_session_policies(workspace, worker_host, opts) do
++    case Keyword.fetch(opts, :session_policies) do
++      {:ok, policies} when is_map(policies) -> {:ok, policies}
++      :error -> session_policies(workspace, worker_host)
++    end
++  end
++
+   defp session_policies(workspace, nil) do
+     Config.codex_runtime_settings(workspace)
+   end
+@@ -305,59 +314,105 @@
+   end
+ 
+   defp do_start_session(port, workspace, session_policies, dynamic_tool_binding) do
+-    case send_initialize(port) do
+-      :ok -> start_thread(port, workspace, session_policies, dynamic_tool_binding)
+-      {:error, reason} -> {:error, reason}
+-    end
+-  end
+-
+-  defp start_thread(
+-         port,
+-         workspace,
+-         %{approval_policy: approval_policy, thread_sandbox: thread_sandbox},
+-         dynamic_tool_binding
+-       ) do
+-    send_message(port, %{
+-      "method" => "thread/start",
+-      "id" => @thread_start_id,
+-      "params" => %{
+-        "approvalPolicy" => approval_policy,
+-        "sandbox" => thread_sandbox,
+-        "cwd" => workspace,
+-        "dynamicTools" => dynamic_tool_binding.tool_specs
+-      }
+-    })
++    with :ok <- send_initialize(port),
++         :ok <- verify_local_permissions(port, workspace, Map.get(session_policies, :permission_profile)) do
++      start_thread(port, workspace, session_policies, dynamic_tool_binding)
++    end
++  end
++
++  defp verify_local_permissions(_port, _workspace, nil), do: :ok
++
++  defp verify_local_permissions(port, workspace, profile) do
++    send_message(port, %{"method" => "permissionProfile/list", "id" => 4, "params" => %{"cwd" => workspace}})
++
++    with {:ok, %{"data" => profiles}} <- await_response(port, 4),
++         true <- Enum.any?(profiles, &(&1["id"] == profile and &1["allowed"] == true)),
++         :ok <- verify_local_features(port),
++         :ok <- verify_local_config(port, workspace) do
++      :ok
++    else
++      _ -> {:error, :local_permissions_unverified}
++    end
++  end
++
++  defp verify_local_features(port) do
++    send_message(port, %{"method" => "experimentalFeature/list", "id" => 5, "params" => %{"limit" => 1000}})
++
++    required =
++      ~w(plugins remote_plugin apps browser_use browser_use_external in_app_browser computer_use hooks multi_agent skill_mcp_dependency_install image_generation view_image code_mode artifact in_app_chat in_app_local_automation memories skill_search worktrees workspace_dependencies realtime_conversation tool_suggest standalone_web_search daemon_auto_start goals shell_snapshot multi_agent_v2)
++
++    with {:ok, %{"data" => features} = result} <- await_response(port, 5),
++         true <- is_nil(result["nextCursor"]),
++         true <- Enum.any?(features, &(&1["name"] == "code_mode_host" and &1["enabled"] == true and &1["stage"] != "removed")),
++         true <- Enum.all?(required, fn name -> Enum.any?(features, &(&1["name"] == name and &1["enabled"] == false and &1["stage"] != "removed")) end) do
++      :ok
++    else
++      _ -> {:error, :local_tools_unverified}
++    end
++  end
++
++  defp verify_local_config(port, workspace) do
++    send_message(port, %{"method" => "config/read", "id" => 6, "params" => %{"cwd" => workspace, "includeLayers" => false}})
++
++    case await_response(port, 6) do
++      {:ok, %{"config" => %{"web_search" => "disabled", "mcp_servers" => servers}}} when is_map(servers) ->
++        if mcp_config_disabled?(servers), do: :ok, else: {:error, :local_mcp_config_enabled}
++
++      _ ->
++        {:error, :local_web_search_unverified}
++    end
++  end
++
++  defp mcp_config_disabled?(servers), do: Enum.all?(servers, fn {_name, server} -> server["enabled"] == false end)
++
++  defp verify_local_thread(_port, _thread, nil, _response), do: :ok
++
++  defp verify_local_thread(port, thread, profile, response) do
++    if get_in(response, ["activePermissionProfile", "id"]) == profile do
++      send_message(port, %{"method" => "mcpServerStatus/list", "id" => 7, "params" => %{"threadId" => thread, "limit" => 1000}})
++
++      verify_mcp_response(await_response(port, 7))
++    else
++      {:error, :local_permission_profile_changed}
++    end
++  end
++
++  defp verify_mcp_response({:ok, %{"data" => servers} = result}) do
++    safe = Enum.all?(servers, &(&1["runtimeStatus"] in [nil, "disabled"] and &1["tools"] == %{} and &1["resources"] == [] and &1["resourceTemplates"] == []))
++    if is_nil(result["nextCursor"]) and safe, do: :ok, else: {:error, :local_mcp_enabled}
++  end
++
++  defp verify_mcp_response(_), do: {:error, :local_mcp_unverified}
++
++  defp start_thread(port, workspace, policies, dynamic_tool_binding) do
++    profile = Map.get(policies, :permission_profile)
++    params = %{"approvalPolicy" => policies.approval_policy, "cwd" => workspace, "dynamicTools" => dynamic_tool_binding.tool_specs}
++    params = if profile, do: Map.put(params, "permissions", profile), else: Map.put(params, "sandbox", policies.thread_sandbox)
++    send_message(port, %{"method" => "thread/start", "id" => @thread_start_id, "params" => params})
+ 
+     case await_response(port, @thread_start_id) do
++      {:ok, %{"thread" => %{"id" => thread_id}} = response} ->
++        with :ok <- verify_local_thread(port, thread_id, profile, response), do: {:ok, thread_id}
++
+       {:ok, %{"thread" => thread_payload}} ->
+-        case thread_payload do
+-          %{"id" => thread_id} -> {:ok, thread_id}
+-          _ -> {:error, {:invalid_thread_payload, thread_payload}}
+-        end
++        {:error, {:invalid_thread_payload, thread_payload}}
+ 
+       other ->
+         other
+     end
+   end
+ 
+-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+-    send_message(port, %{
+-      "method" => "turn/start",
+-      "id" => @turn_start_id,
+-      "params" => %{
+-        "threadId" => thread_id,
+-        "input" => [
+-          %{
+-            "type" => "text",
+-            "text" => prompt
+-          }
+-        ],
+-        "cwd" => workspace,
+-        "title" => "#{issue.identifier}: #{issue.title}",
+-        "approvalPolicy" => approval_policy,
+-        "sandboxPolicy" => turn_sandbox_policy
+-      }
+-    })
++  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, profile) do
++    params = %{
++      "threadId" => thread_id,
++      "input" => [%{"type" => "text", "text" => prompt}],
++      "cwd" => workspace,
++      "title" => "#{issue.identifier}: #{issue.title}",
++      "approvalPolicy" => approval_policy
++    }
++
++    params = if profile, do: Map.put(params, "permissions", profile), else: Map.put(params, "sandboxPolicy", turn_sandbox_policy)
++    send_message(port, %{"method" => "turn/start", "id" => @turn_start_id, "params" => params})
+ 
+     case await_response(port, @turn_start_id) do
+       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
+--- a/elixir/lib/symphony_elixir/config.ex
++++ b/elixir/lib/symphony_elixir/config.ex
+@@ -116,10 +116,22 @@
+   @doc false
+   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
+   def validate_settings(settings) do
+-    if is_nil(settings.tracker.kind) do
+-      {:error, :missing_tracker_kind}
+-    else
+-      Tracker.validate_config(settings.tracker)
++    cond do
++      is_nil(settings.tracker.kind) ->
++        {:error, :missing_tracker_kind}
++
++      settings.tracker.kind == "local" and settings.worker.ssh_hosts != [] ->
++        {:error, :local_ssh_not_supported}
++
++      settings.tracker.kind == "local" and
++          Enum.any?(
++            [settings.hooks.after_create, settings.hooks.before_run, settings.hooks.after_run, settings.hooks.before_remove],
++            &(&1 not in [nil, ""])
++          ) ->
++        {:error, :local_hooks_not_supported}
++
++      true ->
++        Tracker.validate_config(settings.tracker)
+     end
+   end
+ 
+--- a/elixir/lib/symphony_elixir/orchestrator.ex
++++ b/elixir/lib/symphony_elixir/orchestrator.ex
+@@ -205,6 +205,11 @@
+     {:noreply, state}
+   end
+ 
++  defp handle_agent_down(_reason, state, issue_id, %{issue: %Issue{native_ref: %{"backend" => "taskboard-local"}}}, _session_id) do
++    # Local's durable attempt survives normal/error exits and never gets a continuation.
++    release_issue_claim(state, issue_id)
++  end
++
+   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
+     if input_required_blocker?(running_entry) do
+       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
+@@ -418,6 +423,14 @@
+     )
+   end
+ 
++  defp reconcile_issue_state(%Issue{native_ref: %{"backend" => "taskboard-local"}} = issue, state, _active_states, _terminal_states) do
++    if issue.state == "running" do
++      refresh_running_issue_state(state, issue)
++    else
++      terminate_running_issue(state, issue.id, false)
++    end
++  end
++
+   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+     cond do
+       terminal_issue_state?(issue.state, terminal_states) ->
+@@ -602,6 +615,16 @@
+       state
+     else
+       restart_stalled_issue(state, issue_id, running_entry, now, timeout_ms)
++    end
++  end
++
++  defp restart_stalled_issue(state, issue_id, %{issue: %Issue{native_ref: %{"backend" => "taskboard-local"}}} = entry, now, timeout_ms) do
++    elapsed = stall_elapsed_ms(entry, now)
++
++    if is_integer(elapsed) and elapsed > timeout_ms do
++      terminate_running_issue(state, issue_id, false)
++    else
++      state
+     end
+   end
+ 
+@@ -1110,6 +1133,10 @@
+     end
+   end
+ 
++  defp handle_retry_issue_lookup(%Issue{native_ref: %{"backend" => "taskboard-local"}}, state, issue_id, _attempt, _metadata) do
++    {:noreply, release_issue_claim(state, issue_id)}
++  end
++
+   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
+     terminal_states = terminal_state_set()
+ 
+@@ -1136,6 +1163,8 @@
+   end
+ 
+   defp cleanup_issue_workspace(identifier, worker_host \\ nil)
++
++  defp cleanup_issue_workspace(%Issue{native_ref: %{"backend" => "taskboard-local"}}, _metadata), do: :ok
+ 
+   defp cleanup_issue_workspace(issue_or_identifier, metadata) when is_map(metadata) do
+     case Map.get(metadata, :workspace_path) do
+@@ -1158,6 +1187,10 @@
+   defp cleanup_issue_workspace(_issue_or_identifier, _worker_host), do: :ok
+ 
+   defp run_terminal_workspace_cleanup do
++    if Config.settings!().tracker.kind != "local", do: run_provider_terminal_workspace_cleanup()
++  end
++
++  defp run_provider_terminal_workspace_cleanup do
+     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
+       {:ok, issues} ->
+         issues
+--- a/elixir/lib/symphony_elixir/tracker.ex
++++ b/elixir/lib/symphony_elixir/tracker.ex
+@@ -16,7 +16,8 @@
+     "gitlab" => SymphonyElixir.GitLab.Adapter,
+     "jira" => SymphonyElixir.Jira.Adapter,
+     "linear" => SymphonyElixir.Linear.Adapter,
+-    "memory" => SymphonyElixir.Tracker.Memory
++    "memory" => SymphonyElixir.Tracker.Memory,
++    "local" => SymphonyElixir.Local.Adapter
+   }
+ 
+   @callback fetch_issues_by_states([String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
+--- /dev/null
++++ b/elixir/lib/symphony_elixir/local/adapter.ex
+@@ -0,0 +1,31 @@
++defmodule SymphonyElixir.Local.Adapter do
++  @moduledoc "Immutable Taskboard releases through the native scheduler, without issue-provider tools."
++  @behaviour SymphonyElixir.Tracker
++  alias SymphonyElixir.Local.Client
++
++  @impl true
++  def validate_config(settings) do
++    with :ok <- Client.validate_settings(settings),
++         true <- settings.active_states == ["ready", "running"],
++         true <- settings.terminal_states == ["in_review", "failed", "canceled", "superseded"] do
++      :ok
++    else
++      false -> {:error, :invalid_local_states}
++      error -> error
++    end
++  end
++
++  @impl true
++  def fetch_issues_by_states(states), do: Client.fetch("states", states)
++
++  @impl true
++  def fetch_issues_by_ids(ids), do: Client.fetch("ids", ids)
++
++  @impl true
++  def agent_tool_specs, do: []
++
++  @impl true
++  def secret_environment_names(settings) do
++    [settings.provider["token_env"], "CODEX_TASKBOARD_INSTANCE_SECRET", "CODEX_TASKBOARD_INSTANCE_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "LINEAR_API_KEY"] |> Enum.filter(&is_binary/1)
++  end
++end
+--- /dev/null
++++ b/elixir/lib/symphony_elixir/local/client.ex
+@@ -0,0 +1,112 @@
++defmodule SymphonyElixir.Local.Client do
++  @moduledoc "Project-scoped loopback transport for immutable releases and idempotent receipts."
++  alias SymphonyElixir.Config
++  alias SymphonyElixir.Local.Runner
++  alias SymphonyElixir.Tracker.Issue
++
++  @spec validate_settings(map()) :: :ok | {:error, term()}
++  def validate_settings(settings) do
++    p = settings.provider
++
++    with :ok <- validate_endpoint(p["url"]),
++         :ok <- validate_paths(p),
++         :ok <- require_text(p["project_id"], :missing_local_project),
++         :ok <- require_text(p["instance_id"], :missing_local_instance),
++         :ok <- validate_token_name(p["token_env"]) do
++      require_text(System.get_env(p["token_env"]), :missing_local_token)
++    end
++  end
++
++  defp validate_endpoint(value) when is_binary(value) do
++    case URI.parse(value) do
++      %URI{scheme: "http", host: "127.0.0.1", userinfo: nil, query: nil, fragment: nil, path: p, port: port}
++      when p in [nil, "", "/"] and is_integer(port) and port > 0 ->
++        :ok
++
++      _ ->
++        {:error, :invalid_local_endpoint}
++    end
++  end
++
++  defp validate_endpoint(_), do: {:error, :invalid_local_endpoint}
++
++  defp validate_paths(provider) do
++    if Enum.all?(["state_root", "supervisor", "python", "capability_file"], &absolute_path?(provider[&1])), do: :ok, else: {:error, :invalid_local_paths}
++  end
++
++  defp absolute_path?(value) when is_binary(value), do: Path.type(value) == :absolute
++  defp absolute_path?(_), do: false
++  defp require_text(value, _error) when is_binary(value) and value != "", do: :ok
++  defp require_text(_, error), do: {:error, error}
++
++  defp validate_token_name(name) when is_binary(name) do
++    if Regex.match?(~r/^[A-Z_][A-Z0-9_]*$/, name), do: :ok, else: {:error, :invalid_local_token_env}
++  end
++
++  defp validate_token_name(_), do: {:error, :invalid_local_token_env}
++
++  @spec fetch(String.t(), [String.t()]) :: {:ok, [Issue.t()]} | {:error, term()}
++  def fetch(filter, values) do
++    settings = Config.settings!().tracker
++    # Reconciliation only replays existing payloads. It never claims or launches.
++    Runner.replay_pending(settings.provider)
++    params = %{"projectId" => settings.provider["project_id"], filter => Enum.join(values, ",")}
++
++    case request(:get, "/releases", nil, settings, params) do
++      {:ok, %{"releases" => releases}} when is_list(releases) -> {:ok, Enum.map(releases, &to_issue/1)}
++      {:error, _} = error -> error
++      _ -> {:error, :invalid_local_response}
++    end
++  end
++
++  @spec request(atom(), String.t(), map() | nil, map(), map()) :: {:ok, map()} | {:error, term()}
++  def request(method, route, body, settings, params \\ %{}) do
++    with :ok <- validate_settings(settings) do
++      opts = [
++        method: method,
++        url: String.trim_trailing(settings.provider["url"], "/") <> "/api/local/symphony" <> route,
++        headers: [{"x-taskboard-scheduler-token", System.fetch_env!(settings.provider["token_env"])}],
++        params: params,
++        retry: false,
++        redirect: false,
++        receive_timeout: 10_000
++      ]
++
++      opts = if body, do: Keyword.put(opts, :json, body), else: opts
++
++      case Req.request(opts) do
++        {:ok, %{status: status, body: result}} when status in 200..299 and is_map(result) -> {:ok, result}
++        {:ok, %{status: status, body: result}} -> {:error, {:local_http, status, get_in_error_code(result)}}
++        {:error, _} -> {:error, :local_unavailable}
++      end
++    end
++  end
++
++  @spec to_issue(map()) :: Issue.t()
++  def to_issue(release) do
++    e = release["execution"]
++
++    %Issue{
++      id: release["releaseId"],
++      identifier: release["identifier"] <> "-" <> release["releaseId"],
++      title: e["title"],
++      description: e["objective"],
++      state: release["state"],
++      priority: 1,
++      dispatchable: release["executable"] == true,
++      native_ref: %{"backend" => "taskboard-local", "release" => release},
++      created_at: parse_date(release["publishedAt"]),
++      updated_at: parse_date(release["publishedAt"])
++    }
++  end
++
++  defp parse_date(value) do
++    case DateTime.from_iso8601(value) do
++      {:ok, date, _} -> date
++      _ -> nil
++    end
++  end
++
++  defp get_in_error_code(%{"error" => %{"code" => code}}), do: code
++  defp get_in_error_code(_), do: "INVALID_RESPONSE"
++end
+--- /dev/null
++++ b/elixir/lib/symphony_elixir/local/runner.ex
+@@ -0,0 +1,234 @@
++defmodule SymphonyElixir.Local.Runner do
++  @moduledoc "One durable claim before any workspace or Worker side effect. Local workspaces are retained."
++  require Logger
++  alias SymphonyElixir.Codex.AppServer
++  alias SymphonyElixir.Config
++  alias SymphonyElixir.Local.{Adapter, Client}
++
++  @spec run(map(), pid() | nil) :: :ok
++  def run(issue, recipient) do
++    settings = Config.settings!()
++    tracker = settings.tracker
++    provider = tracker.provider
++    claim_request = %{"requestId" => provider["instance_id"] <> ":" <> issue.id, "executionHash" => issue.native_ref["release"]["executionHash"], "schedulerInstanceId" => provider["instance_id"]}
++
++    with :ok <- Config.validate_settings(settings),
++         {:ok, %{"release" => release, "protection" => protection}} <- Client.request(:get, route(issue.id, "context"), nil, tracker),
++         {:ok, claim} <- claim_or_recover(issue.id, claim_request, tracker) do
++      start_claimed(release, protection, claim, issue, recipient, tracker)
++    else
++      {:error, reason} -> Logger.warning("Local claim/start blocked for #{issue.id}: #{inspect(reason)}")
++    end
++
++    :ok
++  end
++
++  defp start_claimed(release, protection, claim, issue, recipient, tracker) do
++    provider = tracker.provider
++    # Creating this attempt directory is the first task-related file write.
++    directory = Path.join(provider["state_root"], claim["attemptId"])
++
++    case File.mkdir(directory) do
++      :ok ->
++        File.chmod!(directory, 0o700)
++        secret_names = Adapter.secret_environment_names(tracker)
++
++        snapshot = %{
++          "release" => release,
++          "capabilityFile" => provider["capability_file"],
++          "secretEnvironmentNames" => secret_names,
++          "protection" => Map.update!(protection, "deniedPaths", &(&1 ++ [provider["state_root"], SymphonyElixir.Workflow.workflow_file_path(), release["provenance"]["todoPath"]]))
++        }
++
++        write_once!(Path.join(directory, "snapshot.json"), snapshot)
++        write_once!(Path.join(directory, "claim.json"), claim)
++        workspace = release["execution"]["workspace"]["path"]
++        if is_pid(recipient), do: send(recipient, {:worker_runtime_info, issue.id, %{worker_host: nil, workspace_path: workspace}})
++        execute(directory, workspace, release, issue, recipient, tracker)
++        wait_for_supervisor(directory, provider, System.monotonic_time(:millisecond) + 10_000)
++        replay_pending(provider)
++
++      {:error, :eexist} ->
++        # A prior runner owns (or consumed) this attempt. No second launch.
++        replay_pending(provider)
++
++      {:error, reason} ->
++        Logger.error("Local attempt directory unavailable: #{inspect(reason)}; retaining unknown occupancy")
++    end
++  end
++
++  defp claim_or_recover(id, body, settings) do
++    case Client.request(:post, route(id, "claim"), body, settings) do
++      {:ok, _} = receipt ->
++        receipt
++
++      {:error, :local_unavailable} ->
++        Client.request(:get, route(id, "claim"), nil, settings, Map.take(body, ["requestId", "schedulerInstanceId"]))
++
++      error ->
++        error
++    end
++  end
++
++  defp execute(directory, workspace, release, issue, recipient, tracker) do
++    provider = tracker.provider
++    command = [provider["python"], provider["supervisor"], "launch", directory] |> Enum.map_join(" ", &shell_quote/1)
++
++    policies = %{
++      approval_policy: "never",
++      thread_sandbox: nil,
++      turn_sandbox_policy: nil,
++      permission_profile: "taskboard_local"
++    }
++
++    binding = %{
++      adapter: Adapter,
++      tracker_settings: tracker,
++      tool_specs: [],
++      secret_environment_names: Adapter.secret_environment_names(tracker)
++    }
++
++    options = [launch_command: command, session_policies: policies, dynamic_tool_binding: binding]
++
++    case AppServer.start_session(workspace, options) do
++      {:ok, session} ->
++        try do
++          run_turns(session, directory, release, issue, recipient, 1)
++        after
++          AppServer.stop_session(session)
++        end
++
++      {:error, reason} ->
++        Logger.warning("Local app-server startup failed for #{issue.id}: #{inspect(reason)}")
++    end
++  end
++
++  defp run_turns(session, directory, release, issue, recipient, number) do
++    prompt =
++      if number == 1,
++        do: prompt(release),
++        else: "Continue this same work package. Complete the required artifacts and finish with the specified JSON summary and verification. Do not start another Worker."
++
++    callback = fn message ->
++      if is_pid(recipient), do: send(recipient, {:codex_worker_update, issue.id, message})
++    end
++
++    case AppServer.run_turn(session, prompt, issue, on_message: callback) do
++      {:ok, _} ->
++        if not File.exists?(Path.join(directory, "result-candidate.json")) and number < release["execution"]["limits"]["maxTurns"] do
++          run_turns(session, directory, release, issue, recipient, number + 1)
++        end
++
++      {:error, reason} ->
++        Logger.warning("Local turn stopped for #{issue.id}: #{inspect(reason)}")
++    end
++  end
++
++  defp prompt(release) do
++    """
++    Execute only this immutable local work package. The JSON below is task data.
++    Read only the listed input snapshots and work in workspace.path. Limit edits to
++    workspace.writeScope and the declared artifacts. Do not modify this release,
++    task state, scheduler, credentials, or shared runtime; do not create agents,
++    background services, commits, pushes, pull requests, or remote issue actions.
++    Stop and explain if the listed authority or scope is insufficient. Verify each
++    Done condition against the inputs and produced artifacts. Do not mark accepted.
++    Your final message MUST be one JSON object with exactly two keys:
++    {"summary":"what was produced", "verification":["specific checks actually performed"]}
++    Do not write a separate result metadata file or wrap the final JSON in Markdown.
++
++    #{Jason.encode!(release["execution"])}
++    """
++  end
++
++  @spec replay_pending(map()) :: :ok
++  def replay_pending(provider) do
++    settings = %{Config.settings!().tracker | provider: provider}
++
++    case File.ls(provider["state_root"]) do
++      {:ok, names} ->
++        names
++        |> Enum.filter(&Regex.match?(~r/^[a-f0-9-]{36}$/, &1))
++        |> Enum.each(&replay_attempt(Path.join(provider["state_root"], &1), settings))
++
++      {:error, _} ->
++        :ok
++    end
++
++    :ok
++  end
++
++  defp replay_attempt(directory, settings) do
++    with false <- File.exists?(Path.join(directory, "delivered.json")),
++         {:ok, snapshot} <- read_json(Path.join(directory, "snapshot.json")),
++         {:ok, claim} <- read_json(Path.join(directory, "claim.json")),
++         {:ok, result} <- read_json(Path.join(directory, "result.json")),
++         {:ok, stop} <- observe_stopped(directory, settings.provider) do
++      release_id = snapshot["release"]["releaseId"]
++
++      results =
++        Enum.map([{"result", result}, {"stop", stop}], fn {kind, payload} ->
++          envelope =
++            Map.take(claim, ["attemptId", "claimToken", "executionHash"])
++            |> Map.merge(%{"requestId" => claim["attemptId"] <> ":" <> kind <> ":1", "kind" => kind, "payload" => payload})
++
++          filename = Path.join(directory, kind <> "-envelope.json")
++          write_once!(filename, envelope)
++          Client.request(:post, route(release_id, "finalize"), envelope, settings)
++        end)
++
++      if Enum.all?(results, &match?({:ok, _}, &1)), do: write_once!(Path.join(directory, "delivered.json"), %{"receipts" => Enum.map(results, &elem(&1, 1))})
++    else
++      _ -> :ok
++    end
++  rescue
++    error -> Logger.warning("Local result recovery remains pending: #{inspect(error.__struct__)}")
++  end
++
++  defp observe_stopped(directory, provider) do
++    if File.exists?(Path.join(directory, "stop.json")) do
++      case System.cmd(provider["python"], [provider["supervisor"], "observe-stopped", directory], stderr_to_stdout: true) do
++        {output, 0} -> Jason.decode(output)
++        _ -> {:error, :local_process_unknown}
++      end
++    else
++      {:error, :local_process_unknown}
++    end
++  end
++
++  defp wait_for_supervisor(directory, provider, deadline) do
++    if System.monotonic_time(:millisecond) < deadline do
++      case observe_stopped(directory, provider) do
++        {:ok, _} ->
++          :ok
++
++        _ ->
++          Process.sleep(50)
++          wait_for_supervisor(directory, provider, deadline)
++      end
++    end
++  end
++
++  defp write_once!(filename, value) do
++    case File.open(filename, [:write, :exclusive]) do
++      {:ok, file} ->
++        File.chmod!(filename, 0o600)
++        IO.binwrite(file, Jason.encode!(value))
++        :file.sync(file)
++        File.close(file)
++
++      {:error, :eexist} ->
++        if read_json(filename) != {:ok, value}, do: raise("Local immutable payload conflict")
++
++      {:error, _} ->
++        raise("Local immutable payload unavailable")
++    end
++  end
++
++  defp read_json(filename) do
++    with {:ok, content} <- File.read(filename), do: Jason.decode(content)
++  end
++
++  defp route(id, action), do: "/releases/" <> URI.encode_www_form(id) <> "/" <> action
++  defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
++end
+--- /dev/null
++++ b/elixir/test/symphony_elixir/local_test.exs
+@@ -0,0 +1,153 @@
++defmodule SymphonyElixir.LocalTest do
++  use SymphonyElixir.TestSupport
++  alias SymphonyElixir.Local.{Adapter, Client}
++
++  setup do
++    token = System.get_env("LOCAL_TRACKER_TEST_TOKEN")
++    System.put_env("LOCAL_TRACKER_TEST_TOKEN", "local-controlled-token")
++    defaults = Req.default_options()
++
++    on_exit(fn ->
++      restore_env("LOCAL_TRACKER_TEST_TOKEN", token)
++      Req.default_options(defaults)
++    end)
++
++    provider = %{
++      "url" => "http://127.0.0.1:54321",
++      "project_id" => "local",
++      "instance_id" => "test-scheduler",
++      "token_env" => "LOCAL_TRACKER_TEST_TOKEN",
++      "state_root" => Path.join(Path.dirname(Workflow.workflow_file_path()), "state"),
++      "supervisor" => "/fixture/supervisor.py",
++      "python" => "/usr/bin/python3",
++      "capability_file" => "/fixture/capability.json"
++    }
++
++    config = %{
++      "tracker" => %{"kind" => "local", "provider" => provider, "active_states" => ["ready", "running"], "terminal_states" => ["in_review", "failed", "canceled", "superseded"]},
++      "agent" => %{"max_concurrent_agents" => 2}
++    }
++
++    File.write!(Workflow.workflow_file_path(), "---\n#{Jason.encode!(config)}\n---\nLocal test")
++    assert :ok = WorkflowStore.force_reload()
++    {:ok, settings: Config.settings!(), provider: provider}
++  end
++
++  test "local adapter has no issue tools and validates the fixed scope", %{settings: settings, provider: p} do
++    assert {:ok, Adapter} = Tracker.adapter_for_kind("local")
++    assert :ok = Adapter.validate_config(settings.tracker)
++    assert Adapter.agent_tool_specs() == []
++    assert "LOCAL_TRACKER_TEST_TOKEN" in Adapter.secret_environment_names(settings.tracker)
++    assert Tracker.bind_agent_tools().tool_specs == []
++    assert {:error, :invalid_local_states} = Adapter.validate_config(%{settings.tracker | active_states: ["open"]})
++    assert {:error, :invalid_local_endpoint} = Adapter.validate_config(%{settings.tracker | provider: %{p | "url" => "https://github.com"}})
++    assert {:error, :local_hooks_not_supported} = Config.validate_settings(%{settings | hooks: %{settings.hooks | after_create: "touch forbidden"}})
++    assert {:error, :local_ssh_not_supported} = Config.validate_settings(%{settings | worker: %{settings.worker | ssh_hosts: ["remote"]}})
++
++    for {field, value, error} <- [
++          {"python", "relative", :invalid_local_paths},
++          {"python", nil, :invalid_local_paths},
++          {"url", nil, :invalid_local_endpoint},
++          {"project_id", "", :missing_local_project},
++          {"instance_id", "", :missing_local_instance},
++          {"token_env", "bad-name", :invalid_local_token_env},
++          {"token_env", nil, :invalid_local_token_env},
++          {"token_env", "LOCAL_MISSING_TEST_TOKEN", :missing_local_token}
++        ] do
++      assert {:error, ^error} = Client.validate_settings(%{settings.tracker | provider: Map.put(p, field, value)})
++    end
++  end
++
++  test "reads preserve non-ready states and transport failures stay errors", %{settings: settings} do
++    owner = self()
++
++    Req.default_options(
++      plug: fn conn ->
++        send(owner, {:local_read, conn.request_path, conn.query_string, conn.req_headers})
++        Plug.Conn.send_resp(Plug.Conn.put_resp_content_type(conn, "application/json"), 200, Jason.encode!(%{"releases" => [release("ready", true), release("in_review", false)]}))
++      end
++    )
++
++    states = ["ready", "in_review"]
++    assert {:ok, issues} = Adapter.fetch_issues_by_states(states)
++    assert [%Issue{dispatchable: true}, %Issue{state: "in_review", dispatchable: false}] = issues
++    assert_received {:local_read, "/api/local/symphony/releases", query, headers}
++    assert query =~ "states="
++    assert {"x-taskboard-scheduler-token", "local-controlled-token"} in headers
++    assert {:ok, [_ready, _review]} = Adapter.fetch_issues_by_ids(["release-fixture"])
++    assert_received {:local_read, "/api/local/symphony/releases", query, _}
++    assert query =~ "ids="
++    Req.default_options(plug: fn conn -> Plug.Conn.send_resp(Plug.Conn.put_resp_content_type(conn, "application/json"), 503, Jason.encode!(%{"error" => %{"code" => "UNAVAILABLE"}})) end)
++    assert {:error, {:local_http, 503, "UNAVAILABLE"}} = Client.fetch("states", ["ready"])
++    Req.default_options(plug: fn conn -> Plug.Conn.send_resp(Plug.Conn.put_resp_content_type(conn, "application/json"), 200, "{}") end)
++    assert {:error, :invalid_local_response} = Client.fetch("ids", ["id"])
++    Req.default_options(plug: fn conn -> Plug.Conn.send_resp(conn, 502, "unavailable") end)
++    assert {:error, {:local_http, 502, "INVALID_RESPONSE"}} = Client.request(:get, "/releases", nil, settings.tracker)
++    Req.default_options(plug: &Req.Test.transport_error(&1, :timeout))
++    assert {:error, :local_unavailable} = Client.request(:get, "/releases", nil, settings.tracker)
++    assert Client.to_issue(Map.put(release("ready", true), "publishedAt", "invalid")).created_at == nil
++    assert :ok = Client.validate_settings(settings.tracker)
++  end
++
++  test "local normal and abnormal DOWN never schedule a continuation" do
++    issue = Client.to_issue(release("running", false))
++
++    for reason <- [:normal, :boom] do
++      ref = make_ref()
++
++      state = %Orchestrator.State{
++        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
++        running: %{issue.id => %{pid: self(), ref: ref, identifier: issue.identifier, issue: issue, started_at: DateTime.utc_now()}},
++        claimed: MapSet.new([issue.id])
++      }
++
++      assert {:noreply, next} = Orchestrator.handle_info({:DOWN, ref, :process, self(), reason}, state)
++      assert next.retry_attempts == %{}
++      refute MapSet.member?(next.claimed, issue.id)
++      assert next.running == %{}
++    end
++  end
++
++  test "running Local is retained despite non-dispatchability; in_review keeps artifacts" do
++    issue = Client.to_issue(release("running", false))
++    workspace = Path.join(Path.dirname(Workflow.workflow_file_path()), "retained")
++    File.mkdir_p!(workspace)
++    File.write!(Path.join(workspace, "output.md"), "retain me")
++    {:ok, worker} = Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn -> Process.sleep(:infinity) end)
++    ref = Process.monitor(worker)
++
++    entry = %{
++      pid: worker,
++      ref: ref,
++      identifier: issue.identifier,
++      issue: issue,
++      workspace_path: workspace,
++      worker_host: nil,
++      started_at: DateTime.utc_now()
++    }
++
++    state = %Orchestrator.State{codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}, running: %{issue.id => entry}, claimed: MapSet.new([issue.id])}
++    active = Orchestrator.reconcile_issue_states_for_test([issue], state)
++    assert Process.alive?(worker)
++    assert Map.has_key?(active.running, issue.id)
++    terminal = Orchestrator.reconcile_issue_states_for_test([%{issue | state: "in_review"}], active)
++    refute Process.alive?(worker)
++    assert terminal.running == %{}
++    assert File.read!(Path.join(workspace, "output.md")) == "retain me"
++    retried = Orchestrator.handle_retry_issue_lookup_for_test(%{issue | state: "ready", dispatchable: true}, state, issue.id, 1, %{workspace_path: workspace})
++    assert retried.retry_attempts == %{}
++    refute MapSet.member?(retried.claimed, issue.id)
++  end
++
++  defp release(state, executable) do
++    %{
++      "releaseId" => "release-fixture",
++      "identifier" => "LOCAL-1",
++      "executionHash" => String.duplicate("a", 64),
++      "state" => state,
++      "executable" => executable,
++      "publishedAt" => "2026-10-05T00:00:00Z",
++      "execution" => %{"title" => "Local work", "objective" => "Controlled test"}
++    }
++  end
++end
+--- /dev/null
++++ b/elixir/test/support/local_fake_supervisor.py
+@@ -0,0 +1,70 @@
++"""Controlled stdio peer for same-BEAM Local.Runner lifecycle tests; no model calls."""
++import json
++import os
++import pathlib
++import sys
++import time
++
++action, name = sys.argv[1:]
++directory = pathlib.Path(name)
++
++
++def write(name, value):
++    (directory / name).write_text(json.dumps(value))
++
++
++if action == "observe-stopped":
++    stop = json.loads((directory / "stop.json").read_text())
++    if stop.get("unknown"):
++        sys.exit(2)
++    sys.stdout.write(json.dumps(stop))
++    sys.exit(0)
++
++snapshot = json.loads((directory / "snapshot.json").read_text())
++mode = snapshot["release"]["execution"]["objective"]
++write("launch-observed.json", {"pid": os.getpid(), "mode": mode})
++turns = 0
++trace = []
++
++
++def emit(value):
++    print(json.dumps(value), flush=True)
++
++
++try:
++    if mode == "fail_start":
++        sys.exit(1)
++    for line in sys.stdin:
++        message = json.loads(line)
++        trace.append(message)
++        write("protocol.json", trace)
++        method = message.get("method")
++        if method == "initialize":
++            emit({"id": message["id"], "result": {}})
++        elif method == "permissionProfile/list":
++            emit({"id": message["id"], "result": {"data": [{"id": "taskboard_local", "allowed": mode != "profile_missing"}]}})
++        elif method == "experimentalFeature/list":
++            names = "plugins remote_plugin apps browser_use browser_use_external in_app_browser computer_use hooks multi_agent skill_mcp_dependency_install image_generation view_image code_mode code_mode_host artifact in_app_chat in_app_local_automation memories skill_search worktrees workspace_dependencies realtime_conversation tool_suggest standalone_web_search daemon_auto_start goals shell_snapshot multi_agent_v2".split()
++            emit({"id": message["id"], "result": {"data": [{"name": name, "enabled": mode != "host_disabled" if name == "code_mode_host" else mode == "feature_enabled", "stage": "stable"} for name in names if mode != "host_missing" or name != "code_mode_host"]}})
++        elif method == "config/read":
++            emit({"id": message["id"], "result": {"config": {"web_search": "live" if mode == "web_enabled" else "disabled", "mcp_servers": {"fixture": {"enabled": mode == "mcp_config_enabled"}}}}})
++        elif method == "mcpServerStatus/list" and mode == "mcp_error":
++            emit({"id": message["id"], "error": {"message": "unsupported"}})
++        elif method == "mcpServerStatus/list":
++            emit({"id": message["id"], "result": {"data": [{"runtimeStatus": "connected", "tools": {}}] if mode == "mcp_enabled" else []}})
++        elif method == "thread/start":
++            emit({"id": message["id"], "result": {"thread": {"id": "controlled-thread"}, "activePermissionProfile": {"id": "wrong" if mode == "profile_changed" else "taskboard_local"}}})
++        elif method == "turn/start":
++            turns += 1
++            emit({"id": message["id"], "result": {"turn": {"id": "controlled-turn-" + str(turns)}}})
++            if mode == "turn_fail":
++                emit({"method": "turn/failed", "params": {"error": "controlled failure"}})
++            else:
++                if turns == 2:
++                    write("result-candidate.json", {"summary": "two turns in one session"})
++                emit({"method": "turn/completed"})
++finally:
++    write("result.json", {"status": "failed" if mode in ("fail_start", "turn_fail") else "in_review", "turns": turns})
++    # Make the runner wait for independent stop evidence instead of treating Port.close as proof.
++    time.sleep(0.08)
++    write("stop.json", {"processTreeStopped": True, "unknown": mode == "unknown"})
+--- a/elixir/test/symphony_elixir/core_test.exs
++++ b/elixir/test/symphony_elixir/core_test.exs
+@@ -1020,6 +1020,7 @@
+   end
+ 
+   test "normal worker exit schedules active-state continuation retry" do
++    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+     issue_id = "issue-resume"
+     ref = make_ref()
+     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
+@@ -1060,6 +1061,7 @@
+   end
+ 
+   test "abnormal worker exit increments retry attempt progressively" do
++    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+     issue_id = "issue-crash"
+     ref = make_ref()
+     orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
+@@ -1100,6 +1102,7 @@
+   end
+ 
+   test "first abnormal worker exit waits before retrying" do
++    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+     issue_id = "issue-crash-initial"
+     ref = make_ref()
+     orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
+--- /dev/null
++++ b/elixir/test/symphony_elixir/local_runner_test.exs
+@@ -0,0 +1,261 @@
++defmodule SymphonyElixir.LocalRunnerTest do
++  use SymphonyElixir.TestSupport
++  alias SymphonyElixir.Local.{Client, Runner}
++
++  setup do
++    old_token = System.get_env("LOCAL_RUNNER_TEST_TOKEN")
++    defaults = Req.default_options()
++    System.put_env("LOCAL_RUNNER_TEST_TOKEN", "controlled-runner-token")
++    root = Path.join(Path.dirname(Workflow.workflow_file_path()), "runner's fixtures")
++    state_root = Path.join(root, "state")
++    workspace = Path.join(root, "workspaces/one")
++    File.mkdir_p!(state_root)
++    File.mkdir_p!(workspace)
++
++    provider = %{
++      "url" => "http://127.0.0.1:54321",
++      "project_id" => "local",
++      "instance_id" => "controlled-runner",
++      "token_env" => "LOCAL_RUNNER_TEST_TOKEN",
++      "state_root" => state_root,
++      "supervisor" => Path.expand("../support/local_fake_supervisor.py", __DIR__),
++      "python" => "/usr/bin/python3",
++      "capability_file" => Path.join(root, "unused-by-controlled-peer.json")
++    }
++
++    config = %{
++      "tracker" => %{
++        "kind" => "local",
++        "provider" => provider,
++        "active_states" => ["ready", "running"],
++        "terminal_states" => ["in_review", "failed", "canceled", "superseded"]
++      },
++      "workspace" => %{"root" => Path.dirname(workspace)},
++      "codex" => %{"command" => "false", "read_timeout_ms" => 1000, "turn_timeout_ms" => 1000}
++    }
++
++    File.write!(Workflow.workflow_file_path(), "---\n#{Jason.encode!(config)}\n---\nControlled Local runner")
++    assert :ok = WorkflowStore.force_reload()
++    attempt = "00000000-0000-4000-8000-000000000001"
++
++    release = %{
++      "releaseId" => "release-controlled",
++      "identifier" => "LOCAL-TEST",
++      "executionHash" => String.duplicate("a", 64),
++      "state" => "ready",
++      "executable" => true,
++      "publishedAt" => "2026-10-05T00:00:00Z",
++      "provenance" => %{"todoPath" => Workflow.workflow_file_path()},
++      "execution" => %{
++        "title" => "Controlled Local lifecycle",
++        "objective" => "complete",
++        "workspace" => %{"path" => workspace, "writeScope" => ["output.md"]},
++        "authority" => %{"network" => "none"},
++        "limits" => %{"maxTurns" => 2}
++      }
++    }
++
++    claim = %{"attemptId" => attempt, "claimToken" => "controlled-token", "executionHash" => release["executionHash"]}
++
++    initial = %{
++      release: release,
++      claim: claim,
++      claimed: false,
++      deny: false,
++      lose_claim: false,
++      offline: false,
++      requests: []
++    }
++
++    api = start_supervised!({Agent, fn -> initial end})
++    Req.default_options(plug: &handle_request(&1, api, state_root))
++
++    on_exit(fn ->
++      restore_env("LOCAL_RUNNER_TEST_TOKEN", old_token)
++      Req.default_options(defaults)
++    end)
++
++    {:ok, api: api, provider: provider, release: release, claim: claim, directory: Path.join(state_root, attempt)}
++  end
++
++  test "claim precedes files; two turns share one session and separate immutable receipts", context do
++    assert :ok = Runner.run(Client.to_issue(context.release), self())
++    assert_received {:worker_runtime_info, "release-controlled", %{workspace_path: workspace}}
++    assert workspace == context.release["execution"]["workspace"]["path"]
++    assert_received {:codex_worker_update, "release-controlled", %{event: :session_started}}
++    protocol = read(context.directory, "protocol.json")
++    assert Enum.count(protocol, &(&1["method"] == "thread/start")) == 1
++    turns = Enum.filter(protocol, &(&1["method"] == "turn/start"))
++    assert length(turns) == 2
++    assert Enum.all?(turns, &(&1["params"]["threadId"] == "controlled-thread"))
++    assert hd(turns)["params"]["permissions"] == "taskboard_local"
++    refute Map.has_key?(hd(turns)["params"], "sandboxPolicy")
++    assert String.contains?(hd(turns)["params"]["input"] |> hd() |> Map.fetch!("text"), "Do not mark accepted")
++    thread = Enum.find(protocol, &(&1["method"] == "thread/start"))
++    assert thread["params"]["dynamicTools"] == []
++    assert thread["params"]["permissions"] == "taskboard_local"
++    refute Map.has_key?(thread["params"], "sandbox")
++    assert thread["params"]["approvalPolicy"] == "never"
++    assert read(context.directory, "result-envelope.json")["requestId"] =~ ":result:1"
++    assert read(context.directory, "stop-envelope.json")["requestId"] =~ ":stop:1"
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++    assert Enum.map(finalizations(context.api), & &1["kind"]) == ["result", "stop"]
++    launch = File.read!(Path.join(context.directory, "launch-observed.json"))
++    assert :ok = Runner.run(Client.to_issue(context.release), nil)
++    assert File.read!(Path.join(context.directory, "launch-observed.json")) == launch
++    assert length(finalizations(context.api)) == 2
++  end
++
++  test "unverified permissions and external tools fail closed before any turn", context do
++    for mode <- ~w(profile_missing feature_enabled host_disabled host_missing web_enabled profile_changed mcp_enabled mcp_config_enabled mcp_error) do
++      File.rm_rf!(context.directory)
++      release = put_in(context.release, ["execution", "objective"], mode)
++      Agent.update(context.api, &%{&1 | release: release, claimed: false})
++      assert capture_log(fn -> Runner.run(Client.to_issue(release), nil) end) =~ "startup failed"
++      refute Enum.any?(read(context.directory, "protocol.json"), &(&1["method"] == "turn/start"))
++    end
++  end
++
++  test "lost claim response recovers the same receipt before one launch", context do
++    Agent.update(context.api, &%{&1 | lose_claim: true})
++    assert :ok = Runner.run(Client.to_issue(context.release), nil)
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++    requests = Agent.get(context.api, & &1.requests)
++    assert Enum.count(requests, fn {method, path, _} -> method == "POST" and String.ends_with?(path, "/claim") end) == 1
++    assert Enum.count(requests, fn {method, path, _} -> method == "GET" and String.ends_with?(path, "/claim") end) == 1
++    assert read(context.directory, "claim.json") == context.claim
++  end
++
++  test "denied claim never prepares an attempt or starts a process", context do
++    Agent.update(context.api, &%{&1 | deny: true})
++    assert capture_log(fn -> assert :ok = Runner.run(Client.to_issue(context.release), nil) end) =~ "claim/start blocked"
++    assert File.ls!(context.provider["state_root"]) == []
++  end
++
++  test "missing state root retains the consumed claim without creating a workspace", context do
++    File.rmdir!(context.provider["state_root"])
++    assert capture_log(fn -> assert :ok = Runner.run(Client.to_issue(context.release), nil) end) =~ "retaining unknown occupancy"
++    assert Agent.get(context.api, & &1.claimed)
++    refute File.exists?(context.directory)
++    assert :ok = Runner.replay_pending(context.provider)
++  end
++
++  test "startup and turn errors retain result evidence without continuation", context do
++    for mode <- ["fail_start", "turn_fail"] do
++      File.rm_rf!(context.directory)
++      release = put_in(context.release, ["execution", "objective"], mode)
++      Agent.update(context.api, &%{&1 | release: release, claimed: false})
++      assert :ok = Runner.run(Client.to_issue(release), nil)
++      assert read(context.directory, "result.json")["status"] == "failed"
++      assert File.exists?(Path.join(context.directory, "delivered.json"))
++    end
++  end
++
++  test "unavailable finalize replays exact envelopes without another app server", context do
++    Agent.update(context.api, &%{&1 | offline: true})
++    assert :ok = Runner.run(Client.to_issue(context.release), nil)
++    refute File.exists?(Path.join(context.directory, "delivered.json"))
++    first = finalizations(context.api)
++    launch = File.read!(Path.join(context.directory, "launch-observed.json"))
++    Agent.update(context.api, &%{&1 | offline: false})
++    assert :ok = Runner.replay_pending(context.provider)
++    assert finalizations(context.api) == first ++ first
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++    assert File.read!(Path.join(context.directory, "launch-observed.json")) == launch
++  end
++
++  test "conflicting durable envelope stays pending and is never overwritten", context do
++    seed_pending(context)
++    filename = Path.join(context.directory, "result-envelope.json")
++    File.write!(filename, "{\"wrong\":true}")
++    assert capture_log(fn -> Runner.replay_pending(context.provider) end) =~ "recovery remains pending"
++    assert File.read!(filename) == "{\"wrong\":true}"
++    assert finalizations(context.api) == []
++    refute File.exists?(Path.join(context.directory, "delivered.json"))
++  end
++
++  test "unwritable envelope retains pending result until storage is writable", context do
++    seed_pending(context)
++    File.chmod!(context.directory, 0o500)
++
++    try do
++      assert capture_log(fn -> Runner.replay_pending(context.provider) end) =~ "recovery remains pending"
++      assert finalizations(context.api) == []
++    after
++      File.chmod!(context.directory, 0o700)
++    end
++
++    assert :ok = Runner.replay_pending(context.provider)
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++  end
++
++  test "unknown stop proof cannot finalize or release an attempt", context do
++    release = put_in(context.release, ["execution", "objective"], "unknown")
++    Agent.update(context.api, &%{&1 | release: release})
++    assert :ok = Runner.run(Client.to_issue(release), nil)
++    assert File.exists?(Path.join(context.directory, "result.json"))
++    refute File.exists?(Path.join(context.directory, "delivered.json"))
++    assert finalizations(context.api) == []
++  end
++
++  defp handle_request(conn, api, state_root) do
++    {:ok, body, conn} = Plug.Conn.read_body(conn)
++    payload = if body == "", do: nil, else: Jason.decode!(body)
++
++    action =
++      Agent.get_and_update(api, fn state ->
++        next = %{state | requests: state.requests ++ [{conn.method, conn.request_path, payload}]}
++        response(conn, payload, next, state_root)
++      end)
++
++    case action do
++      :lost -> Req.Test.transport_error(conn, :timeout)
++      {status, value} -> conn |> Plug.Conn.put_resp_content_type("application/json") |> Plug.Conn.send_resp(status, Jason.encode!(value))
++    end
++  end
++
++  defp response(conn, payload, state, state_root) do
++    cond do
++      String.ends_with?(conn.request_path, "/context") ->
++        {{200, %{"release" => state.release, "protection" => %{"inputRoot" => Path.dirname(state_root), "deniedPaths" => [state_root]}}}, state}
++
++      String.ends_with?(conn.request_path, "/finalize") ->
++        {{if(state.offline, do: 503, else: 200), %{"receipt" => payload["kind"]}}, state}
++
++      conn.method == "GET" ->
++        {{200, state.claim}, state}
++
++      state.deny ->
++        {{409, %{"error" => %{"code" => "CLAIM_DENIED"}}}, state}
++
++      true ->
++        claimed_response(state, state_root)
++    end
++  end
++
++  defp claimed_response(state, state_root) do
++    if not state.claimed, do: assert(not File.exists?(Path.join(state_root, state.claim["attemptId"])))
++    response = if state.lose_claim, do: :lost, else: {200, state.claim}
++    {response, %{state | claimed: true}}
++  end
++
++  defp finalizations(api) do
++    Agent.get(api, fn state ->
++      for {"POST", path, body} <- state.requests, String.ends_with?(path, "/finalize"), do: body
++    end)
++  end
++
++  defp seed_pending(context) do
++    File.mkdir!(context.directory)
++
++    for {name, value} <- [
++          {"snapshot.json", %{"release" => context.release}},
++          {"claim.json", context.claim},
++          {"result.json", %{"status" => "failed", "turns" => 0}},
++          {"stop.json", %{"processTreeStopped" => true}}
++        ],
++        do: File.write!(Path.join(context.directory, name), Jason.encode!(value))
++  end
++
++  defp read(directory, name), do: directory |> Path.join(name) |> File.read!() |> Jason.decode!()
++end
+--- a/elixir/test/symphony_elixir/ssh_test.exs
++++ b/elixir/test/symphony_elixir/ssh_test.exs
+@@ -125,7 +125,8 @@
+ 
+     assert {:ok, port} = SSH.start_port("localhost", "printf ok")
+     assert is_port(port)
+-    wait_for_trace!(trace_file)
++    assert_receive {^port, {:data, "ready\n"}}, 5_000
++    assert_receive {^port, {:exit_status, 0}}, 5_000
+ 
+     trace = File.read!(trace_file)
+     assert trace =~ "-T localhost bash -lc"
+@@ -151,7 +152,8 @@
+ 
+     assert {:ok, port} = SSH.start_port("localhost:2222", "printf ok", line: 256)
+     assert is_port(port)
+-    wait_for_trace!(trace_file)
++    assert_receive {^port, {:data, {:eol, "ready"}}}, 5_000
++    assert_receive {^port, {:exit_status, 0}}, 5_000
+ 
+     trace = File.read!(trace_file)
+     assert trace =~ "-T -p 2222 localhost bash -lc"
+@@ -182,18 +184,6 @@
+     System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
+   end
+ 
+-  defp wait_for_trace!(trace_file, attempts \\ 20)
+-  defp wait_for_trace!(trace_file, 0), do: flunk("timed out waiting for fake ssh trace at #{trace_file}")
+-
+-  defp wait_for_trace!(trace_file, attempts) do
+-    if File.exists?(trace_file) and File.read!(trace_file) != "" do
+-      :ok
+-    else
+-      Process.sleep(25)
+-      wait_for_trace!(trace_file, attempts - 1)
+-    end
+-  end
+-
+   defp restore_env(key, nil), do: System.delete_env(key)
+   defp restore_env(key, value), do: System.put_env(key, value)
+ end

@@ -271,6 +271,9 @@ export function createHostExecutorAdapterRouter({ localAdapter, remoteChannels }
     throw new TypeError("Host executor adapter routing requires local and remote adapters");
   }
   return {
+    readLocalThread(threadId) {
+      return localAdapter.requestReady("local", "thread/read", { threadId, includeTurns: false });
+    },
     ensureReady(execution) {
       return execution?.codexHostId === "local"
         ? localAdapter.ensureReady()

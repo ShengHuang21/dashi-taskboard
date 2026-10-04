@@ -32,6 +32,8 @@ const BOOLEAN_OPTIONS = new Set([
 const GLOBAL_OPTIONS = new Set(["runtime-file"]);
 
 const COMMAND_OPTIONS = new Map([
+  ["symphony release", new Set(["file", "if-version", "json"])],
+  ["symphony context", new Set(["json"])],
   ["background create", new Set(["project", "issue", "title", "model", "reasoning-effort", "sandbox", "goal-team-role", "expected-safe-action-id", "routing-comment-id", "routing-comment-version", "json"])],
   ["background start", new Set(["request-id", "message", "message-file", "json"])],
   ["background continue", new Set(["after-run", "request-id", "message", "message-file", "json"])],
@@ -764,6 +766,7 @@ async function execute(parsed, overrides) {
     ? processEnv
     : { ...processEnv, CODEX_TASKBOARD_RUNTIME_FILE: parsed.options["runtime-file"] };
   const usesCompanionControl = command.startsWith("cloud ")
+    || command.startsWith("symphony ")
     || command.startsWith("background ")
     || command === "project map"
     || command === "run handoff"
@@ -783,6 +786,17 @@ async function execute(parsed, overrides) {
       : await resolveTaskboardBaseUrl(env, overrides),
   });
   switch (command) {
+    case "symphony release": {
+      expectOperandCount(parsed, 1);
+      const filename = resolveInputPath(requiredOption(parsed.options, "file"), overrides);
+      const payload = JSON.parse(await (overrides.readFile ?? readFile)(filename, "utf8"));
+      return api.request("POST", `/api/local/tasks/${encodeURIComponent(parsed.operands[0])}/symphony/releases`, {
+        ...payload, expectedTaskVersion: Number(requiredOption(parsed.options, "if-version")),
+      });
+    }
+    case "symphony context":
+      expectOperandCount(parsed, 1);
+      return api.request("GET", `/api/local/symphony/releases/${encodeURIComponent(parsed.operands[0])}/context`);
     case "background create":
       expectOperandCount(parsed, 0);
       if (parsed.options["goal-team-role"] !== undefined) {

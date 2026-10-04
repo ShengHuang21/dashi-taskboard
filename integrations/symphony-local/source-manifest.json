@@ -1,0 +1,71 @@
+{
+  "upstreamRepository": "https://github.com/openai/symphony",
+  "upstreamCommit": "1c0fb6c8e8ef9031a2c861e62af5f9e66cee39cb",
+  "archiveSha256": "47b20de56016523571c5e21db1825002fe25cb1782bcaaef8cb83edfa211e9df",
+  "existingLocalChangesExcluded": [
+    "elixir/lib/symphony_elixir_web/live/dashboard_live.ex",
+    "elixir/test/symphony_elixir/extensions_test.exs"
+  ],
+  "files": {
+    "SPEC.md": {
+      "before": "c6638056502ecd2e60eb04e1f1a627a4964506fcdf4d39873e78aa5834de85d5",
+      "after": "26beb2541a61915ea82a89e97e18365e829378e168e4a117eae3ca6d03e86ef8"
+    },
+    "elixir/README.md": {
+      "before": "6a630f2effe2b6efac1dbd8a4844f7e9399e3ec697665e41a1019a89aae81050",
+      "after": "32670a95de365f981b395b60ff521fc293bc5d09aabf0adee6004e5a190037e6"
+    },
+    "elixir/lib/symphony_elixir/agent_runner.ex": {
+      "before": "4b4ab877427c76e5778034c7c89a41e9ec884fb1b142f3c6754550f3ba25be39",
+      "after": "deab2fbe2055d3eea35a682f7132f1358843e3e1844341ac10b2d0d144e2c402"
+    },
+    "elixir/lib/symphony_elixir/codex/app_server.ex": {
+      "before": "40b87a197e96755a5343ffb7f211fb3c68e90b4dcdb7658f62d971f07f7e4e6e",
+      "after": "d608dce498cde36ab7f25604d130aa55ee82184d04e6d25406d7e29a369a248f"
+    },
+    "elixir/lib/symphony_elixir/config.ex": {
+      "before": "7dec67698bd0fea2189421dc998c33c7fc5723f3445e9f43582a8dd10c5a88f9",
+      "after": "6851a99c2b08d558faf23c904d0f24cb33e0559acc765260883d07f5758a25ee"
+    },
+    "elixir/lib/symphony_elixir/orchestrator.ex": {
+      "before": "ffa6fd2ca66f775b93ca561adb60a61a416f8fb604ff247128d3638169fdab22",
+      "after": "796470b2130529900e9952c81bdf53eba69a8b6901174abdd04cd91604372a59"
+    },
+    "elixir/lib/symphony_elixir/tracker.ex": {
+      "before": "c4948d523e88385b365edf63fcd14b0f935e485e2fab3465d82fed88f51f2602",
+      "after": "1d2a728df00ce4bcae175915df78e71e9ad86698729fade968d02f8c8f199393"
+    },
+    "elixir/lib/symphony_elixir/local/adapter.ex": {
+      "before": null,
+      "after": "0856668b918e0ed19be02a9316d73daaee5a701ff3fec15e8223f145db6e0dd5"
+    },
+    "elixir/lib/symphony_elixir/local/client.ex": {
+      "before": null,
+      "after": "ffbfc62af4d3b287b3608d3195b21f3a2fd583ea4edec48369d697111ee0cda6"
+    },
+    "elixir/lib/symphony_elixir/local/runner.ex": {
+      "before": null,
+      "after": "6389e05e7906ec17a069697cf9509a8106e5bd12b0fb33912bbcc4d8534fc147"
+    },
+    "elixir/test/symphony_elixir/local_test.exs": {
+      "before": null,
+      "after": "63a12e67d236330173efaa62e7e5c9055c56a06948e3dc5058a21c34db7424d7"
+    },
+    "elixir/test/support/local_fake_supervisor.py": {
+      "before": null,
+      "after": "2147e9131033ef5025ff53d82fd6681014b56f87c165ca31f71d27fed90ca967"
+    },
+    "elixir/test/symphony_elixir/core_test.exs": {
+      "before": "d1a6d82116c696f01e0e6855f6abb738b08d263b8dfeb69475c99efdfdec710f",
+      "after": "175489ebcce15b9ac15ba74fe140a6037269e7b41b37ae50c08e87ced76020de"
+    },
+    "elixir/test/symphony_elixir/local_runner_test.exs": {
+      "before": null,
+      "after": "b980f774d2ef9baba5ebe5c84d30fbe6f67e7ae60d934a95ecf70757510f0437"
+    },
+    "elixir/test/symphony_elixir/ssh_test.exs": {
+      "before": "f158f403a76ca408a9863e2acf784e2988581a7f3b4fef8786a79f315b6453b6",
+      "after": "90e074e8f49913a66f0371a008549ee626112bbdd01b8bc4aea7be4dd75a48ce"
+    }
+  }
+}

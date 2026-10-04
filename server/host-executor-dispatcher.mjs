@@ -45,10 +45,13 @@ export class HostExecutorDispatcher {
 
     await this.afterReserve({ input, reservation });
     await this.adapter.ensureReady(input.execution);
+    const symphonyContexts = input.execution.codexHostId === "local" && this.database.symphonyLocal?.enabled
+      ? await this.database.symphonyLocal.resolveRpcContexts(input.operations, (id) => this.adapter.readLocalThread(id))
+      : null;
 
     // No await may be introduced between this final server-clock fence and the
     // ready adapter call. dispatchReady must enqueue the whole effect synchronously.
-    const dispatch = this.database.beginHostExecutorEffectDispatch(input);
+    const dispatch = this.database.beginHostExecutorEffectDispatch(input, symphonyContexts);
     if (!dispatch.dispatch) {
       return { replayed: true, effect: dispatch.effect, results: dispatch.effect.result };
     }

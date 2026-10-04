@@ -34,6 +34,7 @@ import {
   isLocalCompanionRoute,
 } from "./cloud-proxy.mjs";
 import { ApiError, TaskboardDatabase } from "./database.mjs";
+import { SymphonyLocalStore } from "./symphony-local.mjs";
 import { inspectExternalAgentCard } from "./external-agent-card.mjs";
 import { createJiraConfigStore } from "./jira-config.mjs";
 import { createJiraIntegration } from "./jira-integration.mjs";
@@ -3562,6 +3563,16 @@ export function createTaskboardServer(options = {}) {
     admissionTtlMs: options.admissionTtlMs,
     hostExecutorClock: options.hostExecutorClock,
   });
+  let symphonyLocal;
+  try {
+    if (options.symphonyLocal && (!resolved.instanceToken || !resolved.instanceSecret)) {
+      throw new ApiError(409, "SYMPHONY_OWNER_BOUNDARY_REQUIRED", "Local Symphony requires a protected owner launcher");
+    }
+    symphonyLocal = new SymphonyLocalStore(database, options.symphonyLocal);
+  } catch (error) {
+    database.close();
+    throw error;
+  }
   const worktreeRepositoryExecFile = options.worktreeRepositoryExecFile ?? execFileAsync;
   const worktreeRepositoryTtlMs = options.worktreeRepositoryTtlMs ?? WORKTREE_REPOSITORY_TTL_MS;
   const worktreeRepositoryCache = new Map();
@@ -4256,6 +4267,39 @@ export function createTaskboardServer(options = {}) {
     response.setHeader("referrer-policy", "no-referrer");
     try {
       const incomingUrl = new URL(request.url, "http://127.0.0.1");
+      // The scheduler gets only these narrow routes, never the owner route prefix.
+      if (incomingUrl.pathname.startsWith("/api/local/symphony/")) {
+        assertLoopbackRequest(request);
+        assertTrustedNetworkRequest(request, false);
+        symphonyLocal.authenticate(request.headers["x-taskboard-scheduler-token"]);
+        const pathname = incomingUrl.pathname;
+        const listRoute = /^\/api\/local\/symphony\/(candidates|releases)$/.exec(pathname);
+        if (listRoute) {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(response, 200, { releases: symphonyLocal.list({
+            projectId: incomingUrl.searchParams.get("projectId"),
+            ids: incomingUrl.searchParams.has("ids") ? incomingUrl.searchParams.get("ids").split(",") : undefined,
+            states: incomingUrl.searchParams.has("states") ? incomingUrl.searchParams.get("states").split(",") : undefined,
+            candidates: listRoute[1] === "candidates",
+          }) });
+        }
+        const route = /^\/api\/local\/symphony\/releases\/([^/]+)\/(context|claim|finalize)$/.exec(pathname);
+        if (!route) throw new ApiError(404, "NOT_FOUND", "Route not found");
+        const id = decodeRouteSegment(route[1], "Release id");
+        if (route[2] === "context" && request.method === "GET") return sendJson(response, 200, symphonyLocal.context(id));
+        if (route[2] === "claim" && request.method === "GET") return sendJson(response, 200, symphonyLocal.claimReceipt(id, incomingUrl.searchParams.get("requestId"), incomingUrl.searchParams.get("schedulerInstanceId")));
+        if (route[2] === "claim" && request.method === "POST") {
+          const receipt = symphonyLocal.claim(id, await readJson(request));
+          events.emit("task.updated", { task: database.getTask(symphonyLocal.get(id).taskId) });
+          return sendJson(response, 200, receipt);
+        }
+        if (route[2] === "finalize" && request.method === "POST") {
+          const receipt = symphonyLocal.finalize(id, await readJson(request));
+          events.emit("task.updated", { task: database.getTask(symphonyLocal.get(id).taskId) });
+          return sendJson(response, 200, receipt);
+        }
+        return methodNotAllowed(response, route[2] === "context" ? ["GET"] : route[2] === "claim" ? ["GET", "POST"] : ["POST"]);
+      }
       if (
         resolved.instanceToken
         && incomingUrl.pathname === "/"
@@ -4312,6 +4356,20 @@ export function createTaskboardServer(options = {}) {
       }
       const url = new URL(request.url, "http://127.0.0.1");
       const pathname = url.pathname;
+      const symphonyPublishRoute = /^\/api\/local\/tasks\/([^/]+)\/symphony\/releases$/.exec(pathname);
+      const symphonyContextRoute = /^\/api\/local\/symphony\/releases\/([^/]+)\/context$/.exec(pathname);
+      if (symphonyPublishRoute || symphonyContextRoute) {
+        assertLoopbackRequest(request);
+        if (request.headers["x-taskboard-client"] !== "taskctl") throw new ApiError(403, "TASKCTL_REQUIRED", "Symphony owner operations require protected taskctl");
+        if (symphonyContextRoute) {
+          if (request.method !== "GET") return methodNotAllowed(response, ["GET"]);
+          return sendJson(response, 200, symphonyLocal.context(decodeRouteSegment(symphonyContextRoute[1], "Release id")));
+        }
+        if (request.method !== "POST") return methodNotAllowed(response, ["POST"]);
+        const release = symphonyLocal.publish(decodeRouteSegment(symphonyPublishRoute[1], "Task id"), await readJson(request));
+        events.emit("task.updated", { task: database.getTask(release.taskId) });
+        return sendJson(response, 200, { release });
+      }
       const isLocalAiRoute = pathname === "/api/local/ai" || pathname.startsWith("/api/local/ai/");
       if (isLocalAiRoute) {
         assertAiLoopbackRequest(request);
@@ -7590,6 +7648,7 @@ export function createTaskboardServer(options = {}) {
   let listening = false;
   return {
     database,
+    symphonyLocal,
     refreshTaskWorktreeRepository,
     aiChat,
     agentLanes,
