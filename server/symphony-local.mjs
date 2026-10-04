@@ -309,7 +309,8 @@ export class SymphonyLocalStore {
     const current = this.db.prepare("SELECT 1 FROM symphony_current WHERE task_id=? AND release_id=?").get(r.task_id,id);
     const task = this.taskboard.getTask(r.task_id);
     const result = a?.result_json ? JSON.parse(a.result_json) : null;
-    const state = !current ? "superseded" : result?.status ?? (task.archivedAt || task.status === "canceled" ? "canceled" : a ? a.stopped_at ? "failed" : "running" : task.status === "todo" ? "ready" : "blocked");
+    const terminalState = task.archivedAt ? "canceled" : ["canceled", "done"].includes(task.status) ? task.status : null;
+    const state = !current ? "superseded" : terminalState ?? result?.status ?? (a ? a.stopped_at ? "failed" : "running" : task.status === "todo" ? "ready" : "blocked");
     return { releaseId:id, taskId:r.task_id, identifier:task.identifier, executionHash:r.execution_hash, execution:JSON.parse(r.execution_json), provenance:JSON.parse(r.provenance_json), publishedAt:r.published_at, state, current:Boolean(current), executable:state === "ready" && !a, attempt:a ? { id:a.id, schedulerInstanceId:a.scheduler_id, claimedAt:a.claimed_at, processState:a.stopped_at ? "stopped" : "unknown", stoppedAt:a.stopped_at, stopEvidence:a.stop_json ? JSON.parse(a.stop_json) : null, result } : null };
   }
   list({ projectId, ids, states, candidates = false }) {
@@ -331,7 +332,8 @@ export class SymphonyLocalStore {
       if (!release.executable || input.executionHash !== release.executionHash) fail("SYMPHONY_NOT_READY", "Release is not the current ready execution");
       this.checkCapability(release.execution); this.verifyInputs(release.execution);
       const workspaceKey = this.workspaceKey(release.execution.workspace.path);
-      if (this.db.prepare("SELECT 1 FROM symphony_occupancy WHERE workspace_key=?").get(workspaceKey)) fail("SYMPHONY_WORKSPACE_BUSY", "Another unresolved attempt occupies this checkout");
+      const occupied = this.db.prepare("SELECT workspace_key FROM symphony_occupancy").all();
+      if (occupied.some(({ workspace_key: key }) => within(key, workspaceKey) || within(workspaceKey, key))) fail("SYMPHONY_WORKSPACE_BUSY", "Another unresolved attempt occupies this checkout or a parent/child workspace");
       attempt = { id:randomUUID(),claim_request_id:input.requestId,scheduler_id:input.schedulerInstanceId };
       const token = this.token(release,attempt); const timestamp = now();
       this.db.prepare("INSERT INTO symphony_attempts (id,release_id,claim_request_id,claim_payload_hash,scheduler_id,token_hash,claimed_at) VALUES (?,?,?,?,?,?,?)").run(attempt.id,id,input.requestId,payloadHash,input.schedulerInstanceId,sha256(token),timestamp);
@@ -377,8 +379,8 @@ export class SymphonyLocalStore {
         if(p.status==="in_review" && (!p.verification.length || release.execution.artifacts.some((expected)=>expected.required&&!p.artifacts.some((artifact)=>artifact.path===expected.path)))) fail("SYMPHONY_RESULT_INCOMPLETE","Required artifacts and verification must be present");
         if(a.stop_json && canonicalJson(JSON.parse(a.stop_json).process)!==canonicalJson(p.process)) fail("SYMPHONY_PROCESS_MISMATCH","Result and stop refer to different processes");
         this.db.prepare("UPDATE symphony_attempts SET result_json=? WHERE id=?").run(canonicalJson(p),a.id);
-        this.db.prepare("UPDATE tasks SET status=?,version=version+1,updated_at=? WHERE id=?").run(p.status==="failed"?"blocked":p.status,timestamp,release.taskId);
-        this.taskboard.appendSymphonyResultComment(release.taskId,`Symphony ${id} / attempt ${a.id}\nTodo ${release.execution.todoId} / steps ${release.execution.stepIds.join(", ")} / v${release.execution.executionVersion}\n${p.summary}\nRequested: ${p.requested.model} / ${p.requested.effort}; observed: ${p.observed.model??"unknown"} / ${p.observed.effort??"unknown"}\nSession: ${p.sessionId??"unknown"}\nProcess: wrapper ${p.process.wrapperPid}, child ${p.process.childPid??"not started"}, group ${p.process.processGroupId??"none"}; stopped: ${Boolean(a.stopped_at)} (separate stop receipt)\nArtifacts:\n${p.artifacts.map((artifact)=>`${path.join(release.execution.workspace.path,artifact.path)} (sha256 ${artifact.sha256})`).join("\n")}\nVerification: ${p.verification.join("; ")}\nStatus: ${p.status}; user acceptance pending.`);
+        this.db.prepare("UPDATE tasks SET status=?,version=version+1,updated_at=? WHERE id=? AND status NOT IN ('canceled','done')").run(p.status==="failed"?"blocked":p.status,timestamp,release.taskId);
+        this.taskboard.appendSymphonyResultComment(release.taskId,`Symphony ${id} / attempt ${a.id}\nTodo ${release.execution.todoId} / steps ${release.execution.stepIds.join(", ")} / v${release.execution.executionVersion}\n${p.summary}\nRequested: ${p.requested.model} / ${p.requested.effort}; observed: ${p.observed.model??"unknown"} / ${p.observed.effort??"unknown"}\nSession: ${p.sessionId??"unknown"}\nProcess: wrapper ${p.process.wrapperPid}, child ${p.process.childPid??"not started"}, group ${p.process.processGroupId??"none"}; stopped: ${Boolean(a.stopped_at)} (separate stop receipt)\nArtifacts:\n${p.artifacts.map((artifact)=>`${path.join(release.execution.workspace.path,artifact.path)} (sha256 ${artifact.sha256})`).join("\n")}\nVerification: ${p.verification.join("; ")}\nExecution status: ${p.status}; card status: ${this.taskboard.getTask(release.taskId).status}.`);
       } else {
         fields(p,["state","observedAt","process","groupEmpty","descendants"]); processIdentity(p.process);
         if(p.state!=="stopped" || p.groupEmpty!==true || !Number.isFinite(Date.parse(p.observedAt)) || !Array.isArray(p.descendants) || p.descendants.some((d)=>d.alive!==false)) fail("SYMPHONY_STOP_UNPROVEN","Stop requires process group and descendant observations");

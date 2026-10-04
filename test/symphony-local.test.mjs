@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -149,6 +149,117 @@ for (const sameRelease of [true, false]) test(`SQLite processes compete atomical
     assert.equal(results.filter((result) => result.ok).length, 1);
     assert.equal(results.find((result) => !result.ok).code, sameRelease ? "SYMPHONY_ALREADY_CLAIMED" : "SYMPHONY_WORKSPACE_BUSY");
     assert.equal(f.db.database.prepare("SELECT COUNT(*) n FROM symphony_attempts").get().n, 1);
+  } finally { f.close(); }
+});
+
+for (const first of ["parent", "child", "simultaneous"]) test(`SQLite processes exclude overlapping workspaces: ${first} claim first`, async () => {
+  const f = fixture();
+  try {
+    mkdirSync(path.join(f.config.workspaceRoot, "A/nested"));
+    const parentTask = f.task("Parent"); const childTask = f.task("Child");
+    const parentBody = f.payload(parentTask, "parent");
+    parentBody.execution.workspace.writeScope = ["nested/output.md"];
+    parentBody.execution.artifacts = [{ path: "nested/output.md", required: true }];
+    const parent = f.store.publish(parentTask.id, parentBody);
+    const child = f.store.publish(childTask.id, f.payload(childTask, "child", "A/nested"));
+    assert.equal(path.join(parent.execution.workspace.path, parent.execution.artifacts[0].path), path.join(child.execution.workspace.path, child.execution.artifacts[0].path));
+    const releases = first === "child" ? [child, parent] : [parent, child];
+    const racers = await Promise.all(releases.map((release, i) => contender(f, release, `overlap-${i}`)));
+    racers[0].go();
+    if (first !== "simultaneous") await racers[0].done;
+    racers[1].go();
+    const results = await Promise.all(racers.map((racer) => racer.done));
+    assert.equal(results.filter((result) => result.ok).length, 1);
+    const winner = results.findIndex((result) => result.ok); const loser = 1 - winner;
+    assert.equal(results[loser].code, "SYMPHONY_WORKSPACE_BUSY");
+    assert.equal(f.store.get(releases[loser].releaseId).attempt, null);
+    assert.equal(f.db.getTask(releases[loser].taskId).status, "todo");
+    assert.equal(f.db.listComments(releases[loser].taskId).length, 0);
+    assert.equal(f.db.database.prepare("SELECT COUNT(*) n FROM symphony_attempts").get().n, 1);
+    assert.deepEqual(readdirSync(path.join(f.config.workspaceRoot, "A")), ["nested"]);
+    assert.deepEqual(readdirSync(path.join(f.config.workspaceRoot, "A/nested")), []);
+    const claim = results[winner].value;
+    const result = { ...resultPayload(f), status: "failed", artifacts: [], stopReason: "controlled failure" };
+    f.store.finalize(releases[winner].releaseId, finalBody(claim, "result", result));
+    assert.throws(() => f.store.claim(releases[loser].releaseId, claimBody(releases[loser])), { code: "SYMPHONY_WORKSPACE_BUSY" });
+    f.store.finalize(releases[winner].releaseId, finalBody(claim, "stop", stopPayload()));
+    assert.ok(f.store.claim(releases[loser].releaseId, claimBody(releases[loser])).attemptId);
+  } finally { f.close(); }
+});
+
+test("SQLite processes allow sibling workspaces and separator-safe A versus A2", async () => {
+  const f = fixture();
+  try {
+    mkdirSync(path.join(f.config.workspaceRoot, "A2"));
+    const releases = ["A", "A2", "B"].map((name) => {
+      const task = f.task(name); return f.store.publish(task.id, f.payload(task, name, name));
+    });
+    const racers = await Promise.all(releases.map((release, i) => contender(f, release, `sibling-${i}`)));
+    racers.forEach((racer) => racer.go());
+    assert.ok((await Promise.all(racers.map((racer) => racer.done))).every((result) => result.ok));
+    assert.equal(f.db.database.prepare("SELECT COUNT(*) n FROM symphony_occupancy").get().n, 3);
+  } finally { f.close(); }
+});
+
+for (const status of ["canceled", "done"]) for (const outcome of ["failed", "in_review"]) for (const ownerFirst of [true, false]) test(`HTTP owner ${status} survives ${outcome} result (${ownerFirst ? "owner" : "result"} first)`, async () => {
+  const f = fixture(); let app;
+  try {
+    const task = f.task(); const release = f.store.publish(task.id, f.payload(task));
+    const claim = f.store.claim(release.releaseId, claimBody(release));
+    app = createTaskboardServer({ dataDirectory: f.directory, databasePath: f.filename, codexExecutable: "/usr/bin/false", codexStatePath: path.join(f.directory, "codex-state"), codexSessionsDirectory: path.join(f.directory, "sessions"), instanceToken: "owner-test-token-123", instanceSecret: "d".repeat(64), projectSummaryEnabled: false, symphonyLocal: f.config });
+    const address = await app.listen({ port: 0 }); const base = `http://127.0.0.1:${address.port}`;
+    const result = finalBody(claim, "result", { ...resultPayload(f), status: outcome, ...(outcome === "failed" ? { artifacts: [], stopReason: "controlled failure" } : {}) });
+    async function send(kind, body) {
+      const response = await fetch(`${base}/api/local/symphony/releases/${release.releaseId}/${kind}`, { method: "POST", headers: { "content-type": "application/json", "x-taskboard-scheduler-token": f.config.schedulerToken }, body: JSON.stringify(body) });
+      const value = await response.json(); assert.equal(response.status, 200, JSON.stringify(value)); return value;
+    }
+    let receipt;
+    if (!ownerFirst) receipt = await send("finalize", result);
+    const updated = await fetch(`${base}/owner-test-token-123/api/tasks/${task.id}`, { method: "PATCH", headers: { "content-type": "application/json", "x-taskboard-client": "taskctl" }, body: JSON.stringify({ version: f.db.getTask(task.id).version, status }) });
+    const updatedBody = await updated.json(); assert.equal(updated.status, 200, JSON.stringify(updatedBody));
+    const ownerVersion = updatedBody.task.version;
+    assert.equal(f.store.get(release.releaseId).state, status);
+    if (ownerFirst) receipt = await send("finalize", result);
+    assert.equal(f.db.getTask(task.id).status, status);
+    assert.equal(f.db.getTask(task.id).version, ownerVersion);
+    assert.equal(f.store.get(release.releaseId).state, status);
+    assert.equal(f.store.get(release.releaseId).executable, false);
+    assert.deepEqual(f.store.get(release.releaseId).attempt.result, result.payload);
+    const comments = f.db.listComments(task.id).filter((comment) => comment.authorId === "symphony-local");
+    assert.equal(comments.length, 1);
+    const replay = await send("finalize", result);
+    assert.deepEqual(replay, { ...receipt, replayed: true });
+    assert.equal(f.db.listComments(task.id).filter((comment) => comment.authorId === "symphony-local").length, 1);
+    const other = f.task("Other card"); const otherRelease = f.store.publish(other.id, f.payload(other, "other", "A"));
+    assert.throws(() => f.store.claim(otherRelease.releaseId, claimBody(otherRelease)), { code: "SYMPHONY_WORKSPACE_BUSY" });
+    await send("finalize", finalBody(claim, "stop", stopPayload()));
+    assert.equal(f.store.get(release.releaseId).attempt.processState, "stopped");
+    assert.equal(f.store.get(release.releaseId).state, status);
+    assert.equal(f.db.getTask(task.id).version, ownerVersion);
+    assert.ok(f.store.claim(otherRelease.releaseId, claimBody(otherRelease)).attemptId);
+  } finally { if (app) await app.close(); f.close(); }
+});
+
+test("nonterminal owner in_review still follows execution failure; superseded result cannot update a new card version", () => {
+  const f = fixture();
+  try {
+    const task = f.task(); const body = f.payload(task); const release = f.store.publish(task.id, body);
+    const claim = f.store.claim(release.releaseId, claimBody(release));
+    f.db.updateTask(task.id, f.db.getTask(task.id).version, { status: "in_review" }, undefined, undefined, actor);
+    const result = finalBody(claim, "result", { ...resultPayload(f), status: "failed", artifacts: [], stopReason: "controlled failure" });
+    f.store.finalize(release.releaseId, result);
+    assert.equal(f.db.getTask(task.id).status, "blocked");
+    f.store.finalize(release.releaseId, finalBody(claim, "stop", stopPayload()));
+    const next = f.store.publish(task.id, { ...body, requestId: "v2", expectedTaskVersion: f.db.getTask(task.id).version, execution: { ...body.execution, executionVersion: 2 } });
+    const nextClaim = f.store.claim(next.releaseId, claimBody(next));
+    f.store.finalize(next.releaseId, finalBody(nextClaim, "stop", stopPayload()));
+    const current = f.store.publish(task.id, { ...body, requestId: "v3", expectedTaskVersion: f.db.getTask(task.id).version, execution: { ...body.execution, executionVersion: 3 } });
+    const version = f.db.getTask(task.id).version;
+    assert.equal(f.store.finalize(release.releaseId, result).replayed, true);
+    assert.throws(() => f.store.finalize(next.releaseId, finalBody(nextClaim, "result", result.payload)), { code: "SYMPHONY_SUPERSEDED" });
+    assert.equal(f.db.getTask(task.id).version, version);
+    assert.equal(f.store.get(current.releaseId).state, "ready");
+    assert.equal(f.db.listComments(task.id).length, 1);
   } finally { f.close(); }
 });
 

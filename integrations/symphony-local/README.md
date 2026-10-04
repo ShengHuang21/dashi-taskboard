@@ -85,8 +85,10 @@ header or environment values. Result and stop recovery remain independent.
 ## Attempts, results and recovery
 
 SQLite claims precede task-related directory writes or thread creation. There is
-one durable attempt per release and one unresolved occupant per canonical checkout,
-including different cards targeting that checkout. Attempt directories and the
+one durable attempt per release. Canonical workspaces that are equal or contain
+one another are mutually exclusive, including different cards. The claim transaction
+checks both parent/child directions before creating an attempt. Sibling workspaces
+remain parallel; `A` and `A2` do not overlap. Attempt directories and the
 exclusive `launch.guard` are retained. Normal/error exit, cancellation, stall and
 restart never create another Worker for that version. A live Worker may use its
 package's allowed turn count.
@@ -106,8 +108,12 @@ tree outside this boundary.
 Worker final output is a JSON object containing `summary` and `verification`;
 artifacts are checked independently from their actual files. A valid result moves
 the original card to `in_review` and adds one comment with Todo steps, attempt,
-configuration/session/process information and artifact hashes. It never marks user
-acceptance. Result and stop use separate fixed idempotency keys. Result alone never
+configuration/session/process information and artifact hashes. Owner `canceled`
+or `done` status is preserved: the release exposes that terminal status while the
+attempt retains its immutable execution result, even if the result arrives later.
+The native Local scheduler stops any running release whose state is no longer
+`running`. Nonterminal card status still follows the execution result. Workers
+never mark user acceptance. Result and stop use separate fixed idempotency keys. Result alone never
 releases occupancy. Pending envelopes are replayed unchanged after service recovery,
 with no new claim or launch. Workspaces and artifacts are not auto-deleted.
 
