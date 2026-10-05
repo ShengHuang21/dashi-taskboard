@@ -45,7 +45,7 @@
     },
     "elixir/lib/symphony_elixir/local/runner.ex": {
       "before": null,
-      "after": "6389e05e7906ec17a069697cf9509a8106e5bd12b0fb33912bbcc4d8534fc147"
+      "after": "79d7a4ee6e41a7bdd645a5e002057dc04cc34e5a34556d3716a866d647ec4868"
     },
     "elixir/test/symphony_elixir/local_test.exs": {
       "before": null,
@@ -61,7 +61,7 @@
     },
     "elixir/test/symphony_elixir/local_runner_test.exs": {
       "before": null,
-      "after": "b980f774d2ef9baba5ebe5c84d30fbe6f67e7ae60d934a95ecf70757510f0437"
+      "after": "6040d183e2c34c4da8c71ba755e79fbb887021dc6c0e01873a71045c8afbba63"
     },
     "elixir/test/symphony_elixir/ssh_test.exs": {
       "before": "f158f403a76ca408a9863e2acf784e2988581a7f3b4fef8786a79f315b6453b6",

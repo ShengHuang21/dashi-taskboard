@@ -619,7 +619,7 @@
 +end
 --- /dev/null
 +++ b/elixir/lib/symphony_elixir/local/runner.ex
-@@ -0,0 +1,234 @@
+@@ -0,0 +1,262 @@
 +defmodule SymphonyElixir.Local.Runner do
 +  @moduledoc "One durable claim before any workspace or Worker side effect. Local workspaces are retained."
 +  require Logger
@@ -783,21 +783,9 @@
 +  defp replay_attempt(directory, settings) do
 +    with false <- File.exists?(Path.join(directory, "delivered.json")),
 +         {:ok, snapshot} <- read_json(Path.join(directory, "snapshot.json")),
-+         {:ok, claim} <- read_json(Path.join(directory, "claim.json")),
-+         {:ok, result} <- read_json(Path.join(directory, "result.json")),
-+         {:ok, stop} <- observe_stopped(directory, settings.provider) do
++         {:ok, claim} <- read_json(Path.join(directory, "claim.json")) do
 +      release_id = snapshot["release"]["releaseId"]
-+
-+      results =
-+        Enum.map([{"result", result}, {"stop", stop}], fn {kind, payload} ->
-+          envelope =
-+            Map.take(claim, ["attemptId", "claimToken", "executionHash"])
-+            |> Map.merge(%{"requestId" => claim["attemptId"] <> ":" <> kind <> ":1", "kind" => kind, "payload" => payload})
-+
-+          filename = Path.join(directory, kind <> "-envelope.json")
-+          write_once!(filename, envelope)
-+          Client.request(:post, route(release_id, "finalize"), envelope, settings)
-+        end)
++      results = Enum.map(["result", "stop"], &replay_finalization(directory, release_id, claim, &1, settings))
 +
 +      if Enum.all?(results, &match?({:ok, _}, &1)), do: write_once!(Path.join(directory, "delivered.json"), %{"receipts" => Enum.map(results, &elem(&1, 1))})
 +    else
@@ -806,6 +794,46 @@
 +  rescue
 +    error -> Logger.warning("Local result recovery remains pending: #{inspect(error.__struct__)}")
 +  end
++
++  defp replay_finalization(directory, release_id, claim, kind, settings) do
++    with {:ok, envelope} <- finalization_envelope(directory, claim, kind, settings.provider) do
++      Client.request(:post, route(release_id, "finalize"), envelope, settings)
++    end
++  rescue
++    error ->
++      Logger.warning("Local #{kind} recovery remains pending: #{inspect(error.__struct__)}")
++      {:error, :local_finalization_pending}
++  end
++
++  defp finalization_envelope(directory, claim, kind, provider) do
++    identity =
++      Map.take(claim, ["attemptId", "claimToken", "executionHash"])
++      |> Map.merge(%{"requestId" => claim["attemptId"] <> ":" <> kind <> ":1", "kind" => kind})
++
++    filename = Path.join(directory, kind <> "-envelope.json")
++
++    case read_json(filename) do
++      {:ok, envelope} ->
++        if is_map(envelope) and is_map(envelope["payload"]) and Map.delete(envelope, "payload") == identity do
++          {:ok, envelope}
++        else
++          raise "Local immutable envelope identity conflict"
++        end
++
++      {:error, :enoent} ->
++        with {:ok, payload} <- finalization_payload(directory, kind, provider) do
++          envelope = Map.put(identity, "payload", payload)
++          write_once!(filename, envelope)
++          {:ok, envelope}
++        end
++
++      _ ->
++        raise "Local immutable envelope unavailable"
++    end
++  end
++
++  defp finalization_payload(directory, "result", _provider), do: read_json(Path.join(directory, "result.json"))
++  defp finalization_payload(directory, "stop", provider), do: observe_stopped(directory, provider)
 +
 +  defp observe_stopped(directory, provider) do
 +    if File.exists?(Path.join(directory, "stop.json")) do
@@ -1111,7 +1139,7 @@
      orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
 --- /dev/null
 +++ b/elixir/test/symphony_elixir/local_runner_test.exs
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,383 @@
 +defmodule SymphonyElixir.LocalRunnerTest do
 +  use SymphonyElixir.TestSupport
 +  alias SymphonyElixir.Local.{Client, Runner}
@@ -1178,6 +1206,9 @@
 +      deny: false,
 +      lose_claim: false,
 +      offline: false,
++      offline_kind: nil,
++      lose_finalize: nil,
++      accepted: %{},
 +      requests: []
 +    }
 +
@@ -1224,7 +1255,7 @@
 +    for mode <- ~w(profile_missing feature_enabled host_disabled host_missing web_enabled profile_changed mcp_enabled mcp_config_enabled mcp_error) do
 +      File.rm_rf!(context.directory)
 +      release = put_in(context.release, ["execution", "objective"], mode)
-+      Agent.update(context.api, &%{&1 | release: release, claimed: false})
++      Agent.update(context.api, &%{&1 | release: release, claimed: false, accepted: %{}})
 +      assert capture_log(fn -> Runner.run(Client.to_issue(release), nil) end) =~ "startup failed"
 +      refute Enum.any?(read(context.directory, "protocol.json"), &(&1["method"] == "turn/start"))
 +    end
@@ -1258,7 +1289,7 @@
 +    for mode <- ["fail_start", "turn_fail"] do
 +      File.rm_rf!(context.directory)
 +      release = put_in(context.release, ["execution", "objective"], mode)
-+      Agent.update(context.api, &%{&1 | release: release, claimed: false})
++      Agent.update(context.api, &%{&1 | release: release, claimed: false, accepted: %{}})
 +      assert :ok = Runner.run(Client.to_issue(release), nil)
 +      assert read(context.directory, "result.json")["status"] == "failed"
 +      assert File.exists?(Path.join(context.directory, "delivered.json"))
@@ -1271,6 +1302,8 @@
 +    refute File.exists?(Path.join(context.directory, "delivered.json"))
 +    first = finalizations(context.api)
 +    launch = File.read!(Path.join(context.directory, "launch-observed.json"))
++    File.rm!(Path.join(context.directory, "result.json"))
++    File.rm!(Path.join(context.directory, "stop.json"))
 +    Agent.update(context.api, &%{&1 | offline: false})
 +    assert :ok = Runner.replay_pending(context.provider)
 +    assert finalizations(context.api) == first ++ first
@@ -1284,7 +1317,7 @@
 +    File.write!(filename, "{\"wrong\":true}")
 +    assert capture_log(fn -> Runner.replay_pending(context.provider) end) =~ "recovery remains pending"
 +    assert File.read!(filename) == "{\"wrong\":true}"
-+    assert finalizations(context.api) == []
++    assert Enum.map(finalizations(context.api), & &1["kind"]) == ["stop"]
 +    refute File.exists?(Path.join(context.directory, "delivered.json"))
 +  end
 +
@@ -1303,13 +1336,112 @@
 +    assert File.exists?(Path.join(context.directory, "delivered.json"))
 +  end
 +
-+  test "unknown stop proof cannot finalize or release an attempt", context do
++  test "unknown stop proof retains occupancy but does not block the result", context do
 +    release = put_in(context.release, ["execution", "objective"], "unknown")
 +    Agent.update(context.api, &%{&1 | release: release})
 +    assert :ok = Runner.run(Client.to_issue(release), nil)
 +    assert File.exists?(Path.join(context.directory, "result.json"))
 +    refute File.exists?(Path.join(context.directory, "delivered.json"))
-+    assert finalizations(context.api) == []
++    assert Enum.map(finalizations(context.api), & &1["kind"]) == ["result"]
++    refute File.exists?(Path.join(context.directory, "stop-envelope.json"))
++    launch = File.read!(Path.join(context.directory, "launch-observed.json"))
++    result = read(context.directory, "result-envelope.json")
++    File.rm!(Path.join(context.directory, "result.json"))
++    File.write!(Path.join(context.directory, "stop.json"), Jason.encode!(%{"processTreeStopped" => true, "unknown" => false}))
++    assert :ok = Runner.run(Client.to_issue(release), nil)
++    assert Enum.map(finalizations(context.api), & &1["kind"]) == ["result", "result", "stop"]
++    assert read(context.directory, "result-envelope.json") == result
++    assert File.read!(Path.join(context.directory, "launch-observed.json")) == launch
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++  end
++
++  test "valid stop is delivered without a result and a later result never relaunches", context do
++    seed_pending(context)
++    File.write!(Path.join(context.directory, "launch.guard"), "consumed")
++    result = read(context.directory, "result.json")
++    File.rm!(Path.join(context.directory, "result.json"))
++    assert :ok = Runner.replay_pending(context.provider)
++    assert Enum.map(finalizations(context.api), & &1["kind"]) == ["stop"]
++    assert Agent.get(context.api, &Map.keys(&1.accepted)) == ["stop"]
++    refute File.exists?(Path.join(context.directory, "result-envelope.json"))
++    refute File.exists?(Path.join(context.directory, "delivered.json"))
++    stop = read(context.directory, "stop-envelope.json")
++    File.rm!(Path.join(context.directory, "stop.json"))
++    File.write!(Path.join(context.directory, "result.json"), Jason.encode!(result))
++    assert :ok = Runner.run(Client.to_issue(context.release), nil)
++    assert Enum.map(finalizations(context.api), & &1["kind"]) == ["stop", "result", "stop"]
++    assert read(context.directory, "stop-envelope.json") == stop
++    assert File.read!(Path.join(context.directory, "launch.guard")) == "consumed"
++    refute File.exists?(Path.join(context.directory, "launch-observed.json"))
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++    assert map_size(Agent.get(context.api, & &1.accepted)) == 2
++  end
++
++  test "each unavailable finalization leaves its peer deliverable and replays the same envelopes", context do
++    seed_pending(context)
++
++    for kind <- ["result", "stop"] do
++      Agent.update(context.api, &%{&1 | offline_kind: kind, requests: [], accepted: %{}})
++      assert :ok = Runner.replay_pending(context.provider)
++      refute File.exists?(Path.join(context.directory, "delivered.json"))
++      assert Map.keys(Agent.get(context.api, & &1.accepted)) == [if(kind == "result", do: "stop", else: "result")]
++      first = finalizations(context.api)
++      Agent.update(context.api, &%{&1 | offline_kind: nil})
++      assert :ok = Runner.replay_pending(context.provider)
++      assert finalizations(context.api) == first ++ first
++      assert map_size(Agent.get(context.api, & &1.accepted)) == 2
++      File.rm!(Path.join(context.directory, "delivered.json"))
++    end
++  end
++
++  test "lost result acknowledgement preserves server receipt and the independent stop", context do
++    seed_pending(context)
++    Agent.update(context.api, &%{&1 | lose_finalize: "result"})
++    assert :ok = Runner.replay_pending(context.provider)
++    assert map_size(Agent.get(context.api, & &1.accepted)) == 2
++    refute File.exists?(Path.join(context.directory, "delivered.json"))
++    first = finalizations(context.api)
++    for name <- ["result.json", "stop.json"], do: File.write!(Path.join(context.directory, name), "invalid raw evidence")
++    assert :ok = Runner.replay_pending(context.provider)
++    assert finalizations(context.api) == first ++ first
++    assert map_size(Agent.get(context.api, & &1.accepted)) == 2
++    assert File.exists?(Path.join(context.directory, "delivered.json"))
++  end
++
++  test "invalid stop envelope cannot block a valid result or be rewritten", context do
++    seed_pending(context)
++    filename = Path.join(context.directory, "stop-envelope.json")
++    wrong_kind = Map.merge(context.claim, %{"kind" => "result", "requestId" => context.claim["attemptId"] <> ":stop:1", "payload" => read(context.directory, "stop.json")})
++
++    for invalid <- ["invalid json", "null", Jason.encode!(wrong_kind)] do
++      File.write!(filename, invalid)
++      Agent.update(context.api, &%{&1 | requests: []})
++      assert capture_log(fn -> Runner.replay_pending(context.provider) end) =~ "recovery remains pending"
++      assert Enum.map(finalizations(context.api), & &1["kind"]) == ["result"]
++      assert File.read!(filename) == invalid
++      refute File.exists?(Path.join(context.directory, "delivered.json"))
++    end
++  end
++
++  test "completion marker storage failure retains both envelopes for safe replay", context do
++    seed_pending(context)
++    marker = Path.join(context.directory, "delivered.json")
++
++    Req.default_options(
++      plug: fn conn ->
++        response = handle_request(conn, context.api, context.provider["state_root"])
++        File.mkdir(marker)
++        response
++      end
++    )
++
++    assert capture_log(fn -> Runner.replay_pending(context.provider) end) =~ "recovery remains pending"
++    assert map_size(Agent.get(context.api, & &1.accepted)) == 2
++    File.rmdir!(marker)
++    Req.default_options(plug: &handle_request(&1, context.api, context.provider["state_root"]))
++    assert :ok = Runner.replay_pending(context.provider)
++    assert length(read(context.directory, "delivered.json")["receipts"]) == 2
++    assert map_size(Agent.get(context.api, & &1.accepted)) == 2
 +  end
 +
 +  defp handle_request(conn, api, state_root) do
@@ -1334,7 +1466,7 @@
 +        {{200, %{"release" => state.release, "protection" => %{"inputRoot" => Path.dirname(state_root), "deniedPaths" => [state_root]}}}, state}
 +
 +      String.ends_with?(conn.request_path, "/finalize") ->
-+        {{if(state.offline, do: 503, else: 200), %{"receipt" => payload["kind"]}}, state}
++        finalize_response(payload, state)
 +
 +      conn.method == "GET" ->
 +        {{200, state.claim}, state}
@@ -1344,6 +1476,23 @@
 +
 +      true ->
 +        claimed_response(state, state_root)
++    end
++  end
++
++  defp finalize_response(payload, state) do
++    kind = payload["kind"]
++
++    if state.offline or state.offline_kind == kind do
++      {{503, %{}}, state}
++    else
++      assert Map.get(state.accepted, kind, payload) == payload
++      next = %{state | accepted: Map.put(state.accepted, kind, payload)}
++
++      if state.lose_finalize == kind do
++        {:lost, %{next | lose_finalize: nil}}
++      else
++        {{200, %{"receipt" => kind}}, next}
++      end
 +    end
 +  end
 +
@@ -1361,6 +1510,7 @@
 +
 +  defp seed_pending(context) do
 +    File.mkdir!(context.directory)
++    Agent.update(context.api, &%{&1 | claimed: true})
 +
 +    for {name, value} <- [
 +          {"snapshot.json", %{"release" => context.release}},

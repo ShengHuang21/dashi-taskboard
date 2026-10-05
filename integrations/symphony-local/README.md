@@ -23,10 +23,18 @@ scope; missing/different configuration or signing key prevents startup.
 
 The scheduler receives only its independent token and unprefixed loopback base URL.
 It can read releases, claim once and finalize results/stops, and cannot publish or
-use owner routes. Native/legacy execution is fenced for the configured project and
-workspace root. Native thread RPC checks both persisted project bindings and the
+use owner routes. Native/legacy guards check the configured project and main
+workspace. Native thread RPC checks both persisted project bindings and the
 same adapter's native thread ID/cwd, including caller cwd overrides, at the final
 dispatch transaction. Ambiguous requests fail individually.
+
+These guards do not yet cover every legacy writable scope: additional writable
+directories and a legacy workspace containing the Local root remain open gaps
+(R9-02) before general same-instance coexistence. This dedicated `serve.mjs` sets
+the local legacy executable to `/usr/bin/false`; it does not disable the remote
+channel registry. A limited trial must also verify no replacement adapter, active
+remote channel or old Worker. Do not treat this mitigation as complete legacy
+isolation or enable it in an ordinary daily instance on that basis.
 
 ## Symphony configuration
 
@@ -63,6 +71,11 @@ separate from input/workspace roots. The trusted controller and app-server reuse
 existing authentication; no login secrets are copied or supplied to the model.
 The profile governs Codex-managed tools and descendants, not the trusted entire
 app-server process or an all-machine read allowlist.
+
+`writeScope` is the task contract and artifact-validation scope, not an OS-level
+per-file write allowlist inside the workspace. `authorized-git` enables profile
+network access; it is not a Git-protocol-only network filter. Use the existing
+`model-only` authority for the limited trial.
 
 Inherited MCP servers are individually disabled with process-only overrides and
 checked again in the same app-server's effective configuration. Plugins, apps,
@@ -115,7 +128,15 @@ The native Local scheduler stops any running release whose state is no longer
 `running`. Nonterminal card status still follows the execution result. Workers
 never mark user acceptance. Result and stop use separate fixed idempotency keys. Result alone never
 releases occupancy. Pending envelopes are replayed unchanged after service recovery,
-with no new claim or launch. Workspaces and artifacts are not auto-deleted.
+with no new claim or launch. Result and stop are prepared and sent independently:
+missing evidence, an invalid envelope or a failed send on one side does not block
+the other. A saved envelope is replayed without rereading its original payload;
+a new stop envelope still requires verified process-stop evidence. The delivered
+marker requires both acknowledgements. Workspaces and artifacts are not auto-deleted.
+
+Service GET routes do not claim or launch. Tracker `Local.Client.fetch`, however,
+first replays pending envelopes and may POST an old finalize receipt; the whole
+fetch operation is not strictly read-only.
 
 ## Local verification
 
